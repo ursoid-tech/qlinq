@@ -30,6 +30,7 @@ typedef struct {
   uint64_t largest_delivered;
   uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
   bool delivered_initialized;
+  bool shared_delivery;
   bool checkpoint_initialized;
   uint64_t last_checkpoint_object_id;
   transport_recovery_window_t recovery_windows[QLINQ_RECOVERY_MAX_WINDOWS];
@@ -37,6 +38,7 @@ typedef struct {
 
 typedef struct {
   bool participating;
+  bool retired;
   bool sent_initialized;
   uint64_t sent_group_id;
   uint64_t sent_object_id;
