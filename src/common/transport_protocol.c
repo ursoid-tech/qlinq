@@ -11,17 +11,28 @@
 #include "quicly/sendstate.h"
 #include "quicly/streambuf.h"
 
+#include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static uint32_t local_capabilities(void) {
-  return QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |
-         QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |
-         QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |
-         QLINQ_WIRE_CAP_RATELESS_REPAIR | QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS;
+bool transport_track_type_valid(uint8_t type) {
+  return type == MOQ_TRACK_VIDEO || type == MOQ_TRACK_AUDIO ||
+         type == MOQ_TRACK_INPUT || type == MOQ_TRACK_TEXT ||
+         type == MOQ_TRACK_DATA || type == MOQ_TRACK_TELEMETRY;
+}
+
+static uint32_t local_capabilities(const transport_t *t) {
+  uint32_t capabilities =
+      QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |
+      QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |
+      QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |
+      QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS | QLINQ_WIRE_CAP_RATELESS_REPAIR;
+  if (t->flexicast_enabled)
+    capabilities |= QLINQ_WIRE_CAP_FLEXICAST_DATAGRAM;
+  return capabilities;
 }
 
 bool transport_protocol_send_hello(transport_conn_t *conn) {
@@ -35,7 +46,7 @@ bool transport_protocol_send_hello(transport_conn_t *conn) {
   qlinq_wire_hello_t hello = {
       .role = t->is_server ? QLINQ_WIRE_ROLE_SERVER : QLINQ_WIRE_ROLE_CLIENT,
       .max_paths = (uint16_t)t->socket_count,
-      .capabilities = local_capabilities(),
+      .capabilities = local_capabilities(t),
       .max_reliable_object_size = (uint32_t)t->limits.max_reliable_object_size,
       .max_fec_object_size = (uint32_t)t->limits.max_fec_object_size,
       .max_subscriptions = (uint16_t)t->limits.max_subscriptions_per_connection,
@@ -742,11 +753,9 @@ static void completed_remember(transport_conn_t *conn, uint8_t alias,
   conn->completed_objects[completed].object_id = object_id;
 }
 
-static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
-                                      quicly_conn_t *conn,
-                                      ptls_iovec_t payload) {
-  (void)self;
-  transport_conn_t *tconn = *quicly_get_data(conn);
+void transport_protocol_receive_datagram(transport_conn_t *tconn,
+                                         ptls_iovec_t payload,
+                                         bool allow_telemetry) {
   if (!tconn)
     return;
 
@@ -763,6 +772,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     goto malformed_datagram;
 
   if (datagram_type == QLINQ_WIRE_DATAGRAM_TELEMETRY) {
+    if (!allow_telemetry)
+      return;
     qlinq_wire_telemetry_t telemetry;
     if (qlinq_wire_decode_telemetry(payload.base, payload.len, &telemetry) !=
         QLINQ_WIRE_OK)
@@ -834,14 +845,17 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   }
 
   /* automatically send a telemetry reply to measure OWD */
-  uint8_t reply[QLINQ_WIRE_TELEMETRY_SIZE];
-  qlinq_wire_telemetry_t telemetry = {.path_id = hdr.path_id,
-                                      .send_time_ns = hdr.send_time_ns,
-                                      .recv_time_ns = transport_get_time_ns()};
-  if (qlinq_wire_encode_telemetry(reply, sizeof(reply), &telemetry) ==
-      QLINQ_WIRE_OK) {
-    ptls_iovec_t reply_vec = ptls_iovec_init(reply, sizeof(reply));
-    (void)transport_queue_datagram(tconn, hdr.path_id, reply_vec);
+  if (allow_telemetry) {
+    uint8_t reply[QLINQ_WIRE_TELEMETRY_SIZE];
+    qlinq_wire_telemetry_t telemetry = {.path_id = hdr.path_id,
+                                        .send_time_ns = hdr.send_time_ns,
+                                        .recv_time_ns =
+                                            transport_get_time_ns()};
+    if (qlinq_wire_encode_telemetry(reply, sizeof(reply), &telemetry) ==
+        QLINQ_WIRE_OK) {
+      ptls_iovec_t reply_vec = ptls_iovec_init(reply, sizeof(reply));
+      (void)transport_queue_datagram(tconn, hdr.path_id, reply_vec);
+    }
   }
 
   uint8_t is_keyframe = hdr.is_keyframe;
@@ -876,6 +890,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     return;
   uint64_t generation = subscription_state->generation;
   transport_object_gap_state_t *object_state = &subscription_state->object_gap;
+  if (!allow_telemetry)
+    object_state->shared_delivery = true;
   transport_assembler_observe_receive(tconn, symbol_size);
   if (completed_contains(tconn, track_id, generation, group_id, object_id)) {
     t->stats.fec_duplicate_objects_suppressed++;
@@ -967,12 +983,21 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot->symbol_size = symbol_size;
     asm_slot->original_size = original_size;
     asm_slot->priority = hdr.priority;
+    asm_slot->decoded = false;
+    asm_slot->shared_delivery = !allow_telemetry;
     asm_slot->received_count = 0;
     asm_slot->nack_sent = false;
+    asm_slot->nack_attempt = 0;
     asm_slot->first_symbol_time_ms = transport_get_time_ms();
     asm_slot->last_activity_time_ms = asm_slot->first_symbol_time_ms;
     transport_index_assembler(tconn, asm_slot);
   }
+
+  if (asm_slot->decoded)
+    return;
+
+  if (!allow_telemetry)
+    asm_slot->shared_delivery = true;
 
   if (total_symbols > asm_slot->total_symbols) {
     if (!transport_grow_assembler(t, asm_slot, total_symbols, symbol_size)) {
@@ -1069,9 +1094,43 @@ malformed_datagram:
   tconn->malformed_datagrams++;
 }
 
+static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
+                                      quicly_conn_t *conn,
+                                      ptls_iovec_t payload) {
+  (void)self;
+  transport_protocol_receive_datagram(*quicly_get_data(conn), payload, true);
+}
+
+static quicly_error_t
+on_receive_flexicast_frame(quicly_receive_flexicast_frame_t *self,
+                           quicly_conn_t *conn,
+                           const quicly_flexicast_frame_t *frame) {
+  (void)self;
+  transport_conn_t *tconn = *quicly_get_data(conn);
+  if (!tconn || !tconn->authenticated ||
+      !transport_flexicast_receive_quic_frame(tconn->transport, tconn, frame))
+    return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+  return 0;
+}
+
+static quicly_error_t
+on_receive_flexicast_ack(quicly_receive_flexicast_ack_t *self,
+                         quicly_conn_t *conn, uint64_t flow_id,
+                         const quicly_ack_frame_t *ack) {
+  (void)self;
+  transport_conn_t *tconn = *quicly_get_data(conn);
+  if (!tconn || !tconn->authenticated ||
+      !transport_flexicast_receive_path_ack(tconn->transport, tconn, flow_id,
+                                            ack))
+    return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
+  return 0;
+}
+
 void transport_protocol_setup(transport_t *t) {
   if (!t)
     return;
   t->stream_open.cb = on_stream_open;
   t->receive_datagram.cb = on_receive_datagram_frame;
+  t->receive_flexicast.cb = on_receive_flexicast_frame;
+  t->receive_flexicast_ack.cb = on_receive_flexicast_ack;
 }
