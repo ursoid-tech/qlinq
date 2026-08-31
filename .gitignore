@@ -11,6 +11,7 @@ libqlinq.a
 /libqlinq.a.tmp
 t/00util/test_fec
 t/00util/test_transport
+t/00util/test_flexicast_transport
 t/00util/test_uds
 t/00util/test_audio
 t/00util/test_inputd
@@ -61,6 +62,7 @@ examples/transit_benchmark
 examples/transit_udp_calibration
 examples/__pycache__/
 tmp/
+
 .tmp.dprobes.h
 
 t/00util/test_egress_errors

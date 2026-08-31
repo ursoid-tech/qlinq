@@ -38,7 +38,8 @@ NANORQ_NATIVE_CFLAGS ?= $(if $(filter native,$(CODEC_TARGET)),-march=native)
 # other undefined-behavior checks across qlinq and its linked dependencies.
 SANITIZER_FLAGS = -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=pointer-overflow
 # Quicly is included with -isystem to keep third-party warnings out of qlinq's
-# build. Use -MD so ABI-affecting Quicly and picotls headers remain tracked.
+# build. Use -MD (rather than -MMD) so ABI-affecting Quicly and picotls headers
+# are still tracked as dependencies.
 DEPFLAGS = -MD -MP
 
 # Compile Fusion only when this compiler accepts its ISA and runtime guards.
@@ -60,6 +61,10 @@ INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/inclu
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/bplus_ranges.c \
+              deps/quicly/lib/flexicast.c \
+              deps/quicly/lib/flexicast_cc.c \
+              deps/quicly/lib/flexicast_cc_multicast.c \
+              deps/quicly/lib/flexicast_cc_adaptive.c \
               deps/quicly/lib/defaults.c \
               deps/quicly/lib/frame.c \
               deps/quicly/lib/local_cid.c \
@@ -110,12 +115,14 @@ TRANSPORT_OBJS = src/common/qlinq.o \
               src/common/transport_config.o \
               src/common/transport_egress.o \
               src/common/transport_fec_state.o \
+              src/common/transport_flexicast.o \
               src/common/transport_memory.o \
               src/common/transport_paths.o \
               src/common/transport_protocol.o \
               src/common/transport_publish.o \
               src/common/transport_recovery.o \
               src/common/transport_repair.o \
+              src/common/transport_repair_planner.o \
               src/common/transport_scheduler.o \
               src/common/transport_stream.o \
               src/common/transport_subscriptions.o \
@@ -139,7 +146,7 @@ COMMON_OBJS = src/common/data_uds.o \
 DAEMON_OBJS = src/daemon/main.o \
               $(COMMON_OBJS)
 
-APP_OBJS = src/app/main.o src/app/xfer.o src/app/xfer_file.o
+APP_OBJS = src/app/main.o src/app/transfer.o src/app/xfer.o src/app/xfer_file.o
 
 FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
@@ -285,7 +292,8 @@ t/00util/test_fec: t/00util/test_fec.o $(FEC_OBJS)
 t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_egress.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-TRANSPORT_TESTS = t/00util/test_transport_bind \
+TRANSPORT_TESTS = t/00util/test_flexicast_transport \
+	 t/00util/test_transport_bind \
 	t/00util/test_transport_poll \
 	t/00util/test_crypto_backend \
 	t/00util/test_interleaved_receive \
@@ -452,12 +460,16 @@ check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
+	rm -f qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
 		$(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
+
+check-flexicast-netns: t/00util/test_flexicast_transport gencerts
+	./t/netns_flexicast_ssm.sh
 
 # Check certificate lifetime on every invocation, including existing fixtures.
 # Grouped targets keep each certificate/key pair together under parallel make.
@@ -496,7 +508,7 @@ FORMAT_SOURCES := $(shell find src examples t/00util -type f \
 indent:
 	clang-format -style=file -i $(FORMAT_SOURCES)
 
-.PHONY: all clean check benchmark fuzz-wire check-submodules FORCE \
+.PHONY: all clean check check-flexicast-netns benchmark fuzz-wire check-submodules FORCE \
 	check-multipath-demo check-multipath-bw-demo check-multipath-bw-reports check-reports check-transit-reports check-transit-smoke check-sanitize soak release-check indent gencerts
 
 .PHONY: install-tun check-tun-tool check-tun-real package-tun
