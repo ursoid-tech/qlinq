@@ -115,6 +115,7 @@ DAEMON_OBJS = src/daemon/main.o \
               $(COMMON_OBJS)
 
 APP_OBJS = src/app/main.o
+CAST_OBJS = src/cast/main.o
 
 FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
@@ -140,7 +141,7 @@ deps/nanors/%.o deps/nanorq/%.o: private CODEC_CFLAGS = $(FEC_CFLAGS) $(FEC_NATI
 deps/%.o: deps/%.c
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(CODEC_CFLAGS) -w -c $< -o $@
 
-all: qlinqd qlinq-app qlinq-tund qlinq-tun
+all: qlinqd qlinq-app qlinq-cast qlinq-tund
 
 libqlinq.a: $(TRANSPORT_OBJS)
 	$(AR) rcs $@ $(TRANSPORT_OBJS)
@@ -151,11 +152,12 @@ qlinqd: $(DAEMON_OBJS)
 qlinq-app: $(APP_OBJS) libqlinq.a
 	$(CC) -o $@ $(APP_OBJS) libqlinq.a $(LDFLAGS)
 
-qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
-	$(CC) -o $@ $^ $(LDFLAGS)
+qlinq-cast: $(CAST_OBJS) libqlinq.a
+	$(CC) -o $@ $(CAST_OBJS) libqlinq.a $(LDFLAGS)
 
-qlinq-tun: src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS)
+qlinq-tund: src/host/linux/tund.c
+	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -o $@ src/host/linux/tund.c \
+		$(LDFLAGS)
 
 examples/data_multipath_benchmark: examples/data_multipath_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
@@ -316,7 +318,7 @@ check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_qli
 	prove -I. -v t/*.t
 
 clean: 
-	rm -f qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \

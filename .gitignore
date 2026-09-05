@@ -1,6 +1,7 @@
 # Compiled binaries and intermediate build files
 qlinqd
 qlinq-app
+qlinq-cast
 qlinq-tund
 qlinq-tun
 qlinq-tun-engine
