@@ -881,8 +881,9 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
   if (payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size)
     goto malformed_datagram;
 
-  bool rateless = (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
-  bool rateless_data = resolved_track.type == MOQ_TRACK_DATA && rateless;
+  bool recoverable_data = track_uses_recovery(&resolved_track);
+  bool rateless_data = recoverable_data &&
+                       (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
   transport_subscription_state_t *subscription_state =
       transport_subscriptions_get_state(&tconn->receive_subscriptions,
                                         track_id);
@@ -897,14 +898,16 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     t->stats.fec_duplicate_objects_suppressed++;
     return;
   }
-  if (rateless_data &&
+  if (recoverable_data &&
       transport_recovery_was_delivered(object_state, object_id)) {
     t->stats.fec_duplicate_objects_suppressed++;
     return;
   }
 
-  if (rateless_data)
+  if (recoverable_data)
     transport_recovery_observe(object_state, group_id, object_id);
+  if (recoverable_data && !allow_telemetry)
+    object_state->shared_delivery = true;
 
   frame_assembler_t *asm_slot =
       transport_find_assembler(tconn, track_id, group_id, object_id);
@@ -1076,7 +1079,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
       completed_remember(tconn, track_id, generation, group_id, object_id);
-      if (rateless_data) {
+      if (recoverable_data) {
         transport_recovery_delivered(tconn, track_id, group_id, object_id);
       }
       t->stats.fec_objects_recovered++;

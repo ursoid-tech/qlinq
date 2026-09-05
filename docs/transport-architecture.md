@@ -6,8 +6,8 @@ wrapper in `qlinq.h` adds owned events and named streams; see
 split into internal modules for connection lifecycle, publication, receive
 recovery, path scheduling, and bounded storage.
 
-Applications that link qlinq should use this API directly. `qlinq-app` is the
-reference direct consumer: it drives `transport_tick`, integrates
+Specialized integrations may use `transport.h` directly. `qlinq-app` is the
+reference low-level consumer: it drives `transport_tick`, integrates
 `transport_get_poll_fds` and `transport_get_first_timeout`, publishes with
 `transport_publish_ex`, and consumes callbacks without a Unix-socket hop. The
 `data_uds` interface remains a daemon adapter for out-of-process packet devices
@@ -15,7 +15,7 @@ such as `qlinq-tund`, not the primary application API.
 
 | Module | Responsibility |
 | --- | --- |
-| `qlinq.c` | Application contexts, endpoints, named streams and owned event queues |
+| `qlinq.c` | Native context, endpoint, named-stream, and owned-event facade |
 | `transport_quicly.c` | Connection lifecycle, socket event loop, and public control/query API |
 | `transport_internal.h` | Private shared transport and connection state |
 | `cli_parse.c` | Shared bounded numeric and endpoint parsing for app and daemon |

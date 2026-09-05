@@ -2080,6 +2080,8 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
   uint64_t now = ptls_get_time.cb(&ptls_get_time);
   update_path_measurements(t, now);
   service_connections(t, now);
+  transport_protocol_poll_lifecycle(t);
+  transport_publish_poll_lifecycle(t);
   t->tick_active = false;
 }
 
@@ -2097,6 +2099,7 @@ static bool subscribe_connection(transport_conn_t *conn,
       &conn->receive_subscriptions, track_id);
   if (existing && existing->track_id.flags != track_id->flags)
     return false;
+  bool newly_added = false;
   uint8_t alias = existing ? existing->alias : 0;
   if (!existing) {
     if (transport_subscriptions_count(&conn->receive_subscriptions) >=
@@ -2115,6 +2118,7 @@ static bool subscribe_connection(transport_conn_t *conn,
                                      track_id->type, track_id->flags,
                                      track_id->name, alias))
       return false;
+    newly_added = true;
   }
 
   if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_SUBSCRIBE,
@@ -2123,8 +2127,10 @@ static bool subscribe_connection(transport_conn_t *conn,
       transport_subscriptions_remove(&conn->receive_subscriptions,
                                      track_id->type, track_id->name);
     return false;
-  }
-
+  if (newly_added)
+    memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
+  transport_publish_checkpoint_member_added(conn->transport, conn, track_id,
+                                            alias);
   return true;
 }
 
@@ -2461,9 +2467,12 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
       stats->flexicast_cc_loss_reduction_events += output.loss_reduction_events;
       stats->flexicast_cc_rtt_reduction_events += output.rtt_reduction_events;
       stats->flexicast_cc_ecn_reduction_events += output.ecn_reduction_events;
-      stats->flexicast_cc_timeout_reduction_events += output.timeout_reduction_events;
-      stats->flexicast_cc_rate_limit_reduction_events += output.rate_limit_reduction_events;
-      stats->flexicast_cc_other_reduction_events += output.other_reduction_events;
+      stats->flexicast_cc_timeout_reduction_events +=
+          output.timeout_reduction_events;
+      stats->flexicast_cc_rate_limit_reduction_events +=
+          output.rate_limit_reduction_events;
+      stats->flexicast_cc_other_reduction_events +=
+          output.other_reduction_events;
       stats->flexicast_cc_external_load_growth_freeze_events +=
           output.external_load_growth_freeze_events;
     }

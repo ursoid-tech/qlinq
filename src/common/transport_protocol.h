@@ -9,5 +9,6 @@ void transport_protocol_receive_datagram(transport_conn_t *conn,
                                          bool allow_telemetry);
 bool transport_protocol_send_hello(transport_conn_t *conn);
 void transport_protocol_maybe_emit_connected(transport_conn_t *conn);
+void transport_protocol_poll_lifecycle(transport_t *t);
 
 #endif

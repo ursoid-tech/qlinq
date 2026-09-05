@@ -39,6 +39,8 @@ typedef struct {
 typedef struct {
   bool participating;
   bool retired;
+  bool finish_target;
+  bool finish_accounted;
   bool sent_initialized;
   uint64_t sent_group_id;
   uint64_t sent_object_id;
