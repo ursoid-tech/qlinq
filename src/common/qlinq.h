@@ -169,6 +169,9 @@ typedef struct {
   size_t remote_address_count;
   uint16_t port;
   uint64_t idle_timeout_ms;
+  bool reconnect_enabled;
+  uint32_t reconnect_initial_delay_ms;
+  uint32_t reconnect_max_delay_ms;
   qlinq_security_config_t security;
   qlinq_group_delivery_config_t group_delivery;
   qlinq_repair_mode_t repair_mode;
@@ -268,6 +271,7 @@ struct qlinq_event {
     size_t peers_completed;
     size_t peers_failed;
   } completion;
+  qlinq_disconnect_t disconnect;
   qlinq_status_t status;
   const char *message;
   /* Private ownership token used by qlinq_event_release(). */
@@ -278,7 +282,11 @@ typedef struct {
   uint64_t connections_accepted;
   uint64_t connections_rejected;
   uint64_t connections_closed;
+  uint64_t reconnect_attempts;
+  uint64_t reconnect_succeeded;
+  uint64_t reconnect_failed;
   uint64_t protocol_errors;
+  uint64_t internal_state_recoveries;
   uint64_t records_received;
   /* Public receive-bridge totals. queued/copy fields count successful queued
    * records only; callback fields count synchronous record callbacks only. */
@@ -293,10 +301,26 @@ typedef struct {
   uint64_t repair_requests_received;
   /* Symbols admitted to the QUIC datagram queue, not delivery confirmations. */
   uint64_t repair_symbols_sent;
+  uint64_t repair_commit_failures;
   uint64_t group_packets_sent;
   uint64_t group_packets_received;
+  uint64_t group_native_packets_sent;
+  uint64_t group_fallbacks;
+  uint64_t group_feedback_fallbacks;
+  uint64_t group_control_frames_throttled;
+  uint64_t group_rekeys;
+  uint64_t group_interface_fallbacks;
+  uint64_t group_interface_rejoins;
+  uint64_t group_rate_bytes_per_second;
+  uint64_t group_physical_bytes_sent;
+  uint64_t repair_physical_bytes_sent;
+  uint64_t repair_oldest_age_ms;
   size_t active_connections;
+  size_t active_group_flows;
+  size_t active_group_memberships;
   size_t active_group_members;
+  size_t repair_queued_packets;
+  size_t repair_queued_bytes;
   size_t queued_packets;
   size_t queued_bytes;
 

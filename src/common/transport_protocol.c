@@ -11,7 +11,6 @@
 #include "quicly/sendstate.h"
 #include "quicly/streambuf.h"
 
-#include <assert.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
