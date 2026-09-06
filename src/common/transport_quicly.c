@@ -1549,6 +1549,18 @@ static uint64_t mix_repair_feedback(uint64_t value) {
   return value ^ (value >> 31);
 }
 
+uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt) {
+  if (attempt == 0)
+    return 0;
+  unsigned shift = attempt - 1U;
+  if (shift > 3U)
+    shift = 3U;
+  uint64_t delay = QLINQ_FEC_MULTICAST_NACK_RETRY_BASE_MS << shift;
+  return delay < QLINQ_FEC_MULTICAST_NACK_RETRY_MAX_MS
+             ? delay
+             : QLINQ_FEC_MULTICAST_NACK_RETRY_MAX_MS;
+}
+
 /* Flexicast receivers cannot overhear one another's encrypted control streams.
  * Spread their requests long enough for the first shared repair datagram to
  * suppress most of the cohort, while keeping ordinary unicast recovery at the
@@ -1556,17 +1568,28 @@ static uint64_t mix_repair_feedback(uint64_t value) {
 static int64_t repair_feedback_delay_ms(const transport_conn_t *conn,
                                         bool shared_delivery, uint8_t alias,
                                         uint64_t group_id, uint64_t object_id,
-                                        uint16_t attempt) {
+                                        uint16_t salt,
+                                        uint16_t retry_attempt) {
   if (!shared_delivery)
     return QLINQ_FEC_NACK_DELAY_MS;
   uint64_t value = conn->transport->repair_feedback_nonce;
   value ^= group_id + UINT64_C(0x9e3779b97f4a7c15);
   value ^= object_id * UINT64_C(0xd6e8feb86659fd93);
   value ^= (uint64_t)alias << 48;
-  value ^= (uint64_t)attempt * UINT64_C(0xa0761d6478bd642f);
+  value ^= (uint64_t)salt * UINT64_C(0xa0761d6478bd642f);
   uint64_t span =
       QLINQ_FEC_MULTICAST_NACK_BACKOFF_MAX_MS - QLINQ_FEC_NACK_DELAY_MS + 1U;
-  return QLINQ_FEC_NACK_DELAY_MS + (int64_t)(mix_repair_feedback(value) % span);
+  uint64_t delay =
+      QLINQ_FEC_NACK_DELAY_MS + (mix_repair_feedback(value) % span);
+  if (retry_attempt != 0) {
+    /* The first request remains prompt and independently randomized. Once a
+     * receiver has asked for shared repair, give multicast repair time to
+     * arrive before sending another encrypted unicast request. Without this
+     * retry backoff, every incomplete assembler can consume its full NACK
+     * allowance even though the source is already serving the cohort. */
+    delay += transport_multicast_nack_retry_backoff_ms(retry_attempt);
+  }
+  return delay > INT64_MAX ? INT64_MAX : (int64_t)delay;
 }
 
 static void add_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
