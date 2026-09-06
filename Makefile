@@ -329,6 +329,12 @@ API_TESTS = t/00util/test_qlinq_policy \
 $(API_TESTS): %: %.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_flexicast_transport.o $(COMMON_OBJS) $(LDFLAGS)
+
+t/00util/test_flexicast_scale: t/00util/test_flexicast_scale.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_flexicast_scale.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/test_data_uds: t/00util/test_data_uds.o src/common/data_uds.o
 	$(CC) -o $@ t/00util/test_data_uds.o src/common/data_uds.o $(LDFLAGS)
 
@@ -349,12 +355,23 @@ t/00util/test_ifmon: t/00util/test_ifmon.o
 t/00util/test_qlinq_api: t/00util/test_qlinq_api.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_qlinq_api.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_qlinq_reconnect: t/00util/test_qlinq_reconnect.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_qlinq_reconnect.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
 		-o $@ t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 
+t/00util/fuzz_flexicast_frames: t/00util/fuzz_flexicast_frames.c $(QUICLY_OBJS)
+	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
+		-o $@ t/00util/fuzz_flexicast_frames.c deps/quicly/lib/flexicast.c \
+		$(filter-out deps/quicly/lib/flexicast.o,$(QUICLY_OBJS)) $(LDFLAGS)
+
 fuzz-wire: t/00util/fuzz_transport_wire
 	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_transport_wire -runs=10000
+
+fuzz-flexicast: t/00util/fuzz_flexicast_frames
+	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_flexicast_frames -runs=10000
 
 check-submodules:
 	./scripts/check_submodules.sh
@@ -394,6 +411,7 @@ release-check: check-submodules
 	$(MAKE) clean
 	$(MAKE) check
 	$(MAKE) fuzz-wire
+	$(MAKE) fuzz-flexicast
 	$(MAKE) check-sanitize
 	$(MAKE) clean
 	$(MAKE) all examples/data_multipath_benchmark gencerts
@@ -459,11 +477,11 @@ t/00util/transport_egress_cadence.o: src/common/transport_egress.c Makefile
 t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_egress_cadence.o $(filter-out src/common/qlinq.o src/common/transport_egress.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_qlinq_api gencerts check-reports
+check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_qlinq_api gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
-	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/fuzz_transport_wire t/00util/fuzz_flexicast_frames t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -511,7 +529,7 @@ FORMAT_SOURCES := $(shell find src examples t/00util -type f \
 indent:
 	clang-format -style=file -i $(FORMAT_SOURCES)
 
-.PHONY: all clean check check-flexicast-netns benchmark fuzz-wire check-submodules FORCE \
+.PHONY: all clean check check-flexicast-netns benchmark fuzz-wire fuzz-flexicast check-submodules FORCE \
 	check-multipath-demo check-multipath-bw-demo check-multipath-bw-reports check-reports check-transit-reports check-transit-smoke check-sanitize soak release-check indent gencerts
 
 .PHONY: install-tun check-tun-tool check-tun-real package-tun
