@@ -475,6 +475,14 @@ int main(void) {
         "assembler transient allocation budget");
   CHECK(test_udp_batch_boundaries() == 0, "UDP batch boundaries");
   CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
+  CHECK(transport_multicast_nack_retry_backoff_ms(0) == 0 &&
+            transport_multicast_nack_retry_backoff_ms(1) == 500 &&
+            transport_multicast_nack_retry_backoff_ms(2) == 1000 &&
+            transport_multicast_nack_retry_backoff_ms(3) == 1000 &&
+            transport_multicast_nack_retry_backoff_ms(4) == 1000 &&
+            transport_multicast_nack_retry_backoff_ms(UINT16_MAX) == 1000,
+        "bounded exponential multicast NACK retry backoff");
+
   uint64_t parsed_number = 0;
   CHECK(cli_parse_u64("65535", UINT16_MAX, &parsed_number) &&
             parsed_number == UINT16_MAX &&
