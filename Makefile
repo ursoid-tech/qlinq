@@ -208,6 +208,9 @@ t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_flexicast_transport.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_flexicast_scale: t/00util/test_flexicast_scale.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_flexicast_scale.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/test_tund: t/00util/test_tund.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_tund.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -226,12 +229,23 @@ t/00util/test_udp_gso_prefix: t/00util/test_udp_gso_prefix.o
 t/00util/test_qlinq_api: t/00util/test_qlinq_api.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_qlinq_api.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_qlinq_reconnect: t/00util/test_qlinq_reconnect.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_qlinq_reconnect.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
 		-o $@ t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 
+t/00util/fuzz_flexicast_frames: t/00util/fuzz_flexicast_frames.c $(QUICLY_OBJS)
+	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
+		-o $@ t/00util/fuzz_flexicast_frames.c deps/quicly/lib/flexicast.c \
+		$(filter-out deps/quicly/lib/flexicast.o,$(QUICLY_OBJS)) $(LDFLAGS)
+
 fuzz-wire: t/00util/fuzz_transport_wire
 	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_transport_wire -runs=10000
+
+fuzz-flexicast: t/00util/fuzz_flexicast_frames
+	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_flexicast_frames -runs=10000
 
 check-submodules:
 	./scripts/check_submodules.sh
@@ -267,6 +281,7 @@ release-check: check-submodules
 	$(MAKE) clean
 	$(MAKE) check
 	$(MAKE) fuzz-wire
+	$(MAKE) fuzz-flexicast
 	$(MAKE) check-sanitize
 	$(MAKE) clean
 	$(MAKE) all examples/data_multipath_benchmark gencerts
@@ -315,11 +330,11 @@ CHECK_BINARIES = t/00util/test_fec \
 	t/00util/test_multipath \
 	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
 
-check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_qlinq_api gencerts
+check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_qlinq_api gencerts
 	prove -I. -v t/*.t
 
 clean: 
-	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/fuzz_transport_wire t/00util/fuzz_flexicast_frames t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -364,7 +379,7 @@ gencerts: t/assets/server.crt t/assets/server.key t/assets/verified.crt t/assets
 indent:
 	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
 
-.PHONY: all clean check check-flexicast-netns benchmark fuzz-wire check-submodules FORCE \
+.PHONY: all clean check check-flexicast-netns benchmark fuzz-wire fuzz-flexicast check-submodules FORCE \
 	check-multipath-demo check-multipath-bw-demo check-sanitize soak release-check indent gencerts
 
 -include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
