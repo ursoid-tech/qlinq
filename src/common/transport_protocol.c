@@ -1586,7 +1586,8 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
         }
       }
 
-      /* Preserve the negotiated identity for every datagram delivery mode. */
+      /* The symbol envelope is also used for plain DATAGRAM tracks. Keep
+       * their negotiated identity so application subscriptions still match. */
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = tconn,
                               .track_id = resolved_track,
