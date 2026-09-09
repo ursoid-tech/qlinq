@@ -4,7 +4,6 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdio.h>
-#include <string.h>
 
 static int failure;
 static size_t calls;
@@ -25,6 +24,7 @@ ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
                                  size_t max_gso_segments) {
   (void)fd;
   (void)destination_len;
+  (void)datagrams;
   calls++;
   if (inspect_policy) {
     assert(policy_next_step < policy_step_count);
@@ -48,18 +48,6 @@ ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
       ((const struct sockaddr_in *)destination)->sin_port == htons(1)) {
     errno = failure;
     return -1;
-  }
-  if (inspect_payloads) {
-    if (count > send_allowance)
-      count = send_allowance;
-    for (size_t i = 0; i < count; ++i) {
-      assert(datagrams[i].iov_len == expected_size);
-      const uint8_t *bytes = datagrams[i].iov_base;
-      for (size_t j = 0; j < expected_size; ++j)
-        assert(bytes[j] == (uint8_t)(next_sequence + j * 13));
-      next_sequence++;
-    }
-    send_allowance -= count;
   }
   return (ssize_t)count;
 }

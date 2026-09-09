@@ -27,7 +27,7 @@ bool transport_publish_recipient_eligible(const transport_t *t,
          conn->authenticated &&
          quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
          (!t->is_server ||
-          transport_subscriptions_contains(&conn->send_subscriptions, track));
+          transport_subscriptions_contains(&conn->subscriptions, track));
 }
 
 /* A publication can become ineligible between grouped flushes. Preserve the
@@ -959,7 +959,7 @@ static transport_publish_result_t flush_group(transport_t *t) {
   group->flush_retry_cache_releases = 0;
   group->record_count = 0;
   group->pending = false;
-  if ((track_state->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
+  if (track_uses_recovery(&track_state->track_id) &&
       track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
     uint64_t first_object_id =
         track_state->next_object_id - QLINQ_RECOVERY_WINDOW_OBJECTS;
@@ -1152,6 +1152,8 @@ static transport_publish_result_t publish_object(transport_t *t,
 
   /* audio, video, text tracks go over unreliable datagram frames with FEC */
   size_t data_size = obj->size;
+  /* A shared publication is admitted atomically with respect to peer limits;
+   * no recipient can be counted as served by a packet it must reject. */
   if (data_size == 0 || data_size > fec_limit)
     return TRANSPORT_PUBLISH_INVALID;
   /* Stored rates use full-sized symbols even when a small object shrinks its
@@ -1165,8 +1167,7 @@ static transport_publish_result_t publish_object(transport_t *t,
   if (data_symbols == 0)
     data_symbols = 1;
 
-  bool protect_repair_cache = obj->track_id.type == MOQ_TRACK_DATA &&
-                              profile.fec_rateless &&
+  bool protect_repair_cache = track_uses_recovery(&obj->track_id) &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
   if (obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&
       !transport_sent_cache_can_store(&t->sent_cache, obj,

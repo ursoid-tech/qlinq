@@ -63,4 +63,11 @@ ssize_t transport_udp_gro_receive(transport_udp_gro_t *state, int fd,
                                   transport_udp_view_t *views, size_t count,
                                   bool *more);
 
+/* Single datagram with an explicit source address/interface, including on a
+ * wildcard-bound socket. Same complete-datagram return convention as above. */
+ssize_t transport_udp_send_from(int fd, const struct sockaddr *destination,
+                                const struct sockaddr *source,
+                                unsigned interface_index,
+                                const struct iovec *datagram);
+
 #endif
