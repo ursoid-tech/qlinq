@@ -35,47 +35,8 @@
 #define QLINQ_COMPLETED_OBJECTS (2U * TRANSPORT_HARD_MAX_ASSEMBLERS)
 #define QLINQ_ASSEMBLER_BUCKETS 2048U
 #define QLINQ_MIN_ASSEMBLER_WINDOW 8U
-#define QLINQ_RECOVERY_WINDOW_OBJECTS 32U
-#define QLINQ_RECOVERY_MAX_WINDOWS 8U
-#define QLINQ_RECOVERY_HISTORY_OBJECTS                                         \
-  (QLINQ_RECOVERY_WINDOW_OBJECTS * QLINQ_RECOVERY_MAX_WINDOWS)
-
-typedef struct {
-  bool active;
-  uint64_t group_id;
-  uint64_t first_object_id;
-  uint64_t final_object_id;
-  uint32_t missing_mask;
-  uint32_t requested_mask;
-  uint8_t cursor;
-  uint16_t nack_attempt;
-  int64_t last_request_ms;
-} transport_recovery_window_t;
 
 uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt);
-
-typedef struct {
-  uint64_t last_seen;
-  bool seen_initialized;
-  uint64_t pending_base;
-  uint32_t pending_mask;
-  uint32_t requested_mask;
-  uint64_t group_id;
-  int64_t detected_at_ms;
-  uint16_t nack_attempt;
-  uint64_t largest_delivered;
-  uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
-  bool delivered_initialized;
-  bool checkpoint_initialized;
-  bool shared_delivery;
-  uint64_t last_checkpoint_object_id;
-  bool finish_pending;
-  bool finish_emitted;
-  bool aborted;
-  uint64_t finish_group_id;
-  uint64_t finish_object_id;
-  transport_recovery_window_t recovery_windows[QLINQ_RECOVERY_MAX_WINDOWS];
-} transport_object_gap_state_t;
 
 typedef struct {
   moq_track_id_t track_id;
@@ -92,20 +53,6 @@ typedef struct {
   size_t finish_completed;
   size_t finish_failed;
 } transport_fec_track_state_t;
-
-typedef struct {
-  bool participating;
-  bool retired;
-  bool sent_initialized;
-  uint64_t sent_group_id;
-  uint64_t sent_object_id;
-  int64_t oldest_unacked_sent_at_ms;
-  bool acked_initialized;
-  uint64_t acked_group_id;
-  uint64_t acked_object_id;
-  bool finish_target;
-  bool finish_accounted;
-} transport_checkpoint_ack_state_t;
 
 struct transport_t {
   transport_callback_t callback;
@@ -186,6 +133,10 @@ struct transport_t {
   int ifmon_pipe[2];
   transport_fec_cache_t fec_cache;
   transport_repair_limiter_t aggregate_repair_limiter;
+  transport_repair_limiter_t aggregate_nack_limiter;
+  int64_t aggregate_nack_retry_at_ms;
+  size_t recovery_conn_cursor;
+  uint32_t fec_assembler_timeout_ms;
   transport_repair_mode_t repair_mode;
   uint64_t repair_feedback_nonce;
   FILE *repair_shadow_log;
@@ -269,7 +220,6 @@ struct transport_conn_t {
   size_t round_robin_path;
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
-  transport_checkpoint_ack_state_t checkpoint_acks[UINT8_MAX + 1U];
 };
 
 /* Master identity is stable across path changes and CID rotation. A cache hit

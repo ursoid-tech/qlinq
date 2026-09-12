@@ -226,12 +226,13 @@ void transport_protocol_poll_lifecycle(transport_t *t) {
     if (!conn)
       continue;
     for (size_t alias = 0; alias <= UINT8_MAX; alias++) {
-      transport_object_gap_state_t *gap = &conn->object_gaps[alias];
-      if (!gap->finish_pending || gap->finish_emitted || gap->aborted ||
+      transport_object_gap_state_t *gap =
+          transport_object_gap(conn, (uint8_t)alias);
+      if (!gap || !gap->finish_pending || gap->finish_emitted || gap->aborted ||
           !recovery_windows_empty(gap))
         continue;
       moq_track_id_t track;
-      if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+      if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                                 (uint8_t)alias, &track) != 0)
         continue;
       gap->finish_emitted = true;
@@ -254,6 +255,31 @@ find_recovery_window(transport_object_gap_state_t *state, uint64_t group_id,
       return window;
   }
   return NULL;
+}
+
+static void retire_recovery_through(transport_conn_t *conn, uint8_t alias,
+                                    uint64_t group_id,
+                                    uint64_t final_object_id) {
+  if (!conn || !conn->transport)
+    return;
+  transport_t *t = conn->transport;
+  transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
+  if (gap && gap->pending_mask != 0 && gap->group_id == group_id &&
+      gap->pending_base <= final_object_id) {
+    uint64_t distance = final_object_id - gap->pending_base;
+    uint32_t covered = distance >= 31U
+                           ? UINT32_MAX
+                           : (UINT32_C(1) << (uint32_t)(distance + 1U)) - 1U;
+    gap->pending_mask &= ~covered;
+  }
+  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+    frame_assembler_t *assembler = &conn->assemblers[i];
+    if (assembler->total_symbols > 0 && assembler->track_id == alias &&
+        assembler->group_id == group_id &&
+        assembler->object_id <= final_object_id) {
+      transport_release_assembler(t, assembler);
+    }
+  }
 }
 
 /* Checkpoint ACKs are cumulative at the source. A later complete window must
@@ -333,7 +359,10 @@ static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
   if (!conn || first_object_id > final_object_id ||
       final_object_id - first_object_id >= QLINQ_RECOVERY_WINDOW_OBJECTS)
     return false;
-  transport_object_gap_state_t *state = &conn->object_gaps[alias];
+  transport_object_gap_state_t *state =
+      transport_object_gap(conn, (uint8_t)alias);
+  if (!state)
+    return false;
   transport_recovery_window_t *existing =
       find_recovery_window(state, group_id, first_object_id, final_object_id);
   if (existing)
@@ -545,7 +574,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
         transport_publish_checkpoint_member_removed(t, conn, &parsed_track,
                                                     alias);
         transport_flexicast_remove_member(t, conn, &parsed_track);
-        transport_subscriptions_remove(&conn->subscriptions,
+        transport_subscriptions_remove(&conn->send_subscriptions,
                                        (moq_track_type_t)track_type,
                                        wire_track.name);
       }
@@ -834,8 +863,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
               0 ||
           qlinq_wire_decode_track_checkpoint(input.base, input.len,
                                              &checkpoint) != QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(
-              &conn->subscriptions, checkpoint.alias, &resolved_track) != 0 ||
+          transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                                checkpoint.alias,
+                                                &resolved_track) != 0 ||
           !track_uses_recovery(&resolved_track)) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
                      "protocol error: invalid recovery checkpoint");
@@ -871,8 +901,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (!conn->authenticated ||
           qlinq_wire_decode_track_checkpoint_ack(input.base, input.len, &ack) !=
               QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(&conn->subscriptions, ack.alias,
-                                                &resolved_track) != 0 ||
+          transport_subscriptions_find_by_alias(
+              &conn->send_subscriptions, ack.alias, &resolved_track) != 0 ||
           !track_uses_recovery(&resolved_track) ||
           !transport_publish_checkpoint_acked(t, conn, &ack, &resolved_track)) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
@@ -887,15 +917,15 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (!conn->authenticated ||
           qlinq_wire_decode_track_end(input.base, input.len, &end) !=
               QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(&conn->subscriptions, end.alias,
-                                                &resolved_track) != 0 ||
+          transport_subscriptions_find_by_alias(
+              &conn->receive_subscriptions, end.alias, &resolved_track) != 0 ||
           !track_uses_recovery(&resolved_track)) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
                      "protocol error: invalid track completion");
         break;
       }
 
-      transport_object_gap_state_t *gap = &conn->object_gaps[end.alias];
+      transport_object_gap_state_t *gap = transport_object_gap(conn, end.alias);
       if ((gap->finish_pending &&
            (gap->finish_group_id != end.group_id ||
             gap->finish_object_id != end.final_object_id)) ||
@@ -963,13 +993,15 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (!conn->authenticated ||
           qlinq_wire_decode_track_abort(input.base, input.len, &abort_frame) !=
               QLINQ_WIRE_OK ||
-          transport_subscriptions_find_by_alias(
-              &conn->subscriptions, abort_frame.alias, &resolved_track) != 0) {
+          transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                                abort_frame.alias,
+                                                &resolved_track) != 0) {
         quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
                      "protocol error: invalid track abort");
         break;
       }
-      transport_object_gap_state_t *gap = &conn->object_gaps[abort_frame.alias];
+      transport_object_gap_state_t *gap =
+          transport_object_gap(conn, abort_frame.alias);
       if (!gap->aborted) {
         gap->aborted = true;
         gap->finish_pending = false;
@@ -1211,17 +1243,49 @@ bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
     flags |= QLINQ_WIRE_NACK_RATELESS;
   if (qlinq_wire_encode_nack(buf, payload_len, alias, flags, group_id,
                              object_id, missing, count,
-                             &written) == QLINQ_WIRE_OK &&
-      transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
-                                   written)) {
-    conn->transport->stats.repair_requests_sent++;
-    if (rateless)
-      conn->transport->stats.repair_rateless_requests_sent++;
-    else
-      conn->transport->stats.repair_indexed_requests_sent++;
-    sent = true;
-    if (whole_object)
-      conn->transport->stats.repair_whole_object_requests_sent++;
+                             &written) == QLINQ_WIRE_OK) {
+    if (transport_stream_has_retained_frame(conn->stream, QLINQ_WIRE_NACK, buf,
+                                            written)) {
+      /* QUIC owns retransmission until this exact request is released. A
+       * later application retry can recover a lost repair response. */
+      conn->transport->stats.repair_requests_coalesced++;
+      sent = true;
+    } else if (!transport_stream_can_accept(
+                   conn->stream, QLINQ_WIRE_FRAME_HEADER_SIZE + written,
+                   true)) {
+      /* Recovery timers retain the missing objects and retry after pressure
+       * clears. Preserve essential control capacity without spending tokens. */
+      conn->transport->stats.repair_requests_deferred++;
+    } else if (transport_repair_limiter_wait_ms(
+                   &conn->nack_request_limiter,
+                   conn->transport->limits.max_repair_requests_per_second,
+                   transport_get_time_ms()) != 0 ||
+               transport_repair_limiter_wait_ms(
+                   &conn->transport->aggregate_nack_limiter,
+                   conn->transport->limits
+                       .max_aggregate_nack_requests_per_second,
+                   transport_get_time_ms()) != 0) {
+      conn->transport->stats.repair_requests_deferred++;
+    } else if (transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
+                                            written)) {
+      int64_t admitted_at_ms = transport_get_time_ms();
+      (void)transport_repair_limiter_take(
+          &conn->nack_request_limiter,
+          conn->transport->limits.max_repair_requests_per_second,
+          admitted_at_ms);
+      (void)transport_repair_limiter_take(
+          &conn->transport->aggregate_nack_limiter,
+          conn->transport->limits.max_aggregate_nack_requests_per_second,
+          admitted_at_ms);
+      conn->transport->stats.repair_requests_sent++;
+      if (rateless)
+        conn->transport->stats.repair_rateless_requests_sent++;
+      else
+        conn->transport->stats.repair_indexed_requests_sent++;
+      if (whole_object)
+        conn->transport->stats.repair_whole_object_requests_sent++;
+      sent = true;
+    }
   }
 
   if (buf != static_buf) {
@@ -1265,8 +1329,8 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
      * physical sockets (which can be compacted after interface removal). */
     size_t pid = SIZE_MAX;
     quicly_path_stats_t path;
-    if (quicly_get_path_stats(conn, telemetry.path_id, &path) == 0 &&
-        quicly_is_path_available(conn, telemetry.path_id)) {
+    if (quicly_get_path_stats(tconn->quic, telemetry.path_id, &path) == 0 &&
+        quicly_is_path_available(tconn->quic, telemetry.path_id)) {
       for (size_t i = 0; i < t->num_fds; i++) {
         if (transport_path_matches_local(&path, &t->local_addrs[i])) {
           pid = i;
@@ -1329,7 +1393,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
 
   if ((resolved_track.flags & MOQ_TRACK_FLAG_RELIABLE) != 0) {
     t->stats.protocol_errors++;
-    quicly_close(conn, TRANSPORT_APP_ERROR_PROTOCOL,
+    quicly_close(tconn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
                  "protocol error: datagram on reliable track");
     return;
   }
@@ -1372,8 +1436,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     goto malformed_datagram;
 
   bool recoverable_data = track_uses_recovery(&resolved_track);
-  bool rateless_data = recoverable_data &&
-                       (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
+  bool rateless = (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
   transport_subscription_state_t *subscription_state =
       transport_subscriptions_get_state(&tconn->receive_subscriptions,
                                         track_id);
@@ -1478,7 +1541,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
             &tconn->receive_subscriptions, track_id);
         if (!subscription_state ||
             subscription_state->generation != generation ||
-            quicly_get_state(conn) >= QUICLY_STATE_CLOSING)
+            quicly_get_state(tconn->quic) >= QUICLY_STATE_CLOSING)
           return;
         object_state = &subscription_state->object_gap;
       }
