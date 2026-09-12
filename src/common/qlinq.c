@@ -592,6 +592,7 @@ static void on_transport_event(void *user_data,
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED: {
+    qlinq_peer_state_t *peer = find_peer(endpoint, source->conn);
     qlinq_event_t event = {
         .type = QLINQ_EVENT_PEER_DISCONNECTED,
         .endpoint = endpoint,
@@ -602,7 +603,9 @@ static void on_transport_event(void *user_data,
                            source->disconnect.application_error,
                        .offending_frame_type =
                            source->disconnect.offending_frame_type,
-                       .remote = source->disconnect.remote},
+                       .remote = source->disconnect.remote,
+                       .was_ready = peer && peer->ready,
+                       .outgoing = !endpoint->listener},
         .status = QLINQ_STATUS_OK};
     const char *reason =
         source->disconnect.reason && source->disconnect.reason[0] != '\0'
