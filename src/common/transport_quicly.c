@@ -1568,8 +1568,7 @@ uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt) {
 static int64_t repair_feedback_delay_ms(const transport_conn_t *conn,
                                         bool shared_delivery, uint8_t alias,
                                         uint64_t group_id, uint64_t object_id,
-                                        uint16_t salt,
-                                        uint16_t retry_attempt) {
+                                        uint16_t salt, uint16_t retry_attempt) {
   if (!shared_delivery)
     return QLINQ_FEC_NACK_DELAY_MS;
   uint64_t value = conn->transport->repair_feedback_nonce;
@@ -2221,10 +2220,10 @@ static bool subscribe_connection(transport_conn_t *conn,
       transport_subscriptions_remove(&conn->receive_subscriptions,
                                      track_id->type, track_id->name);
     return false;
-  if (newly_added)
-    memset(&conn->object_gaps[alias], 0, sizeof(conn->object_gaps[alias]));
-  transport_publish_checkpoint_member_added(conn->transport, conn, track_id,
-                                            alias);
+  }
+  if (newly_added && transport_object_gap(conn, alias))
+    memset(transport_object_gap(conn, alias), 0,
+           sizeof(*transport_object_gap(conn, alias)));
   return true;
 }
 
@@ -2271,9 +2270,9 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                           alias, &subscribed_track))
     return false;
 
-  transport_publish_checkpoint_member_removed(t, conn, &subscribed_track,
-                                              alias);
   transport_flexicast_unsubscribe(t, conn, &subscribed_track);
+  memset(transport_object_gap(conn, alias), 0,
+         sizeof(*transport_object_gap(conn, alias)));
   for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
     if (conn->assemblers[i].total_symbols &&
         conn->assemblers[i].track_id == alias)
@@ -2979,6 +2978,8 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
       fds[count].revents = 0;
       count++;
     }
+  if (t->ifmon_pipe[0] >= 0 && count < max_fds)
+    fds[count++] = (struct pollfd){.fd = t->ifmon_pipe[0], .events = POLLIN};
   return count;
 }
 

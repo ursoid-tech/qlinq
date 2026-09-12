@@ -36,6 +36,9 @@
 #define QLINQ_COMPLETED_OBJECTS (2U * TRANSPORT_HARD_MAX_ASSEMBLERS)
 #define QLINQ_ASSEMBLER_BUCKETS 2048U
 #define QLINQ_MIN_ASSEMBLER_WINDOW 8U
+
+uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt);
+
 typedef struct {
   moq_track_id_t track_id;
   uint64_t next_object_id;
@@ -162,6 +165,10 @@ struct transport_t {
   int ifmon_pipe[2];
   transport_fec_cache_t fec_cache;
   transport_repair_limiter_t aggregate_repair_limiter;
+  transport_repair_limiter_t aggregate_nack_limiter;
+  int64_t aggregate_nack_retry_at_ms;
+  size_t recovery_conn_cursor;
+  uint32_t fec_assembler_timeout_ms;
   transport_repair_mode_t repair_mode;
   uint64_t repair_feedback_nonce;
   FILE *repair_shadow_log;

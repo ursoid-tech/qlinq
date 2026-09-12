@@ -780,8 +780,8 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
      * physical sockets (which can be compacted after interface removal). */
     size_t pid = SIZE_MAX;
     quicly_path_stats_t path;
-    if (quicly_get_path_stats(conn, telemetry.path_id, &path) == 0 &&
-        quicly_is_path_available(conn, telemetry.path_id)) {
+    if (quicly_get_path_stats(tconn->quic, telemetry.path_id, &path) == 0 &&
+        quicly_is_path_available(tconn->quic, telemetry.path_id)) {
       for (size_t i = 0; i < t->socket_count; i++) {
         if (transport_path_matches_local(&path, &t->sockets[i].local_addr)) {
           pid = i;
@@ -888,8 +888,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
   }
 
   bool recoverable_data = track_uses_recovery(&resolved_track);
-  bool rateless_data = recoverable_data &&
-                       (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
+  bool rateless = (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
   transport_subscription_state_t *subscription_state =
       transport_subscriptions_get_state(&tconn->receive_subscriptions,
                                         track_id);
@@ -966,7 +965,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
             &tconn->receive_subscriptions, track_id);
         if (!subscription_state ||
             subscription_state->generation != generation ||
-            quicly_get_state(conn) >= QUICLY_STATE_CLOSING)
+            quicly_get_state(tconn->quic) >= QUICLY_STATE_CLOSING)
           return;
         object_state = &subscription_state->object_gap;
       }

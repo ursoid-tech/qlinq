@@ -197,7 +197,7 @@ deps/nanors/%.o deps/nanorq/%.o: private CODEC_CFLAGS = $(FEC_CFLAGS) $(FEC_NATI
 deps/%.o: deps/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(CODEC_CFLAGS) -w -c $< -o $@
 
-all: qlinqd qlinq-app qlinq-cast qlinq-tund
+all: qlinqd qlinq-app qlinq-cast qlinq-tund qlinq-tun
 
 # Track only backend inclusion here; other compiler flag changes still require
 # a clean build. Switching WITH_FUSION must rebuild its dispatch and tests.
@@ -344,12 +344,6 @@ t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_
 t/00util/test_flexicast_regressions: t/00util/test_flexicast_regressions.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_qlinq_delivery: t/00util/test_qlinq_delivery.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_egress.o
-	$(CC) -o $@ $^ $(LDFLAGS)
-
 t/00util/test_quicly_flexicast: deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
 	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -Ideps/quicly/deps/picotest -o $@ $^ $(LDFLAGS)
 
@@ -375,9 +369,6 @@ t/00util/test_ifmon: t/00util/test_ifmon.o
 	$(CC) -o $@ $< $(LDFLAGS)
 t/00util/test_qlinq_api: t/00util/test_qlinq_api.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_qlinq_api.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_qlinq_reconnect: t/00util/test_qlinq_reconnect.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_qlinq_reconnect.o $(COMMON_OBJS) $(LDFLAGS)
 
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
@@ -467,6 +458,9 @@ CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_xfer_file t/00util/tes
 	t/00util/test_qlinq_reconnect t/00util/test_qlinq_delivery \
 	t/00util/test_qlinq_event_ownership t/00util/test_generic_ports \
 	t/00util/test_stream_budget t/00util/test_transport \
+	t/00util/test_flexicast_transport t/00util/test_flexicast_scale \
+	t/00util/test_flexicast_regressions t/00util/test_quicly_flexicast \
+	t/00util/test_qlinq_api \
 	t/00util/test_reliable_bidirectional t/00util/test_tund \
 	t/00util/test_data_uds t/00util/test_transport_wire \
 	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_udp_receive t/00util/test_udp_gro t/00util/test_ifmon \
@@ -528,6 +522,9 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
+
+# Optional Linux integration suite. It uses root/CAP_NET_ADMIN or an
+# unprivileged user namespace to verify native IPv4/IPv6 SSM across a bridge.
 check-flexicast-netns: t/00util/test_flexicast_transport gencerts
 	./t/netns_flexicast_ssm.sh
 
