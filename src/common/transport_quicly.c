@@ -420,40 +420,16 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
   if (count == 0)
     return 0;
 
-  /* A one-packet greedy Pathflow plan selects the path with the earliest
-   * predicted completion, including loss, latency, bandwidth and queued
-   * work. Unlike the former round robin, this applies to stream packets too. */
-  conn->scheduler_context.offset = 0;
-  if (pathflow_optimize(&conn->scheduler_context, count, 1, paths,
-                        FP_FROM_FLOAT(10.0f), 99,
-                        PATHFLOW_SOLVER_GREEDY) == PATHFLOW_ERROR)
-    return 0;
-
-  size_t selected = 0;
-  while (selected < count && paths[selected].m == 0)
-    selected++;
-  if (selected == count)
-    return 0;
-
+  /* Reliable streams recover with QUIC retransmission. A one-packet FEC
+   * plan can reserve a fictitious parity packet even for tiny loss rates.
+   * Use expected transmission cost for both the first choice and fallbacks;
+   * Quicly still enforces congestion, pacing, and stream eligibility. */
+  uint32_t attempted_paths = 0;
   for (size_t attempt = 0; attempt < count; attempt++) {
-    size_t index = attempt == 0 ? selected : SIZE_MAX;
-    if (index == SIZE_MAX) {
-      fp_t earliest = FP_MAX;
-      for (size_t i = 0; i < count; i++) {
-        if (i == selected || paths[i].m == SIZE_MAX)
-          continue;
-        fp_t finish =
-            FP_ADD(paths[i].l,
-                   FP_DIV(FP_ADD(FP_FROM_INT(paths[i].q), FP_ONE), paths[i].b));
-        if (index == SIZE_MAX || finish < earliest) {
-          earliest = finish;
-          index = i;
-        }
-      }
-    }
+    size_t index = transport_stream_select_path(paths, count, attempted_paths);
     if (index == SIZE_MAX)
       break;
-    paths[index].m = SIZE_MAX; /* do not retry an empty send path */
+    attempted_paths |= 1U << index; /* do not retry an empty send path */
     size_t packets_sent = 0;
     quicly_error_t ret = quicly_send_on_path(quic, send_context,
                                              quic_paths[index], &packets_sent);

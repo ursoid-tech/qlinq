@@ -297,6 +297,64 @@ static int test_path_pacing_inputs(void) {
   return 0;
 }
 
+static int test_stream_path_selection(void) {
+  /* Six-packet batch, equal latency: 1000 packets/s at 1% loss still beats
+   * 900 packets/s without loss. The one-symbol FEC optimizer picks path 1
+   * because it charges path 0 for a whole additional parity packet. */
+  path_t paths[3] = {
+      {.b = FP_FROM_INT(1000),
+       .p = FP_FROM_FLOAT(0.01f),
+       .l = FP_FROM_FLOAT(0.05f),
+       .q = 5},
+      {.b = FP_FROM_INT(900), .l = FP_FROM_FLOAT(0.05f), .q = 5},
+      {.b = FP_FROM_INT(2000), .l = FP_FROM_FLOAT(0.05f), .q = 5}};
+  CHECK(transport_stream_select_path(paths, 2, 0) == 0,
+        "small loss does not charge reliable streams for FEC parity");
+  CHECK(transport_stream_select_path(paths, 3, 0) == 2 &&
+            transport_stream_select_path(paths, 3, 1U << 2) == 0 &&
+            transport_stream_select_path(paths, 3, (1U << 2) | 1U) == 1 &&
+            transport_stream_select_path(paths, 3, 7U) == SIZE_MAX,
+        "empty-send fallbacks retain completion ordering without retries");
+
+  paths[0].p = FP_ONE / 2;
+  CHECK(transport_stream_select_path(paths, 2, 0) == 1 &&
+            transport_stream_select_path(paths, 3, 1U << 2) == 1,
+        "substantial retransmission cost affects first choice and fallback");
+  paths[0].p = 0;
+  paths[0].q = 100;
+  CHECK(transport_stream_select_path(paths, 2, 0) == 1,
+        "queued and in-flight work can outweigh a faster stream path");
+  paths[0].q = 5;
+  paths[0].l = FP_FROM_FLOAT(0.06f);
+  CHECK(transport_stream_select_path(paths, 2, 0) == 1,
+        "propagation latency participates in stream selection");
+
+  paths[0] = paths[1];
+  CHECK(transport_stream_select_path(paths, 2, 0) == 0,
+        "equal completion times preserve stable path order");
+  paths[0].p = FP_ONE;
+  CHECK(transport_stream_select_path(paths, 2, 0) == 1,
+        "total-loss paths are ineligible");
+  paths[1].b = 0;
+  CHECK(transport_stream_select_path(paths, 2, 0) == SIZE_MAX,
+        "no positive delivery rate means no selected path");
+  paths[0].b = 1;
+  paths[0].p = FP_ONE / 2;
+  CHECK(transport_stream_select_path(paths, 2, 0) == SIZE_MAX,
+        "rounded-to-zero effective rate cannot cause division by zero");
+  paths[0].b = FP_ONE / 2;
+  paths[0].p = 0;
+  CHECK(transport_stream_select_path(paths, 2, 0) == 0,
+        "positive fractional rates remain usable");
+  paths[0].q = FP_SAFE_WHOLE;
+  paths[1].b = FP_FROM_INT(1);
+  CHECK(transport_stream_select_path(paths, 2, 0) == 1,
+        "maximum bounded queue does not wrap into an early completion");
+  CHECK(transport_stream_select_path(paths, 0, 0) == SIZE_MAX,
+        "empty path list has no selection");
+  return 0;
+}
+
 static int test_path_estimates(void) {
   quicly_path_stats_t fast = {
       .cwnd = 100000, .rtt_smoothed = 100, .sent = 100, .lost = 0};
@@ -405,6 +463,8 @@ static int test_path_estimates(void) {
 }
 
 int main(void) {
+  CHECK(test_stream_path_selection() == 0,
+        "reliable stream path selection without FEC parity");
   CHECK(test_path_pacing_inputs() == 0, "per-path ACK probing and pacing");
   CHECK(test_path_estimates() == 0,
         "heterogeneous path inputs and allocations");

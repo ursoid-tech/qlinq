@@ -3,6 +3,33 @@
 
 #include <string.h>
 
+size_t transport_stream_select_path(const path_t *paths, size_t num_paths,
+                                    uint32_t excluded_paths) {
+  if (!paths || num_paths > TRANSPORT_MAX_PATHS)
+    return SIZE_MAX;
+
+  size_t selected = SIZE_MAX;
+  fp_t earliest = FP_MAX;
+  for (size_t i = 0; i < num_paths; i++) {
+    if ((excluded_paths & (1U << i)) != 0)
+      continue;
+    fp_t success = FP_ONE - paths[i].p;
+    if (success <= 0)
+      continue;
+    fp_t usable_rate = FP_MUL(paths[i].b, success);
+    if (usable_rate <= 0)
+      continue;
+    fp_t finish =
+        FP_ADD(paths[i].l,
+               FP_DIV(FP_ADD(FP_FROM_INT(paths[i].q), FP_ONE), usable_rate));
+    if (selected == SIZE_MAX || finish < earliest) {
+      selected = i;
+      earliest = finish;
+    }
+  }
+  return selected;
+}
+
 bool transport_schedule_build(pathflow_context_t *context,
                               const path_state_t *states, size_t num_paths,
                               size_t data_symbols, size_t symbol_size,
