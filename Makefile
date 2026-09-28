@@ -313,32 +313,29 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-t/assets/server.crt t/assets/server.key &:
-	mkdir -p t/assets
-	openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout t/assets/server.key -out t/assets/server.crt -subj "/CN=localhost"
+# Check certificate lifetime on every invocation, including existing fixtures.
+# Grouped targets keep each certificate/key pair together under parallel make.
+FORCE:
 
-t/assets/verified.crt t/assets/verified.key &:
-	mkdir -p t/assets
-	openssl req -x509 -nodes -days 7 -newkey rsa:2048 \
-		-keyout t/assets/verified.key -out t/assets/verified.crt \
+t/assets/server.crt t/assets/server.key &: FORCE
+	sh scripts/gencert.sh t/assets/server.crt t/assets/server.key 365 -subj "/CN=localhost"
+
+t/assets/verified.crt t/assets/verified.key &: FORCE
+	sh scripts/gencert.sh t/assets/verified.crt t/assets/verified.key 7 \
 		-subj "/CN=localhost" -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
 		-addext "basicConstraints=critical,CA:TRUE" \
 		-addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
 		-addext "extendedKeyUsage=serverAuth,clientAuth"
 
-t/assets/verified-v6.crt t/assets/verified-v6.key &:
-	mkdir -p t/assets
-	openssl req -x509 -nodes -days 7 -newkey rsa:2048 \
-		-keyout t/assets/verified-v6.key -out t/assets/verified-v6.crt \
+t/assets/verified-v6.crt t/assets/verified-v6.key &: FORCE
+	sh scripts/gencert.sh t/assets/verified-v6.crt t/assets/verified-v6.key 7 \
 		-subj "/CN=localhost" -addext "subjectAltName=IP:::1,DNS:localhost" \
 		-addext "basicConstraints=critical,CA:TRUE" \
 		-addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
 		-addext "extendedKeyUsage=serverAuth,clientAuth"
 
-t/assets/untrusted.crt t/assets/untrusted.key &:
-	mkdir -p t/assets
-	openssl req -x509 -nodes -days 7 -newkey rsa:2048 \
-		-keyout t/assets/untrusted.key -out t/assets/untrusted.crt \
+t/assets/untrusted.crt t/assets/untrusted.key &: FORCE
+	sh scripts/gencert.sh t/assets/untrusted.crt t/assets/untrusted.key 7 \
 		-subj "/CN=untrusted" -addext "basicConstraints=critical,CA:TRUE"
 
 t/assets/unsafe.key: t/assets/verified.key
@@ -350,7 +347,7 @@ gencerts: t/assets/server.crt t/assets/server.key t/assets/verified.crt t/assets
 indent:
 	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
 
-.PHONY: all clean check benchmark fuzz-wire check-submodules \
+.PHONY: all clean check benchmark fuzz-wire check-submodules FORCE \
 	check-multipath-demo check-multipath-bw-demo check-sanitize soak release-check indent gencerts
 
 -include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
