@@ -220,9 +220,5 @@ queue drops, and late median kernel queues at most 100 ms with growth at most
 benchmark built with another transport version. Run the report-validator tests
 with `python3 examples/test_multipath_bw_demo.py`.
 
-This is a diagnostic target, not part of `release-check`: the initial per-path
-window/RTT and queue-input implementation still fails the saturated profile.
-An observed run produced 2.009 Mbps goodput, admitted 207 of 1,499 offered
-steady-window records, delivered 205, and reached 923 ms p99 latency. These
-are observed results, not relaxed acceptance limits; the benchmark is intended
-to expose the remaining capacity-estimation and backpressure behavior.
+This is a diagnostic target, not part of `release-check`. The benchmark is
+intended to expose capacity-estimation and backpressure behavior.

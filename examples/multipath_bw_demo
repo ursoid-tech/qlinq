@@ -13,8 +13,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-# Three heterogeneous transit capacities. The 1 Gbps qualification offer
-# requires aggregation once fixed-FEC wire overhead is included.
+# Three heterogeneous transit capacities. The 1 Gbps offered load requires
+# aggregation once fixed-FEC wire overhead is included.
 RATES = (250, 500, 1000)
 WARMUP = 4.0
 DURATION = 12.0

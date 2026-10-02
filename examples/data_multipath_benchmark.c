@@ -17,8 +17,8 @@
 #define PACKET_SIZE 8000 /* 8KB general data payload */
 #define GIGABIT_STREAM_EGRESS_BYTES (16U * 1024U * 1024U)
 #define GIGABIT_TOTAL_STREAM_EGRESS_BYTES (32U * 1024U * 1024U)
-#define QUALIFICATION_RECOVERY_CACHE_FLOOR (16U * 1024U * 1024U)
-#define QUALIFICATION_RECOVERY_CACHE_MAX (128U * 1024U * 1024U)
+#define BENCHMARK_RECOVERY_CACHE_FLOOR (16U * 1024U * 1024U)
+#define BENCHMARK_RECOVERY_CACHE_MAX (128U * 1024U * 1024U)
 
 typedef struct {
   double send_time;
@@ -130,15 +130,15 @@ static double numeric_argument(const char *text, double minimum,
   return value;
 }
 
-static size_t qualification_recovery_cache_bytes(double fps) {
+static size_t benchmark_recovery_cache_bytes(double fps) {
   /* Retain two seconds of offered payload so a delayed checkpoint ACK cannot
    * turn a high-rate run into application backpressure. The fixed maximum is
    * the benchmark's explicit memory cap. */
   double requested = fps * PACKET_SIZE * 2.0;
-  if (requested < QUALIFICATION_RECOVERY_CACHE_FLOOR)
-    return QUALIFICATION_RECOVERY_CACHE_FLOOR;
-  if (requested >= QUALIFICATION_RECOVERY_CACHE_MAX)
-    return QUALIFICATION_RECOVERY_CACHE_MAX;
+  if (requested < BENCHMARK_RECOVERY_CACHE_FLOOR)
+    return BENCHMARK_RECOVERY_CACHE_FLOOR;
+  if (requested >= BENCHMARK_RECOVERY_CACHE_MAX)
+    return BENCHMARK_RECOVERY_CACHE_MAX;
   return (size_t)requested;
 }
 
@@ -408,9 +408,9 @@ int main(int argc, char **argv) {
          use_reliable   ? "reliable stream"
          : use_rateless ? "rateless fec"
                         : "fixed fec");
-  size_t recovery_cache_bytes = qualification_recovery_cache_bytes(fps);
+  size_t recovery_cache_bytes = benchmark_recovery_cache_bytes(fps);
 
-  /* The gigabit qualification retains enough per-object metrics to exceed the
+  /* The gigabit benchmark retains enough per-object metrics to exceed the
    * process stack when both endpoint states are automatic variables. */
   static benchmark_state_t server_state;
   static benchmark_state_t client_state;
