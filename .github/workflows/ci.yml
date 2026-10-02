@@ -29,3 +29,6 @@ jobs:
 
       - name: Run tests
         run: make check
+
+      - name: Real TUN and multipath acceptance (isolated network namespaces)
+        run: sudo python3 t/test_tun_real.py

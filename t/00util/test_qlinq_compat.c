@@ -1,6 +1,7 @@
 #include "qlinq.h"
 #include "transport_internal.h"
 #include <assert.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -95,6 +96,26 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
       break;
   }
   assert(ready && joined && qlinq_stream_is_writable(pub));
+  int application_pipe[2];
+  assert(pipe(application_pipe) == 0);
+  assert(write(application_pipe[1], "x", 1) == 1);
+  short revents = 0;
+  for (unsigned attempt = 0; attempt < 20 && !(revents & POLLIN); attempt++) {
+    assert(qlinq_service_fd(ctx, 100, application_pipe[0], POLLIN, &revents) >=
+           0);
+    qlinq_event_t event;
+    while (qlinq_next_event(ctx, &event))
+      qlinq_event_release(&event);
+  }
+  assert(revents & POLLIN);
+  char untouched;
+  assert(read(application_pipe[0], &untouched, 1) == 1 && untouched == 'x');
+  close(application_pipe[0]);
+  close(application_pipe[1]);
+  qlinq_path_stats_t path;
+  assert(qlinq_endpoint_get_path_stats(ep, 0, &path));
+  assert(strcmp(path.local_address, "127.0.0.1") == 0);
+  assert(!qlinq_endpoint_get_path_stats(ep, QLINQ_MAX_PATHS, &path));
   qlinq_record_t record = {.group_id = 1,
                            .sequence = 2,
                            .data = legacy.payload,

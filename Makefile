@@ -150,8 +150,28 @@ qlinq-app: $(APP_OBJS) libqlinq.a
 qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-qlinq-tun: src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
+qlinq-tun: src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
+
+PREFIX ?= /usr/local
+DESTDIR ?=
+install-tun: qlinq-tun
+	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/systemd/system $(DESTDIR)$(PREFIX)/lib/sysusers.d
+	install -m 755 qlinq-tun $(DESTDIR)$(PREFIX)/bin/
+	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
+	install -m 644 packaging/qlinq.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/qlinq.conf
+
+check-tun-tool: qlinq-tun
+	python3 t/test_tun_tool.py
+
+t/00util/test_tun_json: t/00util/test_tun_json.o src/host/linux/tun_json.o src/common/cli_parse.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+check-tun-real: qlinq-tun
+	python3 t/test_tun_real.py
+
+package-tun: qlinq-tun
+	python3 scripts/package_tun.py
 
 examples/data_multipath_benchmark: examples/data_multipath_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
@@ -257,7 +277,7 @@ benchmark: t/00util/test_benchmark
 benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
-CHECK_BINARIES = t/00util/test_fec \
+CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json \
 	t/00util/test_egress_errors t/00util/test_transport_bind \
 	t/00util/test_interleaved_receive t/00util/test_publication_limits \
 	t/00util/test_directional_subscriptions \
@@ -321,6 +341,8 @@ indent:
 
 .PHONY: all clean check benchmark fuzz-wire check-submodules FORCE \
 	check-multipath-demo check-multipath-bw-demo check-sanitize soak release-check indent gencerts
+
+.PHONY: install-tun check-tun-tool check-tun-real package-tun
 
 -include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
          $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \

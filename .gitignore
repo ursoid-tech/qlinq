@@ -76,3 +76,5 @@ t/00util/test_stream_budget
 # Python
 __pycache__/
 *.py[cod]
+qlinq-tun-engine
+/dist/

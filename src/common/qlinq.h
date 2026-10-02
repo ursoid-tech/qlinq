@@ -141,6 +141,10 @@ typedef struct {
   qlinq_security_config_t security;
   qlinq_repair_mode_t repair_mode;
   qlinq_limits_t limits;
+  /* exact interface allowlist for paths discovered after startup. initial
+   * bind addresses must also belong to the selected interfaces. */
+  const char *path_interface_names[QLINQ_MAX_PATHS];
+  size_t path_interface_count;
 } qlinq_endpoint_config_t;
 
 typedef struct {
@@ -328,6 +332,26 @@ qlinq_send_result_t qlinq_stream_send(qlinq_stream_t *stream,
  * waits until network/timer activity. Pending events make this return
  * immediately. No application callback is made from another thread. */
 qlinq_status_t qlinq_service(qlinq_context_t *context, int timeout_ms);
+
+/* wake for one application fd (poll event bits). the fd is borrowed;
+ * readiness is reported without reading/writing it. pending API events can
+ * cause an immediate return with zero revents. pass fd=-1 to omit it. */
+qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
+                                int fd, short events, short *revents);
+
+typedef struct {
+  char interface_name[64];
+  char local_address[64];
+  bool active;
+  uint64_t bytes_sent;
+  uint64_t bytes_received;
+  uint64_t packets_sent;
+  uint64_t packets_lost;
+  uint32_t rtt_ms;
+} qlinq_path_stats_t;
+
+bool qlinq_endpoint_get_path_stats(qlinq_endpoint_t *endpoint, size_t index,
+                                   qlinq_path_stats_t *stats);
 
 /* Pops one event, transferring its allocation to the caller and releasing
  * queue capacity. Record bytes and strings survive context destruction until

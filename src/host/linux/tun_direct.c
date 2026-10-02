@@ -1,11 +1,14 @@
 #include "cli_parse.h"
 #include "qlinq.h"
+#include "tun_control.h"
 #include "tun_device.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
 #include <net/if.h>
+#include <poll.h>
 #include <pwd.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -15,14 +18,18 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
-#define TUN_MTU 1400U
+#define DEFAULT_TUN_MTU 1400U
 #define PACKET_CAPACITY 2048U
 #define RECEIVE_QUEUE_CAPACITY 64U
 
 typedef struct {
   uint8_t bytes[PACKET_CAPACITY];
   size_t size;
+  uint64_t queued_ms;
 } packet_t;
 
 typedef struct {
@@ -38,6 +45,17 @@ typedef struct {
   const char *key;
   const char *ca;
   const char *run_as;
+  const char *peer_ip;
+  const char *binds[QLINQ_MAX_PATHS];
+  size_t bind_count;
+  const char *uplinks[QLINQ_MAX_PATHS];
+  size_t uplink_count;
+  const char *routes[16];
+  size_t route_count;
+  uint64_t mtu;
+  uint64_t stats_ms;
+  uint64_t queue_ms;
+  uint64_t parent_pid;
   char peer[256];
   uint16_t port;
   uint64_t run_ms;
@@ -73,6 +91,13 @@ static void usage(FILE *out, const char *program) {
       "  --bind ADDRESS          Local IP (default: 0.0.0.0 or ::)\n"
       "  --interface NAME        TUN name (default: tun0)\n"
       "  --ip CIDR               TUN address (default: 10.8.0.1/24)\n"
+      "  --peer-ip ADDRESS       Explicit IPv4 tunnel peer (--ip is a bare "
+      "IP)\n"
+      "  --mtu N                 Tunnel MTU, 1280..2000 (default: 1400)\n"
+      "  --route CIDR            Add a subnet route (repeatable, no default)\n"
+      "  --uplink NAME           Allow discovered paths on this interface\n"
+      "  --stats-ms N            Emit JSON health snapshots periodically\n"
+      "  --queue-ms N            Local queue age limit (default: 100 ms)\n"
       "  --track NAME            Packet stream (default: tund/tun0)\n"
       "  --mode MODE             fixed-fec/fec (default), rateless, reliable, "
       "datagram\n"
@@ -91,6 +116,8 @@ static bool parse_options(int argc, char **argv, options_t *options) {
                          .ip = "10.8.0.1/24",
                          .track = "tund/tun0",
                          .port = 8888,
+                         .mtu = DEFAULT_TUN_MTU,
+                         .queue_ms = 100,
                          .delivery = QLINQ_DELIVERY_FIXED_FEC};
   bool have_role = false;
   for (int i = 1; i < argc; i++) {
@@ -120,7 +147,36 @@ static bool parse_options(int argc, char **argv, options_t *options) {
           return false;
         have_role = true;
       } else if (strcmp(arg, "--bind") == 0) {
+        if (options->bind_count == QLINQ_MAX_PATHS)
+          return false;
         options->bind = value;
+        options->binds[options->bind_count++] = value;
+      } else if (strcmp(arg, "--uplink") == 0) {
+        if (options->uplink_count == QLINQ_MAX_PATHS || !value[0] ||
+            strlen(value) >= IFNAMSIZ)
+          return false;
+        options->uplinks[options->uplink_count++] = value;
+      } else if (strcmp(arg, "--peer-ip") == 0) {
+        options->peer_ip = value;
+      } else if (strcmp(arg, "--route") == 0) {
+        if (options->route_count == 16)
+          return false;
+        options->routes[options->route_count++] = value;
+      } else if (strcmp(arg, "--mtu") == 0) {
+        if (!cli_parse_u64(value, 2000, &options->mtu) || options->mtu < 1280)
+          return false;
+      } else if (strcmp(arg, "--stats-ms") == 0) {
+        if (!cli_parse_u64(value, UINT32_MAX, &options->stats_ms) ||
+            options->stats_ms < 50)
+          return false;
+      } else if (strcmp(arg, "--queue-ms") == 0) {
+        if (!cli_parse_u64(value, 60000, &options->queue_ms) ||
+            options->queue_ms == 0)
+          return false;
+      } else if (strcmp(arg, "--parent-pid") == 0) {
+        if (!cli_parse_u64(value, INT32_MAX, &options->parent_pid) ||
+            options->parent_pid == 0)
+          return false;
       } else if (strcmp(arg, "--interface") == 0) {
         options->interface_name = value;
       } else if (strcmp(arg, "--ip") == 0) {
@@ -151,6 +207,36 @@ static bool parse_options(int argc, char **argv, options_t *options) {
   }
   if (!options->token)
     options->token = getenv("QLINQ_AUTH_TOKEN");
+  if (options->peer_ip) {
+    struct in_addr local, peer;
+    if (inet_pton(AF_INET, options->ip, &local) != 1 ||
+        inet_pton(AF_INET, options->peer_ip, &peer) != 1 ||
+        local.s_addr == peer.s_addr)
+      return false;
+  }
+  for (size_t i = 0; i < options->route_count; i++) {
+    char cidr[64];
+    if (!options->peer_ip || strlen(options->routes[i]) >= sizeof(cidr))
+      return false;
+    strcpy(cidr, options->routes[i]);
+    char *slash = strchr(cidr, '/');
+    uint64_t prefix;
+    struct in_addr network, remote;
+    if (!slash)
+      return false;
+    *slash++ = 0;
+    if (!cli_parse_u64(slash, 32, &prefix) || prefix == 0 ||
+        inet_pton(AF_INET, cidr, &network) != 1)
+      return false;
+    uint32_t mask = UINT32_MAX << (32U - prefix);
+    if ((ntohl(network.s_addr) & ~mask) != 0)
+      return false;
+    if (!options->listen && inet_pton(AF_INET, options->peer, &remote) == 1 &&
+        (ntohl(remote.s_addr) & mask) == ntohl(network.s_addr)) {
+      fprintf(stderr, "route would capture the transport peer\n");
+      return false;
+    }
+  }
   return have_role && options->token && options->token[0] &&
          strlen(options->token) <= UINT16_MAX &&
          strlen(options->interface_name) < IFNAMSIZ &&
@@ -186,7 +272,7 @@ static bool set_nonblocking(int fd) {
 }
 
 static bool valid_packet(const void *data, size_t size) {
-  if (!data || size == 0 || size > TUN_MTU)
+  if (!data || size == 0 || size > PACKET_CAPACITY)
     return false;
   const uint8_t *bytes = data;
   const uint8_t version = bytes[0] >> 4;
@@ -211,12 +297,20 @@ static void enqueue_packet(receive_queue_t *queue, const void *data,
   size_t tail = (queue->head + queue->count) % RECEIVE_QUEUE_CAPACITY;
   memcpy(queue->packets[tail].bytes, data, size);
   queue->packets[tail].size = size;
+  queue->packets[tail].queued_ms = monotonic_ms();
   queue->count++;
 }
 
-static bool flush_packets(receive_queue_t *queue, int tun_fd) {
+static bool flush_packets(receive_queue_t *queue, int tun_fd,
+                          uint64_t max_age) {
   while (queue->count > 0) {
     packet_t *packet = &queue->packets[queue->head];
+    if (monotonic_ms() - packet->queued_ms >= max_age) {
+      queue->head = (queue->head + 1) % RECEIVE_QUEUE_CAPACITY;
+      queue->count--;
+      queue->dropped++;
+      continue;
+    }
     ssize_t written = tun_write(tun_fd, packet->bytes, packet->size);
     if (written < 0 && errno == EINTR)
       continue;
@@ -246,12 +340,70 @@ static void make_mock_packet(packet_t *packet, uint64_t sequence) {
   memcpy(packet->bytes + 20, &sequence, sizeof(sequence));
 }
 
+static void json_string(const char *value) {
+  putchar('"');
+  for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+    if (*p < 32 || *p == '"' || *p == '\\')
+      printf("\\u%04x", *p);
+    else
+      putchar(*p);
+  }
+  putchar('"');
+}
+
+static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
+                        uint64_t sent, uint64_t received, uint64_t tx_bytes,
+                        uint64_t rx_bytes, uint64_t dropped) {
+  qlinq_endpoint_stats_t stats = {0};
+  qlinq_endpoint_get_stats(endpoint, &stats);
+  bool have_active_path = false;
+  for (size_t i = 0; i < QLINQ_MAX_PATHS; i++) {
+    qlinq_path_stats_t path;
+    if (qlinq_endpoint_get_path_stats(endpoint, i, &path) && path.active)
+      have_active_path = true;
+  }
+  if (strcmp(state, "connected") == 0 && !have_active_path)
+    state = "degraded";
+  printf("QLINQ_STATUS {\"state\":\"%s\",\"sent\":%llu,\"received\":%llu,"
+         "\"tx_bytes\":%llu,\"rx_bytes\":%llu,\"dropped\":%llu,"
+         "\"fec_recovered\":%llu,\"fec_lost\":%llu,\"reconnects\":%llu,"
+         "\"queued_bytes\":%zu,\"paths\":[",
+         state, (unsigned long long)sent, (unsigned long long)received,
+         (unsigned long long)tx_bytes, (unsigned long long)rx_bytes,
+         (unsigned long long)dropped,
+         (unsigned long long)stats.fec_objects_recovered,
+         (unsigned long long)stats.fec_objects_lost,
+         (unsigned long long)stats.reconnect_attempts, stats.queued_bytes);
+  bool first = true;
+  for (size_t i = 0; i < QLINQ_MAX_PATHS; i++) {
+    qlinq_path_stats_t path;
+    if (!qlinq_endpoint_get_path_stats(endpoint, i, &path))
+      continue;
+    printf("%s{\"interface\":", first ? "" : ",");
+    json_string(path.interface_name);
+    printf(",\"address\":");
+    json_string(path.local_address);
+    printf(",\"active\":%s,\"tx_bytes\":%llu,\"rx_bytes\":%llu,\"rtt_ms\":%u,"
+           "\"packets_lost\":%llu}",
+           path.active ? "true" : "false", (unsigned long long)path.bytes_sent,
+           (unsigned long long)path.bytes_received, path.rtt_ms,
+           (unsigned long long)path.packets_lost);
+    first = false;
+  }
+  puts("]}");
+}
+
 static int run_tunnel(const options_t *options) {
   int tun_fd = -1;
   char interface_name[IFNAMSIZ];
   snprintf(interface_name, sizeof(interface_name), "%s",
            options->interface_name);
   if (!options->mock) {
+    if (if_nametoindex(interface_name) != 0) {
+      fprintf(stderr, "interface %s already exists; refusing to modify it\n",
+              interface_name);
+      return 1;
+    }
     if (geteuid() == 0 && !options->run_as) {
       fprintf(stderr, "root execution requires --run-as USER\n");
       return 1;
@@ -263,15 +415,22 @@ static int run_tunnel(const options_t *options) {
     tun_fd = tun_alloc(interface_name);
     if (tun_fd < 0)
       return 1;
-    if (configure_ip_and_up(interface_name, options->ip) != 0 ||
-        tun_set_mtu(interface_name, TUN_MTU) != 0 || !set_nonblocking(tun_fd)) {
+    int configured =
+        options->peer_ip
+            ? tun_configure_peer(interface_name, options->ip, options->peer_ip)
+            : configure_ip_and_up(interface_name, options->ip);
+    if (configured != 0 || tun_set_mtu(interface_name, options->mtu) != 0 ||
+        !set_nonblocking(tun_fd)) {
       fprintf(stderr, "failed to configure TUN interface %s\n", interface_name);
       close(tun_fd);
       return 1;
     }
-    if (geteuid() == 0 && !drop_privileges(options->run_as)) {
-      close(tun_fd);
-      return 1;
+    for (size_t i = 0; i < options->route_count; i++) {
+      if (tun_add_route(interface_name, options->routes[i]) != 0) {
+        fprintf(stderr, "failed to add route %s\n", options->routes[i]);
+        close(tun_fd);
+        return 1;
+      }
     }
   }
 
@@ -291,6 +450,7 @@ static int run_tunnel(const options_t *options) {
       .bind_address_count = 1,
       .port = options->port,
       .reconnect_enabled = !options->listen,
+      .idle_timeout_ms = 10000,
       .limits = {.max_connections = 1},
       .security = {.shared_secret = options->token,
                    .shared_secret_size = strlen(options->token),
@@ -299,6 +459,14 @@ static int run_tunnel(const options_t *options) {
                    .trust_store_file = options->ca,
                    .verify_peer = !options->insecure,
                    .allow_insecure_peer = options->insecure}};
+  if (options->bind_count) {
+    config.bind_address_count = options->bind_count;
+    for (size_t i = 0; i < options->bind_count; i++)
+      config.bind_addresses[i] = options->binds[i];
+  }
+  config.path_interface_count = options->uplink_count;
+  for (size_t i = 0; i < options->uplink_count; i++)
+    config.path_interface_names[i] = options->uplinks[i];
   if (!options->listen) {
     config.remote_addresses[0] = options->peer;
     config.remote_address_count = 1;
@@ -321,6 +489,25 @@ static int run_tunnel(const options_t *options) {
       close(tun_fd);
     return 1;
   }
+  /* load root-owned identity files and bind sockets before dropping uid;
+   * no peer packets are serviced until privilege drop succeeds */
+  if (!options->mock && geteuid() == 0 && !drop_privileges(options->run_as)) {
+    qlinq_context_destroy(context);
+    close(tun_fd);
+    return 1;
+  }
+#ifdef __linux__
+  /* setuid clears parent-death signal, arm it after dropping uid;
+   * checking the original parent closes the setup-time race */
+  if (options->parent_pid && (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 ||
+                              (uint64_t)getppid() != options->parent_pid)) {
+    fprintf(stderr, "tunnel supervisor disappeared during startup\n");
+    qlinq_context_destroy(context);
+    if (tun_fd >= 0)
+      close(tun_fd);
+    return 1;
+  }
+#endif
   printf("direct TUN %s, track=%s, mode=%d, interface=%s%s\n",
          options->listen ? "listening" : "connecting", options->track,
          options->delivery, interface_name, options->mock ? " (mock)" : "");
@@ -328,11 +515,16 @@ static int run_tunnel(const options_t *options) {
   receive_queue_t queue = {0};
   packet_t pending = {0};
   uint64_t sent = 0, received = 0, partial = 0;
+  uint64_t tx_bytes = 0, rx_bytes = 0, tx_dropped = 0, last_stats = 0;
+  const char *state = options->listen ? "listening" : "connecting";
   uint64_t started = monotonic_ms(), last_mock = 0;
   int result = 0;
   while (!stopping &&
          (!options->run_ms || monotonic_ms() - started < options->run_ms)) {
-    qlinq_status_t status = qlinq_service(context, 2);
+    short ready_events = 0;
+    qlinq_status_t status =
+        qlinq_service_fd(context, options->mock ? 10 : 50, tun_fd,
+                         POLLIN | (queue.count ? POLLOUT : 0), &ready_events);
     if (status < QLINQ_STATUS_OK) {
       fprintf(stderr, "qlinq service failed: %d\n", status);
       result = 1;
@@ -341,32 +533,47 @@ static int run_tunnel(const options_t *options) {
     qlinq_event_t event;
     while (qlinq_next_event(context, &event)) {
       if (event.type == QLINQ_EVENT_RECORD && event.stream == subscriber) {
-        if (valid_packet(event.record.data, event.record.size)) {
+        if (valid_packet(event.record.data, event.record.size) &&
+            event.record.size <= options->mtu) {
           received++;
+          rx_bytes += event.record.size;
           if (!options->mock)
             enqueue_packet(&queue, event.record.data, event.record.size);
         } else {
           queue.dropped++;
         }
       } else if (event.type == QLINQ_EVENT_PEER_READY) {
+        state = "connected";
         fprintf(stderr, "peer %u ready\n", event.peer_id);
       } else if (event.type == QLINQ_EVENT_PEER_DISCONNECTED ||
                  event.type == QLINQ_EVENT_SUBSCRIBER_LEFT) {
-        /* Do not replay an old IP packet after a reconnect. */
+        /* do not replay an old IP packet after reconnect */
         pending.size = 0;
+        queue.dropped += queue.count;
+        queue.count = 0;
+        state = options->listen ? "listening" : "reconnecting";
       } else if (event.type == QLINQ_EVENT_PEER_REJECTED ||
                  event.type == QLINQ_EVENT_ERROR) {
+        state = "error";
         fprintf(stderr, "peer error: %s (status=%d)\n",
                 event.message ? event.message : "unknown", event.status);
       }
       qlinq_event_release(&event);
     }
-    if (tun_fd >= 0 && !flush_packets(&queue, tun_fd)) {
+    uint64_t now_ms = monotonic_ms();
+    if (options->stats_ms && now_ms - last_stats >= options->stats_ms) {
+      print_stats(endpoint, state, sent, received, tx_bytes, rx_bytes,
+                  queue.dropped + tx_dropped);
+      last_stats = now_ms;
+    }
+    if (pending.size && now_ms - pending.queued_ms >= options->queue_ms) {
+      pending.size = 0;
+      tx_dropped++;
+    }
+    if (tun_fd >= 0 && !flush_packets(&queue, tun_fd, options->queue_ms)) {
       result = 1;
       break;
     }
-    if (!qlinq_stream_is_writable(publisher))
-      continue;
     for (size_t batch = 0; batch < 32; batch++) {
       if (pending.size == 0) {
         if (options->mock) {
@@ -376,7 +583,8 @@ static int run_tunnel(const options_t *options) {
           make_mock_packet(&pending, sent + 1);
           last_mock = now;
         } else {
-          ssize_t count = tun_read(tun_fd, pending.bytes, TUN_MTU);
+          ssize_t count =
+              tun_read(tun_fd, pending.bytes, sizeof(pending.bytes));
           if (count < 0 && errno == EINTR)
             continue;
           if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
@@ -388,11 +596,23 @@ static int run_tunnel(const options_t *options) {
             break;
           }
           pending.size = (size_t)count;
-          if (!valid_packet(pending.bytes, pending.size)) {
+          if (!valid_packet(pending.bytes, pending.size) ||
+              pending.size > options->mtu) {
             pending.size = 0;
+            tx_dropped++;
             continue;
           }
         }
+        pending.queued_ms = monotonic_ms();
+      }
+      if (!qlinq_stream_is_writable(publisher)) {
+        /* drain kernel packets while disconnected instead of replaying a
+         * stale burst when connectivity returns */
+        pending.size = 0;
+        tx_dropped++;
+        if (options->mock)
+          break;
+        continue;
       }
       qlinq_record_t record = {.data = pending.bytes,
                                .size = pending.size,
@@ -413,24 +633,37 @@ static int run_tunnel(const options_t *options) {
       if (send_result == QLINQ_SEND_PARTIAL)
         partial++;
       sent++;
+      tx_bytes += pending.size;
       pending.size = 0;
       if (options->mock)
         break;
     }
   }
+  if (options->stats_ms)
+    print_stats(endpoint, "stopped", sent, received, tx_bytes, rx_bytes,
+                queue.dropped + tx_dropped);
   printf("direct TUN summary: sent=%llu received=%llu partial=%llu "
          "dropped=%llu\n",
          (unsigned long long)sent, (unsigned long long)received,
          (unsigned long long)partial, (unsigned long long)queue.dropped);
   if (options->mock && options->run_ms && (!sent || !received))
     result = 1;
+  qlinq_endpoint_shutdown(endpoint, "tunnel stopped");
+  uint64_t drain_until = monotonic_ms() + 250;
+  while (!qlinq_endpoint_is_drained(endpoint) && monotonic_ms() < drain_until) {
+    if (qlinq_service(context, 10) < QLINQ_STATUS_OK)
+      break;
+    qlinq_event_t event;
+    while (qlinq_next_event(context, &event))
+      qlinq_event_release(&event);
+  }
   qlinq_context_destroy(context);
   if (tun_fd >= 0)
     close(tun_fd);
   return result;
 }
 
-int main(int argc, char **argv) {
+int tun_worker_main(int argc, char **argv) {
   options_t options;
   setvbuf(stdout, NULL, _IONBF, 0);
   if (!parse_options(argc, argv, &options)) {

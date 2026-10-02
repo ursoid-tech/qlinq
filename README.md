@@ -20,14 +20,16 @@ git submodule update --init --recursive
 make
 ```
 
-This produces four binaries and an embeddable transport library:
+This produces the following tools and an embeddable transport library:
 
 - `qlinqd`: The background peer-to-peer network daemon.
 - `qlinq-app`: A direct `transport.h` file/stream sender and receiver that does
   not use the daemon's Unix data socket.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
-- `qlinq-tun`: An opt-in direct unicast TUN helper using the native `qlinq.h`
-  API, without `qlinqd` or a Unix data socket.
+- `qlinq-tun`: Single native executable for Linux tunnel management and the
+  direct `qlinq.h` packet worker: local identities, pairing, saved profiles,
+  up/down, status and diagnostics. No Python runtime or companion engine is
+  required. Existing `--peer ...` and `--listen ...` invocations remain supported.
 - `libqlinq.a`: The in-process `transport.h` API used by `qlinq-app`, plus the
   [native application API](docs/application-api.md) in `qlinq.h` for named
   streams, owned events and endpoint management.
@@ -59,15 +61,30 @@ Delivery mode names are shared by `qlinq-app`, `qlinqd`, and `qlinq-tun`:
 The daemon also retains its `--reliable` and `--rateless` aliases. Each tool
 keeps its existing default mode.
 
-## Direct packet tunnel
+## Managed packet tunnel
+
+See the [two-machine quickstart](docs/tun-tool.md) for installation, secure
+pairing, uplink selection, subnet routes and systemd operation. The pilot is a
+Linux point-to-point IPv4 tunnel with one reachable server; no cloud account is
+required. The core tunnel commands are:
+
+```bash
+sudo qlinq-tun up office
+sudo qlinq-tun status office
+sudo qlinq-tun diag office
+sudo qlinq-tun down office
+```
+
+## Direct packet tunnel (advanced)
 
 `qlinq-tun` maps each IP packet to one `QLINQ_CONTENT_DATA` record and
 publishes/subscribes to the same named stream in opposite directions. Both
 peers must choose the same `--track` and `--mode` (default `fixed-fec`). The
 listener is limited to one peer; the connecting side reconnects automatically.
 For a real interface, configure the TUN as root and use `--run-as USER` to drop
-privileges before the network endpoint starts. Create a dedicated unprivileged
-`qlinq` account that can read its certificate and private key. For example,
+privileges before servicing peer traffic. TLS identities and sockets are
+initialized before the drop; private keys can remain root-owned. Create a
+dedicated unprivileged `qlinq` account. For example,
 with identities issued by a shared CA:
 
 ```bash
@@ -82,10 +99,13 @@ sudo ./qlinq-tun --peer SERVER_IP:8888 --interface tun0 \
   --auth-token 'replace-with-a-secret' --run-as qlinq
 ```
 
-The helper sets MTU 1400, bounds its receive queue, and never retries a
-partially accepted record as a new packet. It does not yet integrate the TUN
-file descriptor into `qlinq_service`'s poller or support multipath/mesh
-configuration; retain `qlinqd` plus `qlinq-tund` for those deployments.
+The helper defaults to MTU 1400 (`--mtu` overrides it), bounds its receive queue,
+and never retries a partially accepted record as a new packet. TUN readiness
+wakes the transport poller. Repeat `--bind` and `--uplink` to select paths;
+`--peer-ip` enables explicit point-to-point IPv4 addressing and `--route` adds
+subnet routes. `--stats-ms` emits JSON health snapshots. The managed workflow
+supplies these options from a saved profile. Retain `qlinqd` plus `qlinq-tund`
+for legacy mesh deployments.
 `--mock --run-ms N` exercises the direct stream without a privileged TUN.
 
 ## Security

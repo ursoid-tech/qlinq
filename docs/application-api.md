@@ -16,6 +16,10 @@ paths. Configure certificate verification and an application shared secret
 through `qlinq_security_config_t`. Secrets are copied; address and file-name
 strings need only remain valid during endpoint creation.
 
+`path_interface_names` / `path_interface_count` restrict hot-added paths to
+selected interfaces. Match initial bind addresses to the same interfaces;
+the allowlist does not configure OS routing.
+
 `qlinq_publish` and `qlinq_subscribe` return named stream handles. Each stream
 selects content type and datagram, reliable, fixed-FEC or rateless delivery.
 Subscriptions created before authentication activate when peers become ready,
@@ -32,6 +36,12 @@ application authentication completed. Subscriber join/leave events and
 `QLINQ_EVENT_STREAM_WRITABLE` let publishers discover recipients and resume
 sending. The writable event describes a transition to writable, not a promise
 that every future record will fit; always check `qlinq_stream_send`'s result.
+
+`qlinq_service_fd(context, timeout_ms, fd, events, &revents)` additionally polls
+one borrowed application descriptor using `poll(2)` event bits. It reports
+readiness without consuming bytes and follows the same event/deadline semantics.
+Pass `fd=-1` to omit it. This lets a TUN wake the network loop without periodic
+busy polling.
 
 ```c
 qlinq_stream_config_t stream_config = {
@@ -62,6 +72,10 @@ while (qlinq_next_event(context, &event)) {
 `qlinq_stream_get_stats` expose connection state, recovery/queue counters,
 subscriber counts and stream readiness. `qlinq_context_last_status` reports
 operation errors, including failures that could not be queued as events.
+
+`qlinq_endpoint_get_path_stats` exposes active/validated state, interface/address,
+wire byte counters, packet-loss counters and RTT in milliseconds for each path.
+Slots can move when interfaces disappear; use interface/address as identity.
 
 ## Record compatibility and ownership
 

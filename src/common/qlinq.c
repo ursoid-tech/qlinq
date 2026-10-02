@@ -574,6 +574,7 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   if (!config || config->port == 0 || config->bind_address_count == 0 ||
       config->bind_address_count > QLINQ_MAX_PATHS ||
       config->remote_address_count > QLINQ_MAX_PATHS ||
+      config->path_interface_count > QLINQ_MAX_PATHS ||
       (listener && config->remote_address_count != 0) ||
       (!listener && config->remote_address_count == 0) ||
       (listener && (!config->security.certificate_file ||
@@ -595,6 +596,14 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   }
   for (size_t i = 0; i < config->remote_address_count; i++) {
     if (!config->remote_addresses[i]) {
+      set_status(context, QLINQ_STATUS_INVALID);
+      return NULL;
+    }
+  }
+  for (size_t i = 0; i < config->path_interface_count; i++) {
+    if (!config->path_interface_names[i] ||
+        !config->path_interface_names[i][0] ||
+        strlen(config->path_interface_names[i]) >= 64) {
       set_status(context, QLINQ_STATUS_INVALID);
       return NULL;
     }
@@ -628,6 +637,10 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
     transport_config.remote_hosts[transport_config.num_remote_hosts++] =
         config->remote_addresses[i];
   transport_config.port = config->port;
+  for (size_t i = 0; i < config->path_interface_count; i++)
+    transport_config
+        .path_interface_names[transport_config.num_path_interface_names++] =
+        config->path_interface_names[i];
   transport_config.quic_idle_timeout_ms = config->idle_timeout_ms;
   transport_config.fec_assembler_timeout_ms = config->receive_object_timeout_ms;
   transport_config.handshake_timeout_rtt_multiplier =
@@ -1028,15 +1041,16 @@ static size_t service_pending_endpoints(qlinq_context_t *context) {
 }
 
 static qlinq_status_t poll_endpoints(qlinq_context_t *context,
-                                     size_t endpoint_count, int timeout_ms) {
+                                     size_t endpoint_count, int timeout_ms,
+                                     int fd, short events, short *revents) {
   if (endpoint_count > SIZE_MAX / sizeof(qlinq_endpoint_poll_t) ||
       endpoint_count > SIZE_MAX / TRANSPORT_MAX_POLL_FDS ||
       endpoint_count * TRANSPORT_MAX_POLL_FDS >
-          SIZE_MAX / sizeof(struct pollfd)) {
+          SIZE_MAX / sizeof(struct pollfd) - 1U) {
     set_status(context, QLINQ_STATUS_RESOURCE_LIMIT);
     return QLINQ_STATUS_RESOURCE_LIMIT;
   }
-  size_t capacity = endpoint_count * TRANSPORT_MAX_POLL_FDS;
+  size_t capacity = endpoint_count * TRANSPORT_MAX_POLL_FDS + 1U;
   if (endpoint_count > context->poll_endpoint_capacity) {
     struct pollfd *fds = calloc(capacity, sizeof(*fds));
     qlinq_endpoint_poll_t *polls = calloc(endpoint_count, sizeof(*polls));
@@ -1078,7 +1092,12 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
     }
   }
 
+  size_t app_index = count;
+  if (fd >= 0)
+    fds[count++] = (struct pollfd){.fd = fd, .events = events};
   int result = poll(fds, count, wait_ms);
+  if (result >= 0 && fd >= 0 && revents)
+    *revents = fds[app_index].revents;
   if (result < 0 && SOCKET_ERROR_CODE != SOCKET_EINTR) {
     set_status(context, QLINQ_STATUS_IO);
     return QLINQ_STATUS_IO;
@@ -1105,6 +1124,13 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
 }
 
 qlinq_status_t qlinq_service(qlinq_context_t *context, int timeout_ms) {
+  return qlinq_service_fd(context, timeout_ms, -1, 0, NULL);
+}
+
+qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
+                                int fd, short events, short *revents) {
+  if (revents)
+    *revents = 0;
   if (!context_access(context))
     return QLINQ_STATUS_STATE;
 
@@ -1123,7 +1149,8 @@ qlinq_status_t qlinq_service(qlinq_context_t *context, int timeout_ms) {
     return QLINQ_STATUS_STATE;
   }
 
-  qlinq_status_t status = poll_endpoints(context, endpoint_count, timeout_ms);
+  qlinq_status_t status =
+      poll_endpoints(context, endpoint_count, timeout_ms, fd, events, revents);
   if (status != QLINQ_STATUS_OK)
     return status;
   refresh_writable_events(context);
@@ -1209,6 +1236,28 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
       .active_connections = transport_stats.active_connections,
       .queued_packets = transport_stats.egress_current_packets,
       .queued_bytes = transport_stats.egress_current_bytes};
+  return true;
+}
+
+bool qlinq_endpoint_get_path_stats(qlinq_endpoint_t *endpoint, size_t index,
+                                   qlinq_path_stats_t *stats) {
+  if (!endpoint_access(endpoint) || !endpoint || !endpoint->active ||
+      !endpoint->transport || !stats)
+    return false;
+  transport_path_stats_t source;
+  if (!transport_get_path_stats(endpoint->transport, index, &source))
+    return false;
+  *stats =
+      (qlinq_path_stats_t){.bytes_sent = source.bytes_sent,
+                           .active = source.lifecycle == TRANSPORT_PATH_ACTIVE,
+                           .bytes_received = source.bytes_received,
+                           .packets_sent = source.sent,
+                           .packets_lost = source.lost,
+                           .rtt_ms = source.rtt};
+  memcpy(stats->interface_name, source.interface_name,
+         sizeof(stats->interface_name));
+  memcpy(stats->local_address, source.local_address,
+         sizeof(stats->local_address));
   return true;
 }
 

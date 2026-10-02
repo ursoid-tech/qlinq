@@ -68,7 +68,7 @@ static int tun_create_by_id(char if_name[IFNAMSIZ], unsigned int id) {
 
 static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name) {
 #if defined(__linux__)
-  struct ifreq ifr;
+  struct ifreq ifr = {0};
   int fd;
   int err;
 
@@ -221,11 +221,6 @@ static int run_command(char *const argv[]) {
   if (pid < 0)
     return -1;
   if (pid == 0) {
-    int null_fd = open("/dev/null", O_WRONLY);
-    if (null_fd >= 0) {
-      dup2(null_fd, STDERR_FILENO);
-      close(null_fd);
-    }
     execvp(argv[0], argv);
     _exit(127);
   }
@@ -235,6 +230,42 @@ static int run_command(char *const argv[]) {
       return -1;
   }
   return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+int tun_configure_peer(const char *if_name, const char *local_ip,
+                       const char *peer_ip) {
+#ifdef __linux__
+  struct in_addr local, peer;
+  if (inet_pton(AF_INET, local_ip, &local) != 1 ||
+      inet_pton(AF_INET, peer_ip, &peer) != 1 || local.s_addr == peer.s_addr)
+    return -1;
+  char peer_cidr[32];
+  snprintf(peer_cidr, sizeof(peer_cidr), "%s/32", peer_ip);
+  char *addr[] = {"ip",   "addr",    "add", (char *)local_ip,
+                  "peer", peer_cidr, "dev", (char *)if_name,
+                  NULL};
+  char *up[] = {"ip", "link", "set", "dev", (char *)if_name, "up", NULL};
+  return run_command(addr) == 0 && run_command(up) == 0 ? 0 : -1;
+#else
+  (void)if_name;
+  (void)local_ip;
+  (void)peer_ip;
+  errno = ENOTSUP;
+  return -1;
+#endif
+}
+
+int tun_add_route(const char *if_name, const char *cidr) {
+#ifdef __linux__
+  char *args[] = {"ip",  "route",         "add", (char *)cidr,
+                  "dev", (char *)if_name, NULL};
+  return run_command(args);
+#else
+  (void)if_name;
+  (void)cidr;
+  errno = ENOTSUP;
+  return -1;
+#endif
 }
 
 /* configure interface ip and bring it up */
