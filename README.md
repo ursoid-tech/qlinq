@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/sleepybishop/qlinq/actions/workflows/ci.yml/badge.svg)](https://github.com/sleepybishop/qlinq/actions/workflows/ci.yml)
 
-`qlinq` ("clink") is a QUIC-based swiss army knife for different types of data streams. It combines a high-performance network link path manager with forward error correction and provides interfaces via tun devices or unix sockets.
+`qlinq` ("clink") is a resilient data transport over QUIC with multipath scheduling and fixed-block or rateless forward error correction.
 
 ## Features
 
@@ -54,7 +54,7 @@ idle timeout, machine-readable counter snapshots, and `--pv` for pv-style wire
 throughput per physical interface. Run `qlinq-app --help` for the complete
 interface.
 
-## Direct packet tunnel (prototype)
+## Direct packet tunnel
 
 `qlinq-tun` maps each IP packet to one `QLINQ_CONTENT_DATA` record and
 publishes/subscribes to the same named stream in opposite directions. Both
@@ -104,8 +104,3 @@ To run the test suite:
 make check
 ```
 
-The private peer protocol is documented in
-[docs/wire-protocol.md](docs/wire-protocol.md). Protocol version 1 is required
-on both peers; incompatible versions are rejected instead of being guessed.
-The implementation boundaries and ownership rules are described in
-[docs/transport-architecture.md](docs/transport-architecture.md).

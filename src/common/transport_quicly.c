@@ -442,7 +442,7 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
 }
 
 static quicly_path_scheduler_t qlinq_path_scheduler = {
-    qlinq_path_scheduler_send};
+    .do_send = qlinq_path_scheduler_send};
 
 static bool ifmon_address_matches(const ifmon_addr_t *address,
                                   const struct sockaddr_storage *local) {
@@ -1025,7 +1025,7 @@ transport_t *transport_create(const transport_config_t *config) {
 
   t->quic_ctx = quicly_spec_context;
   if (config->initial_rtt_ms != 0)
-    t->quic_ctx.loss.default_initial_rtt = config->initial_rtt_ms;
+    t->quic_ctx.egress[0].loss.default_initial_rtt = config->initial_rtt_ms;
   if (config->handshake_timeout_rtt_multiplier != 0)
     t->quic_ctx.handshake_timeout_rtt_multiplier =
         config->handshake_timeout_rtt_multiplier;
@@ -1046,7 +1046,7 @@ transport_t *transport_create(const transport_config_t *config) {
    * been removed. Datagram scheduling applies the same invariant. */
   t->quic_ctx.path_scheduler = &qlinq_path_scheduler;
 
-  t->quic_ctx.initcwnd_packets = 100;
+  t->quic_ctx.egress[0].cc.initcwnd_packets = 100;
   t->quic_ctx.initial_egress_max_udp_payload_size =
       t->limits.max_udp_payload_size;
   t->quic_ctx.transport_params.max_datagram_frame_size =

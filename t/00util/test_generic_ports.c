@@ -210,7 +210,7 @@ static void transport_regressions(void) {
     ep[i].transport = transport_create(&config);
     assert(ep[i].transport);
     assert(ep[i].transport->fec_assembler_timeout_ms == 10000);
-    assert(ep[i].transport->quic_ctx.loss.default_initial_rtt == 125);
+    assert(ep[i].transport->quic_ctx.egress[0].loss.default_initial_rtt == 125);
     assert(ep[i].transport->quic_ctx.handshake_timeout_rtt_multiplier == 40);
     config.remote_hosts[0] = "127.0.0.1";
     config.num_remote_hosts = 1;
