@@ -407,10 +407,10 @@ static transport_publish_result_t publish_datagram_to_flexicast(
     transport_schedule_t member_schedule;
     size_t scratch_round_robin = member->round_robin_path;
     bool use_fec = profile->fec_enabled || profile->fec_rateless;
-    if (!transport_schedule_build(
-            &member->scheduler_context, active_states, active_paths,
-            data_symbols, symbol_size, use_fec, obj->priority,
-            &scratch_round_robin, &member_schedule))
+    if (!transport_schedule_build(&member->scheduler_context, active_states,
+                                  active_paths, data_symbols, symbol_size,
+                                  use_fec, obj->priority, &scratch_round_robin,
+                                  &member_schedule))
       return TRANSPORT_PUBLISH_ERROR;
     if (member_schedule.parity_symbols > parity_symbols)
       parity_symbols = member_schedule.parity_symbols;
@@ -965,8 +965,6 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
           obj->size > fec_limit - 2U)
         return TRANSPORT_PUBLISH_INVALID;
 
-      size_t group_limit = fec_limit < 16384U ? fec_limit : 16384U;
-
       if (t->fec_buf_len > 0 &&
           (t->fec_flush_pending ||
            !transport_track_id_equal(&t->fec_track_id, &obj->track_id) ||
@@ -1129,7 +1127,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
 
   bool protect_repair_cache = track_uses_recovery(&obj->track_id) &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
-  if (obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&
+  if (track_uses_recovery(&obj->track_id) &&
       !transport_sent_cache_can_store(&t->sent_cache, obj,
                                       !protect_repair_cache)) {
     t->stats.recovery_cache_backpressure++;
@@ -1216,7 +1214,7 @@ transport_publish_impl(transport_t *t, const moq_object_t *obj) {
   }
 
   if ((delivered > 0 || partially_queued) &&
-      obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&
+      track_uses_recovery(&obj->track_id) &&
       !transport_sent_cache_store(&t->sent_cache, obj, maximum_sent_symbols,
                                   (uint16_t)data_symbols, (uint16_t)symbol_size,
                                   !protect_repair_cache))

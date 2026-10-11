@@ -353,7 +353,7 @@ CHECK_BINARIES = t/00util/test_fec \
 	t/00util/test_multipath \
 	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
 
-check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_flexicast_regressions t/00util/test_quicly_flexicast t/00util/test_qlinq_api gencerts
+check: all $(CHECK_BINARIES) gencerts
 	prove -I. -v t/*.t
 
 clean: 

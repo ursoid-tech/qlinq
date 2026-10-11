@@ -91,7 +91,7 @@ static void test_partial_group_retry(void) {
       t)); /* First peer accepted, second did not. */
   sent_object_cache_t *cached =
       transport_sent_cache_find(&t->sent_cache, &track, 0, 0);
-  assert(cached == NULL); /* Fixed FEC never retains repair obligations. */
+  assert(cached && cached->recovery_protected);
   assert(t->fec_buf_len == 1002 && memcmp(t->fec_buf + 2, original, 1000) == 0);
   size_t first_queued =
       quicly_get_num_datagram_frames_path(first_conn->quic, 0);

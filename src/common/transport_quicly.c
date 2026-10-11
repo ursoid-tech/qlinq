@@ -1596,11 +1596,15 @@ void transport_tick(transport_t *t) {
             &gap->recovery_windows[window_index];
         if (!window->active || window->missing_mask == 0)
           continue;
+        if (!gap->shared_delivery && now_nack_ms - window->last_request_ms <
+                                         QLINQ_FEC_COMPLETION_RETRY_MS)
+          continue;
         /* Pipeline distinct missing objects within the existing tick, token
          * and control-queue budgets. One request per retry interval adds
          * 500 ms between requests for a burst of lost objects. Keep the start
          * fixed while the cursor advances after each admitted request. */
         uint32_t first_bit = window->cursor;
+        bool requested = false;
         for (uint32_t attempt = 0;
              attempt < QLINQ_RECOVERY_WINDOW_OBJECTS && object_nack_budget > 0;
              attempt++) {
@@ -1619,7 +1623,8 @@ void transport_tick(transport_t *t) {
                 conn, true, (uint8_t)alias, window->group_id, object_id,
                 shared_rateless_feedback ? (uint16_t)bit : window->cursor,
                 shared_rateless_feedback ? window->nack_attempt : 0);
-          if (now_nack_ms - window->last_request_ms < recovery_delay)
+          if (gap->shared_delivery &&
+              now_nack_ms - window->last_request_ms < recovery_delay)
             continue;
           if (transport_find_assembler(conn, alias, window->group_id,
                                        object_id))
@@ -1631,8 +1636,9 @@ void transport_tick(transport_t *t) {
                 (uint8_t)((bit + 1U) % QLINQ_RECOVERY_WINDOW_OBJECTS);
             if (shared_rateless_feedback)
               window->requested_mask |= bit_mask;
-            else
+            else if (gap->shared_delivery)
               window->last_request_ms = now_nack_ms;
+            requested = true;
             object_nack_budget--;
             t->recovery_conn_cursor = (c + 1U) % active_conns;
             if (transport_repair_limiter_wait_ms(
@@ -1643,9 +1649,11 @@ void transport_tick(transport_t *t) {
           } else {
             break;
           }
-          if (!shared_rateless_feedback)
+          if (gap->shared_delivery && !shared_rateless_feedback)
             break;
         }
+        if (!gap->shared_delivery && requested)
+          window->last_request_ms = now_nack_ms;
         if (shared_rateless_feedback && window->missing_mask != 0 &&
             (window->requested_mask & window->missing_mask) ==
                 window->missing_mask) {
