@@ -171,6 +171,7 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
         !source_overlaps_entry(object, &cache->entries[index]))
       release_entry(cache, &cache->entries[index]);
   }
+
   sent_object_cache_t *entry = NULL;
   size_t next_entry = cache->next_entry;
   for (size_t offset = 0; offset < cache_capacity(cache); offset++) {
