@@ -92,26 +92,28 @@ static void test_partial_group_retry(void) {
   sent_object_cache_t *cached =
       transport_sent_cache_find(&t->sent_cache, &track, 0, 0);
   assert(cached == NULL); /* Fixed FEC never retains repair obligations. */
-  assert(t->fec_buf_len == 1002 && memcmp(t->fec_buf + 2, original, 1000) == 0);
+  assert(t->pending_group.size == 1002 &&
+         memcmp(t->pending_group.data + 2, original, 1000) == 0);
   size_t first_queued =
       quicly_get_num_datagram_frames_path(first_conn->quic, 0);
   assert(first_queued > 0);
   object.data = next;
   for (size_t i = 0; i < 3; i++) {
     assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BACKPRESSURE);
-    assert(t->fec_buf_len == 1002 &&
-           memcmp(t->fec_buf + 2, original, 1000) == 0);
+    assert(t->pending_group.size == 1002 &&
+           memcmp(t->pending_group.data + 2, original, 1000) == 0);
     assert(quicly_get_num_datagram_frames_path(first_conn->quic, 0) ==
            first_queued);
     assert(t->stats.recovery_cache_backpressure == 0);
   }
-  for (size_t i = 0; i < 2000 && (t->fec_buf_len || f.client.objects < 1 ||
-                                  second.objects < 1);
+  for (size_t i = 0; i < 2000 && (t->pending_group.size ||
+                                  f.client.objects < 1 || second.objects < 1);
        i++) {
     fixture_tick(&f);
     transport_tick(second.transport);
   }
-  assert(!t->fec_buf_len && f.client.objects == 1 && second.objects == 1);
+  assert(!t->pending_group.size && f.client.objects == 1 &&
+         second.objects == 1);
   assert(memcmp(f.client.payload + 2, original, 1000) == 0 &&
          memcmp(second.payload + 2, original, 1000) == 0);
   assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
@@ -131,19 +133,59 @@ static void test_partial_group_retry(void) {
   object.data = original;
   for (size_t i = 0; i < 4; i++)
     assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
-  assert(t->fec_buf_len == 4008 && t->fec_flush_pending);
-  for (size_t i = 0; i < 2000 && (t->fec_buf_len || f.client.objects < 3 ||
-                                  second.objects < 3);
+  assert(t->pending_group.size == 4008 && t->pending_group.pending);
+  for (size_t i = 0; i < 2000 && (t->pending_group.size ||
+                                  f.client.objects < 3 || second.objects < 3);
        i++) {
     fixture_tick(&f);
     transport_tick(second.transport);
   }
-  assert(!t->fec_buf_len && f.client.objects == 3 && second.objects == 3);
+  assert(!t->pending_group.size && f.client.objects == 3 &&
+         second.objects == 3);
   assert(f.client.payload_size == 4008 && second.payload_size == 4008);
   for (size_t i = 0; i < 4; i++) {
     assert(memcmp(f.client.payload + i * 1002 + 2, original, 1000) == 0);
     assert(memcmp(second.payload + i * 1002 + 2, original, 1000) == 0);
   }
+  /* Membership stays live while a group is pending. Change subscriptions
+   * directly so no event-loop tick drains the deliberately blocked queue. */
+  assert(transport_mock_path_state(t, 0, 100000, 1, 0));
+  uint8_t alias;
+  assert(transport_subscriptions_find_alias(&first_conn->send_subscriptions,
+                                            &track, &alias) == 0);
+  transport_subscriptions_remove(&first_conn->send_subscriptions, track.type,
+                                 track.name);
+  transport_publish_checkpoint_member_removed(t, first_conn, &track, alias);
+  fill_queue(blocked_conn, 64);
+  assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
+  assert(!transport_publish_flush_grouped(t));
+  uint64_t pending_object_id = t->fec_tracks[0].next_object_id;
+  size_t before_join = quicly_get_num_datagram_frames_path(first_conn->quic, 0);
+  assert(transport_subscriptions_add(&first_conn->send_subscriptions,
+                                     track.type, track.flags, track.name,
+                                     alias));
+  transport_publish_checkpoint_member_added(t, first_conn, &track, alias);
+  assert(!transport_publish_flush_grouped(t));
+  size_t after_join = quicly_get_num_datagram_frames_path(first_conn->quic, 0);
+  assert(after_join > before_join && first_conn->fec_group_delivered);
+  assert(!transport_publish_flush_grouped(t));
+  assert(quicly_get_num_datagram_frames_path(first_conn->quic, 0) ==
+         after_join);
+
+  /* Re-subscribing on an existing connection also creates a new recipient. */
+  transport_subscriptions_remove(&first_conn->send_subscriptions, track.type,
+                                 track.name);
+  transport_publish_checkpoint_member_removed(t, first_conn, &track, alias);
+  assert(transport_subscriptions_add(&first_conn->send_subscriptions,
+                                     track.type, track.flags, track.name,
+                                     alias));
+  transport_publish_checkpoint_member_added(t, first_conn, &track, alias);
+  assert(!first_conn->fec_group_delivered);
+  assert(!transport_publish_flush_grouped(t));
+  assert(quicly_get_num_datagram_frames_path(first_conn->quic, 0) > after_join);
+  assert(t->pending_group.size == 1002 &&
+         memcmp(t->pending_group.data + 2, original, 1000) == 0);
+  assert(t->fec_tracks[0].next_object_id == pending_object_id);
   transport_destroy(second.transport);
   fixture_destroy(&f);
 }
@@ -160,8 +202,8 @@ static void test_slow_group_admission(void) {
         .type = MOQ_TRACK_DATA, .flags = modes[mode], .name = "slow-group"};
     fixture_subscribe(&f, &f.client, track);
     transport_conn_t *conn = f.server.conn;
-    conn->path_states[0].initialized = true;
-    conn->path_states[0].b_ewma = FP_FROM_INT(100);
+    conn->paths[0].state.initialized = true;
+    conn->paths[0].state.b_ewma = FP_FROM_INT(100);
     uint8_t payload[8000] = {42};
     moq_object_t object = {
         .track_id = track, .data = payload, .size = sizeof(payload)};
@@ -172,20 +214,20 @@ static void test_slow_group_admission(void) {
            TRANSPORT_PUBLISH_DELIVERED);
     size_t queued = quicly_get_num_datagram_frames_path(conn->quic, 0);
     assert(queued >= 27 && queued <= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
-    assert(conn->path_budgets[0].debt == FP_FROM_INT(queued));
+    assert(conn->paths[0].budget.debt == FP_FROM_INT(queued));
     for (size_t i = 0; i < 4; i++)
       assert(transport_publish_ex(f.server.transport, &object) ==
              TRANSPORT_PUBLISH_BUFFERED);
-    assert(f.server.transport->fec_buf_len == 32008);
+    assert(f.server.transport->pending_group.size == 32008);
     assert(!transport_publish_flush_grouped(f.server.transport));
     assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == queued);
     assert(conn->admission_retry_at_ns > transport_get_monotonic_ns());
     /* Advance the budget clock without sleeping or changing the measured
      * rate. Both groups fit the actual queue once the first debt expires. */
-    conn->path_budgets[0].at_ns -= UINT64_C(1000000000);
+    conn->paths[0].budget.at_ns -= UINT64_C(1000000000);
     assert(transport_publish_flush_grouped(f.server.transport));
     assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 2 * queued);
-    assert(f.server.transport->fec_buf_len == 0);
+    assert(f.server.transport->pending_group.size == 0);
     fixture_destroy(&f);
   }
 }
@@ -271,7 +313,7 @@ int main(void) {
   moq_object_t object = {.track_id = track, .data = payload, .size = 31};
   assert(transport_publish_ex(fixture.server.transport, &object) ==
          TRANSPORT_PUBLISH_INVALID);
-  assert(fixture.server.transport->fec_buf_len == 0);
+  assert(fixture.server.transport->pending_group.size == 0);
   object.size = 10;
   /* Three framed records cannot share one 32-byte object: flush the first
    * two before admitting the third, preserving every record exactly once. */

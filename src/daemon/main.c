@@ -1,13 +1,14 @@
-#include "cli_parse.h"
 /* main.c (daemon) */
 
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
 
+#include "cli_parse.h"
 #include "data_uds.h"
 #include "portable_sockets.h"
 #include "transport.h"
+#include "transport_wire.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <openssl/crypto.h>
@@ -51,8 +52,10 @@ static void show_help(FILE *out, const char *program) {
       "  --socket NAME               Unix data socket name\n"
       "  --track NAME                subscribe to a track (repeatable)\n"
       "  --stats-ms MS               periodically print transport counters\n"
-      "  --reliable                  reliable track mode\n"
-      "  --rateless                  rateless FEC track mode\n"
+      "  --mode datagram|fixed-fec|rateless|reliable (default fixed-fec)\n"
+      "                              fec is an alias for fixed-fec\n"
+      "  --reliable                  alias for --mode reliable\n"
+      "  --rateless                  alias for --mode rateless\n"
       "  --verbose\n\n"
       "SIGHUP reloads --cert and --key atomically.\n",
       program);
@@ -74,17 +77,6 @@ static bool parse_u32(const char *text, uint32_t *value) {
   return true;
 }
 
-static bool parse_peer_endpoint(const char *endpoint, char *host,
-                                size_t host_capacity, int *port) {
-  if (!port || *port < 0 || *port > UINT16_MAX)
-    return false;
-  uint16_t parsed = (uint16_t)*port;
-  if (!cli_parse_endpoint(endpoint, host, host_capacity, &parsed, NULL))
-    return false;
-  *port = parsed;
-  return true;
-}
-
 struct daemon_ctx_s;
 
 typedef struct {
@@ -93,34 +85,47 @@ typedef struct {
   bool is_server;
 } daemon_transport_ctx_t;
 
+typedef struct {
+  const char *argument;
+  char host[256];
+  uint16_t port;
+} peer_options_t;
+
+typedef struct {
+  int listen_port;
+  const char *listen_host;
+  peer_options_t peers[MAX_TRANSPORTS - 1];
+  size_t num_peers;
+  const char *cert_file;
+  const char *key_file;
+  const char *ca_file;
+  bool verify_peer;
+  bool allow_insecure_peer;
+  const char *socket_name;
+  const char *auth_token;
+  size_t auth_token_len;
+  char subscribe_tracks[16][64];
+  size_t num_subscribe_tracks;
+  uint8_t track_flags;
+  uint32_t stats_ms;
+  bool verbose;
+  bool help;
+} options_t;
+
 typedef struct daemon_ctx_s {
+  const options_t *options;
   daemon_transport_ctx_t transports[MAX_TRANSPORTS];
   size_t num_transports;
   data_uds_t *data_pipe;
-  bool running;
-  char subscribe_tracks[16][64];
-  size_t num_subscribe_tracks;
-  bool use_reliable;
-  bool use_rateless;
-  bool verbose;
-  const char *auth_token;
-  size_t auth_token_len;
-  const char *cert_file;
-  const char *key_file;
-  uint32_t stats_ms;
   int64_t next_stats_at;
 } daemon_ctx_t;
 
 static void subscribe_to_tracks(transport_t *t, daemon_ctx_t *ctx) {
-  for (size_t i = 0; i < ctx->num_subscribe_tracks; i++) {
-    uint8_t flags = MOQ_TRACK_FLAG_FEC_ENABLED;
-    if (ctx->use_reliable) {
-      flags = MOQ_TRACK_FLAG_RELIABLE;
-    } else if (ctx->use_rateless) {
-      flags = MOQ_TRACK_FLAG_FEC_RATELESS;
-    }
-    moq_track_id_t t_data = {.type = MOQ_TRACK_DATA, .flags = flags};
-    strncpy(t_data.name, ctx->subscribe_tracks[i], sizeof(t_data.name) - 1);
+  const options_t *options = ctx->options;
+  for (size_t i = 0; i < options->num_subscribe_tracks; i++) {
+    moq_track_id_t t_data = {.type = MOQ_TRACK_DATA,
+                             .flags = options->track_flags};
+    strncpy(t_data.name, options->subscribe_tracks[i], sizeof(t_data.name) - 1);
     t_data.name[sizeof(t_data.name) - 1] = '\0';
     transport_subscribe(t, t_data);
   }
@@ -130,21 +135,22 @@ static void on_transport_event(void *user_data,
                                const transport_event_t *event) {
   daemon_transport_ctx_t *tctx = user_data;
   daemon_ctx_t *ctx = tctx->daemon;
+  const options_t *options = ctx->options;
   transport_t *t = tctx->transport;
 
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
     printf("peer connected\n");
     if (!tctx->is_server) {
-      transport_send_auth(t, event->conn, (const uint8_t *)ctx->auth_token,
-                          ctx->auth_token_len);
+      transport_send_auth(t, event->conn, (const uint8_t *)options->auth_token,
+                          options->auth_token_len);
     }
     break;
   case TRANSPORT_EVENT_AUTH:
     if (tctx->is_server) {
       bool success = false;
-      if (event->auth.token_len == ctx->auth_token_len &&
-          CRYPTO_memcmp(event->auth.token, ctx->auth_token,
+      if (event->auth.token_len == options->auth_token_len &&
+          CRYPTO_memcmp(event->auth.token, options->auth_token,
                         event->auth.token_len) == 0) {
         success = true;
         printf("peer authentication successful\n");
@@ -186,36 +192,29 @@ static void on_transport_event(void *user_data,
            event->track_id.name, event->track_id.type);
     break;
   case TRANSPORT_EVENT_OBJECT:
-    if (ctx->verbose && event->track_id.type == MOQ_TRACK_DATA) {
+    if (options->verbose && event->track_id.type == MOQ_TRACK_DATA) {
       printf("daemon: received object from peer on track '%s', size=%zu, "
              "flags=%d, type=%d\n",
              event->track_id.name, event->object.size, event->track_id.flags,
              event->track_id.type);
     }
     if (ctx->data_pipe && event->track_id.type == MOQ_TRACK_DATA &&
-        (event->track_id.flags & (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS))) {
-      /* Extract datagram packets from aggregated symbol */
-      size_t remaining = event->object.size;
-      const uint8_t *ptr = event->object.data;
-      while (remaining >= 2) {
-        uint16_t pkt_len;
-        memcpy(&pkt_len, ptr, 2);
-        pkt_len = ntohs(pkt_len);
-        if (remaining < 2 + (size_t)pkt_len) {
-          break;
-        }
-        if (!data_uds_send(ctx->data_pipe, &event->track_id, ptr + 2, pkt_len,
+        (event->track_id.flags &
+         (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS))) {
+      qlinq_wire_cursor_t cursor = {event->object.data, event->object.size};
+      const uint8_t *record;
+      size_t size;
+      while (qlinq_wire_next_record(&cursor, &record, &size)) {
+        if (!data_uds_send(ctx->data_pipe, &event->track_id, record, size,
                            event->object.priority) &&
-            ctx->verbose)
+            options->verbose)
           fprintf(stderr, "daemon: UDS output queue unavailable\n");
-        ptr += 2 + pkt_len;
-        remaining -= 2 + pkt_len;
       }
     } else if (ctx->data_pipe) {
       /* Forward raw packet for reliable tracks */
       if (!data_uds_send(ctx->data_pipe, &event->track_id, event->object.data,
                          event->object.size, event->object.priority) &&
-          ctx->verbose)
+          options->verbose)
         fprintf(stderr, "daemon: UDS output queue unavailable\n");
     }
     break;
@@ -287,10 +286,10 @@ static void daemon_tick(daemon_ctx_t *ctx) {
 }
 
 static void daemon_print_stats(daemon_ctx_t *ctx, int64_t now_ms) {
-  if (!ctx || ctx->stats_ms == 0)
+  if (!ctx || ctx->options->stats_ms == 0)
     return;
   if (ctx->next_stats_at == 0) {
-    ctx->next_stats_at = now_ms + ctx->stats_ms;
+    ctx->next_stats_at = now_ms + ctx->options->stats_ms;
     return;
   }
   if (now_ms < ctx->next_stats_at)
@@ -318,24 +317,26 @@ static void daemon_print_stats(daemon_ctx_t *ctx, int64_t now_ms) {
             stats.udp_would_block, stats.publish_backpressure,
             stats.publish_errors);
   }
-  ctx->next_stats_at = now_ms + ctx->stats_ms;
+  ctx->next_stats_at = now_ms + ctx->options->stats_ms;
 }
 
 /* run daemon loop driven by socket polling and quicly pacer timeouts */
 static void daemon_run(daemon_ctx_t *ctx) {
+  const options_t *options = ctx->options;
   printf("daemon is running. press ctrl+c to exit.\n");
-  while (ctx->running && g_running) {
+  while (g_running) {
 #ifdef SIGHUP
     if (g_reload_credentials) {
       g_reload_credentials = 0;
-      if (!ctx->cert_file) {
+      if (!options->cert_file) {
         fprintf(stderr, "daemon: TLS credential reload skipped; no identity "
                         "configured\n");
       } else {
         bool ok = true;
         for (size_t i = 0; i < ctx->num_transports; i++) {
           if (!transport_reload_credentials(ctx->transports[i].transport,
-                                            ctx->cert_file, ctx->key_file))
+                                            options->cert_file,
+                                            options->key_file))
             ok = false;
         }
         fprintf(stderr, "daemon: TLS credential reload %s\n",
@@ -392,10 +393,216 @@ static void daemon_run(daemon_ctx_t *ctx) {
   printf("\nshutting down daemon cleanly...\n");
 }
 
+static bool parse_options(int argc, char **argv, options_t *options) {
+  *options = (options_t){.listen_port = -1,
+                         .listen_host = "0.0.0.0",
+                         .verify_peer = true,
+                         .socket_name = "qlinq-data",
+                         .track_flags = MOQ_TRACK_FLAG_FEC_ENABLED};
+  bool have_mode = false;
+
+  for (int i = 1; i < argc; i++) {
+    const char *arg = argv[i];
+    if (strcmp(arg, "--help") == 0) {
+      options->help = true;
+      return true;
+    }
+    if (strcmp(arg, "--verify-peer") == 0) {
+      options->verify_peer = true;
+      options->allow_insecure_peer = false;
+      continue;
+    }
+    if (strcmp(arg, "--insecure-no-verify") == 0) {
+      options->verify_peer = false;
+      options->allow_insecure_peer = true;
+      continue;
+    }
+    if (strcmp(arg, "--verbose") == 0) {
+      options->verbose = true;
+      continue;
+    }
+
+    const char *value;
+    if (strcmp(arg, "--reliable") == 0 || strcmp(arg, "--rateless") == 0) {
+      value = arg + 2;
+      arg = "--mode";
+    } else {
+      if (++i >= argc)
+        goto invalid;
+      value = argv[i];
+    }
+    if (strcmp(arg, "--listen") == 0) {
+      if (!parse_port(value, &options->listen_port))
+        goto invalid;
+    } else if (strcmp(arg, "--bind") == 0) {
+      options->listen_host = value;
+    } else if (strcmp(arg, "--cert") == 0) {
+      options->cert_file = value;
+    } else if (strcmp(arg, "--key") == 0) {
+      options->key_file = value;
+    } else if (strcmp(arg, "--ca") == 0) {
+      options->ca_file = value;
+    } else if (strcmp(arg, "--auth-token") == 0) {
+      options->auth_token = value;
+    } else if (strcmp(arg, "--socket") == 0 || strcmp(arg, "-s") == 0) {
+      options->socket_name = value;
+    } else if (strcmp(arg, "--peer") == 0) {
+      if (options->num_peers >= MAX_TRANSPORTS - 1)
+        goto invalid;
+      peer_options_t *peer = &options->peers[options->num_peers];
+      peer->argument = value;
+      peer->port = 8888;
+      if (!cli_parse_endpoint(value, peer->host, sizeof(peer->host),
+                              &peer->port, NULL))
+        goto invalid;
+      options->num_peers++;
+    } else if (strcmp(arg, "--track") == 0) {
+      if (options->num_subscribe_tracks >= 15 ||
+          strlen(value) >= sizeof(options->subscribe_tracks[0]))
+        goto invalid;
+      strcpy(options->subscribe_tracks[options->num_subscribe_tracks++], value);
+    } else if (strcmp(arg, "--stats-ms") == 0) {
+      if (!parse_u32(value, &options->stats_ms))
+        goto invalid;
+    } else if (strcmp(arg, "--mode") == 0) {
+      uint8_t flags;
+      if (!cli_parse_track_mode(value, &flags) ||
+          (have_mode && flags != options->track_flags))
+        goto invalid;
+      options->track_flags = flags;
+      have_mode = true;
+    } else {
+      goto invalid;
+    }
+  }
+
+  if (!options->auth_token)
+    options->auth_token = getenv("QLINQ_AUTH_TOKEN");
+  if (!options->auth_token || options->auth_token[0] == '\0') {
+    fprintf(stderr, "an authentication token is required; use --auth-token or "
+                    "QLINQ_AUTH_TOKEN\n");
+    return false;
+  }
+  if ((options->cert_file == NULL) != (options->key_file == NULL) ||
+      ((options->listen_port > 0 || options->verify_peer) &&
+       options->cert_file == NULL)) {
+    fprintf(stderr, "a TLS identity is required; use both --cert and --key "
+                    "(insecure clients may omit both)\n");
+    return false;
+  }
+  options->auth_token_len = strlen(options->auth_token);
+  if (options->auth_token_len > UINT16_MAX) {
+    fprintf(stderr, "authentication token is too long\n");
+    return false;
+  }
+
+  if (options->num_subscribe_tracks == 0) {
+    strcpy(options->subscribe_tracks[options->num_subscribe_tracks++],
+           "bishnc/default");
+    strcpy(options->subscribe_tracks[options->num_subscribe_tracks++],
+           "tund/tun0");
+    strcpy(options->subscribe_tracks[options->num_subscribe_tracks++], "");
+  }
+
+  return true;
+
+invalid:
+  fprintf(stderr, "invalid command line\n");
+  show_help(stderr, argv[0]);
+  return false;
+}
+
+static bool add_transport(daemon_ctx_t *ctx, const peer_options_t *peer) {
+  const options_t *options = ctx->options;
+  daemon_transport_ctx_t *tctx = &ctx->transports[ctx->num_transports];
+  tctx->daemon = ctx;
+  tctx->is_server = peer == NULL;
+  transport_config_t config = {.port = peer ? peer->port : options->listen_port,
+                               .num_bind_hosts = 1,
+                               .cert_file = options->cert_file,
+                               .key_file = options->key_file,
+                               .ca_file = options->ca_file,
+                               .verify_peer = options->verify_peer,
+                               .allow_insecure_peer =
+                                   options->allow_insecure_peer,
+                               .reconnect_enabled = peer != NULL,
+                               .callback = on_transport_event,
+                               .user_data = tctx};
+  config.bind_hosts[0] = peer ? (strchr(peer->host, ':') ? "::" : "0.0.0.0")
+                              : options->listen_host;
+  if (peer) {
+    config.remote_hosts[0] = peer->host;
+    config.num_remote_hosts = 1;
+  }
+  tctx->transport = transport_create(&config);
+  if (!tctx->transport)
+    return false;
+  ctx->num_transports++;
+  return true;
+}
+
+static void drain_transports(daemon_ctx_t *ctx) {
+  for (size_t i = 0; i < ctx->num_transports; i++)
+    transport_shutdown(ctx->transports[i].transport, "daemon shutdown");
+  int64_t shutdown_started = transport_get_time_ms();
+  bool drained = false;
+  while (!drained && transport_get_time_ms() - shutdown_started < 1000) {
+    drained = true;
+    for (size_t i = 0; i < ctx->num_transports; i++) {
+      transport_tick(ctx->transports[i].transport);
+      if (!transport_is_drained(ctx->transports[i].transport))
+        drained = false;
+    }
+    if (!drained)
+      usleep(1000);
+  }
+}
+
+static int run_daemon(const options_t *options) {
+  daemon_ctx_t ctx = {.options = options};
+  int status = 1;
+  if (options->listen_port > 0) {
+    if (!add_transport(&ctx, NULL)) {
+      fprintf(stderr, "failed to create server transport\n");
+      goto cleanup;
+    }
+    printf("listening on %s:%d\n", options->listen_host, options->listen_port);
+  }
+  for (size_t i = 0; i < options->num_peers; i++) {
+    const peer_options_t *peer = &options->peers[i];
+    if (!add_transport(&ctx, peer)) {
+      fprintf(stderr, "failed to create client transport for %s\n",
+              peer->argument);
+      continue;
+    }
+    printf("connecting to peer %s:%d\n", peer->host, peer->port);
+  }
+  if (ctx.num_transports == 0) {
+    fprintf(stderr, "no listener or peers specified. exiting.\n");
+    goto cleanup;
+  }
+  ctx.data_pipe = data_uds_create_ex(options->socket_name, on_data_packet,
+                                     on_is_track_ready, &ctx);
+  if (!ctx.data_pipe) {
+    fprintf(stderr, "failed to create UDS data pipe\n");
+    goto cleanup;
+  }
+
+  daemon_run(&ctx);
+  drain_transports(&ctx);
+  status = 0;
+
+cleanup:
+  if (ctx.data_pipe)
+    data_uds_destroy(ctx.data_pipe);
+  for (size_t i = 0; i < ctx.num_transports; i++)
+    transport_destroy(ctx.transports[i].transport);
+  return status;
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   setvbuf(stderr, NULL, _IONBF, 0);
-
 #ifndef _WIN32
   signal(SIGINT, handle_signal);
   signal(SIGTERM, handle_signal);
@@ -403,253 +610,23 @@ int main(int argc, char **argv) {
   signal(SIGHUP, handle_signal);
 #endif
 #endif
-
   printf("starting qlinqd peer mesh daemon...\n");
-
   if (portable_socket_init() != 0) {
     fprintf(stderr, "failed to initialize sockets\n");
     return 1;
   }
 
-  daemon_ctx_t ctx = {0};
-  ctx.running = true;
-
-  int listen_port = -1;
-  const char *listen_host = "0.0.0.0";
-  const char *peers[MAX_TRANSPORTS];
-  size_t num_peers = 0;
-
-  const char *cert_file = NULL;
-  const char *key_file = NULL;
-  const char *ca_file = NULL;
-  bool verify_peer = true;
-  bool allow_insecure_peer = false;
-  const char *socket_name = "qlinq-data";
-  bool invalid_args = false;
-
-  for (int i = 1; i < argc; i++) {
-    const char *arg = argv[i];
-    if (strcmp(arg, "--help") == 0) {
-      show_help(stdout, argv[0]);
-      portable_socket_cleanup();
-      return 0;
-    } else if (strcmp(arg, "--listen") == 0) {
-      if (++i >= argc || !parse_port(argv[i], &listen_port)) {
-        invalid_args = true;
-        break;
-      }
-    } else if (strcmp(arg, "--bind") == 0) {
-      if (++i >= argc) {
-        invalid_args = true;
-        break;
-      }
-      listen_host = argv[i];
-    } else if (strcmp(arg, "--cert") == 0) {
-      if (++i >= argc) {
-        invalid_args = true;
-        break;
-      }
-      cert_file = argv[i];
-    } else if (strcmp(arg, "--key") == 0) {
-      if (++i >= argc) {
-        invalid_args = true;
-        break;
-      }
-      key_file = argv[i];
-    } else if (strcmp(arg, "--ca") == 0) {
-      if (++i >= argc) {
-        invalid_args = true;
-        break;
-      }
-      ca_file = argv[i];
-    } else if (strcmp(argv[i], "--verify-peer") == 0) {
-      verify_peer = true;
-      allow_insecure_peer = false;
-    } else if (strcmp(argv[i], "--insecure-no-verify") == 0) {
-      verify_peer = false;
-      allow_insecure_peer = true;
-    } else if (strcmp(arg, "--auth-token") == 0) {
-      if (++i >= argc) {
-        invalid_args = true;
-        break;
-      }
-      ctx.auth_token = argv[i];
-    } else if (strcmp(argv[i], "--verbose") == 0) {
-      ctx.verbose = true;
-    } else if (strcmp(arg, "--socket") == 0 || strcmp(arg, "-s") == 0) {
-      if (++i >= argc) {
-        invalid_args = true;
-        break;
-      }
-      socket_name = argv[i];
-    } else if (strcmp(arg, "--peer") == 0) {
-      if (++i >= argc || num_peers >= MAX_TRANSPORTS - 1) {
-        invalid_args = true;
-        break;
-      }
-      char parsed_host[256];
-      int parsed_port = 8888;
-      if (!parse_peer_endpoint(argv[i], parsed_host, sizeof(parsed_host),
-                               &parsed_port)) {
-        invalid_args = true;
-        break;
-      }
-      peers[num_peers++] = argv[i];
-    } else if (strcmp(arg, "--track") == 0) {
-      if (++i >= argc || ctx.num_subscribe_tracks >= 15 ||
-          strlen(argv[i]) >= sizeof(ctx.subscribe_tracks[0])) {
-        invalid_args = true;
-        break;
-      }
-      strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], argv[i]);
-    } else if (strcmp(arg, "--stats-ms") == 0) {
-      if (++i >= argc || !parse_u32(argv[i], &ctx.stats_ms)) {
-        invalid_args = true;
-        break;
-      }
-    } else if (strcmp(argv[i], "--reliable") == 0) {
-      ctx.use_reliable = true;
-    } else if (strcmp(argv[i], "--rateless") == 0) {
-      ctx.use_rateless = true;
-    } else {
-      invalid_args = true;
-      break;
-    }
+  int status = 1;
+  options_t options;
+  if (!parse_options(argc, argv, &options))
+    goto cleanup;
+  if (options.help) {
+    show_help(stdout, argv[0]);
+    status = 0;
+  } else {
+    status = run_daemon(&options);
   }
-
-  if (invalid_args || (ctx.use_reliable && ctx.use_rateless)) {
-    fprintf(stderr, "invalid command line\n");
-    show_help(stderr, argv[0]);
-    portable_socket_cleanup();
-    return 1;
-  }
-
-  if (!ctx.auth_token)
-    ctx.auth_token = getenv("QLINQ_AUTH_TOKEN");
-  if (!ctx.auth_token || ctx.auth_token[0] == '\0') {
-    fprintf(stderr, "an authentication token is required; use --auth-token or "
-                    "QLINQ_AUTH_TOKEN\n");
-    portable_socket_cleanup();
-    return 1;
-  }
-  if ((cert_file == NULL) != (key_file == NULL) ||
-      ((listen_port > 0 || verify_peer) && cert_file == NULL)) {
-    fprintf(stderr, "a TLS identity is required; use both --cert and --key "
-                    "(insecure clients may omit both)\n");
-    portable_socket_cleanup();
-    return 1;
-  }
-  ctx.auth_token_len = strlen(ctx.auth_token);
-  ctx.cert_file = cert_file;
-  ctx.key_file = key_file;
-  if (ctx.auth_token_len > UINT16_MAX) {
-    fprintf(stderr, "authentication token is too long\n");
-    portable_socket_cleanup();
-    return 1;
-  }
-
-  if (ctx.num_subscribe_tracks == 0) {
-    strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], "bishnc/default");
-    strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], "tund/tun0");
-    strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], "");
-  }
-
-  if (listen_port > 0) {
-    /* Create server transport */
-    transport_config_t config = {0};
-    config.port = listen_port;
-    config.bind_hosts[config.num_bind_hosts++] = listen_host;
-    config.cert_file = cert_file;
-    config.key_file = key_file;
-    config.ca_file = ca_file;
-    config.verify_peer = verify_peer;
-    config.allow_insecure_peer = allow_insecure_peer;
-
-    daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
-    tctx->daemon = &ctx;
-    tctx->is_server = true;
-    config.callback = on_transport_event;
-    config.user_data = tctx;
-
-    tctx->transport = transport_create(&config);
-    if (!tctx->transport) {
-      fprintf(stderr, "failed to create server transport\n");
-      return 1;
-    }
-    ctx.num_transports++;
-    printf("listening on %s:%d\n", listen_host, listen_port);
-  }
-
-  for (size_t i = 0; i < num_peers; i++) {
-    /* Create client transport for each peer */
-    transport_config_t config = {0};
-    char peer_ip[256];
-    int port = 8888;
-    if (!parse_peer_endpoint(peers[i], peer_ip, sizeof(peer_ip), &port)) {
-      fprintf(stderr, "invalid peer endpoint: %s\n", peers[i]);
-      continue;
-    }
-
-    config.port = port;
-    config.remote_hosts[config.num_remote_hosts++] = peer_ip;
-    config.bind_hosts[config.num_bind_hosts++] =
-        strchr(peer_ip, ':') ? "::" : "0.0.0.0";
-    config.cert_file = cert_file;
-    config.key_file = key_file;
-    config.ca_file = ca_file;
-    config.verify_peer = verify_peer;
-    config.allow_insecure_peer = allow_insecure_peer;
-    config.reconnect_enabled = true;
-
-    daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
-    tctx->daemon = &ctx;
-    tctx->is_server = false;
-    config.callback = on_transport_event;
-    config.user_data = tctx;
-
-    tctx->transport = transport_create(&config);
-    if (!tctx->transport) {
-      fprintf(stderr, "failed to create client transport for %s\n", peers[i]);
-      continue;
-    }
-    ctx.num_transports++;
-    printf("connecting to peer %s:%d\n", peer_ip, port);
-  }
-
-  if (ctx.num_transports == 0) {
-    fprintf(stderr, "no listener or peers specified. exiting.\n");
-    return 1;
-  }
-
-  ctx.data_pipe =
-      data_uds_create_ex(socket_name, on_data_packet, on_is_track_ready, &ctx);
-  if (!ctx.data_pipe) {
-    fprintf(stderr, "failed to create UDS data pipe\n");
-    return 1;
-  }
-
-  daemon_run(&ctx);
-
-  for (size_t i = 0; i < ctx.num_transports; i++)
-    transport_shutdown(ctx.transports[i].transport, "daemon shutdown");
-  int64_t shutdown_started = transport_get_time_ms();
-  bool drained = false;
-  while (!drained && transport_get_time_ms() - shutdown_started < 1000) {
-    drained = true;
-    for (size_t i = 0; i < ctx.num_transports; i++) {
-      transport_tick(ctx.transports[i].transport);
-      if (!transport_is_drained(ctx.transports[i].transport))
-        drained = false;
-    }
-    if (!drained)
-      usleep(1000);
-  }
-
-  data_uds_destroy(ctx.data_pipe);
-  for (size_t i = 0; i < ctx.num_transports; i++) {
-    transport_destroy(ctx.transports[i].transport);
-  }
-
+cleanup:
   portable_socket_cleanup();
-  return 0;
+  return status;
 }

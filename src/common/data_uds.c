@@ -24,7 +24,6 @@
 typedef struct {
   int fd;
   moq_track_id_t track_id;
-  bool active;
   bool registered;
   uint8_t registration[3 + 63];
   size_t registration_len;
@@ -104,7 +103,7 @@ static bool set_nonblocking(int fd) {
 static void close_client(uds_client_t *client) {
   if (!client)
     return;
-  if (client->active) {
+  if (client->fd >= 0) {
     shutdown(client->fd, SHUT_RDWR);
     CLOSE_SOCKET(client->fd);
   }
@@ -328,33 +327,23 @@ bool data_uds_send(data_uds_t *d, const moq_track_id_t *track_id,
   if (!track_id || (size > 0 && !buf))
     return false;
 
-  int target_idx = -1;
+  uds_client_t *client = NULL;
   for (int i = 0; i < MAX_UDS_CLIENTS; i++) {
-    if (d->clients[i].active && d->clients[i].registered &&
-        d->clients[i].track_id.type == track_id->type &&
-        strcmp(d->clients[i].track_id.name, track_id->name) == 0) {
-      target_idx = i;
+    uds_client_t *candidate = &d->clients[i];
+    if (candidate->fd < 0 || !candidate->registered ||
+        candidate->track_id.type != track_id->type)
+      continue;
+    if (strcmp(candidate->track_id.name, track_id->name) == 0) {
+      client = candidate;
       break;
     }
+    /* Keep the first DATA fallback while looking for an exact match. */
+    if (!client && track_id->type == MOQ_TRACK_DATA)
+      client = candidate;
   }
-
-  /* Fallback: if no strict match and type is MOQ_TRACK_DATA, find any active
-   * MOQ_TRACK_DATA client */
-  if (target_idx == -1 && track_id->type == MOQ_TRACK_DATA) {
-    for (int i = 0; i < MAX_UDS_CLIENTS; i++) {
-      if (d->clients[i].active && d->clients[i].registered &&
-          d->clients[i].track_id.type == MOQ_TRACK_DATA) {
-        target_idx = i;
-        break;
-      }
-    }
-  }
-
-  if (target_idx == -1) {
+  if (!client)
     return false;
-  }
 
-  uds_client_t *client = &d->clients[target_idx];
   if (!queue_client_frame(client, buf, size, priority)) {
     close_client(client);
     return false;
@@ -486,6 +475,17 @@ static int process_client_input(data_uds_t *d, uds_client_t *client) {
   return 0;
 }
 
+static short client_poll_events(const data_uds_t *d,
+                                const uds_client_t *client) {
+  bool ready = !client->pending_record &&
+               (!client->registered || !d->is_ready_cb ||
+                d->is_ready_cb(d->user_data, &client->track_id));
+  short events = ready ? POLLIN : 0;
+  if (client->output_offset < client->output_len)
+    events |= POLLOUT;
+  return events;
+}
+
 /* process listener and client fds without blocking the transport event loop */
 void data_uds_tick(data_uds_t *d) {
   if (!d)
@@ -498,18 +498,13 @@ void data_uds_tick(data_uds_t *d) {
 
   for (int i = 0; i < MAX_UDS_CLIENTS; i++) {
     uds_client_t *client = &d->clients[i];
-    if (!client->active)
+    if (client->fd < 0)
       continue;
     if (client->pending_record && process_client_input(d, client) < 0) {
       close_client(client);
       continue;
     }
-    bool is_ready = !client->pending_record &&
-                    (!client->registered || !d->is_ready_cb ||
-                     d->is_ready_cb(d->user_data, &client->track_id));
-    short events = is_ready ? POLLIN : 0;
-    if (client->output_offset < client->output_len)
-      events |= POLLOUT;
+    short events = client_poll_events(d, client);
     if (!events)
       continue;
     fds[nfds] = (struct pollfd){.fd = client->fd, .events = events};
@@ -527,7 +522,7 @@ void data_uds_tick(data_uds_t *d) {
         break;
       int slot = -1;
       for (int i = 0; i < MAX_UDS_CLIENTS; i++) {
-        if (!d->clients[i].active) {
+        if (d->clients[i].fd < 0) {
           slot = i;
           break;
         }
@@ -539,14 +534,13 @@ void data_uds_tick(data_uds_t *d) {
       uds_client_t *client = &d->clients[slot];
       memset(client, 0, sizeof(*client));
       client->fd = client_fd;
-      client->active = true;
       client->registration_needed = 3;
     }
   }
 
   for (int i = 1; i < nfds; i++) {
     uds_client_t *client = &d->clients[client_indices[i - 1]];
-    if (!client->active)
+    if (client->fd < 0)
       continue;
     bool close_now = (fds[i].revents & (POLLERR | POLLNVAL)) != 0;
     if (!close_now && (fds[i].revents & POLLOUT) &&
@@ -579,19 +573,12 @@ size_t data_uds_get_poll_fds(data_uds_t *d, struct pollfd *fds,
   }
 
   for (size_t i = 0; i < MAX_UDS_CLIENTS && count < max_fds; i++) {
-    if (d->clients[i].active && d->clients[i].fd >= 0 && count < max_fds) {
-      fds[count].fd = d->clients[i].fd;
-      bool is_ready = !d->clients[i].pending_record &&
-                      (!d->clients[i].registered || !d->is_ready_cb ||
-                       d->is_ready_cb(d->user_data, &d->clients[i].track_id));
-      fds[count].events = is_ready ? POLLIN : 0;
-      if (d->clients[i].output_offset < d->clients[i].output_len)
-        fds[count].events |= POLLOUT;
-      if (!fds[count].events)
-        continue;
-      fds[count].revents = 0;
-      count++;
-    }
+    uds_client_t *client = &d->clients[i];
+    if (client->fd < 0)
+      continue;
+    short events = client_poll_events(d, client);
+    if (events)
+      fds[count++] = (struct pollfd){.fd = client->fd, .events = events};
   }
 
   return count;

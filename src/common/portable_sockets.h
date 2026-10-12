@@ -28,7 +28,9 @@ static inline int portable_socket_init(void) {
   WSADATA wsaData;
   return WSAStartup(MAKEWORD(2, 2), &wsaData);
 }
-static inline void portable_socket_cleanup(void) { WSACleanup(); }
+static inline void portable_socket_cleanup(void) {
+  WSACleanup();
+}
 #else
 #include <arpa/inet.h>
 #include <errno.h>
@@ -83,8 +85,11 @@ static inline ssize_t socket_write(int fd, const void *buf, size_t len) {
 #endif
 }
 
-static inline int portable_socket_init(void) { return 0; }
-static inline void portable_socket_cleanup(void) {}
+static inline int portable_socket_init(void) {
+  return 0;
+}
+static inline void portable_socket_cleanup(void) {
+}
 #endif
 
 #endif /* PORTABLE_SOCKETS_H */

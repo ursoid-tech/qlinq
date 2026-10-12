@@ -52,6 +52,20 @@ static qlinq_wire_result_t check_envelope(const uint8_t *src, size_t len,
   return QLINQ_WIRE_OK;
 }
 
+bool qlinq_wire_next_record(qlinq_wire_cursor_t *cursor, const uint8_t **data,
+                            size_t *size) {
+  if (!cursor || !cursor->data || !data || !size || cursor->remaining < 2U)
+    return false;
+  size_t length = read_u16(cursor->data);
+  if (length > cursor->remaining - 2U)
+    return false;
+  *data = cursor->data + 2U;
+  *size = length;
+  cursor->data += 2U + length;
+  cursor->remaining -= 2U + length;
+  return true;
+}
+
 bool qlinq_wire_frame_type_is_known(uint8_t type) {
   return (type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_HELLO) ||
          (type >= QLINQ_WIRE_TRACK_END &&

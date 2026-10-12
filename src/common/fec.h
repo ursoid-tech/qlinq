@@ -20,6 +20,9 @@ typedef struct fec_t fec_t;
 
 typedef enum { FEC_REED_SOLOMON, FEC_RAPTORQ } fec_type_t;
 
+/* Rateless objects and blocks larger than RS permits use RaptorQ. */
+fec_type_t fec_select_type(bool rateless, size_t total_symbols);
+
 /* create a forward error correction instance */
 fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
                      size_t parity_symbols, size_t symbol_size);

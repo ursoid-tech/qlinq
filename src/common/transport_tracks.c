@@ -1,8 +1,12 @@
 #include "transport_tracks.h"
 
-#include "transport_protocol.h"
-
 #include <string.h>
+
+bool transport_track_type_valid(uint8_t type) {
+  return type == MOQ_TRACK_VIDEO || type == MOQ_TRACK_AUDIO ||
+         type == MOQ_TRACK_INPUT || type == MOQ_TRACK_TEXT ||
+         type == MOQ_TRACK_DATA || type == MOQ_TRACK_TELEMETRY;
+}
 
 transport_track_profile_t transport_track_profile(const moq_track_id_t *track) {
   transport_track_profile_t profile = {

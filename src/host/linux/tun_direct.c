@@ -66,23 +66,24 @@ static uint64_t monotonic_ms(void) {
 }
 
 static void usage(FILE *out, const char *program) {
-  fprintf(out,
-          "Usage: %s (--listen PORT | --peer HOST[:PORT]) --auth-token TOKEN "
-          "[options]\n"
-          "  --bind ADDRESS          Local IP (default: 0.0.0.0 or ::)\n"
-          "  --interface NAME        TUN name (default: tun0)\n"
-          "  --ip CIDR               TUN address (default: 10.8.0.1/24)\n"
-          "  --track NAME            Packet stream (default: tund/tun0)\n"
-          "  --mode MODE             fixed-fec (default), rateless, reliable, "
-          "datagram\n"
-          "  --cert FILE --key FILE  TLS identity (required on listener)\n"
-          "  --ca FILE               Trust store for verified peers\n"
-          "  --insecure-no-verify    Disable certificate verification (tests "
-          "only)\n"
-          "  --run-as USER           Drop root privileges after TUN setup\n"
-          "  --mock                  Generate/receive packets without a TUN\n"
-          "  --run-ms N              Stop mock mode after N milliseconds\n",
-          program);
+  fprintf(
+      out,
+      "Usage: %s (--listen PORT | --peer HOST[:PORT]) --auth-token TOKEN "
+      "[options]\n"
+      "  --bind ADDRESS          Local IP (default: 0.0.0.0 or ::)\n"
+      "  --interface NAME        TUN name (default: tun0)\n"
+      "  --ip CIDR               TUN address (default: 10.8.0.1/24)\n"
+      "  --track NAME            Packet stream (default: tund/tun0)\n"
+      "  --mode MODE             fixed-fec/fec (default), rateless, reliable, "
+      "datagram\n"
+      "  --cert FILE --key FILE  TLS identity (required on listener)\n"
+      "  --ca FILE               Trust store for verified peers\n"
+      "  --insecure-no-verify    Disable certificate verification (tests "
+      "only)\n"
+      "  --run-as USER           Drop root privileges after TUN setup\n"
+      "  --mock                  Generate/receive packets without a TUN\n"
+      "  --run-ms N              Stop mock mode after N milliseconds\n",
+      program);
 }
 
 static bool parse_options(int argc, char **argv, options_t *options) {
@@ -141,15 +142,7 @@ static bool parse_options(int argc, char **argv, options_t *options) {
             options->run_ms == 0)
           return false;
       } else if (strcmp(arg, "--mode") == 0) {
-        if (strcmp(value, "fixed-fec") == 0)
-          options->delivery = QLINQ_DELIVERY_FIXED_FEC;
-        else if (strcmp(value, "rateless") == 0)
-          options->delivery = QLINQ_DELIVERY_RATELESS;
-        else if (strcmp(value, "reliable") == 0)
-          options->delivery = QLINQ_DELIVERY_RELIABLE;
-        else if (strcmp(value, "datagram") == 0)
-          options->delivery = QLINQ_DELIVERY_DATAGRAM;
-        else
+        if (!cli_parse_delivery(value, &options->delivery))
           return false;
       } else {
         return false;

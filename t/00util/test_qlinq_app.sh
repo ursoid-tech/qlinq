@@ -114,4 +114,36 @@ fi
 cmp -n 256 README.md "$tmp_dir/fanout-a.bin"
 cmp -n 256 README.md "$tmp_dir/fanout-b.bin"
 
+# Small records reach stdio's buffer before /dev/full rejects the flush.
+# Exercise both payload layouts and both owned-file and stdout destinations.
+if [ -c /dev/full ]; then
+    for mode in rateless reliable; do
+        for output in /dev/full -; do
+            timeout 8 "$app_bin" \
+                --listen 10095 --bind 127.0.0.1 \
+                --cert t/assets/server.crt --key t/assets/server.key \
+                --auth-token output-test --insecure-no-verify \
+                --input README.md --message-size 64 --count 1 \
+                --wait-subscribers 1 --one-shot --drain-ms 500 --mode "$mode" \
+                2>"$tmp_dir/output-server.log" &
+            server_pid=$!
+            status=0
+            timeout 4 "$app_bin" \
+                --peer 127.0.0.1:10095 \
+                --auth-token output-test --insecure-no-verify \
+                --output "$output" --mode "$mode" \
+                --receive-count 1 --drain-ms 100 \
+                >/dev/full 2>"$tmp_dir/output-client.log" || status=$?
+            if [ "$status" -ne 1 ] ||
+                ! grep -q 'malformed object or output error' "$tmp_dir/output-client.log"; then
+                cat "$tmp_dir/output-server.log" "$tmp_dir/output-client.log" >&2
+                echo "output failure was not reported ($mode, $output, status=$status)" >&2
+                exit 1
+            fi
+            wait "$server_pid"
+            server_pid=
+        done
+    done
+fi
+
 printf '%s\n' '===QLINQ APP DIRECT API OK==='

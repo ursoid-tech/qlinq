@@ -27,10 +27,11 @@ static void fixture_event(void *data, const transport_event_t *event) {
   case TRANSPORT_EVENT_CONNECTED:
     if (!endpoint->server)
       endpoint->failed |= !transport_send_auth(endpoint->transport, event->conn,
-                                              (const uint8_t *)"test", 4);
+                                               (const uint8_t *)"test", 4);
     break;
   case TRANSPORT_EVENT_AUTH:
-    endpoint->failed |= !transport_respond_auth(endpoint->transport, event->conn, true);
+    endpoint->failed |=
+        !transport_respond_auth(endpoint->transport, event->conn, true);
     endpoint->authenticated = !endpoint->failed;
     break;
   case TRANSPORT_EVENT_AUTH_COMPLETE:
@@ -69,8 +70,10 @@ static void fixture_create(transport_fixture_t *fixture, uint16_t port,
                            const transport_limits_t *client_limits) {
   memset(fixture, 0, sizeof(*fixture));
   fixture->server.server = true;
-  transport_config_t config = {.bind_hosts = {"127.0.0.1"}, .num_bind_hosts = 1,
-                               .port = port, .allow_insecure_peer = true,
+  transport_config_t config = {.bind_hosts = {"127.0.0.1"},
+                               .num_bind_hosts = 1,
+                               .port = port,
+                               .allow_insecure_peer = true,
                                .callback = fixture_event,
                                .cert_file = "t/assets/server.crt",
                                .key_file = "t/assets/server.key",
@@ -91,8 +94,10 @@ static void fixture_create(transport_fixture_t *fixture, uint16_t port,
 }
 
 static void fixture_subscribe(transport_fixture_t *fixture,
-                              fixture_endpoint_t *receiver, moq_track_id_t track) {
-  fixture_endpoint_t *source = receiver->server ? &fixture->client : &fixture->server;
+                              fixture_endpoint_t *receiver,
+                              moq_track_id_t track) {
+  fixture_endpoint_t *source =
+      receiver->server ? &fixture->client : &fixture->server;
   size_t expected = source->subscriptions + 1;
   assert(transport_subscribe_conn(receiver->transport, receiver->conn, track));
   for (size_t i = 0; i < 2000 && source->subscriptions < expected; i++)

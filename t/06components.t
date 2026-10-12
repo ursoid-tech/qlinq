@@ -18,4 +18,10 @@ subtest 'UDP GSO grouping and partial sends' => sub {
          'datagrams remain ordered and accepted prefixes are never replayed') or diag($stderr);
 };
 
+subtest 'interface snapshots' => sub {
+    my ($stderr, $stdout) = run_prog('./t/00util/test_ifmon');
+    like($stdout, qr/===IFMON SNAPSHOTS OK===/,
+         'interface changes and missing IPv4/IPv6 prefixes retain their semantics') or diag($stderr);
+};
+
 done_testing;

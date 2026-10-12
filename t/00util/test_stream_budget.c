@@ -1,7 +1,7 @@
 #include "quicly/streambuf.h"
 #include "transport_config.h"
 #include "transport_internal.h"
-#include "transport_protocol.h"
+#include "transport_recovery.h"
 #include "transport_stream.h"
 
 #include <stdio.h>
@@ -315,13 +315,13 @@ static int retained_nack_retries(bool rateless) {
                                     MOQ_TRACK_DATA, flags, "nack-one", 1));
   CHECK(transport_subscriptions_add(&conn->receive_subscriptions,
                                     MOQ_TRACK_DATA, flags, "nack-two", 2));
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
   size_t first_size = sb->bytes_written;
   CHECK(t->stats.stream_egress_frames == 1);
   /* Repeated timer callbacks cannot multiply a request which has not had a
    * chance to leave this reliable stream. No packet service occurs here. */
   for (size_t i = 0; i < 512; i++) {
-    CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+    CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
     CHECK(t->stats.stream_egress_frames == 1 &&
           sb->bytes_written == first_size);
   }
@@ -339,7 +339,7 @@ static int retained_nack_retries(bool rateless) {
    * when packet service has marked every queued byte as transmitted. */
   for (size_t i = 0; i < 512; i++) {
     stream->sendstate.size_inflight = sb->bytes_written;
-    CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+    CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
     CHECK(t->stats.stream_egress_frames == 1 &&
           sb->bytes_written == first_size);
   }
@@ -347,35 +347,54 @@ static int retained_nack_retries(bool rateless) {
         t->stats.repair_requests_coalesced == 1024);
   /* A partial ACK retains the entire original frame and must still coalesce. */
   CHECK(acknowledge(stream, 1));
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
   CHECK(t->stats.stream_egress_frames == 1);
   CHECK(acknowledge(stream, first_size - 1));
   CHECK(t->stats.stream_egress_bytes == 0 &&
         t->stats.stream_egress_vector_capacity == 0);
   /* The request arrived, but its repair response can be lost. After QUIC
    * releases that request, the existing application retry can enqueue again. */
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
   CHECK(t->stats.repair_requests_sent == 2 &&
         t->stats.stream_egress_frames == 1);
   stream->sendstate.size_inflight = sb->bytes_written;
   CHECK(acknowledge(stream, first_size));
   CHECK(t->stats.stream_egress_bytes == 0 &&
         t->stats.stream_egress_vector_capacity == 0);
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
   CHECK(t->stats.repair_requests_sent == 3);
   /* Different aliases, groups, objects, request scopes and missing symbols
    * are independent requests, even when none has been transmitted. */
-  CHECK(transport_protocol_send_nack(conn, 2, 7, 11, NULL, 0, true));
-  CHECK(transport_protocol_send_nack(conn, 1, 8, 11, NULL, 0, true));
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 12, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 2, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 8, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 12, NULL, 0, true));
   uint16_t missing[] = {3, 5};
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, rateless ? NULL : missing,
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, rateless ? NULL : missing,
                                      2, false));
   missing[1] = 6;
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, rateless ? NULL : missing,
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, rateless ? NULL : missing,
                                      rateless ? 3 : 2, false));
   CHECK(t->stats.repair_requests_sent == 8 &&
         t->stats.stream_egress_frames == 6);
+  uint16_t maximum_missing[QLINQ_WIRE_MAX_NACK_SYMBOLS];
+  for (size_t i = 0; i < QLINQ_WIRE_MAX_NACK_SYMBOLS; i++)
+    maximum_missing[i] = (uint16_t)i;
+  const uint16_t *indices = rateless ? NULL : maximum_missing;
+  CHECK(!transport_recovery_send_nack(conn, 1, 7, 13, indices,
+                                      QLINQ_WIRE_MAX_NACK_SYMBOLS + 1U, false));
+  CHECK(t->stats.repair_requests_sent == 8 &&
+        t->stats.stream_egress_frames == 6);
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 13, indices,
+                                     QLINQ_WIRE_MAX_NACK_SYMBOLS, false));
+  uint8_t payload[20U + 2U * QLINQ_WIRE_MAX_NACK_SYMBOLS];
+  size_t written = 0;
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 1,
+                               rateless ? QLINQ_WIRE_NACK_RATELESS : 0, 7, 13,
+                               indices, QLINQ_WIRE_MAX_NACK_SYMBOLS,
+                               &written) == QLINQ_WIRE_OK);
+  CHECK(written == (rateless ? 20U : sizeof(payload)) &&
+        transport_stream_has_retained_frame(stream, QLINQ_WIRE_NACK, payload,
+                                            written));
 cleanup:
   if (!dispose(t))
     failed = 1;
@@ -403,9 +422,9 @@ static int retained_nack_ack_gap(bool rateless) {
   quicly_stream_t *stream = conn->stream;
   quicly_sendbuf_t *sb =
       &((transport_stream_ctx_t *)stream->data)->streambuf.egress;
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
   size_t first_size = sb->bytes_written;
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 12, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 12, NULL, 0, true));
   stream->sendstate.size_inflight = sb->bytes_written;
   quicly_sendstate_sent_t later = {.start = first_size,
                                    .end = sb->bytes_written};
@@ -413,10 +432,10 @@ static int retained_nack_ack_gap(bool rateless) {
   CHECK(quicly_sendstate_acked(&stream->sendstate, &later, &shift) == 0 &&
         shift == 0);
   stream->callbacks->on_send_shift(stream, shift);
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 12, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 12, NULL, 0, true));
   CHECK(t->stats.stream_egress_frames == 2 &&
         t->stats.repair_requests_sent == 2);
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
   CHECK(t->stats.stream_egress_frames == 2 &&
         t->stats.repair_requests_coalesced == 2);
   quicly_sendstate_sent_t first = {.start = 0, .end = first_size};
@@ -426,7 +445,7 @@ static int retained_nack_ack_gap(bool rateless) {
   CHECK(t->stats.stream_egress_frames == 0 &&
         t->stats.stream_egress_bytes == 0 &&
         t->stats.stream_egress_vector_capacity == 0);
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 12, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 12, NULL, 0, true));
   CHECK(t->stats.stream_egress_frames == 1 &&
         t->stats.repair_requests_sent == 3);
 cleanup:
@@ -480,7 +499,7 @@ static int repair_pressure(bool endpoint, bool rateless) {
   /* Repair timers own retry state. Queue pressure must neither consume the
    * essential-control reserve nor turn an unanswered request into a close. */
   for (unsigned n = 0; n < 512; n++) {
-    CHECK(!transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+    CHECK(!transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
     CHECK(t->stats.stream_egress_bytes == bytes &&
           t->stats.stream_egress_frames == frames &&
           t->stats.stream_egress_vector_capacity == vectors);
@@ -495,7 +514,7 @@ static int repair_pressure(bool endpoint, bool rateless) {
   quicly_sendbuf_t *sb =
       &((transport_stream_ctx_t *)release->data)->streambuf.egress;
   CHECK(acknowledge(release, sb->bytes_written));
-  CHECK(transport_protocol_send_nack(conn, 1, 7, 11, NULL, 0, true));
+  CHECK(transport_recovery_send_nack(conn, 1, 7, 11, NULL, 0, true));
   CHECK(t->stats.repair_requests_sent == 1 &&
         t->stats.repair_requests_deferred == 512 &&
         t->stats.stream_control_failures == 0 &&
@@ -510,6 +529,19 @@ cleanup:
   return failed;
 }
 
+static bool receive_bytes(quicly_stream_t *stream, const uint8_t *data,
+                          size_t size) {
+  size_t offset = quicly_streambuf_ingress_get(stream).len;
+  size_t received = size;
+  if (quicly_recvstate_update(&stream->recvstate,
+                              stream->recvstate.data_off + offset, &received, 0,
+                              32) != 0 ||
+      received != size)
+    return false;
+  stream->callbacks->on_receive(stream, offset, data, size);
+  return true;
+}
+
 static bool receive_control(quicly_stream_t *stream, uint8_t type,
                             const uint8_t *payload, size_t payload_size) {
   uint8_t frame[128];
@@ -520,12 +552,8 @@ static bool receive_control(quicly_stream_t *stream, uint8_t type,
           QLINQ_WIRE_OK)
     return false;
   memcpy(frame + QLINQ_WIRE_FRAME_HEADER_SIZE, payload, payload_size);
-  size_t received = size;
-  if (quicly_recvstate_update(&stream->recvstate, stream->recvstate.data_off,
-                              &received, 0, 32) != 0 ||
-      received != size)
+  if (!receive_bytes(stream, frame, size))
     return false;
-  stream->callbacks->on_receive(stream, 0, frame, size);
   if (quicly_get_state(stream->conn) >= QUICLY_STATE_CLOSING) {
     const char *reason = NULL;
     (void)quicly_get_close_reason(stream->conn, NULL, &reason, NULL);
@@ -534,6 +562,118 @@ static bool receive_control(quicly_stream_t *stream, uint8_t type,
     return false;
   }
   return true;
+}
+
+static void count_objects(void *data, const transport_event_t *event) {
+  if (event->type == TRANSPORT_EVENT_OBJECT)
+    (*(size_t *)data)++;
+}
+
+/* A fragmented request and the next frame must each be consumed exactly once,
+ * including the NACK path that runs out of aggregate repair tokens. */
+static int control_dispatch_consumption(void) {
+  int failed = 0;
+  transport_t *t = fixture();
+  size_t delivered = 0;
+  CHECK(t && t->client_conn && t->client_conn->stream);
+  t->callback = count_objects;
+  t->user_data = &delivered;
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = conn->protocol_ready = conn->hello_received = true;
+  conn->negotiated_limits = t->limits;
+  t->limits.max_aggregate_repair_requests_per_second = 0;
+  moq_object_t object = {.track_id = {.type = MOQ_TRACK_DATA,
+                                      .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                                      .name = "throttled"},
+                         .data = (const uint8_t *)"abc",
+                         .size = 3};
+  CHECK(transport_subscriptions_add(&conn->send_subscriptions,
+                                    object.track_id.type, object.track_id.flags,
+                                    object.track_id.name, 1));
+  CHECK(transport_sent_cache_store(&t->sent_cache, &object, 1, 1, 3, false));
+  uint8_t nack[20], frames[64];
+  size_t nack_size = 0, first_size = 0, second_size = 0;
+  CHECK(qlinq_wire_encode_nack(nack, sizeof(nack), 1,
+                               QLINQ_WIRE_NACK_WHOLE_OBJECT, 0, 0, NULL, 0,
+                               &nack_size) == QLINQ_WIRE_OK);
+  CHECK(qlinq_wire_encode_frame(frames, sizeof(frames), QLINQ_WIRE_NACK, nack,
+                                nack_size, TRANSPORT_WIRE_MAX_STREAM_PAYLOAD,
+                                &first_size) == QLINQ_WIRE_OK);
+  CHECK(qlinq_wire_encode_frame(frames + first_size,
+                                sizeof(frames) - first_size, QLINQ_WIRE_UNICAST,
+                                "x", 1, TRANSPORT_WIRE_MAX_STREAM_PAYLOAD,
+                                &second_size) == QLINQ_WIRE_OK);
+  CHECK(receive_bytes(conn->stream, frames, 3));
+  CHECK(t->stats.stream_frames_received == 0 && delivered == 0);
+  CHECK(receive_bytes(conn->stream, frames + 3, first_size + second_size - 3));
+  CHECK(quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
+        quicly_streambuf_ingress_get(conn->stream).len == 0);
+  CHECK(t->stats.stream_frames_received == 2 && delivered == 1 &&
+        t->stats.repair_requests_received == 1 &&
+        t->stats.repair_requests_aggregate_throttled == 1 &&
+        t->stats.protocol_errors == 0);
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
+static int control_error_accounting(void) {
+  static const struct {
+    uint8_t type;
+    bool hello, authenticated, valid_nack;
+    uint64_t error;
+    const char *reason;
+  } cases[] = {{QLINQ_WIRE_UNICAST, false, false, false, 0x100,
+                "protocol error: HELLO must be first"},
+               {QLINQ_WIRE_NACK, true, false, false, 0x100,
+                "protocol error: invalid nack"},
+               {QLINQ_WIRE_NACK, true, false, true, 0x101, "unauthorized"},
+               {QLINQ_WIRE_TRACK_CHECKPOINT, true, false, false, 0x100,
+                "protocol error: invalid recovery checkpoint"},
+               {QLINQ_WIRE_AUTH_RESPONSE, true, true, false, 0x100,
+                "protocol error: invalid auth response"},
+               {QLINQ_WIRE_UNICAST, true, false, false, 0x102,
+                "protocol error: payload too large"},
+               {QLINQ_WIRE_TRACK_END, true, true, false, 0x100,
+                "protocol error: invalid track completion"}};
+  int failed = 0;
+  transport_t *t = NULL;
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    t = fixture();
+    CHECK(t && t->client_conn && t->client_conn->stream);
+    transport_conn_t *conn = t->client_conn;
+    conn->hello_received = cases[i].hello;
+    conn->authenticated = cases[i].authenticated;
+    conn->negotiated_limits = t->limits;
+    if (cases[i].error == 0x102)
+      conn->negotiated_limits.max_reliable_object_size = 0;
+    uint8_t payload[20] = {2}, frame[64];
+    size_t payload_size = 1, frame_size = 0;
+    if (cases[i].valid_nack)
+      CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 1,
+                                   QLINQ_WIRE_NACK_WHOLE_OBJECT, 0, 0, NULL, 0,
+                                   &payload_size) == QLINQ_WIRE_OK);
+    CHECK(qlinq_wire_encode_frame(
+              frame, sizeof(frame), cases[i].type, payload, payload_size,
+              TRANSPORT_WIRE_MAX_STREAM_PAYLOAD, &frame_size) == QLINQ_WIRE_OK);
+    CHECK(receive_bytes(conn->stream, frame, frame_size));
+    const char *reason = NULL;
+    quicly_error_t error =
+        quicly_get_close_reason(conn->quic, NULL, &reason, NULL);
+    CHECK(quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING &&
+          QUICLY_ERROR_GET_ERROR_CODE(error) == cases[i].error && reason &&
+          strcmp(reason, cases[i].reason) == 0);
+    CHECK(t->stats.protocol_errors == (cases[i].error == 0x100) &&
+          t->stats.resource_limit_errors == (cases[i].error == 0x102));
+    bool released = dispose(t);
+    t = NULL;
+    CHECK(released);
+  }
+cleanup:
+  if (t && !dispose(t))
+    failed = 1;
+  return failed;
 }
 
 static int checkpoint_retires_redundant_recovery(void) {
@@ -752,7 +892,7 @@ static int checkpoint_ack_pressure(void) {
                                                &ack) == QLINQ_WIRE_OK);
   CHECK(transport_stream_has_retained_frame(
       conn->stream, QLINQ_WIRE_TRACK_CHECKPOINT_ACK, payload, sizeof(payload)));
-  transport_protocol_flush_recovery_acks(conn);
+  transport_recovery_flush_acks(conn);
   CHECK(t->stats.recovery_checkpoint_acks_sent == 1);
   /* Once the gap closes, two groups require two separate cumulative ACKs. */
   header.object_id = 96;
@@ -763,7 +903,7 @@ static int checkpoint_ack_pressure(void) {
   CHECK(quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
         t->stats.recovery_checkpoint_acks_sent == 1);
   CHECK(acknowledge(conn->stream, 2 * frame_size));
-  transport_protocol_flush_recovery_acks(conn);
+  transport_recovery_flush_acks(conn);
   CHECK(t->stats.recovery_checkpoint_acks_sent == 3 &&
         !gap->recovery_windows[0].active && !gap->recovery_windows[1].active);
   for (unsigned group = 3; group <= 4; group++) {
@@ -783,6 +923,7 @@ cleanup:
 
 int main(void) {
   int failed =
+      control_dispatch_consumption() || control_error_accounting() ||
       checkpoint_ack_pressure() || checkpoint_repair_batch(1024, 1024) ||
       checkpoint_repair_batch(2, 1024) || checkpoint_repair_batch(1024, 3) ||
       entry_limit_and_control_failure() || byte_limits_and_recovery() ||

@@ -17,9 +17,8 @@
  * They provide a recent, per-path ACK-rate lower bound for probing. */
 typedef struct {
   quicly_path_stats_t baseline;
-  uint64_t started_ms, rate_at_ms;
+  uint64_t started_ms;
   size_t quic_path;
-  uint64_t delivered_bytes_per_second;
   uint64_t probe_rates[4], probe_times[4];
   size_t probe_cursor;
   uint32_t minimum_rtt;
@@ -61,6 +60,13 @@ path_t transport_path_estimate(const quicly_path_stats_t *stats,
 void transport_path_update_state(path_state_t *state, const path_t *sample,
                                  bool periodic);
 
+/* Address identity includes IPv6 scope. Endpoint identity also includes the
+ * UDP port; ports do not identify a physical link. */
+bool transport_address_equal(const struct sockaddr *a,
+                             const struct sockaddr *b);
+bool transport_endpoint_equal(const struct sockaddr *a,
+                              const struct sockaddr *b);
+
 /* Match the same interface identity as link lookup (IPv6 scope included;
  * transport ports do not identify a physical link). */
 bool transport_path_matches_local(const quicly_path_stats_t *stats,
@@ -70,14 +76,13 @@ bool transport_path_matches_local(const quicly_path_stats_t *stats,
 size_t transport_path_find_by_addresses(quicly_conn_t *quic,
                                         const struct sockaddr *local,
                                         const struct sockaddr *remote);
-size_t transport_path_find_by_link(quicly_conn_t *quic,
-                                   const struct sockaddr_storage *local_addrs,
-                                   size_t num_local_addrs, size_t link_index);
+size_t transport_path_find_by_local(quicly_conn_t *quic,
+                                    const struct sockaddr_storage *local);
 /* Return the matching path and the statistics already read during lookup.
  * Statistics are valid only when the return value is not SIZE_MAX. */
-size_t transport_path_get_stats_by_link(
-    quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
-    size_t num_local_addrs, size_t link_index, quicly_path_stats_t *stats);
+size_t transport_path_get_stats_by_local(quicly_conn_t *quic,
+                                         const struct sockaddr_storage *local,
+                                         quicly_path_stats_t *stats);
 /* SIZE_MAX means the symbol has no allocation; never fall back to path zero. */
 size_t transport_path_select_physical(const path_t *paths, size_t num_paths,
                                       size_t packet_index);

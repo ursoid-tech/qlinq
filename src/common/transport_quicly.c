@@ -12,6 +12,7 @@
 #include "transport_memory.h"
 #include "transport_paths.h"
 #include "transport_protocol.h"
+#include "transport_recovery.h"
 #include "transport_publish.h"
 #include "transport_repair.h"
 #include "transport_scheduler.h"
@@ -41,6 +42,8 @@
 #include "quicly/streambuf.h"
 
 #define QLINQ_STREAM_MULTIPATH_SEND_BATCH 6U
+#define QLINQ_PATHFLOW_UPDATE_MS 25U
+#define QLINQ_GROUP_FLUSH_MS 3U
 
 uint64_t transport_get_time_ns(void) {
   struct timespec ts;
@@ -309,23 +312,21 @@ void transport_log(transport_t *t, transport_log_level_t level,
 static bool transport_has_connection(const transport_t *t,
                                      const transport_conn_t *conn);
 
-static void accumulate_egress_stats(transport_t *t,
+static void accumulate_egress_stats(transport_stats_t *stats,
                                     const transport_egress_t *egress,
                                     bool dropping_pending) {
-  if (!t || !egress)
-    return;
-  t->stats.udp_packets_sent += egress->packets_sent;
-  t->stats.udp_bytes_sent += egress->bytes_sent;
-  t->stats.udp_would_block += egress->would_block;
-  t->stats.udp_send_errors += egress->send_errors;
-  t->stats.egress_packets_queued += egress->packets_queued;
-  t->stats.egress_bytes_queued += egress->bytes_queued;
-  t->stats.egress_packets_dropped +=
+  stats->udp_packets_sent += egress->packets_sent;
+  stats->udp_bytes_sent += egress->bytes_sent;
+  stats->udp_would_block += egress->would_block;
+  stats->udp_send_errors += egress->send_errors;
+  stats->egress_packets_queued += egress->packets_queued;
+  stats->egress_bytes_queued += egress->bytes_queued;
+  stats->egress_packets_dropped +=
       egress->packets_dropped + (dropping_pending ? egress->count : 0U);
-  if (egress->peak_count > t->stats.egress_peak_packets)
-    t->stats.egress_peak_packets = egress->peak_count;
-  if (egress->peak_bytes > t->stats.egress_peak_bytes)
-    t->stats.egress_peak_bytes = egress->peak_bytes;
+  if (egress->peak_count > stats->egress_peak_packets)
+    stats->egress_peak_packets = egress->peak_count;
+  if (egress->peak_bytes > stats->egress_peak_bytes)
+    stats->egress_peak_bytes = egress->peak_bytes;
 }
 
 bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
@@ -339,7 +340,6 @@ bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
   size_t before = quicly_get_num_datagram_frames_path(conn->quic, path_index);
   quicly_send_datagram_frames_path(conn->quic, path_index, &datagram, 1);
   size_t after = quicly_get_num_datagram_frames_path(conn->quic, path_index);
-  conn->queued_datagrams[path_index] = (uint16_t)after;
   return after == before + 1U;
 }
 
@@ -374,17 +374,18 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
   if (symbol_size == 0)
     symbol_size = 1200;
 
-  for (size_t physical = 0; physical < t->num_fds; physical++) {
+  for (size_t physical = 0; physical < t->socket_count; physical++) {
     quicly_path_stats_t stats;
-    size_t path = transport_path_get_stats_by_link(
-        quic, t->local_addrs, t->num_fds, physical, &stats);
+    size_t path = transport_path_get_stats_by_local(
+        quic, &t->sockets[physical].local_addr, &stats);
     if (path >= TRANSPORT_MAX_QUIC_PATHS ||
         !quicly_is_path_available(quic, path))
       continue;
     path_t sample = transport_path_estimate(
         &stats, quicly_get_num_datagram_frames_path(quic, path),
-        t->egress[physical].bytes, symbol_size, conn->latest_owd_fp[physical]);
-    const path_state_t *state = &conn->path_states[physical];
+        t->sockets[physical].egress.bytes, symbol_size,
+        conn->paths[physical].latest_owd_fp);
+    const path_state_t *state = &conn->paths[physical].state;
     if (state->initialized) {
       /* Delivery-rate EWMA is demand-limited when this path has been
        * underused. Keep the live cwnd / RTT rate for stream scheduling, while
@@ -444,18 +445,22 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
 static quicly_path_scheduler_t qlinq_path_scheduler = {
     .do_send = qlinq_path_scheduler_send};
 
-static bool ifmon_address_matches(const ifmon_addr_t *address,
-                                  const struct sockaddr_storage *local) {
-  if (!address || !local || address->family != local->ss_family)
-    return false;
-  if (address->family == AF_INET)
-    return address->ip.v4.s_addr ==
-           ((const struct sockaddr_in *)local)->sin_addr.s_addr;
-  if (address->family == AF_INET6)
-    return memcmp(&address->ip.v6,
-                  &((const struct sockaddr_in6 *)local)->sin6_addr,
-                  sizeof(address->ip.v6)) == 0;
-  return false;
+static socklen_t ifmon_socket_address(struct sockaddr_storage *out,
+                                      const ifmon_addr_t *address,
+                                      uint32_t interface_index) {
+  memset(out, 0, sizeof(*out));
+  if (address->family == AF_INET) {
+    struct sockaddr_in *v4 = (struct sockaddr_in *)out;
+    v4->sin_family = AF_INET;
+    v4->sin_addr = address->ip.v4;
+    return sizeof(*v4);
+  }
+  struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)out;
+  v6->sin6_family = AF_INET6;
+  v6->sin6_addr = address->ip.v6;
+  if (IN6_IS_ADDR_LINKLOCAL(&v6->sin6_addr))
+    v6->sin6_scope_id = interface_index;
+  return sizeof(*v6);
 }
 
 static void resolve_configured_interfaces(transport_t *t) {
@@ -463,17 +468,21 @@ static void resolve_configured_interfaces(transport_t *t) {
   uint8_t scratchpad[IFMON_SCRATCHPAD_SIZE];
   if (!t || ifmon_list_get(&interfaces, scratchpad, sizeof(scratchpad)) != 0)
     return;
-  for (size_t path = 0; path < t->num_fds; path++) {
+  for (size_t path = 0; path < t->socket_count; path++) {
     for (int i = 0; i < interfaces.count; i++) {
       const ifmon_iface_t *iface = &interfaces.ifaces[i];
       for (int a = 0; a < iface->addr_count; a++) {
-        if (!ifmon_address_matches(&iface->addrs[a], &t->local_addrs[path]))
+        struct sockaddr_storage address;
+        ifmon_socket_address(&address, &iface->addrs[a], iface->index);
+        if (!transport_address_equal(
+                (const struct sockaddr *)&address,
+                (const struct sockaddr *)&t->sockets[path].local_addr))
           continue;
-        t->local_ifindices[path] = iface->index;
-        copy_interface_name(t->local_ifnames[path], iface->name);
+        t->sockets[path].interface_index = iface->index;
+        copy_interface_name(t->sockets[path].interface_name, iface->name);
         break;
       }
-      if (t->local_ifindices[path] != 0)
+      if (t->sockets[path].interface_index != 0)
         break;
     }
   }
@@ -527,17 +536,7 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
           msg.index = idx;
           copy_interface_name(msg.name, iface->name);
           msg.is_added = 1;
-          if (a->family == AF_INET) {
-            struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
-            sin->sin_family = AF_INET;
-            sin->sin_addr = a->ip.v4;
-            msg.addr_len = sizeof(*sin);
-          } else {
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg.addr;
-            sin6->sin6_family = AF_INET6;
-            sin6->sin6_addr = a->ip.v6;
-            msg.addr_len = sizeof(*sin6);
-          }
+          msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
           ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
           (void)w;
         }
@@ -568,17 +567,7 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
             msg.index = diff->index;
             copy_interface_name(msg.name, iface->name);
             msg.is_added = diff->is_up ? 1 : 0;
-            if (a->family == AF_INET) {
-              struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
-              sin->sin_family = AF_INET;
-              sin->sin_addr = a->ip.v4;
-              msg.addr_len = sizeof(*sin);
-            } else {
-              struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg.addr;
-              sin6->sin6_family = AF_INET6;
-              sin6->sin6_addr = a->ip.v6;
-              msg.addr_len = sizeof(*sin6);
-            }
+            msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
             ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
             (void)w;
           }
@@ -598,17 +587,7 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
           break;
         }
       }
-      if (a->family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
-        sin->sin_family = AF_INET;
-        sin->sin_addr = a->ip.v4;
-        msg.addr_len = sizeof(*sin);
-      } else {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg.addr;
-        sin6->sin6_family = AF_INET6;
-        sin6->sin6_addr = a->ip.v6;
-        msg.addr_len = sizeof(*sin6);
-      }
+      msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
       ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
       (void)w;
     }
@@ -624,17 +603,7 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
           break;
         }
       }
-      if (a->family == AF_INET) {
-        struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
-        sin->sin_family = AF_INET;
-        sin->sin_addr = a->ip.v4;
-        msg.addr_len = sizeof(*sin);
-      } else {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&msg.addr;
-        sin6->sin6_family = AF_INET6;
-        sin6->sin6_addr = a->ip.v6;
-        msg.addr_len = sizeof(*sin6);
-      }
+      msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
       ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
       (void)w;
     }
@@ -672,13 +641,76 @@ static void configure_socket_buffers(transport_t *t, int fd) {
                   "unable to enlarge receive buffer: %s", strerror(errno));
 }
 
+static void set_address_port(struct sockaddr_storage *address, uint16_t port) {
+  if (address->ss_family == AF_INET)
+    ((struct sockaddr_in *)address)->sin_port = htons(port);
+  else
+    ((struct sockaddr_in6 *)address)->sin6_port = htons(port);
+}
+
+static bool parse_address(const char *host, uint16_t port,
+                          struct sockaddr_storage *address, socklen_t *length) {
+  memset(address, 0, sizeof(*address));
+  void *ip;
+  if (strchr(host, ':')) {
+    address->ss_family = AF_INET6;
+    ip = &((struct sockaddr_in6 *)address)->sin6_addr;
+    *length = sizeof(struct sockaddr_in6);
+  } else {
+    address->ss_family = AF_INET;
+    ip = &((struct sockaddr_in *)address)->sin_addr;
+    *length = sizeof(struct sockaddr_in);
+  }
+  set_address_port(address, port);
+  return inet_pton(address->ss_family, host, ip) == 1;
+}
+
+static void destroy_socket(transport_socket_t *socket) {
+  if (socket->fd >= 0)
+    CLOSE_SOCKET(socket->fd);
+  transport_egress_destroy(&socket->egress);
+  *socket = (transport_socket_t){.fd = -1, .remote_index = SIZE_MAX};
+}
+
+/* Install a socket only when its descriptor and egress queue are both ready.
+ * Unicast tuples stay exclusive: SO_REUSEADDR can let a later endpoint steal
+ * an earlier endpoint's QUIC replies, even for bind(port=0) on Linux. */
+static const char *open_local_socket(transport_t *t,
+                                     transport_socket_t *socket) {
+  const char *error = "socket creation failed";
+  int saved_errno;
+  socket->fd = open_unicast_socket(socket->local_addr.ss_family);
+  if (socket->fd < 0)
+    goto Fail;
+  error = "socket bind failed";
+  if (bind(socket->fd, (struct sockaddr *)&socket->local_addr,
+           socket->local_addr_len) != 0)
+    goto Fail;
+  configure_socket_buffers(t, socket->fd);
+  error = "failed to make socket nonblocking";
+  if (!set_fd_nonblocking(socket->fd))
+    goto Fail;
+  error = "failed to allocate socket egress queue";
+  if (!transport_egress_init(&socket->egress,
+                             t->limits.max_egress_packets_per_socket,
+                             t->limits.max_egress_bytes_per_socket))
+    goto Fail;
+  return NULL;
+
+Fail:
+  saved_errno = errno;
+  destroy_socket(socket);
+  errno = saved_errno;
+  return error;
+}
+
 #define QLINQ_PATH_OPEN_RETRY_MS 100U
 
 static bool path_endpoint_families_match(const transport_t *t,
                                          size_t local_index,
                                          size_t remote_index) {
-  return local_index < t->num_fds && remote_index < t->num_remote_addrs &&
-         t->local_addrs[local_index].ss_family ==
+  return local_index < t->socket_count && remote_index < t->num_remote_addrs &&
+         t->sockets[local_index].local_addr.ss_family ==
              t->remote_addrs[remote_index].ss_family;
 }
 
@@ -694,36 +726,15 @@ static bool path_interface_allowed(const transport_t *t, const char *name) {
 
 static void remove_connection_physical_slot(transport_t *t,
                                             size_t removed_index) {
-  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  size_t count = transport_connection_count(t);
   for (size_t c = 0; c < count; c++) {
-    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    transport_conn_t *conn = transport_connection_at(t, c);
     if (!conn)
       continue;
-    for (size_t i = removed_index; i + 1 < t->num_fds; i++) {
-      conn->path_states[i] = conn->path_states[i + 1];
-      conn->path_measurements[i] = conn->path_measurements[i + 1];
-      conn->path_budgets[i] = conn->path_budgets[i + 1];
-      conn->min_owd_ns[i] = conn->min_owd_ns[i + 1];
-      conn->owd_initialized[i] = conn->owd_initialized[i + 1];
-      conn->telemetry_path[i] = conn->telemetry_path[i + 1];
-      conn->latest_owd_fp[i] = conn->latest_owd_fp[i + 1];
-      conn->last_telemetry_s_ns[i] = conn->last_telemetry_s_ns[i + 1];
-      conn->last_telemetry_r_ns[i] = conn->last_telemetry_r_ns[i + 1];
-      conn->path_state_overridden[i] = conn->path_state_overridden[i + 1];
-    }
-    size_t last = t->num_fds - 1U;
-    memset(&conn->path_states[last], 0, sizeof(conn->path_states[last]));
-    memset(&conn->path_measurements[last], 0,
-           sizeof(conn->path_measurements[last]));
-    memset(&conn->path_budgets[last], 0, sizeof(conn->path_budgets[last]));
+    for (size_t i = removed_index; i + 1 < t->socket_count; i++)
+      conn->paths[i] = conn->paths[i + 1];
+    conn->paths[t->socket_count - 1U] = (transport_conn_path_t){0};
     conn->admission_retry_at_ns = 0;
-    conn->min_owd_ns[last] = 0;
-    conn->owd_initialized[last] = false;
-    conn->telemetry_path[last] = 0;
-    conn->latest_owd_fp[last] = 0;
-    conn->last_telemetry_s_ns[last] = 0;
-    conn->last_telemetry_r_ns[last] = 0;
-    conn->path_state_overridden[last] = false;
   }
 }
 
@@ -739,8 +750,8 @@ static size_t select_remote_for_added_local(const transport_t *t,
     if (!path_endpoint_families_match(t, local_index, remote_index))
       continue;
     bool assigned = false;
-    for (size_t i = 0; i < t->num_fds; i++) {
-      if (i != local_index && t->local_remote_indices[i] == remote_index) {
+    for (size_t i = 0; i < t->socket_count; i++) {
+      if (i != local_index && t->sockets[i].remote_index == remote_index) {
         assigned = true;
         break;
       }
@@ -756,34 +767,35 @@ static void try_open_pending_paths(transport_t *t, transport_conn_t *conn,
   if (!t || !conn || t->is_server || !conn->quic_ready)
     return;
 
-  for (size_t local_index = 0; local_index < t->num_fds; local_index++) {
-    if (!t->path_open_pending[local_index] ||
-        now < t->path_open_retry_at[local_index])
+  for (size_t local_index = 0; local_index < t->socket_count; local_index++) {
+    if (!t->sockets[local_index].open_pending ||
+        now < t->sockets[local_index].open_retry_at_ms)
       continue;
-    size_t remote_index = t->local_remote_indices[local_index];
+    size_t remote_index = t->sockets[local_index].remote_index;
     if (!path_endpoint_families_match(t, local_index, remote_index)) {
-      t->path_open_pending[local_index] = false;
+      t->sockets[local_index].open_pending = false;
       continue;
     }
 
-    struct sockaddr *local = (struct sockaddr *)&t->local_addrs[local_index];
+    struct sockaddr *local =
+        (struct sockaddr *)&t->sockets[local_index].local_addr;
     struct sockaddr *remote = (struct sockaddr *)&t->remote_addrs[remote_index];
     if (transport_path_find_by_addresses(conn->quic, local, remote) !=
         SIZE_MAX) {
-      t->path_open_pending[local_index] = false;
+      t->sockets[local_index].open_pending = false;
       continue;
     }
 
     quicly_error_t ret = quicly_open_path(conn->quic, remote, local);
     if (ret == 0) {
-      t->path_open_pending[local_index] = false;
+      t->sockets[local_index].open_pending = false;
     } else if (ret == QUICLY_ERROR_PACKET_IGNORED) {
       /* The peer may not have supplied a path ID or CID yet. */
-      t->path_open_retry_at[local_index] = now + QLINQ_PATH_OPEN_RETRY_MS;
+      t->sockets[local_index].open_retry_at_ms = now + QLINQ_PATH_OPEN_RETRY_MS;
     } else {
       transport_log(t, TRANSPORT_LOG_ERROR, "path", conn->id, local_index,
                     "unable to open QUIC path: %" PRId64, (int64_t)ret);
-      t->path_open_pending[local_index] = false;
+      t->sockets[local_index].open_pending = false;
     }
   }
 }
@@ -803,7 +815,7 @@ static bool init_connection_subscriptions(transport_conn_t *conn,
 }
 
 static bool start_client_connection(transport_t *t) {
-  if (!t || t->is_server || t->num_remote_addrs == 0 || t->num_fds == 0 ||
+  if (!t || t->is_server || t->num_remote_addrs == 0 || t->socket_count == 0 ||
       t->client_conn)
     return false;
 
@@ -818,10 +830,11 @@ static bool start_client_connection(transport_t *t) {
     return false;
   }
 
-  int ret = quicly_connect(&conn->quic, &t->quic_ctx, t->server_name,
-                           (struct sockaddr *)&t->remote_addrs[0],
-                           (struct sockaddr *)&t->local_addrs[0], &t->next_cid,
-                           ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
+  int ret =
+      quicly_connect(&conn->quic, &t->quic_ctx, t->server_name,
+                     (struct sockaddr *)&t->remote_addrs[0],
+                     (struct sockaddr *)&t->sockets[0].local_addr, &t->next_cid,
+                     ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
   if (ret != 0 || !conn->quic) {
     destroy_connection_subscriptions(conn);
     free(conn);
@@ -840,9 +853,9 @@ static bool start_client_connection(transport_t *t) {
   }
 
   t->client_conn = conn;
-  for (size_t i = 1; i < t->num_fds; i++) {
-    t->path_open_pending[i] = true;
-    t->path_open_retry_at[i] = 0;
+  for (size_t i = 1; i < t->socket_count; i++) {
+    t->sockets[i].open_pending = true;
+    t->sockets[i].open_retry_at_ms = 0;
   }
   return true;
 }
@@ -915,57 +928,36 @@ transport_t *transport_create(const transport_config_t *config) {
   }
 
   for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++) {
-    t->fds[i] = -1;
-    t->local_remote_indices[i] = SIZE_MAX;
+    t->sockets[i].fd = -1;
+    t->sockets[i].remote_index = SIZE_MAX;
   }
   t->owner_thread = pthread_self();
   atomic_init(&t->cross_thread_violations, 0);
   t->limits = limits;
+  t->ifmon_pipe[0] = -1;
+  t->ifmon_pipe[1] = -1;
   size_t recovery_object_bytes =
       limits.max_fec_object_size < TRANSPORT_MAX_FEC_GROUP_SIZE
           ? limits.max_fec_object_size
           : TRANSPORT_MAX_FEC_GROUP_SIZE;
   if (!transport_sent_cache_init(&t->sent_cache,
                                  limits.max_recovery_cache_bytes,
-                                 recovery_object_bytes)) {
-    free(t);
-    return NULL;
-  }
+                                 recovery_object_bytes))
+    goto Fail;
   if (config->repair_mode != TRANSPORT_REPAIR_MODE_AUTO &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_INDEXED &&
-      config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS) {
-    transport_sent_cache_destroy(&t->sent_cache);
-    free(t);
-    return NULL;
-  }
+      config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS)
+    goto Fail;
   t->repair_mode = config->repair_mode;
   t->next_conn_id = 1;
-  t->ifmon_pipe[0] = -1;
-  t->ifmon_pipe[1] = -1;
 
   t->conns = calloc(t->limits.max_connections, sizeof(*t->conns));
-  if (!t->conns) {
-    transport_sent_cache_destroy(&t->sent_cache);
-    free(t);
-    return NULL;
-  }
-  for (size_t i = 0; i < config->num_bind_hosts; i++) {
-    if (!transport_egress_init(&t->egress[i],
-                               t->limits.max_egress_packets_per_socket,
-                               t->limits.max_egress_bytes_per_socket)) {
-      transport_destroy(t);
-      return NULL;
-    }
-  }
-
+  if (!t->conns)
+    goto Fail;
   if (!transport_arena_init(&t->arena, 16U * 1024U * 1024U)) {
     transport_log(t, TRANSPORT_LOG_ERROR, "memory", 0, SIZE_MAX,
                   "failed to allocate packet arena");
-    for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
-      transport_egress_destroy(&t->egress[i]);
-    free(t->conns);
-    free(t);
-    return NULL;
+    goto Fail;
   }
 
   t->callback = config->callback;
@@ -973,6 +965,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->log_callback = config->log_callback;
   t->log_user_data = config->log_user_data;
   t->is_server = (config->num_remote_hosts == 0);
+  t->bind_port = t->is_server ? config->port : 0;
   t->reconnect_enabled = !t->is_server && config->reconnect_enabled;
   t->reconnect_initial_delay_ms =
       config->reconnect_initial_delay_ms != 0
@@ -1080,64 +1073,25 @@ transport_t *transport_create(const transport_config_t *config) {
   t->quic_ctx.transport_params.active_connection_id_limit = 8;
   t->quic_ctx.transport_params.initial_max_path_id = TRANSPORT_MAX_PATHS;
 
-  t->num_fds = config->num_bind_hosts;
   t->num_remote_addrs = config->num_remote_hosts;
-
-  for (size_t i = 0; i < t->num_fds; i++) {
-    if (strchr(config->bind_hosts[i], ':')) {
-      struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->local_addrs[i];
-      sin6->sin6_family = AF_INET6;
-      if (inet_pton(AF_INET6, config->bind_hosts[i], &sin6->sin6_addr) != 1) {
-        transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
-                      "invalid IPv6 bind address: %s", config->bind_hosts[i]);
-        transport_destroy(t);
-        return NULL;
-      }
-      sin6->sin6_port = t->is_server ? htons(config->port) : 0;
-      t->local_addrs_len[i] = sizeof(struct sockaddr_in6);
-      t->fds[i] = open_unicast_socket(AF_INET6);
-    } else {
-      struct sockaddr_in *sin = (struct sockaddr_in *)&t->local_addrs[i];
-      sin->sin_family = AF_INET;
-      if (inet_pton(AF_INET, config->bind_hosts[i], &sin->sin_addr) != 1) {
-        transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
-                      "invalid IPv4 bind address: %s", config->bind_hosts[i]);
-        transport_destroy(t);
-        return NULL;
-      }
-      sin->sin_port = t->is_server ? htons(config->port) : 0;
-      t->local_addrs_len[i] = sizeof(struct sockaddr_in);
-      t->fds[i] = open_unicast_socket(AF_INET);
+  for (size_t i = 0; i < config->num_bind_hosts; i++) {
+    transport_socket_t *socket = &t->sockets[i];
+    if (!parse_address(config->bind_hosts[i], t->bind_port, &socket->local_addr,
+                       &socket->local_addr_len)) {
+      transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
+                    "invalid IPv%d bind address: %s",
+                    socket->local_addr.ss_family == AF_INET6 ? 6 : 4,
+                    config->bind_hosts[i]);
+      goto Fail;
     }
-    if (t->fds[i] < 0) {
-      transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i,
-                    "socket creation failed: %s", strerror(errno));
-      transport_destroy(t);
-      return NULL;
+    const char *error = open_local_socket(t, socket);
+    if (error) {
+      transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i, "%s for %s:%u: %s",
+                    error, config->bind_hosts[i], config->port,
+                    strerror(errno));
+      goto Fail;
     }
-
-    /* Unicast endpoints must own their local UDP tuple exclusively. On Linux,
-     * SO_REUSEADDR also permits bind(port=0) to reuse an occupied ephemeral
-     * port: a later endpoint then steals an earlier endpoint's QUIC replies.
-     * Only the separate multicast receive sockets need address reuse. */
-
-    if (bind(t->fds[i], (struct sockaddr *)&t->local_addrs[i],
-             t->local_addrs_len[i]) != 0) {
-      transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i,
-                    "bind failed for %s:%u: %s", config->bind_hosts[i],
-                    config->port, strerror(errno));
-      transport_destroy(t);
-      return NULL;
-    }
-
-    configure_socket_buffers(t, t->fds[i]);
-
-    if (!set_fd_nonblocking(t->fds[i])) {
-      transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i,
-                    "failed to make socket nonblocking: %s", strerror(errno));
-      transport_destroy(t);
-      return NULL;
-    }
+    t->socket_count++;
   }
   resolve_configured_interfaces(t);
 
@@ -1147,8 +1101,7 @@ transport_t *transport_create(const transport_config_t *config) {
                                                config->key_file) != 0) {
       transport_log(t, TRANSPORT_LOG_ERROR, "tls", 0, SIZE_MAX,
                     "failed to load TLS identity");
-      transport_destroy(t);
-      return NULL;
+      goto Fail;
     }
   }
 
@@ -1161,8 +1114,7 @@ transport_t *transport_create(const transport_config_t *config) {
                       "failed to load CA certificates from %s",
                       config->ca_file);
         X509_STORE_free(store);
-        transport_destroy(t);
-        return NULL;
+        goto Fail;
       }
     }
 
@@ -1175,8 +1127,7 @@ transport_t *transport_create(const transport_config_t *config) {
       if (store) {
         X509_STORE_free(store);
       }
-      transport_destroy(t);
-      return NULL;
+      goto Fail;
     }
     if (store) {
       X509_STORE_free(store); /* drop our local reference */
@@ -1198,68 +1149,73 @@ transport_t *transport_create(const transport_config_t *config) {
     if (strlen(config->remote_hosts[0]) >= sizeof(t->server_name)) {
       transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, SIZE_MAX,
                     "remote host name exceeds implementation limit");
-      transport_destroy(t);
-      return NULL;
+      goto Fail;
     }
     strcpy(t->server_name, config->remote_hosts[0]);
     for (size_t i = 0; i < t->num_remote_addrs; i++) {
-      if (strchr(config->remote_hosts[i], ':')) {
-        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->remote_addrs[i];
-        sin6->sin6_family = AF_INET6;
-        sin6->sin6_port = htons(config->port);
-        if (inet_pton(AF_INET6, config->remote_hosts[i], &sin6->sin6_addr) !=
-            1) {
-          transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
-                        "invalid IPv6 remote address: %s",
-                        config->remote_hosts[i]);
-          transport_destroy(t);
-          return NULL;
-        }
-        t->remote_addrs_len[i] = sizeof(struct sockaddr_in6);
-      } else {
-        struct sockaddr_in *sin = (struct sockaddr_in *)&t->remote_addrs[i];
-        sin->sin_family = AF_INET;
-        sin->sin_port = htons(config->port);
-        if (inet_pton(AF_INET, config->remote_hosts[i], &sin->sin_addr) != 1) {
-          transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
-                        "invalid IPv4 remote address: %s",
-                        config->remote_hosts[i]);
-          transport_destroy(t);
-          return NULL;
-        }
-        t->remote_addrs_len[i] = sizeof(struct sockaddr_in);
+      socklen_t length;
+      if (!parse_address(config->remote_hosts[i], config->port,
+                         &t->remote_addrs[i], &length)) {
+        transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
+                      "invalid IPv%d remote address: %s",
+                      t->remote_addrs[i].ss_family == AF_INET6 ? 6 : 4,
+                      config->remote_hosts[i]);
+        goto Fail;
       }
     }
 
-    if (t->num_remote_addrs > 1 && t->num_fds > t->num_remote_addrs) {
+    if (t->num_remote_addrs > 1 && t->socket_count > t->num_remote_addrs) {
       transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, SIZE_MAX,
                     "multiple remote hosts require at least one remote for "
                     "each configured bind host");
-      transport_destroy(t);
-      return NULL;
+      goto Fail;
     }
-    for (size_t i = 0; i < t->num_fds; i++) {
+    for (size_t i = 0; i < t->socket_count; i++) {
       size_t remote_index = t->num_remote_addrs == 1 ? 0 : i;
       if (!path_endpoint_families_match(t, i, remote_index)) {
         transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
                       "remote host %zu uses a different address family",
                       remote_index);
-        transport_destroy(t);
-        return NULL;
+        goto Fail;
       }
-      t->local_remote_indices[i] = remote_index;
+      t->sockets[i].remote_index = remote_index;
     }
 
     if (!start_client_connection(t)) {
       transport_log(t, TRANSPORT_LOG_ERROR, "connection", 0, SIZE_MAX,
                     "failed to create initial client connection");
-      transport_destroy(t);
-      return NULL;
+      goto Fail;
     }
   }
 
-  /* make socket nonblocking is handled in the loop */
   return t;
+
+Fail:
+  transport_destroy(t);
+  return NULL;
+}
+
+static void destroy_connection(transport_conn_t *conn) {
+  transport_t *t = conn->transport;
+  quicly_free(conn->quic);
+  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
+    transport_release_assembler(t, &conn->assemblers[i]);
+  destroy_connection_subscriptions(conn);
+  free(conn);
+}
+
+static void dispose_tls_identity(ptls_context_t *tls,
+                                 ptls_openssl_sign_certificate_t *signer) {
+  if (!tls || !signer)
+    return;
+  if (tls->sign_certificate)
+    ptls_openssl_dispose_sign_certificate(signer);
+  for (size_t i = 0; i < tls->certificates.count; i++)
+    free(tls->certificates.list[i].base);
+  free(tls->certificates.list);
+  tls->certificates.list = NULL;
+  tls->certificates.count = 0;
+  tls->sign_certificate = NULL;
 }
 
 void transport_destroy(transport_t *t) {
@@ -1280,31 +1236,11 @@ void transport_destroy(transport_t *t) {
     CLOSE_SOCKET(t->ifmon_pipe[1]);
   }
 
-  for (size_t i = 0; i < t->num_fds; i++) {
-    if (t->fds[i] >= 0) {
-      CLOSE_SOCKET(t->fds[i]);
-    }
-  }
   for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
-    transport_egress_destroy(&t->egress[i]);
+    destroy_socket(&t->sockets[i]);
 
-  if (t->is_server) {
-    for (size_t i = 0; i < t->conn_count; i++) {
-      transport_conn_t *conn = t->conns[i];
-      quicly_free(conn->quic);
-      for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
-        transport_release_assembler(t, &conn->assemblers[a]);
-      destroy_connection_subscriptions(conn);
-      free(conn);
-    }
-  } else if (t->client_conn) {
-    transport_conn_t *conn = t->client_conn;
-    quicly_free(conn->quic);
-    for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
-      transport_release_assembler(t, &conn->assemblers[a]);
-    destroy_connection_subscriptions(conn);
-    free(conn);
-  }
+  for (size_t i = 0; i < transport_connection_count(t); i++)
+    destroy_connection(transport_connection_at(t, i));
 
   transport_sent_cache_destroy(&t->sent_cache);
   transport_fec_cache_destroy(&t->fec_cache);
@@ -1315,445 +1251,114 @@ void transport_destroy(transport_t *t) {
     quicly_free_default_cid_encryptor(t->quic_ctx.cid_encryptor);
   }
 
-  if (t->fec_buf) {
-    free(t->fec_buf);
+  if (t->pending_group.data) {
+    free(t->pending_group.data);
   }
 
   if (t->verifier_initialized) {
     ptls_openssl_dispose_verify_certificate(&t->verifier);
   }
 
-  if (t->tls_ctx.sign_certificate) {
-    ptls_openssl_dispose_sign_certificate(&t->sign_cert);
-  }
-  for (size_t i = 0; i < t->tls_ctx.certificates.count; i++)
-    free(t->tls_ctx.certificates.list[i].base);
-  free(t->tls_ctx.certificates.list);
+  dispose_tls_identity(&t->tls_ctx, &t->sign_cert);
 
   free(t->conns);
   free(t);
 }
 
-void transport_tick(transport_t *t) {
-  if (!transport_owner_ok(t))
+static void add_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
+  if (!path_interface_allowed(t, msg->name) ||
+      t->socket_count >= TRANSPORT_MAX_PATHS)
     return;
-  if (t->tick_active) {
-    t->stats.recursive_tick_rejections++;
+  for (size_t i = 0; i < t->socket_count; i++)
+    if (transport_address_equal(
+            (const struct sockaddr *)&t->sockets[i].local_addr,
+            (const struct sockaddr *)&msg->addr))
+      return;
+
+  size_t local_index = t->socket_count;
+  transport_socket_t *socket = &t->sockets[local_index];
+  socket->local_addr = msg->addr;
+  socket->local_addr_len = msg->addr_len;
+  socket->interface_index = msg->index;
+  copy_interface_name(socket->interface_name, msg->name);
+  set_address_port(&socket->local_addr, t->bind_port);
+  if (open_local_socket(t, socket))
     return;
-  }
-  t->tick_active = true;
+  bind_to_device(socket->fd, msg->index);
+  t->socket_count++;
 
-  for (size_t i = 0; i < t->num_fds; i++)
-    (void)transport_egress_flush(&t->egress[i], t->fds[i]);
-
-  int64_t now_nack_ms = transport_get_time_ms();
-  if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
-      !t->shutting_down && now_nack_ms >= t->reconnect_at_ms) {
-    t->stats.reconnect_attempts++;
-    t->reconnect_in_progress = true;
-    if (!start_client_connection(t)) {
-      t->stats.reconnect_failed++;
-      t->reconnect_in_progress = false;
-      schedule_client_reconnect(t, now_nack_ms);
-      transport_log(t, TRANSPORT_LOG_WARNING, "connection", 0, SIZE_MAX,
-                    "reconnect attempt failed; retry scheduled");
+  if (!t->is_server) {
+    socket->remote_index = select_remote_for_added_local(t, local_index);
+    if (socket->remote_index == SIZE_MAX) {
+      destroy_socket(socket);
+      t->socket_count--;
+      return;
     }
+    socket->open_pending = true;
   }
 
-  /* Expiration releases memory and reports loss even when the receiver-wide
-   * NACK budget is exhausted. It must not be gated by request admission. */
-  size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
-  for (size_t c = 0; c < active_conns; c++) {
-    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
-    if (!conn || !conn->quic ||
-        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+  char ip_str[64];
+  const void *address =
+      msg->addr.ss_family == AF_INET
+          ? (const void *)&((const struct sockaddr_in *)&msg->addr)->sin_addr
+          : (const void *)&((const struct sockaddr_in6 *)&msg->addr)->sin6_addr;
+  inet_ntop(msg->addr.ss_family, address, ip_str, sizeof(ip_str));
+  transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, local_index,
+                "opened socket for local IP %s", ip_str);
+}
+
+static void remove_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
+  for (size_t i = 0; i < t->socket_count; i++) {
+    bool match = msg->addr.ss_family == AF_UNSPEC
+                     ? t->sockets[i].interface_index == msg->index
+                     : transport_address_equal(
+                           (const struct sockaddr *)&t->sockets[i].local_addr,
+                           (const struct sockaddr *)&msg->addr);
+    if (!match)
       continue;
-    transport_protocol_flush_recovery_acks(conn);
-    for (size_t i = transport_next_assembler(conn, 0);
-         i < t->limits.max_assemblers_per_connection;
-         i = transport_next_assembler(conn, i + 1U)) {
-      frame_assembler_t *asm_slot = &conn->assemblers[i];
-      if (asm_slot->total_symbols == 0)
-        continue;
-      if (now_nack_ms - asm_slot->last_activity_time_ms >=
-          t->fec_assembler_timeout_ms) {
-        moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
-                                                  asm_slot->track_id,
-                                                  &resolved_track) == 0) {
-          transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
-                                  .conn = conn,
-                                  .track_id = resolved_track,
-                                  .object = {.track_id = resolved_track,
-                                             .group_id = asm_slot->group_id,
-                                             .object_id = asm_slot->object_id}};
-          t->stats.fec_objects_lost++;
-          transport_emit_event(t, &ev);
-        }
-        transport_release_assembler(t, asm_slot);
-        continue;
-      }
-    }
+    accumulate_egress_stats(&t->stats, &t->sockets[i].egress, true);
+    destroy_socket(&t->sockets[i]);
+    remove_connection_physical_slot(t, i);
+    for (size_t j = i; j + 1 < t->socket_count; j++)
+      t->sockets[j] = t->sockets[j + 1];
+    t->sockets[--t->socket_count] =
+        (transport_socket_t){.fd = -1, .remote_index = SIZE_MAX};
+    transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, i,
+                  "removed socket for local IP");
+    break;
   }
+}
 
-  /* Bound aggregate feedback and rotate the starting peer after admission.
-   * Skip the more expensive alias/repair scans while no token is available. */
-  size_t object_nack_budget = 32;
-  uint64_t aggregate_wait = transport_repair_limiter_wait_ms(
-      &t->aggregate_nack_limiter,
-      t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
-  if (aggregate_wait != 0)
-    goto aggregate_nack_exhausted;
-  t->aggregate_nack_retry_at_ms = 0;
-  size_t recovery_start =
-      active_conns == 0 ? 0 : t->recovery_conn_cursor % active_conns;
-  for (size_t offset = 0; offset < active_conns; offset++) {
-    size_t c = (recovery_start + offset) % active_conns;
-    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
-    if (!conn || !conn->quic ||
-        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
-      continue;
-
-    for (size_t slot = 0;
-         slot < conn->receive_subscriptions.capacity && object_nack_budget > 0;
-         slot++) {
-      const track_subscription_t *sub =
-          &conn->receive_subscriptions.entries[slot];
-      if (!sub->active)
-        continue;
-      uint8_t alias = sub->alias;
-      transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
-      if (!gap)
-        continue;
-      if (gap->pending_mask != 0 &&
-          now_nack_ms - gap->detected_at_ms >= QLINQ_FEC_NACK_DELAY_MS) {
-        for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
-          if ((gap->pending_mask & (1U << bit)) == 0)
-            continue;
-          aggregate_wait = transport_repair_limiter_wait_ms(
-              &t->aggregate_nack_limiter,
-              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
-          if (aggregate_wait != 0)
-            goto aggregate_nack_exhausted;
-          if (transport_protocol_send_nack(conn, (uint8_t)alias, gap->group_id,
-                                           gap->pending_base + bit, NULL, 0,
-                                           true)) {
-            gap->detected_at_ms = now_nack_ms;
-            object_nack_budget--;
-            t->recovery_conn_cursor = (c + 1U) % active_conns;
-          } else {
-            break;
-          }
-        }
-      }
-
-      for (size_t window_index = 0;
-           window_index < QLINQ_RECOVERY_MAX_WINDOWS && object_nack_budget > 0;
-           window_index++) {
-        transport_recovery_window_t *window =
-            &gap->recovery_windows[window_index];
-        if (!window->active || window->missing_mask == 0 ||
-            now_nack_ms - window->last_request_ms <
-                QLINQ_FEC_COMPLETION_RETRY_MS)
-          continue;
-        /* Pipeline distinct missing objects within the existing tick, token
-         * and control-queue budgets. One request per retry interval adds
-         * 500 ms between requests for a burst of lost objects. Keep the start
-         * fixed while the cursor advances after each admitted request. */
-        uint32_t first_bit = window->cursor;
-        for (uint32_t attempt = 0;
-             attempt < QLINQ_RECOVERY_WINDOW_OBJECTS && object_nack_budget > 0;
-             attempt++) {
-          uint32_t bit = (first_bit + attempt) % QLINQ_RECOVERY_WINDOW_OBJECTS;
-          if ((window->missing_mask & (1U << bit)) == 0)
-            continue;
-          uint64_t object_id = window->first_object_id + bit;
-          if (object_id > window->final_object_id)
-            continue;
-          if (transport_find_assembler(conn, alias, window->group_id,
-                                       object_id))
-            continue;
-          aggregate_wait = transport_repair_limiter_wait_ms(
-              &t->aggregate_nack_limiter,
-              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
-          if (aggregate_wait != 0)
-            goto aggregate_nack_exhausted;
-          if (transport_protocol_send_nack(conn, (uint8_t)alias,
-                                           window->group_id, object_id, NULL, 0,
-                                           true)) {
-            window->cursor =
-                (uint8_t)((bit + 1U) % QLINQ_RECOVERY_WINDOW_OBJECTS);
-            window->last_request_ms = now_nack_ms;
-            object_nack_budget--;
-            t->recovery_conn_cursor = (c + 1U) % active_conns;
-          } else {
-            break;
-          }
-        }
-      }
-    }
-
-    for (size_t i = transport_next_assembler(conn, 0);
-         i < t->limits.max_assemblers_per_connection;
-         i = transport_next_assembler(conn, i + 1U)) {
-      frame_assembler_t *asm_slot = &conn->assemblers[i];
-      if (asm_slot->total_symbols == 0)
-        continue;
-
-      if (!asm_slot->decoded &&
-          now_nack_ms - asm_slot->first_symbol_time_ms >=
-              QLINQ_FEC_NACK_DELAY_MS &&
-          (!asm_slot->nack_sent || now_nack_ms - asm_slot->last_nack_time_ms >=
-                                       QLINQ_FEC_NACK_DELAY_MS)) {
-        moq_track_id_t resolved_track;
-        if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
-                                                  asm_slot->track_id,
-                                                  &resolved_track) != 0 ||
-            !(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
-          continue; /* Fixed RS-FEC does not send NACKs */
-        transport_repair_mode_t repair_mode =
-            transport_get_effective_repair_mode(t, conn, &resolved_track);
-        uint16_t missing_count = 0;
-        const uint16_t *missing = NULL;
-        if (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-          missing_count = asm_slot->received_count < asm_slot->data_symbols
-                              ? (uint16_t)(asm_slot->data_symbols -
-                                           asm_slot->received_count)
-                              : 1U;
-          if (missing_count > TRANSPORT_REPAIR_MAX_SYMBOLS)
-            missing_count = TRANSPORT_REPAIR_MAX_SYMBOLS;
-        } else {
-          for (uint16_t s = 0; s < asm_slot->total_symbols; s++) {
-            if (!asm_slot->received_mask[s] &&
-                missing_count < TRANSPORT_REPAIR_MAX_SYMBOLS) {
-              asm_slot->missing_indices[missing_count++] = s;
-            }
-          }
-          missing = asm_slot->missing_indices;
-        }
-        if (missing_count > 0) {
-          aggregate_wait = transport_repair_limiter_wait_ms(
-              &t->aggregate_nack_limiter,
-              t->limits.max_aggregate_nack_requests_per_second, now_nack_ms);
-          if (aggregate_wait != 0)
-            goto aggregate_nack_exhausted;
-          if (transport_protocol_send_nack(
-                  conn, asm_slot->track_id, asm_slot->group_id,
-                  asm_slot->object_id, missing, missing_count, false)) {
-            asm_slot->nack_sent = true;
-            asm_slot->last_nack_time_ms = now_nack_ms;
-            t->recovery_conn_cursor = (c + 1U) % active_conns;
-          }
-        }
-      }
-    }
+static void service_interfaces(transport_t *t) {
+  if (t->ifmon_pipe[0] < 0)
+    return;
+  ifmon_pipe_msg_t msg;
+  while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
+    if (msg.is_added)
+      add_interface(t, &msg);
+    else
+      remove_interface(t, &msg);
   }
+}
 
-  goto recovery_sweep_done;
-
-aggregate_nack_exhausted:
-  t->aggregate_nack_retry_at_ms =
-      aggregate_wait == UINT64_MAX ||
-              aggregate_wait > (uint64_t)(INT64_MAX - now_nack_ms)
-          ? INT64_MAX
-          : now_nack_ms + (int64_t)aggregate_wait;
-
-recovery_sweep_done:
-  /* Check for FEC grouping buffer timeout (3 milliseconds) */
-  if (t->fec_buf_len > 0) {
-    uint64_t now = ptls_get_time.cb(&ptls_get_time);
-    if ((now - t->fec_first_pkt_time) >= 3) {
-      (void)transport_publish_flush_grouped(t);
-    }
-  }
-
-  /* process ifmon events */
-  if (t->ifmon_pipe[0] >= 0) {
-    ifmon_pipe_msg_t msg;
-    while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
-      if (msg.is_added) {
-        if (!path_interface_allowed(t, msg.name))
-          continue;
-        if (t->num_fds < TRANSPORT_MAX_PATHS) {
-          /* Deduplicate: Check if this IP is already bound */
-          int is_duplicate = 0;
-          for (size_t i = 0; i < t->num_fds; i++) {
-            if (t->local_addrs[i].ss_family == msg.addr.ss_family) {
-              if (msg.addr.ss_family == AF_INET) {
-                struct sockaddr_in *s1 =
-                    (struct sockaddr_in *)&t->local_addrs[i];
-                struct sockaddr_in *s2 = (struct sockaddr_in *)&msg.addr;
-                if (s1->sin_addr.s_addr == s2->sin_addr.s_addr)
-                  is_duplicate = 1;
-              } else if (msg.addr.ss_family == AF_INET6) {
-                struct sockaddr_in6 *s1 =
-                    (struct sockaddr_in6 *)&t->local_addrs[i];
-                struct sockaddr_in6 *s2 = (struct sockaddr_in6 *)&msg.addr;
-                if (memcmp(&s1->sin6_addr, &s2->sin6_addr,
-                           sizeof(struct in6_addr)) == 0)
-                  is_duplicate = 1;
-              }
-            }
-          }
-          if (is_duplicate) {
-            continue;
-          }
-
-          int fd = open_unicast_socket(msg.addr.ss_family);
-          if (fd >= 0) {
-            /* Keep dynamically discovered unicast paths exclusive too. */
-            configure_socket_buffers(t, fd);
-            if (msg.addr.ss_family == AF_INET) {
-              ((struct sockaddr_in *)&msg.addr)->sin_port =
-                  t->is_server
-                      ? (t->local_addrs[0].ss_family == AF_INET
-                             ? ((struct sockaddr_in *)&t->local_addrs[0])
-                                   ->sin_port
-                             : ((struct sockaddr_in6 *)&t->local_addrs[0])
-                                   ->sin6_port)
-                      : 0;
-            } else {
-              ((struct sockaddr_in6 *)&msg.addr)->sin6_port =
-                  t->is_server
-                      ? (t->local_addrs[0].ss_family == AF_INET
-                             ? ((struct sockaddr_in *)&t->local_addrs[0])
-                                   ->sin_port
-                             : ((struct sockaddr_in6 *)&t->local_addrs[0])
-                                   ->sin6_port)
-                      : 0;
-            }
-
-            if (bind(fd, (struct sockaddr *)&msg.addr, msg.addr_len) == 0) {
-              if (!set_fd_nonblocking(fd)) {
-                CLOSE_SOCKET(fd);
-                continue;
-              }
-              bind_to_device(fd, msg.index);
-
-              if (!transport_egress_init(
-                      &t->egress[t->num_fds],
-                      t->limits.max_egress_packets_per_socket,
-                      t->limits.max_egress_bytes_per_socket)) {
-                CLOSE_SOCKET(fd);
-                continue;
-              }
-
-              size_t local_index = t->num_fds;
-              t->fds[local_index] = fd;
-              t->local_addrs[local_index] = msg.addr;
-              t->local_addrs_len[local_index] = msg.addr_len;
-              t->local_ifindices[local_index] = msg.index;
-              copy_interface_name(t->local_ifnames[local_index], msg.name);
-              t->num_fds++;
-
-              if (!t->is_server) {
-                size_t remote_index =
-                    select_remote_for_added_local(t, local_index);
-                if (remote_index == SIZE_MAX) {
-                  transport_egress_destroy(&t->egress[local_index]);
-                  CLOSE_SOCKET(t->fds[local_index]);
-                  t->fds[local_index] = -1;
-                  memset(&t->local_addrs[local_index], 0,
-                         sizeof(t->local_addrs[local_index]));
-                  t->local_addrs_len[local_index] = 0;
-                  t->local_ifindices[local_index] = 0;
-                  memset(t->local_ifnames[local_index], 0,
-                         sizeof(t->local_ifnames[local_index]));
-                  t->num_fds--;
-                  continue;
-                }
-                t->local_remote_indices[local_index] = remote_index;
-                t->path_open_pending[local_index] = true;
-              }
-
-              char ip_str[64];
-              if (msg.addr.ss_family == AF_INET) {
-                inet_ntop(AF_INET, &((struct sockaddr_in *)&msg.addr)->sin_addr,
-                          ip_str, sizeof(ip_str));
-              } else {
-                inet_ntop(AF_INET6,
-                          &((struct sockaddr_in6 *)&msg.addr)->sin6_addr,
-                          ip_str, sizeof(ip_str));
-              }
-              transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, local_index,
-                            "opened socket for local IP %s", ip_str);
-
-            } else {
-              CLOSE_SOCKET(fd);
-            }
-          }
-        }
-      } else {
-        /* ip removed */
-        for (size_t i = 0; i < t->num_fds; i++) {
-          int match = msg.addr.ss_family == AF_UNSPEC
-                          ? t->local_ifindices[i] == msg.index
-                          : 0;
-          if (!match && t->local_addrs[i].ss_family == msg.addr.ss_family) {
-            if (msg.addr.ss_family == AF_INET) {
-              struct sockaddr_in *s1 = (struct sockaddr_in *)&t->local_addrs[i];
-              struct sockaddr_in *s2 = (struct sockaddr_in *)&msg.addr;
-              if (s1->sin_addr.s_addr == s2->sin_addr.s_addr)
-                match = 1;
-            } else {
-              struct sockaddr_in6 *s1 =
-                  (struct sockaddr_in6 *)&t->local_addrs[i];
-              struct sockaddr_in6 *s2 = (struct sockaddr_in6 *)&msg.addr;
-              if (memcmp(&s1->sin6_addr, &s2->sin6_addr,
-                         sizeof(struct in6_addr)) == 0)
-                match = 1;
-            }
-          }
-          if (match) {
-            accumulate_egress_stats(t, &t->egress[i], true);
-            transport_egress_destroy(&t->egress[i]);
-            CLOSE_SOCKET(t->fds[i]);
-            remove_connection_physical_slot(t, i);
-            /* remove from array */
-            for (size_t j = i; j < t->num_fds - 1; j++) {
-              t->fds[j] = t->fds[j + 1];
-              t->local_addrs[j] = t->local_addrs[j + 1];
-              t->local_addrs_len[j] = t->local_addrs_len[j + 1];
-              t->local_ifindices[j] = t->local_ifindices[j + 1];
-              memcpy(t->local_ifnames[j], t->local_ifnames[j + 1],
-                     sizeof(t->local_ifnames[j]));
-              t->udp_bytes_received[j] = t->udp_bytes_received[j + 1];
-              t->egress[j] = t->egress[j + 1];
-              t->local_remote_indices[j] = t->local_remote_indices[j + 1];
-              t->path_open_pending[j] = t->path_open_pending[j + 1];
-              t->path_open_retry_at[j] = t->path_open_retry_at[j + 1];
-            }
-            t->num_fds--;
-            memset(t->local_ifnames[t->num_fds], 0,
-                   sizeof(t->local_ifnames[t->num_fds]));
-            t->udp_bytes_received[t->num_fds] = 0;
-            memset(&t->egress[t->num_fds], 0, sizeof(t->egress[t->num_fds]));
-            t->local_remote_indices[t->num_fds] = SIZE_MAX;
-            t->path_open_pending[t->num_fds] = false;
-            t->path_open_retry_at[t->num_fds] = 0;
-            transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, i,
-                          "removed socket for local IP");
-            break;
-          }
-        }
-      }
-    }
-  }
-
+static void receive_packets(transport_t *t) {
   size_t receive_budget = t->limits.max_packets_per_tick;
-  size_t receive_start = t->num_fds ? t->receive_cursor % t->num_fds : 0;
-  t->receive_cursor = t->num_fds ? (receive_start + 1U) % t->num_fds : 0;
-  size_t quantum =
-      t->num_fds ? (receive_budget + t->num_fds - 1U) / t->num_fds : 0;
-  for (size_t visited = 0; visited < t->num_fds && receive_budget > 0;
+  size_t receive_start =
+      t->socket_count ? t->receive_cursor % t->socket_count : 0;
+  t->receive_cursor =
+      t->socket_count ? (receive_start + 1U) % t->socket_count : 0;
+  size_t quantum = t->socket_count ? (receive_budget + t->socket_count - 1U) /
+                                         t->socket_count
+                                   : 0;
+  for (size_t visited = 0; visited < t->socket_count && receive_budget > 0;
        visited++) {
-    size_t fd_idx = (receive_start + visited) % t->num_fds;
+    size_t fd_idx = (receive_start + visited) % t->socket_count;
     size_t serviced = 0;
     while (receive_budget > 0 && serviced < quantum) {
       uint8_t buf[2048];
       struct sockaddr_storage sa;
       socklen_t sa_len = sizeof(sa);
-      ssize_t rret = recvfrom(t->fds[fd_idx], buf, sizeof(buf), 0,
+      ssize_t rret = recvfrom(t->sockets[fd_idx].fd, buf, sizeof(buf), 0,
                               (struct sockaddr *)&sa, &sa_len);
       if (rret == -1) {
         if (SOCKET_ERROR_CODE == SOCKET_EAGAIN ||
@@ -1765,7 +1370,7 @@ recovery_sweep_done:
       }
       receive_budget--;
       serviced++;
-      t->udp_bytes_received[fd_idx] += (uint64_t)rret;
+      t->sockets[fd_idx].bytes_received += (uint64_t)rret;
 
       struct sockaddr *psa = (struct sockaddr *)&sa;
 
@@ -1786,16 +1391,16 @@ recovery_sweep_done:
               !QUICLY_PACKET_IS_LONG_HEADER(decoded.octets.base[0])) {
             transport_conn_t *hint =
                 transport_connection_cache_find(t, &decoded.cid.dest.plaintext);
-            if (hint &&
-                quicly_is_destination(
-                    hint->quic, (struct sockaddr *)&t->local_addrs[fd_idx], psa,
-                    &decoded))
+            if (hint && quicly_is_destination(
+                            hint->quic,
+                            (struct sockaddr *)&t->sockets[fd_idx].local_addr,
+                            psa, &decoded))
               target = hint;
           }
           for (size_t i = 0; !target && i < t->conn_count; ++i) {
             if (quicly_is_destination(
                     t->conns[i]->quic,
-                    (struct sockaddr *)&t->local_addrs[fd_idx], psa,
+                    (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
                     &decoded)) {
               target = t->conns[i];
               transport_connection_cache_remember(t, target);
@@ -1808,8 +1413,8 @@ recovery_sweep_done:
             quicly_cid_plaintext_t connection_cid = t->next_cid;
             int accept_res =
                 quicly_accept(&new_quic, &t->quic_ctx,
-                              (struct sockaddr *)&t->local_addrs[fd_idx], psa,
-                              &decoded, NULL, &connection_cid, NULL, NULL);
+                              (struct sockaddr *)&t->sockets[fd_idx].local_addr,
+                              psa, &decoded, NULL, &connection_cid, NULL, NULL);
             if (accept_res == 0 && new_quic) {
               t->next_cid.master_id++;
               target = calloc(1, sizeof(transport_conn_t));
@@ -1849,64 +1454,64 @@ recovery_sweep_done:
 
         if (target) {
           quicly_receive(target->quic,
-                         (struct sockaddr *)&t->local_addrs[fd_idx], psa,
+                         (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
                          &decoded);
         }
       }
     }
   }
+}
 
-  /* run tick timeout for active connections and check sends */
-  uint64_t now = ptls_get_time.cb(&ptls_get_time);
-
-  if (now - t->last_pathflow_update >= 25) {
+static void update_path_measurements(transport_t *t, uint64_t now) {
+  if (now - t->last_pathflow_update >= QLINQ_PATHFLOW_UPDATE_MS) {
     t->last_pathflow_update = now;
     /* Peer limits are unchanged throughout this synchronous update. Resolve
      * their common symbol size once, instead of scanning the cohort again
      * for each connection. */
     size_t symbol_size = transport_get_datagram_symbol_size(t);
 
-    size_t update_count =
-        t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+    size_t update_count = transport_connection_count(t);
     for (size_t c = 0; c < update_count; c++) {
-      transport_conn_t *target = t->is_server ? t->conns[c] : t->client_conn;
+      transport_conn_t *target = transport_connection_at(t, c);
       if (!target || !target->quic)
         continue;
-      for (size_t i = 0; i < t->num_fds; i++) {
-        if (target->path_state_overridden[i])
+      for (size_t i = 0; i < t->socket_count; i++) {
+        if (target->paths[i].state_overridden)
           continue;
         quicly_path_stats_t stats;
-        size_t mapped = transport_path_get_stats_by_link(
-            target->quic, t->local_addrs, t->num_fds, i, &stats);
+        size_t mapped = transport_path_get_stats_by_local(
+            target->quic, &t->sockets[i].local_addr, &stats);
         if (mapped == SIZE_MAX ||
             !quicly_is_path_available(target->quic, mapped)) {
           /* A newly available path must start from its own measurements. */
-          memset(&target->path_states[i], 0, sizeof(target->path_states[i]));
-          memset(&target->path_measurements[i], 0,
-                 sizeof(target->path_measurements[i]));
-          memset(&target->path_budgets[i], 0, sizeof(target->path_budgets[i]));
+          memset(&target->paths[i].state, 0, sizeof(target->paths[i].state));
+          memset(&target->paths[i].measurement, 0,
+                 sizeof(target->paths[i].measurement));
+          memset(&target->paths[i].budget, 0, sizeof(target->paths[i].budget));
           continue;
         }
         size_t queued =
             quicly_get_num_datagram_frames_path(target->quic, mapped);
-        if (transport_path_measure(&target->path_measurements[i], &stats,
+        if (transport_path_measure(&target->paths[i].measurement, &stats,
                                    mapped, queued, now))
-          memset(&target->path_budgets[i], 0, sizeof(target->path_budgets[i]));
-        path_t sample =
-            transport_path_estimate(&stats, queued, t->egress[i].bytes,
-                                    symbol_size, target->latest_owd_fp[i]);
-        fp_t cap = transport_path_probe_cap(&target->path_measurements[i],
+          memset(&target->paths[i].budget, 0, sizeof(target->paths[i].budget));
+        path_t sample = transport_path_estimate(
+            &stats, queued, t->sockets[i].egress.bytes, symbol_size,
+            target->paths[i].latest_owd_fp);
+        fp_t cap = transport_path_probe_cap(&target->paths[i].measurement,
                                             &stats, symbol_size, now);
         if (sample.b > cap)
           sample.b = cap;
-        transport_path_update_state(&target->path_states[i], &sample, true);
+        transport_path_update_state(&target->paths[i].state, &sample, true);
       }
     }
   }
+}
 
-  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+static void service_connections(transport_t *t, uint64_t now) {
+  size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; ++i) {
-    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    transport_conn_t *conn = transport_connection_at(t, i);
     if (!conn)
       continue;
 
@@ -1920,8 +1525,9 @@ recovery_sweep_done:
 
     while (1) {
       bool egress_has_room = true;
-      for (size_t p = 0; p < t->num_fds; p++) {
-        if (!transport_egress_can_accept(&t->egress[p], 64U, 64U * 1500U)) {
+      for (size_t p = 0; p < t->socket_count; p++) {
+        if (!transport_egress_can_accept(&t->sockets[p].egress, 64U,
+                                         64U * 1500U)) {
           egress_has_room = false;
           break;
         }
@@ -1937,49 +1543,21 @@ recovery_sweep_done:
        * Quicly may consume the whole output batch on that path, so bound
        * stream-only multipath batches to keep a single decision from steering
        * 64 packets. Datagram publication retains its 64-packet queue batch. */
-      if (t->num_fds > 1 && !quicly_has_datagram_frames(conn->quic))
+      if (t->socket_count > 1 && !quicly_has_datagram_frames(conn->quic))
         num_dgrams = QLINQ_STREAM_MULTIPATH_SEND_BATCH;
       int send_res = quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams,
                                  dgrams_buf, sizeof(dgrams_buf));
       if (send_res == 0) {
-        if (num_dgrams == 0) {
-          if (!quicly_has_datagram_frames(conn->quic))
-            memset(conn->queued_datagrams, 0, sizeof(conn->queued_datagrams));
+        if (num_dgrams == 0)
           break;
-        }
-
-        size_t sent_path =
-            transport_path_find_by_addresses(conn->quic, &src.sa, &dest.sa);
-        if (sent_path < TRANSPORT_MAX_QUIC_PATHS)
-          conn->queued_datagrams[sent_path] =
-              (uint16_t)quicly_get_num_datagram_frames_path(conn->quic,
-                                                            sent_path);
 
         size_t out_fd_index = SIZE_MAX;
-        if (src.sa.sa_family == AF_INET) {
-          struct sockaddr_in *src_in = (struct sockaddr_in *)&src.sa;
-          for (size_t k = 0; k < t->num_fds; k++) {
-            if (t->local_addrs[k].ss_family == AF_INET) {
-              struct sockaddr_in *loc =
-                  (struct sockaddr_in *)&t->local_addrs[k];
-              if (loc->sin_addr.s_addr == src_in->sin_addr.s_addr) {
-                out_fd_index = k;
-                break;
-              }
-            }
-          }
-        } else if (src.sa.sa_family == AF_INET6) {
-          struct sockaddr_in6 *src_in6 = (struct sockaddr_in6 *)&src.sa;
-          for (size_t k = 0; k < t->num_fds; k++) {
-            if (t->local_addrs[k].ss_family == AF_INET6) {
-              struct sockaddr_in6 *loc =
-                  (struct sockaddr_in6 *)&t->local_addrs[k];
-              if (memcmp(&loc->sin6_addr, &src_in6->sin6_addr,
-                         sizeof(struct in6_addr)) == 0) {
-                out_fd_index = k;
-                break;
-              }
-            }
+        for (size_t k = 0; k < t->socket_count; k++) {
+          if (transport_address_equal(
+                  (const struct sockaddr *)&t->sockets[k].local_addr,
+                  &src.sa)) {
+            out_fd_index = k;
+            break;
           }
         }
 
@@ -1991,8 +1569,8 @@ recovery_sweep_done:
         }
 
         if (!transport_egress_submit(
-                &t->egress[out_fd_index], t->fds[out_fd_index], &dest.sa,
-                quicly_get_socklen(&dest.sa), dgrams, num_dgrams))
+                &t->sockets[out_fd_index].egress, t->sockets[out_fd_index].fd,
+                &dest.sa, quicly_get_socklen(&dest.sa), dgrams, num_dgrams))
           transport_log(t, TRANSPORT_LOG_WARNING, "udp", conn->id, out_fd_index,
                         "egress queue exhausted");
       } else if (send_res == QUICLY_ERROR_FREE_CONNECTION) {
@@ -2031,11 +1609,7 @@ recovery_sweep_done:
 
         transport_publish_checkpoint_connection_removed(t, conn);
         transport_connection_cache_forget(t, conn);
-        quicly_free(conn->quic);
-        for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
-          transport_release_assembler(t, &conn->assemblers[a]);
-        destroy_connection_subscriptions(conn);
-        free(conn);
+        destroy_connection(conn);
 
         if (t->is_server) {
           memmove(t->conns + i, t->conns + i + 1,
@@ -2055,6 +1629,48 @@ recovery_sweep_done:
       }
     }
   }
+}
+
+void transport_tick(transport_t *t) {
+  if (!transport_owner_ok(t))
+    return;
+  if (t->tick_active) {
+    t->stats.recursive_tick_rejections++;
+    return;
+  }
+  t->tick_active = true;
+
+  for (size_t i = 0; i < t->socket_count; i++)
+    (void)transport_egress_flush(&t->sockets[i].egress, t->sockets[i].fd);
+
+  int64_t now_nack_ms = transport_get_time_ms();
+  if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
+      !t->shutting_down && now_nack_ms >= t->reconnect_at_ms) {
+    t->stats.reconnect_attempts++;
+    t->reconnect_in_progress = true;
+    if (!start_client_connection(t)) {
+      t->stats.reconnect_failed++;
+      t->reconnect_in_progress = false;
+      schedule_client_reconnect(t, now_nack_ms);
+      transport_log(t, TRANSPORT_LOG_WARNING, "connection", 0, SIZE_MAX,
+                    "reconnect attempt failed; retry scheduled");
+    }
+  }
+
+  transport_recovery_tick(t, now_nack_ms);
+
+  if (t->pending_group.size > 0) {
+    uint64_t now = ptls_get_time.cb(&ptls_get_time);
+    if ((now - t->pending_group.started_at_ms) >= QLINQ_GROUP_FLUSH_MS) {
+      (void)transport_publish_flush_grouped(t);
+    }
+  }
+
+  service_interfaces(t);
+  receive_packets(t);
+  uint64_t now = ptls_get_time.cb(&ptls_get_time);
+  update_path_measurements(t, now);
+  service_connections(t, now);
   t->tick_active = false;
 }
 
@@ -2068,10 +1684,8 @@ static bool subscribe_connection(transport_conn_t *conn,
       &conn->receive_subscriptions, track_id);
   if (existing && existing->track_id.flags != track_id->flags)
     return false;
-  uint8_t alias;
-  bool newly_added = false;
-  if (transport_subscriptions_find_alias(&conn->receive_subscriptions, track_id,
-                                         &alias) != 0) {
+  uint8_t alias = existing ? existing->alias : 0;
+  if (!existing) {
     if (transport_subscriptions_count(&conn->receive_subscriptions) >=
         conn->negotiated_limits.max_subscriptions_per_connection)
       return false;
@@ -2088,14 +1702,11 @@ static bool subscribe_connection(transport_conn_t *conn,
                                      track_id->type, track_id->flags,
                                      track_id->name, alias))
       return false;
-    newly_added = true;
-    memset(transport_object_gap(conn, alias), 0,
-           sizeof((*transport_object_gap(conn, alias))));
   }
 
   if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_SUBSCRIBE,
                                           alias, track_id)) {
-    if (newly_added)
+    if (!existing)
       transport_subscriptions_remove(&conn->receive_subscriptions,
                                      track_id->type, track_id->name);
     return false;
@@ -2147,8 +1758,6 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                           alias, &subscribed_track))
     return false;
 
-  memset(transport_object_gap(conn, alias), 0,
-         sizeof((*transport_object_gap(conn, alias))));
   for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
     if (conn->assemblers[i].total_symbols &&
         conn->assemblers[i].track_id == alias)
@@ -2227,9 +1836,9 @@ void transport_shutdown(transport_t *t, const char *reason) {
   t->shutting_down = true;
   t->reconnect_in_progress = false;
   const char *phrase = reason && reason[0] ? reason : "application shutdown";
-  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  size_t count = transport_connection_count(t);
   for (size_t i = 0; i < count; i++) {
-    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    transport_conn_t *conn = transport_connection_at(t, i);
     if (conn && conn->quic &&
         quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING)
       (void)quicly_close(conn->quic, 0, phrase);
@@ -2241,25 +1850,11 @@ bool transport_is_drained(transport_t *t) {
     return false;
   if (t->is_server ? t->conn_count != 0 : t->client_conn != NULL)
     return false;
-  for (size_t i = 0; i < t->num_fds; i++) {
-    if (t->egress[i].count != 0)
+  for (size_t i = 0; i < t->socket_count; i++) {
+    if (t->sockets[i].egress.count != 0)
       return false;
   }
   return true;
-}
-
-static void dispose_tls_identity(ptls_context_t *tls,
-                                 ptls_openssl_sign_certificate_t *signer) {
-  if (!tls || !signer)
-    return;
-  if (tls->sign_certificate)
-    ptls_openssl_dispose_sign_certificate(signer);
-  for (size_t i = 0; i < tls->certificates.count; i++)
-    free(tls->certificates.list[i].base);
-  free(tls->certificates.list);
-  tls->certificates.list = NULL;
-  tls->certificates.count = 0;
-  tls->sign_certificate = NULL;
 }
 
 bool transport_reload_credentials(transport_t *t, const char *cert_file,
@@ -2360,14 +1955,12 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
   stats->recovery_cache_peak_entries = t->sent_cache.peak_count;
   stats->api_thread_violations +=
       atomic_load_explicit(&t->cross_thread_violations, memory_order_relaxed);
-  stats->active_connections =
-      t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  stats->active_connections = transport_connection_count(t);
   stats->assembler_memory_bytes = t->assembler_memory_bytes;
   int64_t now_ms = transport_get_time_ms();
-  size_t active_count =
-      t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
-    const transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    const transport_conn_t *conn = transport_connection_at(t, i);
     if (!conn)
       continue;
     for (size_t slot = 0; slot < conn->send_subscriptions.capacity; slot++) {
@@ -2391,21 +1984,11 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
             (uint64_t)(now_ms - ack->oldest_unacked_sent_at_ms);
     }
   }
-  for (size_t i = 0; i < t->num_fds; i++) {
-    const transport_egress_t *egress = &t->egress[i];
-    stats->udp_packets_sent += egress->packets_sent;
-    stats->udp_bytes_sent += egress->bytes_sent;
-    stats->udp_would_block += egress->would_block;
-    stats->udp_send_errors += egress->send_errors;
-    stats->egress_packets_queued += egress->packets_queued;
-    stats->egress_bytes_queued += egress->bytes_queued;
-    stats->egress_packets_dropped += egress->packets_dropped;
+  for (size_t i = 0; i < t->socket_count; i++) {
+    const transport_egress_t *egress = &t->sockets[i].egress;
+    accumulate_egress_stats(stats, egress, false);
     stats->egress_current_packets += egress->count;
     stats->egress_current_bytes += egress->bytes;
-    if (egress->peak_count > stats->egress_peak_packets)
-      stats->egress_peak_packets = egress->peak_count;
-    if (egress->peak_bytes > stats->egress_peak_bytes)
-      stats->egress_peak_bytes = egress->peak_bytes;
   }
   return true;
 }
@@ -2486,26 +2069,27 @@ int transport_enable_qlog(const char *socket_path) {
 
 bool transport_get_path_stats(transport_t *t, size_t path_idx,
                               transport_path_stats_t *stats) {
-  if (!transport_owner_ok(t) || !stats || path_idx >= t->num_fds)
+  if (!transport_owner_ok(t) || !stats || path_idx >= t->socket_count)
     return false;
 
   memset(stats, 0, sizeof(*stats));
-  stats->interface_index = t->local_ifindices[path_idx];
-  copy_interface_name(stats->interface_name, t->local_ifnames[path_idx]);
+  stats->interface_index = t->sockets[path_idx].interface_index;
+  copy_interface_name(stats->interface_name,
+                      t->sockets[path_idx].interface_name);
   const void *address = NULL;
-  if (t->local_addrs[path_idx].ss_family == AF_INET)
-    address =
-        &((const struct sockaddr_in *)&t->local_addrs[path_idx])->sin_addr;
-  else if (t->local_addrs[path_idx].ss_family == AF_INET6)
-    address =
-        &((const struct sockaddr_in6 *)&t->local_addrs[path_idx])->sin6_addr;
+  if (t->sockets[path_idx].local_addr.ss_family == AF_INET)
+    address = &((const struct sockaddr_in *)&t->sockets[path_idx].local_addr)
+                   ->sin_addr;
+  else if (t->sockets[path_idx].local_addr.ss_family == AF_INET6)
+    address = &((const struct sockaddr_in6 *)&t->sockets[path_idx].local_addr)
+                   ->sin6_addr;
   if (address)
-    (void)inet_ntop(t->local_addrs[path_idx].ss_family, address,
+    (void)inet_ntop(t->sockets[path_idx].local_addr.ss_family, address,
                     stats->local_address, sizeof(stats->local_address));
   if (!stats->interface_name[0])
     copy_interface_name(stats->interface_name, stats->local_address);
-  stats->bytes_sent = t->egress[path_idx].bytes_sent;
-  stats->bytes_received = t->udp_bytes_received[path_idx];
+  stats->bytes_sent = t->sockets[path_idx].egress.bytes_sent;
+  stats->bytes_received = t->sockets[path_idx].bytes_received;
 
   transport_conn_t *target =
       t->is_server ? (t->conn_count > 0 ? t->conns[0] : NULL) : t->client_conn;
@@ -2516,12 +2100,12 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
                                                    : TRANSPORT_PATH_FAILED));
   if (target && target->quic) {
     quicly_path_stats_t path_stats;
-    size_t mapped_path_idx = transport_path_get_stats_by_link(
-        target->quic, t->local_addrs, t->num_fds, path_idx, &path_stats);
+    size_t mapped_path_idx = transport_path_get_stats_by_local(
+        target->quic, &t->sockets[path_idx].local_addr, &path_stats);
     if (quicly_get_state(target->quic) >= QUICLY_STATE_CLOSING) {
       stats->lifecycle = TRANSPORT_PATH_DRAINING;
     } else if (mapped_path_idx >= TRANSPORT_MAX_QUIC_PATHS) {
-      stats->lifecycle = t->path_open_pending[path_idx]
+      stats->lifecycle = t->sockets[path_idx].open_pending
                              ? TRANSPORT_PATH_OPENING
                              : TRANSPORT_PATH_DISCOVERED;
     } else if (!quicly_is_path_available(target->quic, mapped_path_idx)) {
@@ -2535,11 +2119,12 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
   }
 
   stats->relative_owd =
-      target ? (double)FP_TO_FLOAT(target->latest_owd_fp[path_idx]) * 1000.0
-             : 0.0;
+      target
+          ? (double)FP_TO_FLOAT(target->paths[path_idx].latest_owd_fp) * 1000.0
+          : 0.0;
   stats->ewma_latency =
       target
-          ? (double)FP_TO_FLOAT(target->path_states[path_idx].l_ewma) * 1000.0
+          ? (double)FP_TO_FLOAT(target->paths[path_idx].state.l_ewma) * 1000.0
           : 0.0;
 
   return true;
@@ -2575,26 +2160,26 @@ void transport_mock_iface_remove(transport_t *t, const char *ip_addr) {
 bool transport_mock_path_state(transport_t *t, size_t path_idx,
                                uint32_t packets_per_second, double latency_ms,
                                double loss_rate) {
-  if (!transport_owner_ok(t) || path_idx >= t->num_fds ||
+  if (!transport_owner_ok(t) || path_idx >= t->socket_count ||
       packets_per_second == 0 || latency_ms < 0.0 || loss_rate < 0.0 ||
       loss_rate > 1.0)
     return false;
-  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  size_t active_count = transport_connection_count(t);
   if (active_count == 0)
     return false;
   for (size_t i = 0; i < active_count; i++) {
-    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    transport_conn_t *conn = transport_connection_at(t, i);
     if (!conn)
       continue;
-    path_state_t *state = &conn->path_states[path_idx];
+    path_state_t *state = &conn->paths[path_idx].state;
     state->initialized = 1;
     state->b_ewma = FP_FROM_INT(packets_per_second);
     state->l_ewma = FP_FROM_FLOAT((float)(latency_ms / 1000.0));
     state->p_ewma = FP_FROM_FLOAT((float)loss_rate);
     state->q_ewma = 0;
-    conn->path_state_overridden[path_idx] = true;
-    memset(&conn->path_budgets[path_idx], 0,
-           sizeof(conn->path_budgets[path_idx]));
+    conn->paths[path_idx].state_overridden = true;
+    memset(&conn->paths[path_idx].budget, 0,
+           sizeof(conn->paths[path_idx].budget));
     conn->admission_retry_at_ns = 0;
   }
   return true;
@@ -2604,9 +2189,9 @@ size_t transport_get_datagram_symbol_size(const transport_t *t) {
   if (!t || !transport_owner_ok((transport_t *)t))
     return 0;
   size_t udp_payload_size = t->limits.max_udp_payload_size;
-  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
-    const transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    const transport_conn_t *conn = transport_connection_at(t, i);
     if (conn && conn->protocol_ready &&
         conn->negotiated_limits.max_udp_payload_size < udp_payload_size)
       udp_payload_size = conn->negotiated_limits.max_udp_payload_size;
@@ -2622,8 +2207,8 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
   if (!transport_publish_recovery_ready(t, track_id))
     return false;
 
-  for (size_t i = 0; i < t->num_fds; i++) {
-    const transport_egress_t *egress = &t->egress[i];
+  for (size_t i = 0; i < t->socket_count; i++) {
+    const transport_egress_t *egress = &t->sockets[i].egress;
     if (egress->count >= egress->capacity * 3U / 4U ||
         egress->bytes >= egress->max_bytes * 3U / 4U)
       return false;
@@ -2631,13 +2216,12 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
 
   transport_track_profile_t profile = transport_track_profile(track_id);
 
-  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  size_t active_count = transport_connection_count(t);
   if (active_count == 0)
     return true; /* no peers means data is dropped anyway, so it's "ready" */
 
-  bool all_ready = true;
   for (size_t c = 0; c < active_count; c++) {
-    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    transport_conn_t *conn = transport_connection_at(t, c);
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
@@ -2646,52 +2230,35 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
       return false;
     if (!transport_publish_recipient_eligible(t, conn, track_id))
       continue;
-    const track_subscription_t *mode =
+    const track_subscription_t *subscription =
         transport_subscriptions_find_const(&conn->send_subscriptions, track_id);
-    if (mode && mode->track_id.flags != track_id->flags)
+    if (subscription && subscription->track_id.flags != track_id->flags)
       return false;
 
     if (profile.reliable) {
-      const track_subscription_t *subscription =
-          transport_subscriptions_find_const(&conn->send_subscriptions,
-                                             track_id);
       quicly_stream_t *stream = subscription ? subscription->stream : NULL;
-
-      if (stream) {
-        if (!transport_stream_can_accept(
-                stream,
-                QLINQ_WIRE_FRAME_HEADER_SIZE +
-                    QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE,
-                true)) {
-          all_ready = false;
-          break;
-        }
-      }
+      if (stream &&
+          !transport_stream_can_accept(stream,
+                                       QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                           QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE,
+                                       true))
+        return false;
     } else {
       if (conn->admission_retry_at_ns > transport_get_monotonic_ns())
         return false;
       for (size_t p = 0; p < TRANSPORT_MAX_QUIC_PATHS; p++) {
-        conn->queued_datagrams[p] =
-            (uint16_t)quicly_get_num_datagram_frames_path(conn->quic, p);
-        if (conn->queued_datagrams[p] >=
-            QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4) {
-          all_ready = false;
-          break;
-        }
+        size_t queued = quicly_get_num_datagram_frames_path(conn->quic, p);
+        if (queued >= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4)
+          return false;
       }
-      if (!all_ready)
-        break;
       quicly_path_stats_t pstats;
-      if (quicly_get_path_stats(conn->quic, 0, &pstats) == 0) {
-        if (pstats.bytes_in_flight >= pstats.cwnd * 2) {
-          all_ready = false;
-          break;
-        }
-      }
+      if (quicly_get_path_stats(conn->quic, 0, &pstats) == 0 &&
+          pstats.bytes_in_flight >= pstats.cwnd * 2)
+        return false;
     }
   }
 
-  return all_ready;
+  return true;
 }
 
 int64_t transport_get_time_ms(void) {
@@ -2705,9 +2272,9 @@ int64_t transport_get_first_timeout(transport_t *t) {
   int64_t first_timeout = t->aggregate_nack_retry_at_ms > 0
                               ? t->aggregate_nack_retry_at_ms
                               : INT64_MAX;
-  size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  size_t active_conns = transport_connection_count(t);
   for (size_t c = 0; c < active_conns; c++) {
-    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    transport_conn_t *conn = transport_connection_at(t, c);
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
@@ -2726,44 +2293,33 @@ int64_t transport_get_first_timeout(transport_t *t) {
           first_timeout = retry_at;
       }
     }
-    for (size_t i = transport_next_assembler(conn, 0);
-         i < t->limits.max_assemblers_per_connection;
-         i = transport_next_assembler(conn, i + 1U)) {
-      const frame_assembler_t *assembler = &conn->assemblers[i];
-      if (assembler->total_symbols == 0)
-        continue;
-      int64_t expires =
-          assembler->last_activity_time_ms >
-                  INT64_MAX - t->fec_assembler_timeout_ms
-              ? INT64_MAX
-              : assembler->last_activity_time_ms + t->fec_assembler_timeout_ms;
-      if (expires < first_timeout)
-        first_timeout = expires;
-    }
+    int64_t recovery_at = transport_recovery_deadline(conn);
+    if (recovery_at < first_timeout)
+      first_timeout = recovery_at;
   }
 
-  if (active_conns != 0 && t->last_pathflow_update <= INT64_MAX - 25 &&
-      (int64_t)t->last_pathflow_update + 25 < first_timeout)
-    first_timeout = (int64_t)t->last_pathflow_update + 25;
-  if (t->fec_buf_len != 0 && t->fec_first_pkt_time <= INT64_MAX - 3 &&
-      (int64_t)t->fec_first_pkt_time + 3 < first_timeout)
-    first_timeout = (int64_t)t->fec_first_pkt_time + 3;
+  if (active_conns != 0 &&
+      t->last_pathflow_update <= INT64_MAX - QLINQ_PATHFLOW_UPDATE_MS &&
+      (int64_t)t->last_pathflow_update + QLINQ_PATHFLOW_UPDATE_MS <
+          first_timeout)
+    first_timeout = (int64_t)t->last_pathflow_update + QLINQ_PATHFLOW_UPDATE_MS;
+  if (t->pending_group.size != 0 &&
+      t->pending_group.started_at_ms <= INT64_MAX - QLINQ_GROUP_FLUSH_MS &&
+      (int64_t)t->pending_group.started_at_ms + QLINQ_GROUP_FLUSH_MS <
+          first_timeout)
+    first_timeout =
+        (int64_t)t->pending_group.started_at_ms + QLINQ_GROUP_FLUSH_MS;
 
   if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
       !t->shutting_down && t->reconnect_at_ms < first_timeout)
     first_timeout = t->reconnect_at_ms;
 
-  if (t->client_conn && t->client_conn->quic) {
-    int64_t to = quicly_get_first_timeout(t->client_conn->quic);
-    if (to < first_timeout)
-      first_timeout = to;
-  }
-
-  for (size_t i = 0; i < t->conn_count; i++) {
-    if (t->conns[i] && t->conns[i]->quic) {
-      int64_t to = quicly_get_first_timeout(t->conns[i]->quic);
-      if (to < first_timeout)
-        first_timeout = to;
+  for (size_t i = 0; i < active_conns; i++) {
+    transport_conn_t *conn = transport_connection_at(t, i);
+    if (conn && conn->quic) {
+      int64_t deadline = quicly_get_first_timeout(conn->quic);
+      if (deadline < first_timeout)
+        first_timeout = deadline;
     }
   }
 
@@ -2776,11 +2332,11 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
     return 0;
 
   size_t count = 0;
-  for (size_t i = 0; i < t->num_fds && count < max_fds; i++) {
-    if (t->fds[i] >= 0) {
-      fds[count].fd = t->fds[i];
+  for (size_t i = 0; i < t->socket_count && count < max_fds; i++) {
+    if (t->sockets[i].fd >= 0) {
+      fds[count].fd = t->sockets[i].fd;
       fds[count].events = POLLIN;
-      if (t->egress[i].count > 0)
+      if (t->sockets[i].egress.count > 0)
         fds[count].events |= POLLOUT;
       fds[count].revents = 0;
       count++;
@@ -2797,9 +2353,9 @@ bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
   if (!transport_owner_ok(t) || !transport_track_id_valid(track) || !stats)
     return false;
   *stats = (transport_track_stats_t){0};
-  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  size_t count = transport_connection_count(t);
   for (size_t i = 0; i < count; i++) {
-    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    transport_conn_t *conn = transport_connection_at(t, i);
     uint8_t alias;
     if (conn && conn->authenticated && conn->quic &&
         quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&

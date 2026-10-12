@@ -1,8 +1,46 @@
 #include "cli_parse.h"
+#include "transport.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+
+bool cli_parse_delivery(const char *text, qlinq_delivery_t *delivery) {
+  if (!text || !delivery)
+    return false;
+  if (strcmp(text, "datagram") == 0)
+    *delivery = QLINQ_DELIVERY_DATAGRAM;
+  else if (strcmp(text, "reliable") == 0)
+    *delivery = QLINQ_DELIVERY_RELIABLE;
+  else if (strcmp(text, "fixed-fec") == 0 || strcmp(text, "fec") == 0)
+    *delivery = QLINQ_DELIVERY_FIXED_FEC;
+  else if (strcmp(text, "rateless") == 0)
+    *delivery = QLINQ_DELIVERY_RATELESS;
+  else
+    return false;
+  return true;
+}
+
+bool cli_parse_track_mode(const char *text, uint8_t *flags) {
+  qlinq_delivery_t delivery;
+  if (!flags || !cli_parse_delivery(text, &delivery))
+    return false;
+  switch (delivery) {
+  case QLINQ_DELIVERY_DATAGRAM:
+    *flags = 0;
+    break;
+  case QLINQ_DELIVERY_RELIABLE:
+    *flags = MOQ_TRACK_FLAG_RELIABLE;
+    break;
+  case QLINQ_DELIVERY_FIXED_FEC:
+    *flags = MOQ_TRACK_FLAG_FEC_ENABLED;
+    break;
+  case QLINQ_DELIVERY_RATELESS:
+    *flags = MOQ_TRACK_FLAG_FEC_RATELESS;
+    break;
+  }
+  return true;
+}
 
 bool cli_parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
   char *end = NULL;

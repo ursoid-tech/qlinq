@@ -1,9 +1,15 @@
 #ifndef QLINQ_CLI_PARSE_H
 #define QLINQ_CLI_PARSE_H
 
+#include "qlinq.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+/* fixed-fec and fec name the same delivery mode. */
+bool cli_parse_delivery(const char *text, qlinq_delivery_t *delivery);
+bool cli_parse_track_mode(const char *text, uint8_t *flags);
 
 bool cli_parse_u64(const char *text, uint64_t maximum, uint64_t *value);
 

@@ -22,9 +22,11 @@ enum fault {
   NONE,
   SECOND_BLOCK,
   SECOND_HARD,
+  FIRST_BLOCK,
   FIRST_HARD,
   UNSUPPORTED,
   INTERRUPTED,
+  INTERRUPTED_BLOCK,
   PARTIAL_BLOCK
 };
 static enum fault fault;
@@ -43,12 +45,18 @@ static void accept_datagram(const void *data, size_t len) {
 static ssize_t mock_sendmsg(int fd, const struct msghdr *msg, int flags) {
   assert(fd == 7 && flags == 0 && msg->msg_iovlen == 1);
   gso_calls++;
+  if (fault == INTERRUPTED_BLOCK) {
+    errno = gso_calls == 1 ? EINTR : EAGAIN;
+    return -1;
+  }
   if ((fault == INTERRUPTED && gso_calls == 1) || (fault == UNSUPPORTED) ||
-      (fault == FIRST_HARD) ||
+      (fault == FIRST_HARD) || (fault == FIRST_BLOCK) ||
       ((fault == SECOND_BLOCK || fault == SECOND_HARD ||
         fault == PARTIAL_BLOCK) &&
        gso_calls == 2)) {
-    errno = fault == INTERRUPTED ? EINTR : EOPNOTSUPP;
+    errno = fault == INTERRUPTED   ? EINTR
+            : fault == FIRST_BLOCK ? EAGAIN
+                                   : EOPNOTSUPP;
     return -1;
   }
   struct cmsghdr *c = CMSG_FIRSTHDR((struct msghdr *)msg);
@@ -72,13 +80,19 @@ static int mock_sendmmsg(int fd, struct mmsghdr *messages, unsigned int count,
                          int flags) {
   assert(fd == 7 && flags == 0 && count == expected_count - accepted);
   ordinary_calls++;
+  if (fault == INTERRUPTED_BLOCK) {
+    errno = ordinary_calls == 1 ? EINTR : EAGAIN;
+    return -1;
+  }
   if ((fault == SECOND_BLOCK) || (fault == SECOND_HARD) ||
-      (fault == FIRST_HARD) ||
+      (fault == FIRST_HARD) || (fault == FIRST_BLOCK) ||
       (fault == PARTIAL_BLOCK && ordinary_calls == 2) ||
       (fault == INTERRUPTED && ordinary_calls == 1)) {
-    errno = fault == INTERRUPTED                                ? EINTR
-            : (fault == SECOND_BLOCK || fault == PARTIAL_BLOCK) ? EAGAIN
-                                                                : EIO;
+    errno = fault == INTERRUPTED ? EINTR
+            : (fault == SECOND_BLOCK || fault == FIRST_BLOCK ||
+               fault == PARTIAL_BLOCK)
+                ? EAGAIN
+                : EIO;
     return -1;
   }
   unsigned int sent = fault == PARTIAL_BLOCK && ordinary_calls == 1 ? 5 : count;
@@ -137,6 +151,16 @@ int main(void) {
   assert(send_suffix() == 13 && accepted == 64);
   setup(64, 1280, FIRST_HARD);
   assert(send_suffix() == -1 && errno == EIO && accepted == 0);
+  setup(64, 1280, FIRST_BLOCK);
+  assert(send_suffix() == 0 && accepted == 0 && gso_calls == 1 &&
+         ordinary_calls == 1);
+  fault = NONE;
+  assert(send_suffix() == 64 && accepted == 64);
+  setup(64, 1280, INTERRUPTED_BLOCK);
+  assert(send_suffix() == 0 && accepted == 0 && gso_calls == 2 &&
+         ordinary_calls == 2);
+  fault = NONE;
+  assert(send_suffix() == 64 && accepted == 64);
   setup(64, 1280, PARTIAL_BLOCK);
   assert(send_suffix() == 56 && accepted == 56);
   fault = NONE;
@@ -150,5 +174,7 @@ int main(void) {
   return 0;
 }
 #else
-int main(void) { return 0; }
+int main(void) {
+  return 0;
+}
 #endif

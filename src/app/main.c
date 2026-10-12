@@ -1,12 +1,13 @@
-#include "cli_parse.h"
 /* qlinq-app: direct transport API file and stream bridge. */
 
 #ifndef _DEFAULT_SOURCE
 #define _DEFAULT_SOURCE
 #endif
 
+#include "cli_parse.h"
 #include "portable_sockets.h"
 #include "transport.h"
+#include "transport_wire.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -39,28 +40,53 @@ typedef struct {
 } pv_path_t;
 
 typedef struct {
-  transport_t *transport;
   moq_track_id_t track;
   const uint8_t *auth_token;
   size_t auth_token_len;
-  FILE *input;
-  FILE *output;
-  FILE *stats_output;
   const char *node_id;
-  uint8_t *message;
-  size_t message_capacity;
-  size_t pending_size;
-  uint64_t next_object_id;
-  uint64_t sent_records;
-  uint64_t received_records;
-  uint64_t received_bytes;
   uint64_t count_limit;
   uint64_t receive_limit;
-  size_t subscriptions;
   size_t required_subscriptions;
   uint32_t interval_ms;
   uint32_t drain_ms;
   uint32_t stats_ms;
+  bool is_server;
+  bool one_shot;
+  bool pv;
+  bool verbose;
+  bool help;
+  const char *bind_host;
+  const char *peer_arg;
+  const char *cert_file;
+  const char *key_file;
+  const char *ca_file;
+  const char *input_path;
+  const char *output_path;
+  const char *stats_path;
+  uint16_t listen_port;
+  uint64_t idle_timeout_ms;
+  uint8_t simulated_loss;
+  size_t message_size;
+  size_t max_connections;
+  size_t max_repair_requests;
+  size_t max_aggregate_repairs;
+  transport_repair_mode_t repair_mode;
+  bool verify_peer;
+  bool allow_insecure;
+} options_t;
+
+typedef struct {
+  const options_t *options;
+  transport_t *transport;
+  FILE *input;
+  FILE *output;
+  FILE *stats_output;
+  uint8_t *message;
+  size_t pending_size;
+  uint64_t sent_records;
+  uint64_t received_records;
+  uint64_t received_bytes;
+  size_t subscriptions;
   int64_t next_send_at;
   int64_t next_stats_at;
   int64_t finished_at;
@@ -68,12 +94,8 @@ typedef struct {
   int64_t started_at;
   int64_t pv_last_at;
   int64_t next_pv_at;
-  bool is_server;
   bool input_eof;
   bool track_finished;
-  bool one_shot;
-  bool pv;
-  bool verbose;
   bool failed;
   bool reorder_initialized;
   uint64_t reorder_group_id;
@@ -114,7 +136,7 @@ static void show_help(FILE *out, const char *program) {
           "  --loss PERCENT              test-only simulated packet loss\n\n"
           "Data:\n"
           "  --track NAME                default qlinq-app/data\n"
-          "  --mode datagram|fec|rateless|reliable\n"
+          "  --mode datagram|fixed-fec|rateless|reliable (fec is an alias)\n"
           "  --repair-mode auto|indexed|rateless\n"
           "  --input FILE|-              publish fixed-size records\n"
           "  --output FILE|-             write received records\n"
@@ -138,24 +160,20 @@ static void show_help(FILE *out, const char *program) {
 static bool write_payload(app_t *app, const moq_track_id_t *track,
                           const uint8_t *data, size_t size) {
   if (track->type == MOQ_TRACK_DATA &&
-      (track->flags & (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0) {
-    while (size != 0) {
-      uint16_t record_size;
-      if (size < 2)
-        return false;
-      memcpy(&record_size, data, sizeof(record_size));
-      record_size = ntohs(record_size);
-      data += 2;
-      size -= 2;
-      if (record_size == 0 || record_size > size)
+      (track->flags &
+       (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0) {
+    qlinq_wire_cursor_t cursor = {data, size};
+    while (cursor.remaining != 0) {
+      const uint8_t *record;
+      size_t record_size;
+      if (!qlinq_wire_next_record(&cursor, &record, &record_size) ||
+          record_size == 0)
         return false;
       if (app->output &&
-          fwrite(data, 1, record_size, app->output) != record_size)
+          fwrite(record, 1, record_size, app->output) != record_size)
         return false;
       app->received_records++;
       app->received_bytes += record_size;
-      data += record_size;
-      size -= record_size;
     }
   } else {
     if (app->output && size != 0 && fwrite(data, 1, size, app->output) != size)
@@ -163,9 +181,10 @@ static bool write_payload(app_t *app, const moq_track_id_t *track,
     app->received_records++;
     app->received_bytes += size;
   }
-  if (app->output)
-    fflush(app->output);
-  if (app->receive_limit != 0 && app->received_records >= app->receive_limit &&
+  if (app->output && fflush(app->output) != 0)
+    return false;
+  if (app->options->receive_limit != 0 &&
+      app->received_records >= app->options->receive_limit &&
       app->received_at == 0)
     app->received_at = transport_get_time_ms();
   return true;
@@ -173,7 +192,8 @@ static bool write_payload(app_t *app, const moq_track_id_t *track,
 
 static bool write_object(app_t *app, const transport_event_t *event) {
   bool ordered = event->track_id.type == MOQ_TRACK_DATA &&
-                 (event->track_id.flags & (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
+                 (event->track_id.flags & (MOQ_TRACK_FLAG_FEC_ENABLED |
+                                           MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
   if (!ordered)
     return write_payload(app, &event->track_id, event->object.data,
                          event->object.size);
@@ -218,29 +238,30 @@ static bool write_object(app_t *app, const transport_event_t *event) {
 }
 
 static void subscribe(app_t *app, transport_conn_t *conn) {
-  if (!transport_subscribe_conn(app->transport, conn, app->track)) {
+  if (!transport_subscribe_conn(app->transport, conn, app->options->track)) {
     fprintf(stderr, "qlinq-app: unable to subscribe to '%s'\n",
-            app->track.name);
+            app->options->track.name);
     app->failed = true;
   }
 }
 
 static void on_event(void *user_data, const transport_event_t *event) {
   app_t *app = user_data;
+  const options_t *options = app->options;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
-    if (app->verbose)
+    if (options->verbose)
       fprintf(stderr, "qlinq-app: peer connected\n");
-    if (!app->is_server &&
-        !transport_send_auth(app->transport, event->conn, app->auth_token,
-                             app->auth_token_len))
+    if (!options->is_server &&
+        !transport_send_auth(app->transport, event->conn, options->auth_token,
+                             options->auth_token_len))
       app->failed = true;
     break;
   case TRANSPORT_EVENT_AUTH: {
-    bool accepted = app->is_server &&
-                    event->auth.token_len == app->auth_token_len &&
-                    CRYPTO_memcmp(event->auth.token, app->auth_token,
-                                  app->auth_token_len) == 0;
+    bool accepted = options->is_server &&
+                    event->auth.token_len == options->auth_token_len &&
+                    CRYPTO_memcmp(event->auth.token, options->auth_token,
+                                  options->auth_token_len) == 0;
     if (!transport_respond_auth(app->transport, event->conn, accepted))
       app->failed = true;
     if (accepted)
@@ -254,26 +275,26 @@ static void on_event(void *user_data, const transport_event_t *event) {
       app->failed = true;
     break;
   case TRANSPORT_EVENT_SUBSCRIBE:
-    if (event->track_id.type == app->track.type &&
-        strcmp(event->track_id.name, app->track.name) == 0)
+    if (event->track_id.type == options->track.type &&
+        strcmp(event->track_id.name, options->track.name) == 0)
       app->subscriptions++;
     break;
   case TRANSPORT_EVENT_UNSUBSCRIBE:
-    if (event->track_id.type == app->track.type &&
-        strcmp(event->track_id.name, app->track.name) == 0 &&
+    if (event->track_id.type == options->track.type &&
+        strcmp(event->track_id.name, options->track.name) == 0 &&
         app->subscriptions != 0)
       app->subscriptions--;
     break;
   case TRANSPORT_EVENT_OBJECT:
-    if (event->track_id.type == app->track.type &&
-        strcmp(event->track_id.name, app->track.name) == 0 &&
+    if (event->track_id.type == options->track.type &&
+        strcmp(event->track_id.name, options->track.name) == 0 &&
         !write_object(app, event)) {
       fprintf(stderr, "qlinq-app: malformed object or output error\n");
       app->failed = true;
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
-    if (app->verbose)
+    if (options->verbose)
       fprintf(stderr,
               "qlinq-app: peer disconnected origin=%s class=%s code=%" PRIu64
               " raw=%" PRId64 " reason=%s\n",
@@ -287,7 +308,7 @@ static void on_event(void *user_data, const transport_event_t *event) {
                   : "none");
     break;
   case TRANSPORT_EVENT_OBJECT_LOST:
-    if (app->verbose)
+    if (options->verbose)
       fprintf(stderr, "qlinq-app: object recovery failed\n");
     break;
   case TRANSPORT_EVENT_KEYFRAME_REQUEST:
@@ -298,9 +319,9 @@ static void on_event(void *user_data, const transport_event_t *event) {
 static void publish_pending(app_t *app, int64_t now) {
   if (app->pending_size == 0 || now < app->next_send_at)
     return;
-  moq_object_t object = {.track_id = app->track,
+  moq_object_t object = {.track_id = app->options->track,
                          .group_id = 0,
-                         .object_id = app->next_object_id,
+                         .object_id = app->sent_records,
                          .data = app->message,
                          .size = app->pending_size,
                          .priority = 1};
@@ -316,20 +337,21 @@ static void publish_pending(app_t *app, int64_t now) {
     return;
   }
   app->pending_size = 0;
-  app->next_object_id++;
   app->sent_records++;
-  app->next_send_at = now + app->interval_ms;
+  app->next_send_at = now + app->options->interval_ms;
 }
 
 static void load_input(app_t *app, bool ready) {
   if (!ready || !app->input || app->input_eof || app->pending_size != 0 ||
-      app->subscriptions < app->required_subscriptions)
+      app->subscriptions < app->options->required_subscriptions)
     return;
-  if (app->count_limit != 0 && app->sent_records >= app->count_limit) {
+  if (app->options->count_limit != 0 &&
+      app->sent_records >= app->options->count_limit) {
     app->input_eof = true;
     return;
   }
-  ssize_t n = read(fileno(app->input), app->message, app->message_capacity);
+  ssize_t n =
+      read(fileno(app->input), app->message, app->options->message_size);
   if (n > 0) {
     app->pending_size = (size_t)n;
   } else if (n == 0) {
@@ -343,17 +365,17 @@ static void load_input(app_t *app, bool ready) {
 static void finish_track(app_t *app, int64_t now) {
   if (!app->input_eof || app->pending_size != 0 || app->track_finished)
     return;
-  if ((app->track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
-      !transport_finish_track(app->transport, app->track))
+  if ((app->options->track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
+      !transport_finish_track(app->transport, app->options->track))
     return;
   app->track_finished = true;
   app->finished_at = now;
 }
 
 static void print_stats(app_t *app, int64_t now, bool force) {
-  if (!force && (app->stats_ms == 0 || now < app->next_stats_at))
+  if (!force && (app->options->stats_ms == 0 || now < app->next_stats_at))
     return;
-  if (app->stats_ms == 0 && !app->stats_output)
+  if (app->options->stats_ms == 0 && !app->stats_output)
     return;
   transport_stats_t stats = {0};
   if (!transport_get_stats(app->transport, &stats))
@@ -365,7 +387,7 @@ static void print_stats(app_t *app, int64_t now, bool force) {
             "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
             "\t%" PRIu64 "\t%" PRIu64 "\t%zu\t%" PRIu64 "\t%zu\t%zu\t%zu\t%zu"
             "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\n",
-            now - app->started_at, app->node_id, app->sent_records,
+            now - app->started_at, app->options->node_id, app->sent_records,
             app->received_records, app->received_bytes, stats.track_ends_sent,
             stats.track_ends_received, stats.recovery_checkpoints_sent,
             stats.recovery_checkpoints_received, stats.active_connections,
@@ -388,7 +410,7 @@ static void print_stats(app_t *app, int64_t now, bool force) {
             app->sent_records, app->received_records, app->received_bytes,
             stats.active_connections);
   }
-  app->next_stats_at = now + app->stats_ms;
+  app->next_stats_at = now + app->options->stats_ms;
 }
 
 static void format_bytes(double bytes, char *output, size_t capacity) {
@@ -405,7 +427,7 @@ static void format_bytes(double bytes, char *output, size_t capacity) {
 }
 
 static void print_pv(app_t *app, int64_t now, bool force) {
-  if (!app->pv || (!force && now < app->next_pv_at))
+  if (!app->options->pv || (!force && now < app->next_pv_at))
     return;
   int64_t interval_ms = now - app->pv_last_at;
   if (interval_ms <= 0)
@@ -469,213 +491,259 @@ static void cleanup_reorder(app_t *app) {
     free(app->reorder[i].data);
 }
 
-int main(int argc, char **argv) {
-  app_t app = {.track = {.type = MOQ_TRACK_DATA,
-                         .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
-                         .name = "qlinq-app/data"},
-               .drain_ms = 1000,
-               .node_id = "qlinq-app"};
-  const char *bind_host = NULL;
-  const char *peer_arg = NULL;
-  const char *cert_file = NULL;
-  const char *key_file = NULL;
-  const char *ca_file = NULL;
-  const char *input_path = NULL;
-  const char *output_path = NULL;
-  const char *stats_path = NULL;
-  uint16_t listen_port = 0;
-  uint64_t idle_timeout_ms = 0;
-  uint8_t simulated_loss = 0;
-  size_t message_size = 1200;
-  size_t max_connections = 0;
-  size_t max_repair_requests = 0;
-  size_t max_aggregate_repairs = 0;
-  transport_repair_mode_t repair_mode = TRANSPORT_REPAIR_MODE_AUTO;
-  bool verify_peer = true;
-  bool allow_insecure = false;
+static bool parse_options(int argc, char **argv, options_t *options) {
+  *options = (options_t){.track = {.type = MOQ_TRACK_DATA,
+                                   .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                   .name = "qlinq-app/data"},
+                         .drain_ms = 1000,
+                         .node_id = "qlinq-app",
+                         .message_size = 1200,
+                         .repair_mode = TRANSPORT_REPAIR_MODE_AUTO,
+                         .verify_peer = true};
   uint64_t parsed;
 
-#define REQUIRE_VALUE()                                                        \
-  do {                                                                         \
-    if (++i >= argc)                                                           \
-      goto invalid;                                                            \
-  } while (0)
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--help") == 0) {
-      show_help(stdout, argv[0]);
-      return 0;
-    } else if (strcmp(argv[i], "--listen") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+    const char *arg = argv[i];
+    if (strcmp(arg, "--help") == 0) {
+      options->help = true;
+      return true;
+    }
+    if (strcmp(arg, "--insecure-no-verify") == 0) {
+      options->verify_peer = false;
+      options->allow_insecure = true;
+      continue;
+    }
+    if (strcmp(arg, "--one-shot") == 0) {
+      options->one_shot = true;
+      continue;
+    }
+    if (strcmp(arg, "--pv") == 0) {
+      options->pv = true;
+      continue;
+    }
+    if (strcmp(arg, "--verbose") == 0) {
+      options->verbose = true;
+      continue;
+    }
+    if (++i >= argc)
+      goto invalid;
+    const char *value = argv[i];
+    if (strcmp(arg, "--listen") == 0) {
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         goto invalid;
-      listen_port = (uint16_t)parsed;
-    } else if (strcmp(argv[i], "--peer") == 0) {
-      REQUIRE_VALUE();
-      peer_arg = argv[i];
-    } else if (strcmp(argv[i], "--bind") == 0) {
-      REQUIRE_VALUE();
-      bind_host = argv[i];
-    } else if (strcmp(argv[i], "--cert") == 0) {
-      REQUIRE_VALUE();
-      cert_file = argv[i];
-    } else if (strcmp(argv[i], "--key") == 0) {
-      REQUIRE_VALUE();
-      key_file = argv[i];
-    } else if (strcmp(argv[i], "--ca") == 0) {
-      REQUIRE_VALUE();
-      ca_file = argv[i];
-    } else if (strcmp(argv[i], "--auth-token") == 0) {
-      REQUIRE_VALUE();
-      app.auth_token = (const uint8_t *)argv[i];
-    } else if (strcmp(argv[i], "--insecure-no-verify") == 0) {
-      verify_peer = false;
-      allow_insecure = true;
-    } else if (strcmp(argv[i], "--idle-timeout-ms") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT64_MAX, &idle_timeout_ms) ||
-          idle_timeout_ms == 0)
+      options->listen_port = (uint16_t)parsed;
+    } else if (strcmp(arg, "--peer") == 0) {
+      options->peer_arg = value;
+    } else if (strcmp(arg, "--bind") == 0) {
+      options->bind_host = value;
+    } else if (strcmp(arg, "--cert") == 0) {
+      options->cert_file = value;
+    } else if (strcmp(arg, "--key") == 0) {
+      options->key_file = value;
+    } else if (strcmp(arg, "--ca") == 0) {
+      options->ca_file = value;
+    } else if (strcmp(arg, "--auth-token") == 0) {
+      options->auth_token = (const uint8_t *)value;
+    } else if (strcmp(arg, "--idle-timeout-ms") == 0) {
+      if (!cli_parse_u64(value, UINT64_MAX, &options->idle_timeout_ms) ||
+          options->idle_timeout_ms == 0)
         goto invalid;
-    } else if (strcmp(argv[i], "--max-connections") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], TRANSPORT_HARD_MAX_CONNECTIONS, &parsed) ||
+    } else if (strcmp(arg, "--max-connections") == 0) {
+      if (!cli_parse_u64(value, TRANSPORT_HARD_MAX_CONNECTIONS, &parsed) ||
           parsed == 0)
         goto invalid;
-      max_connections = (size_t)parsed;
-    } else if (strcmp(argv[i], "--max-repair-requests") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      options->max_connections = (size_t)parsed;
+    } else if (strcmp(arg, "--max-repair-requests") == 0) {
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         goto invalid;
-      max_repair_requests = (size_t)parsed;
-    } else if (strcmp(argv[i], "--max-aggregate-repairs") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT16_MAX, &parsed) || parsed == 0)
+      options->max_repair_requests = (size_t)parsed;
+    } else if (strcmp(arg, "--max-aggregate-repairs") == 0) {
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         goto invalid;
-      max_aggregate_repairs = (size_t)parsed;
-    } else if (strcmp(argv[i], "--loss") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], 100, &parsed))
+      options->max_aggregate_repairs = (size_t)parsed;
+    } else if (strcmp(arg, "--loss") == 0) {
+      if (!cli_parse_u64(value, 100, &parsed))
         goto invalid;
-      simulated_loss = (uint8_t)parsed;
-    } else if (strcmp(argv[i], "--track") == 0) {
-      REQUIRE_VALUE();
-      if (strlen(argv[i]) >= sizeof(app.track.name))
+      options->simulated_loss = (uint8_t)parsed;
+    } else if (strcmp(arg, "--track") == 0) {
+      if (strlen(value) >= sizeof(options->track.name))
         goto invalid;
-      strcpy(app.track.name, argv[i]);
-    } else if (strcmp(argv[i], "--mode") == 0) {
-      REQUIRE_VALUE();
-      if (strcmp(argv[i], "datagram") == 0)
-        app.track.flags = 0;
-      else if (strcmp(argv[i], "fec") == 0)
-        app.track.flags = MOQ_TRACK_FLAG_FEC_ENABLED;
-      else if (strcmp(argv[i], "rateless") == 0)
-        app.track.flags = MOQ_TRACK_FLAG_FEC_RATELESS;
-      else if (strcmp(argv[i], "reliable") == 0)
-        app.track.flags = MOQ_TRACK_FLAG_RELIABLE;
+      strcpy(options->track.name, value);
+    } else if (strcmp(arg, "--mode") == 0) {
+      if (!cli_parse_track_mode(value, &options->track.flags))
+        goto invalid;
+    } else if (strcmp(arg, "--repair-mode") == 0) {
+      if (strcmp(value, "auto") == 0)
+        options->repair_mode = TRANSPORT_REPAIR_MODE_AUTO;
+      else if (strcmp(value, "indexed") == 0)
+        options->repair_mode = TRANSPORT_REPAIR_MODE_INDEXED;
+      else if (strcmp(value, "rateless") == 0)
+        options->repair_mode = TRANSPORT_REPAIR_MODE_RATELESS;
       else
         goto invalid;
-    } else if (strcmp(argv[i], "--repair-mode") == 0) {
-      REQUIRE_VALUE();
-      if (strcmp(argv[i], "auto") == 0)
-        repair_mode = TRANSPORT_REPAIR_MODE_AUTO;
-      else if (strcmp(argv[i], "indexed") == 0)
-        repair_mode = TRANSPORT_REPAIR_MODE_INDEXED;
-      else if (strcmp(argv[i], "rateless") == 0)
-        repair_mode = TRANSPORT_REPAIR_MODE_RATELESS;
-      else
-        goto invalid;
-    } else if (strcmp(argv[i], "--input") == 0) {
-      REQUIRE_VALUE();
-      input_path = argv[i];
-    } else if (strcmp(argv[i], "--output") == 0) {
-      REQUIRE_VALUE();
-      output_path = argv[i];
-    } else if (strcmp(argv[i], "--message-size") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], TRANSPORT_MAX_FEC_OBJECT_SIZE, &parsed) ||
+    } else if (strcmp(arg, "--input") == 0) {
+      options->input_path = value;
+    } else if (strcmp(arg, "--output") == 0) {
+      options->output_path = value;
+    } else if (strcmp(arg, "--message-size") == 0) {
+      if (!cli_parse_u64(value, TRANSPORT_MAX_FEC_OBJECT_SIZE, &parsed) ||
           parsed == 0)
         goto invalid;
-      message_size = (size_t)parsed;
-    } else if (strcmp(argv[i], "--count") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT64_MAX, &app.count_limit))
+      options->message_size = (size_t)parsed;
+    } else if (strcmp(arg, "--count") == 0) {
+      if (!cli_parse_u64(value, UINT64_MAX, &options->count_limit))
         goto invalid;
-    } else if (strcmp(argv[i], "--receive-count") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT64_MAX, &app.receive_limit) ||
-          app.receive_limit == 0)
+    } else if (strcmp(arg, "--receive-count") == 0) {
+      if (!cli_parse_u64(value, UINT64_MAX, &options->receive_limit) ||
+          options->receive_limit == 0)
         goto invalid;
-    } else if (strcmp(argv[i], "--wait-subscribers") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], SIZE_MAX, &parsed))
+    } else if (strcmp(arg, "--wait-subscribers") == 0) {
+      if (!cli_parse_u64(value, SIZE_MAX, &parsed))
         goto invalid;
-      app.required_subscriptions = (size_t)parsed;
-    } else if (strcmp(argv[i], "--interval-ms") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
+      options->required_subscriptions = (size_t)parsed;
+    } else if (strcmp(arg, "--interval-ms") == 0) {
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed))
         goto invalid;
-      app.interval_ms = (uint32_t)parsed;
-    } else if (strcmp(argv[i], "--one-shot") == 0) {
-      app.one_shot = true;
-    } else if (strcmp(argv[i], "--drain-ms") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
+      options->interval_ms = (uint32_t)parsed;
+    } else if (strcmp(arg, "--drain-ms") == 0) {
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed))
         goto invalid;
-      app.drain_ms = (uint32_t)parsed;
-    } else if (strcmp(argv[i], "--stats-ms") == 0) {
-      REQUIRE_VALUE();
-      if (!cli_parse_u64(argv[i], UINT32_MAX, &parsed))
+      options->drain_ms = (uint32_t)parsed;
+    } else if (strcmp(arg, "--stats-ms") == 0) {
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed))
         goto invalid;
-      app.stats_ms = (uint32_t)parsed;
-    } else if (strcmp(argv[i], "--stats-file") == 0) {
-      REQUIRE_VALUE();
-      stats_path = argv[i];
-    } else if (strcmp(argv[i], "--pv") == 0) {
-      app.pv = true;
-    } else if (strcmp(argv[i], "--node-id") == 0) {
-      REQUIRE_VALUE();
-      if (!argv[i][0] || strchr(argv[i], '\t') || strchr(argv[i], '\n'))
+      options->stats_ms = (uint32_t)parsed;
+    } else if (strcmp(arg, "--stats-file") == 0) {
+      options->stats_path = value;
+    } else if (strcmp(arg, "--node-id") == 0) {
+      if (!value[0] || strchr(value, '\t') || strchr(value, '\n'))
         goto invalid;
-      app.node_id = argv[i];
-    } else if (strcmp(argv[i], "--verbose") == 0) {
-      app.verbose = true;
+      options->node_id = value;
     } else {
       goto invalid;
     }
   }
-#undef REQUIRE_VALUE
 
-  if ((cert_file == NULL) != (key_file == NULL) ||
-      ((listen_port != 0 || verify_peer) && cert_file == NULL)) {
+  if ((options->cert_file == NULL) != (options->key_file == NULL) ||
+      ((options->listen_port != 0 || options->verify_peer) &&
+       options->cert_file == NULL)) {
     fprintf(stderr,
             "qlinq-app: a TLS identity is required; use both --cert and "
             "--key (insecure clients may omit both)\n");
-    return 1;
+    return false;
   }
-  if ((listen_port == 0) == (peer_arg == NULL) ||
-      (!input_path && !output_path) || (app.one_shot && !input_path) ||
-      !app.auth_token || !app.auth_token[0])
+  if ((options->listen_port == 0) == (options->peer_arg == NULL) ||
+      (!options->input_path && !options->output_path) ||
+      (options->one_shot && !options->input_path) || !options->auth_token ||
+      !options->auth_token[0])
     goto invalid;
-  app.auth_token_len = strlen((const char *)app.auth_token);
-  if (app.auth_token_len > UINT16_MAX ||
-      ((app.track.flags &
+  options->auth_token_len = strlen((const char *)options->auth_token);
+  if (options->auth_token_len > UINT16_MAX ||
+      ((options->track.flags &
         (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0 &&
-       message_size > TRANSPORT_MAX_FEC_RECORD_SIZE))
+       options->message_size > TRANSPORT_MAX_FEC_RECORD_SIZE))
     goto invalid;
-  app.is_server = listen_port != 0;
-  if (input_path && app.required_subscriptions == 0)
-    app.required_subscriptions = 1;
+  options->is_server = options->listen_port != 0;
+  if (options->input_path && options->required_subscriptions == 0)
+    options->required_subscriptions = 1;
 
-  if (input_path) {
-    app.input = strcmp(input_path, "-") == 0 ? stdin : fopen(input_path, "rb");
+  return true;
+
+invalid:
+  fprintf(stderr, "qlinq-app: invalid command line\n");
+  show_help(stderr, argv[0]);
+  return false;
+}
+
+static void service_app(app_t *app) {
+  const options_t *options = app->options;
+  app->started_at = transport_get_time_ms();
+  app->next_stats_at = app->started_at + options->stats_ms;
+  app->pv_last_at = app->started_at;
+  app->next_pv_at = app->started_at + APP_PV_INTERVAL_MS;
+  while (running && !app->failed) {
+    int64_t now = transport_get_time_ms();
+#ifdef SIGHUP
+    if (reload_credentials_requested) {
+      reload_credentials_requested = 0;
+      if (!options->cert_file) {
+        fprintf(stderr, "qlinq-app: TLS credential reload skipped; no identity "
+                        "configured\n");
+      } else if (!transport_reload_credentials(
+                     app->transport, options->cert_file, options->key_file)) {
+        fprintf(stderr, "qlinq-app: TLS credential reload failed\n");
+      } else {
+        fprintf(stderr, "qlinq-app: TLS credentials reloaded\n");
+      }
+    }
+#endif
+    transport_tick(app->transport);
+    publish_pending(app, now);
+    finish_track(app, now);
+    print_stats(app, now, false);
+    print_pv(app, now, false);
+
+    bool send_done =
+        !options->one_shot ||
+        (app->track_finished && now - app->finished_at >= options->drain_ms);
+    bool receive_done =
+        options->receive_limit == 0 ||
+        (app->received_at != 0 && now - app->received_at >= options->drain_ms);
+    if ((options->one_shot || options->receive_limit != 0) && send_done &&
+        receive_done)
+      break;
+
+    struct pollfd fds[TRANSPORT_MAX_POLL_FDS + 1];
+    size_t num_fds = transport_get_poll_fds(app->transport, fds,
+                                            sizeof(fds) / sizeof(fds[0]));
+    size_t input_index = SIZE_MAX;
+    if (app->input && !app->input_eof && app->pending_size == 0 &&
+        app->subscriptions >= options->required_subscriptions &&
+        num_fds < sizeof(fds) / sizeof(fds[0])) {
+      input_index = num_fds;
+      fds[num_fds++] =
+          (struct pollfd){.fd = fileno(app->input), .events = POLLIN};
+    }
+    int timeout = 10;
+    int64_t deadline = transport_get_first_timeout(app->transport);
+    if (deadline != INT64_MAX && deadline <= now)
+      timeout = 0;
+    else if (deadline != INT64_MAX && deadline - now < timeout)
+      timeout = (int)(deadline - now);
+    int polled = num_fds ? poll(fds, num_fds, timeout) : 0;
+    bool input_ready = input_index != SIZE_MAX && polled > 0 &&
+                       (fds[input_index].revents & (POLLIN | POLLHUP)) != 0;
+    load_input(app, input_ready);
+  }
+  int64_t shutdown_started = transport_get_time_ms();
+  transport_shutdown(app->transport,
+                     running ? "application complete" : "signal shutdown");
+  while (!transport_is_drained(app->transport) &&
+         transport_get_time_ms() - shutdown_started < options->drain_ms) {
+    transport_tick(app->transport);
+    usleep(1000);
+  }
+  int64_t stopped_at = transport_get_time_ms();
+  print_stats(app, stopped_at, true);
+  print_pv(app, stopped_at, true);
+}
+
+static int run_app(const options_t *options) {
+  app_t app = {.options = options};
+  if (options->input_path) {
+    app.input = strcmp(options->input_path, "-") == 0
+                    ? stdin
+                    : fopen(options->input_path, "rb");
     if (!app.input) {
       fprintf(stderr, "qlinq-app: unable to open input: %s\n", strerror(errno));
       app.failed = true;
       goto cleanup;
     }
   }
-  if (output_path) {
-    app.output =
-        strcmp(output_path, "-") == 0 ? stdout : fopen(output_path, "wb");
+  if (options->output_path) {
+    app.output = strcmp(options->output_path, "-") == 0
+                     ? stdout
+                     : fopen(options->output_path, "wb");
     if (!app.output) {
       fprintf(stderr, "qlinq-app: unable to open output: %s\n",
               strerror(errno));
@@ -683,8 +751,8 @@ int main(int argc, char **argv) {
       goto cleanup;
     }
   }
-  if (stats_path) {
-    app.stats_output = fopen(stats_path, "w");
+  if (options->stats_path) {
+    app.stats_output = fopen(options->stats_path, "w");
     if (!app.stats_output) {
       fprintf(stderr, "qlinq-app: unable to open stats: %s\n", strerror(errno));
       app.failed = true;
@@ -701,12 +769,11 @@ int main(int argc, char **argv) {
             "egress_current_bytes\tegress_peak_packets\tegress_peak_bytes\t"
             "udp_would_block\tpublish_backpressure\tpublish_errors\n");
   }
-  app.message = malloc(message_size);
+  app.message = malloc(options->message_size);
   if (!app.message) {
     app.failed = true;
     goto cleanup;
   }
-  app.message_capacity = message_size;
 
   if (portable_socket_init() != 0) {
     app.failed = true;
@@ -719,39 +786,41 @@ int main(int argc, char **argv) {
 #endif
 
   char peer_host[256] = {0};
-  uint16_t port = listen_port;
-  if (peer_arg) {
+  uint16_t port = options->listen_port;
+  if (options->peer_arg) {
     port = 8888;
-    if (!cli_parse_endpoint(peer_arg, peer_host, sizeof(peer_host), &port, NULL)) {
+    if (!cli_parse_endpoint(options->peer_arg, peer_host, sizeof(peer_host),
+                            &port, NULL)) {
       app.failed = true;
       goto cleanup_sockets;
     }
   }
   transport_config_t config = {0};
   config.bind_hosts[0] =
-      bind_host ? bind_host
-                : (peer_arg && strchr(peer_host, ':') ? "::" : "0.0.0.0");
+      options->bind_host
+          ? options->bind_host
+          : (options->peer_arg && strchr(peer_host, ':') ? "::" : "0.0.0.0");
   config.num_bind_hosts = 1;
-  if (peer_arg) {
+  if (options->peer_arg) {
     config.remote_hosts[0] = peer_host;
     config.num_remote_hosts = 1;
   }
   config.port = port;
-  config.quic_idle_timeout_ms = idle_timeout_ms;
-  config.cert_file = cert_file;
-  config.key_file = key_file;
-  config.ca_file = ca_file;
-  config.verify_peer = verify_peer;
-  config.allow_insecure_peer = allow_insecure;
+  config.quic_idle_timeout_ms = options->idle_timeout_ms;
+  config.cert_file = options->cert_file;
+  config.key_file = options->key_file;
+  config.ca_file = options->ca_file;
+  config.verify_peer = options->verify_peer;
+  config.allow_insecure_peer = options->allow_insecure;
   config.callback = on_event;
   config.user_data = &app;
-  config.simulated_loss_rate = simulated_loss;
-  config.reconnect_enabled = peer_arg != NULL;
-  config.repair_mode = repair_mode;
-  config.limits.max_connections = max_connections;
-  config.limits.max_repair_requests_per_second = max_repair_requests;
+  config.simulated_loss_rate = options->simulated_loss;
+  config.reconnect_enabled = options->peer_arg != NULL;
+  config.repair_mode = options->repair_mode;
+  config.limits.max_connections = options->max_connections;
+  config.limits.max_repair_requests_per_second = options->max_repair_requests;
   config.limits.max_aggregate_repair_requests_per_second =
-      max_aggregate_repairs;
+      options->max_aggregate_repairs;
   app.transport = transport_create(&config);
   if (!app.transport) {
     fprintf(stderr, "qlinq-app: unable to create transport\n");
@@ -759,73 +828,7 @@ int main(int argc, char **argv) {
     goto cleanup_sockets;
   }
 
-  app.started_at = transport_get_time_ms();
-  app.next_stats_at = app.started_at + app.stats_ms;
-  app.pv_last_at = app.started_at;
-  app.next_pv_at = app.started_at + APP_PV_INTERVAL_MS;
-  while (running && !app.failed) {
-    int64_t now = transport_get_time_ms();
-#ifdef SIGHUP
-    if (reload_credentials_requested) {
-      reload_credentials_requested = 0;
-      if (!cert_file) {
-        fprintf(stderr, "qlinq-app: TLS credential reload skipped; no identity "
-                        "configured\n");
-      } else if (!transport_reload_credentials(app.transport, cert_file,
-                                               key_file)) {
-        fprintf(stderr, "qlinq-app: TLS credential reload failed\n");
-      } else {
-        fprintf(stderr, "qlinq-app: TLS credentials reloaded\n");
-      }
-    }
-#endif
-    transport_tick(app.transport);
-    publish_pending(&app, now);
-    finish_track(&app, now);
-    print_stats(&app, now, false);
-    print_pv(&app, now, false);
-
-    bool send_done = !app.one_shot || (app.track_finished &&
-                                       now - app.finished_at >= app.drain_ms);
-    bool receive_done =
-        app.receive_limit == 0 ||
-        (app.received_at != 0 && now - app.received_at >= app.drain_ms);
-    if ((app.one_shot || app.receive_limit != 0) && send_done && receive_done)
-      break;
-
-    struct pollfd fds[TRANSPORT_MAX_POLL_FDS + 1];
-    size_t num_fds = transport_get_poll_fds(app.transport, fds,
-                                            sizeof(fds) / sizeof(fds[0]));
-    size_t input_index = SIZE_MAX;
-    if (app.input && !app.input_eof && app.pending_size == 0 &&
-        app.subscriptions >= app.required_subscriptions &&
-        num_fds < sizeof(fds) / sizeof(fds[0])) {
-      input_index = num_fds;
-      fds[num_fds++] =
-          (struct pollfd){.fd = fileno(app.input), .events = POLLIN};
-    }
-    int timeout = 10;
-    int64_t deadline = transport_get_first_timeout(app.transport);
-    if (deadline != INT64_MAX && deadline <= now)
-      timeout = 0;
-    else if (deadline != INT64_MAX && deadline - now < timeout)
-      timeout = (int)(deadline - now);
-    int polled = num_fds ? poll(fds, num_fds, timeout) : 0;
-    bool input_ready = input_index != SIZE_MAX && polled > 0 &&
-                       (fds[input_index].revents & (POLLIN | POLLHUP)) != 0;
-    load_input(&app, input_ready);
-  }
-  int64_t shutdown_started = transport_get_time_ms();
-  transport_shutdown(app.transport,
-                     running ? "application complete" : "signal shutdown");
-  while (!transport_is_drained(app.transport) &&
-         transport_get_time_ms() - shutdown_started < app.drain_ms) {
-    transport_tick(app.transport);
-    usleep(1000);
-  }
-  int64_t stopped_at = transport_get_time_ms();
-  print_stats(&app, stopped_at, true);
-  print_pv(&app, stopped_at, true);
+  service_app(&app);
 
 cleanup_sockets:
   if (app.transport)
@@ -836,14 +839,22 @@ cleanup:
   free(app.message);
   if (app.input && app.input != stdin)
     fclose(app.input);
-  if (app.output && app.output != stdout)
-    fclose(app.output);
+  if (app.output && app.output != stdout && fclose(app.output) != 0) {
+    fprintf(stderr, "qlinq-app: output close failed\n");
+    app.failed = true;
+  }
   if (app.stats_output)
     fclose(app.stats_output);
   return app.failed ? 1 : 0;
+}
 
-invalid:
-  fprintf(stderr, "qlinq-app: invalid command line\n");
-  show_help(stderr, argv[0]);
-  return 1;
+int main(int argc, char **argv) {
+  options_t options;
+  if (!parse_options(argc, argv, &options))
+    return 1;
+  if (options.help) {
+    show_help(stdout, argv[0]);
+    return 0;
+  }
+  return run_app(&options);
 }

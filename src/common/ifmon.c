@@ -117,112 +117,100 @@ static int is_iface_allowed(const char *name) {
   return 1;
 }
 
+static const ifmon_iface_t *find_iface(const ifmon_list_t *list,
+                                       uint32_t index) {
+  for (int i = 0; i < list->count; i++)
+    if (list->ifaces[i].index == index)
+      return &list->ifaces[i];
+  return NULL;
+}
+
+static int missing_addresses(const ifmon_iface_t *from,
+                             const ifmon_iface_t *other, ifmon_addr_t *out) {
+  int count = 0;
+  for (int i = 0; i < from->addr_count; i++) {
+    const ifmon_addr_t *addr = &from->addrs[i];
+    int found = 0;
+    for (int j = 0; j < other->addr_count; j++) {
+      const ifmon_addr_t *candidate = &other->addrs[j];
+      if (addr->family != candidate->family ||
+          addr->prefix_len != candidate->prefix_len)
+        continue;
+      found =
+          (addr->family == AF_INET &&
+           addr->ip.v4.s_addr == candidate->ip.v4.s_addr) ||
+          (addr->family == AF_INET6 &&
+           memcmp(&addr->ip.v6, &candidate->ip.v6, sizeof(addr->ip.v6)) == 0);
+      if (found)
+        break;
+    }
+    if (!found && count < IFMON_MAX_IPS_PER_IFACE)
+      out[count++] = *addr;
+  }
+  return count;
+}
+
 static void generate_update(const ifmon_list_t *prev, const ifmon_list_t *curr,
                             int is_initial, ifmon_update_t *up) {
-  memset(up, 0, sizeof(ifmon_update_t));
+  memset(up, 0, sizeof(*up));
   up->is_initial = is_initial;
   up->interfaces = curr;
-
-  if (is_initial) {
+  if (is_initial)
     return;
-  }
 
   for (int i = 0; i < curr->count; i++) {
     const ifmon_iface_t *curr_if = &curr->ifaces[i];
-    const ifmon_iface_t *prev_if = NULL;
-    for (int j = 0; j < prev->count; j++) {
-      if (prev->ifaces[j].index == curr_if->index) {
-        prev_if = &prev->ifaces[j];
-        break;
-      }
-    }
-
+    const ifmon_iface_t *prev_if = find_iface(prev, curr_if->index);
     if (!prev_if) {
-      if (up->added_count < IFMON_MAX_INTERFACES) {
+      if (up->added_count < IFMON_MAX_INTERFACES)
         up->added[up->added_count++] = curr_if->index;
-      }
-    } else {
-      int hw_changed = (strcmp(prev_if->hw_addr, curr_if->hw_addr) != 0);
-      int link_changed = (prev_if->is_up != curr_if->is_up);
-
-      ifmon_iface_diff_t diff;
-      memset(&diff, 0, sizeof(diff));
-      diff.index = curr_if->index;
-      diff.hw_addr_changed = hw_changed;
-      diff.link_state_changed = link_changed;
-      diff.is_up = curr_if->is_up;
-
-      for (int c = 0; c < curr_if->addr_count; c++) {
-        const ifmon_addr_t *ca = &curr_if->addrs[c];
-        int found = 0;
-        for (int p = 0; p < prev_if->addr_count; p++) {
-          const ifmon_addr_t *pa = &prev_if->addrs[p];
-          if (ca->family == pa->family && ca->prefix_len == pa->prefix_len) {
-            if (ca->family == AF_INET && ca->ip.v4.s_addr == pa->ip.v4.s_addr) {
-              found = 1;
-            } else if (ca->family == AF_INET6 &&
-                       memcmp(ca->ip.v6.s6_addr, pa->ip.v6.s6_addr, 16) == 0) {
-              found = 1;
-            }
-          }
-          if (found)
-            break;
-        }
-        if (!found) {
-          if (diff.addrs_added_count < IFMON_MAX_IPS_PER_IFACE) {
-            diff.addrs_added[diff.addrs_added_count++] = *ca;
-          }
-        }
-      }
-
-      for (int p = 0; p < prev_if->addr_count; p++) {
-        const ifmon_addr_t *pa = &prev_if->addrs[p];
-        int found = 0;
-        for (int c = 0; c < curr_if->addr_count; c++) {
-          const ifmon_addr_t *ca = &curr_if->addrs[c];
-          if (ca->family == pa->family && ca->prefix_len == pa->prefix_len) {
-            if (ca->family == AF_INET && ca->ip.v4.s_addr == pa->ip.v4.s_addr) {
-              found = 1;
-            } else if (ca->family == AF_INET6 &&
-                       memcmp(ca->ip.v6.s6_addr, pa->ip.v6.s6_addr, 16) == 0) {
-              found = 1;
-            }
-          }
-          if (found)
-            break;
-        }
-        if (!found) {
-          if (diff.addrs_removed_count < IFMON_MAX_IPS_PER_IFACE) {
-            diff.addrs_removed[diff.addrs_removed_count++] = *pa;
-          }
-        }
-      }
-
-      if (hw_changed || link_changed || diff.addrs_added_count > 0 ||
-          diff.addrs_removed_count > 0) {
-        if (up->modified_count < IFMON_MAX_INTERFACES) {
-          up->modified[up->modified_count++] = diff;
-        }
-      }
+      continue;
     }
+    ifmon_iface_diff_t diff = {
+        .index = curr_if->index,
+        .hw_addr_changed = strcmp(prev_if->hw_addr, curr_if->hw_addr) != 0,
+        .link_state_changed = prev_if->is_up != curr_if->is_up,
+        .is_up = curr_if->is_up};
+    diff.addrs_added_count =
+        missing_addresses(curr_if, prev_if, diff.addrs_added);
+    diff.addrs_removed_count =
+        missing_addresses(prev_if, curr_if, diff.addrs_removed);
+    if ((diff.hw_addr_changed || diff.link_state_changed ||
+         diff.addrs_added_count || diff.addrs_removed_count) &&
+        up->modified_count < IFMON_MAX_INTERFACES)
+      up->modified[up->modified_count++] = diff;
   }
+  for (int i = 0; i < prev->count; i++) {
+    uint32_t index = prev->ifaces[i].index;
+    if (!find_iface(curr, index) && up->removed_count < IFMON_MAX_INTERFACES)
+      up->removed[up->removed_count++] = index;
+  }
+}
 
-  for (int p = 0; p < prev->count; p++) {
-    const ifmon_iface_t *prev_if = &prev->ifaces[p];
-    int found = 0;
-    for (int c = 0; c < curr->count; c++) {
-      if (curr->ifaces[c].index == prev_if->index) {
-        found = 1;
-        break;
-      }
+#ifndef _WIN32
+static void fill_missing_prefixes(ifmon_list_t *list) {
+  for (int i = 0; i < list->count; i++) {
+    ifmon_iface_t *iface = &list->ifaces[i];
+    uint8_t v4 = 0, v6 = 0;
+    for (int j = 0; j < iface->addr_count; j++) {
+      const ifmon_addr_t *addr = &iface->addrs[j];
+      if (addr->family == AF_INET && v4 == 0)
+        v4 = addr->prefix_len;
+      if (addr->family == AF_INET6 && v6 == 0)
+        v6 = addr->prefix_len;
     }
-    if (!found) {
-      if (up->removed_count < IFMON_MAX_INTERFACES) {
-        up->removed[up->removed_count++] = prev_if->index;
+    for (int j = 0; j < iface->addr_count; j++) {
+      ifmon_addr_t *addr = &iface->addrs[j];
+      if (addr->prefix_len == 0) {
+        if (addr->family == AF_INET)
+          addr->prefix_len = v4 ? v4 : 24;
+        else if (addr->family == AF_INET6)
+          addr->prefix_len = v6 ? v6 : 64;
       }
     }
   }
 }
+#endif
 
 #if defined(__linux__)
 int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
@@ -384,33 +372,7 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
       break;
   }
 
-  for (int i = 0; i < list->count; i++) {
-    ifmon_iface_t *iface = &list->ifaces[i];
-    uint8_t first_v4_prefix = 0;
-    uint8_t first_v6_prefix = 0;
-    for (int j = 0; j < iface->addr_count; j++) {
-      if (iface->addrs[j].family == AF_INET && iface->addrs[j].prefix_len > 0) {
-        first_v4_prefix = iface->addrs[j].prefix_len;
-        break;
-      }
-    }
-    for (int j = 0; j < iface->addr_count; j++) {
-      if (iface->addrs[j].family == AF_INET6 &&
-          iface->addrs[j].prefix_len > 0) {
-        first_v6_prefix = iface->addrs[j].prefix_len;
-        break;
-      }
-    }
-    for (int j = 0; j < iface->addr_count; j++) {
-      if (iface->addrs[j].prefix_len == 0) {
-        if (iface->addrs[j].family == AF_INET) {
-          iface->addrs[j].prefix_len = first_v4_prefix ? first_v4_prefix : 24;
-        } else if (iface->addrs[j].family == AF_INET6) {
-          iface->addrs[j].prefix_len = first_v6_prefix ? first_v6_prefix : 64;
-        }
-      }
-    }
-  }
+  fill_missing_prefixes(list);
 
   close(fd);
   return 0;
@@ -530,33 +492,7 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
     next += rtm->rtm_msglen;
   }
 
-  for (int i = 0; i < list->count; i++) {
-    ifmon_iface_t *iface = &list->ifaces[i];
-    uint8_t first_v4_prefix = 0;
-    uint8_t first_v6_prefix = 0;
-    for (int j = 0; j < iface->addr_count; j++) {
-      if (iface->addrs[j].family == AF_INET && iface->addrs[j].prefix_len > 0) {
-        first_v4_prefix = iface->addrs[j].prefix_len;
-        break;
-      }
-    }
-    for (int j = 0; j < iface->addr_count; j++) {
-      if (iface->addrs[j].family == AF_INET6 &&
-          iface->addrs[j].prefix_len > 0) {
-        first_v6_prefix = iface->addrs[j].prefix_len;
-        break;
-      }
-    }
-    for (int j = 0; j < iface->addr_count; j++) {
-      if (iface->addrs[j].prefix_len == 0) {
-        if (iface->addrs[j].family == AF_INET) {
-          iface->addrs[j].prefix_len = first_v4_prefix ? first_v4_prefix : 24;
-        } else if (iface->addrs[j].family == AF_INET6) {
-          iface->addrs[j].prefix_len = first_v6_prefix ? first_v6_prefix : 64;
-        }
-      }
-    }
-  }
+  fill_missing_prefixes(list);
 
   return 0;
 }

@@ -80,35 +80,17 @@ bool transport_assembler_grow(frame_assembler_t *assembler, uint16_t symbols,
   bool *received = calloc(new_symbols, sizeof(*received));
   bool *missing = calloc(new_symbols, sizeof(*missing));
   uint16_t *indices = calloc(new_symbols, sizeof(*indices));
-  if (!buffers || !storage || !received || !missing || !indices) {
-    free(buffers);
-    free(storage);
-    free(received);
-    free(missing);
-    free(indices);
-    return false;
-  }
+  if (!buffers || !storage || !received || !missing || !indices)
+    goto Fail;
   for (size_t i = 0; i < new_symbols; i++)
     buffers[i] = storage + i * new_symbol_size;
   if (assembler->buffers && assembler->total_symbols > 0) {
     if (!assembler->received_mask || assembler->total_symbols > new_symbols ||
-        assembler->symbol_size > new_symbol_size) {
-      free(buffers);
-      free(storage);
-      free(received);
-      free(missing);
-      free(indices);
-      return false;
-    }
+        assembler->symbol_size > new_symbol_size)
+      goto Fail;
     for (size_t i = 0; i < assembler->total_symbols; i++) {
-      if (!assembler->buffers[i]) {
-        free(buffers);
-        free(storage);
-        free(received);
-        free(missing);
-        free(indices);
-        return false;
-      }
+      if (!assembler->buffers[i])
+        goto Fail;
       memcpy(buffers[i], assembler->buffers[i], assembler->symbol_size);
       received[i] = assembler->received_mask[i];
     }
@@ -127,6 +109,14 @@ bool transport_assembler_grow(frame_assembler_t *assembler, uint16_t symbols,
   assembler->capacity_symbols = new_symbols;
   assembler->capacity_symbol_size = new_symbol_size;
   return true;
+
+Fail:
+  free(buffers);
+  free(storage);
+  free(received);
+  free(missing);
+  free(indices);
+  return false;
 }
 
 size_t transport_assembler_required_bytes(uint16_t symbols,

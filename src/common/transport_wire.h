@@ -67,6 +67,11 @@ typedef enum {
 } qlinq_wire_datagram_type_t;
 
 typedef struct {
+  const uint8_t *data;
+  size_t remaining;
+} qlinq_wire_cursor_t;
+
+typedef struct {
   uint8_t type;
   const uint8_t *payload;
   size_t payload_len;
@@ -147,6 +152,12 @@ typedef struct {
   uint64_t group_id;
   uint64_t final_object_id;
 } qlinq_wire_track_checkpoint_ack_t;
+
+/* Borrow the next length-prefixed DATA record, including empty records.
+ * On exhaustion or truncation, return false without advancing the cursor.
+ * Callers decide whether empty records and incomplete tails are acceptable. */
+bool qlinq_wire_next_record(qlinq_wire_cursor_t *cursor, const uint8_t **data,
+                            size_t *size);
 
 bool qlinq_wire_frame_type_is_known(uint8_t type);
 

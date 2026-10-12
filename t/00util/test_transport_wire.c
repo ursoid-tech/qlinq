@@ -11,7 +11,48 @@
     }                                                                          \
   } while (0)
 
+static int test_grouped_records(void) {
+  const uint8_t grouped[] = {0, 3, 'a', 'b', 'c', 0, 0, 0, 1, 'd'};
+  qlinq_wire_cursor_t cursor = {grouped, sizeof(grouped)};
+  const uint8_t *record = NULL;
+  size_t size = 99;
+  CHECK(qlinq_wire_next_record(&cursor, &record, &size) &&
+            record == grouped + 2 && size == 3 && cursor.remaining == 5,
+        "grouped record is a borrowed slice");
+  CHECK(qlinq_wire_next_record(&cursor, &record, &size) && size == 0 &&
+            cursor.remaining == 3,
+        "empty record remains available to caller policy");
+  CHECK(qlinq_wire_next_record(&cursor, &record, &size) &&
+            record == grouped + 9 && size == 1 && cursor.remaining == 0 &&
+            !qlinq_wire_next_record(&cursor, &record, &size),
+        "grouped records consume exactly their payload");
+
+  for (size_t length = 0; length < 5; length++) {
+    cursor = (qlinq_wire_cursor_t){grouped, length};
+    record = NULL;
+    size = 99;
+    CHECK(!qlinq_wire_next_record(&cursor, &record, &size) &&
+              cursor.data == grouped && cursor.remaining == length &&
+              record == NULL && size == 99,
+          "truncated record leaves cursor and output unchanged");
+  }
+  const uint8_t tail[] = {0, 1, 'x', 0};
+  cursor = (qlinq_wire_cursor_t){tail, sizeof(tail)};
+  CHECK(qlinq_wire_next_record(&cursor, &record, &size) && size == 1 &&
+            !qlinq_wire_next_record(&cursor, &record, &size) &&
+            cursor.remaining == 1,
+        "complete records preceding a truncated tail remain available");
+
+  uint8_t largest[UINT16_MAX + 2U] = {0xff, 0xff};
+  cursor = (qlinq_wire_cursor_t){largest, sizeof(largest)};
+  CHECK(qlinq_wire_next_record(&cursor, &record, &size) && size == UINT16_MAX &&
+            cursor.remaining == 0,
+        "record length uses the full unsigned network-order prefix");
+  return 0;
+}
+
 int main(void) {
+  CHECK(test_grouped_records() == 0, "grouped record cursor");
   uint8_t payload[4096];
   uint8_t frame_buf[8192];
   size_t payload_len = 0;

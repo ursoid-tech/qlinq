@@ -58,6 +58,19 @@ static int run_family(const char *host, int family) {
   duplicate = transport_create(&config);
   if (duplicate)
     goto Exit;
+  if (family == AF_INET) {
+    /* A returning last interface must keep the listener's configured port. */
+    for (size_t turn = 0; turn < 2; turn++) {
+      transport_mock_iface_remove(listener, host);
+      transport_tick(listener);
+      if (exclusive_port(listener, family) != 0)
+        goto Exit;
+      transport_mock_iface_add(listener, host);
+      transport_tick(listener);
+      if (exclusive_port(listener, family) != config.port)
+        goto Exit;
+    }
+  }
   config.remote_hosts[0] = host;
   config.num_remote_hosts = 1;
   config.limits.max_connections = 1;
@@ -107,11 +120,40 @@ static int run_dual_wildcard(void) {
   return 0;
 }
 
+static int run_partial_bind_failure(const char *host, int family) {
+  const char *second_hosts[] = {"invalid-address", host};
+  for (size_t i = 0; i < sizeof(second_hosts) / sizeof(*second_hosts); i++) {
+    transport_config_t config = {.bind_hosts = {host, second_hosts[i]},
+                                 .num_bind_hosts = 2,
+                                 .port = 19867,
+                                 .cert_file = "t/assets/server.crt",
+                                 .key_file = "t/assets/server.key",
+                                 .allow_insecure_peer = true,
+                                 .callback = ignore_event,
+                                 .log_callback = ignore_log};
+    transport_t *transport = transport_create(&config);
+    if (transport) {
+      transport_destroy(transport);
+      return 1;
+    }
+    /* A parse or bind failure on the second socket must release the first. */
+    config.num_bind_hosts = 1;
+    transport = transport_create(&config);
+    bool valid = transport && exclusive_port(transport, family) == config.port;
+    transport_destroy(transport);
+    if (!valid)
+      return 1;
+  }
+  return 0;
+}
+
 int main(void) {
   if (portable_socket_init())
     return 1;
   int result = run_family("127.0.0.1", AF_INET) ||
-               run_family("::1", AF_INET6) || run_dual_wildcard();
+               run_family("::1", AF_INET6) || run_dual_wildcard() ||
+               run_partial_bind_failure("127.0.0.1", AF_INET) ||
+               run_partial_bind_failure("::1", AF_INET6);
   portable_socket_cleanup();
   if (!result)
     puts("===UNICAST BIND OWNERSHIP OK===");

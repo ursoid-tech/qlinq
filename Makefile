@@ -84,6 +84,7 @@ TRANSPORT_OBJS = src/common/qlinq.o \
               src/common/transport_paths.o \
               src/common/transport_protocol.o \
               src/common/transport_publish.o \
+              src/common/transport_recovery.o \
               src/common/transport_repair.o \
               src/common/transport_scheduler.o \
               src/common/transport_stream.o \
@@ -160,47 +161,35 @@ t/00util/test_fec: t/00util/test_fec.o $(FEC_OBJS)
 t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_egress.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_transport_bind: t/00util/test_transport_bind.o $(COMMON_OBJS)
+TRANSPORT_TESTS = t/00util/test_transport_bind \
+	t/00util/test_interleaved_receive \
+	t/00util/test_publication_limits \
+	t/00util/test_directional_subscriptions \
+	t/00util/test_generic_ports \
+	t/00util/test_stream_budget \
+	t/00util/test_transport \
+	t/00util/test_reliable_bidirectional \
+	t/00util/test_tund \
+	t/00util/test_transport_components \
+	t/00util/test_benchmark \
+	t/00util/test_tc_benchmark \
+	t/00util/test_multipath \
+	t/00util/test_multipath_nack \
+	t/00util/test_operational \
+	t/00util/test_tls \
+	t/00util/test_rateless_benchmark
+
+$(TRANSPORT_TESTS): %: %.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_interleaved_receive: t/00util/test_interleaved_receive.o $(COMMON_OBJS)
+API_TESTS = t/00util/test_qlinq_event_overflow \
+	t/00util/test_qlinq_compat \
+	t/00util/test_qlinq_reconnect \
+	t/00util/test_qlinq_delivery \
+	t/00util/test_qlinq_event_ownership
+
+$(API_TESTS): %: %.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_publication_limits: t/00util/test_publication_limits.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_directional_subscriptions: t/00util/test_directional_subscriptions.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_qlinq_event_overflow: t/00util/test_qlinq_event_overflow.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_qlinq_compat: t/00util/test_qlinq_compat.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_qlinq_reconnect: t/00util/test_qlinq_reconnect.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_qlinq_delivery: t/00util/test_qlinq_delivery.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_qlinq_event_ownership: t/00util/test_qlinq_event_ownership.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_generic_ports: t/00util/test_generic_ports.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_stream_budget: t/00util/test_stream_budget.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_transport.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_reliable_bidirectional: t/00util/test_reliable_bidirectional.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_reliable_bidirectional.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_tund: t/00util/test_tund.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_tund.o $(COMMON_OBJS) $(LDFLAGS)
 
 t/00util/test_data_uds: t/00util/test_data_uds.o src/common/data_uds.o
 	$(CC) -o $@ t/00util/test_data_uds.o src/common/data_uds.o $(LDFLAGS)
@@ -208,10 +197,10 @@ t/00util/test_data_uds: t/00util/test_data_uds.o src/common/data_uds.o
 t/00util/test_transport_wire: t/00util/test_transport_wire.o src/common/transport_wire.o
 	$(CC) -o $@ t/00util/test_transport_wire.o src/common/transport_wire.o $(LDFLAGS)
 
-t/00util/test_transport_components: t/00util/test_transport_components.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_transport_components.o $(COMMON_OBJS) $(LDFLAGS)
-
 t/00util/test_udp_gso_prefix: t/00util/test_udp_gso_prefix.o
+	$(CC) -o $@ $< $(LDFLAGS)
+
+t/00util/test_ifmon: t/00util/test_ifmon.o
 	$(CC) -o $@ $< $(LDFLAGS)
 
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
@@ -261,27 +250,6 @@ release-check: check-submodules
 	$(MAKE) check-multipath-demo
 	@echo "=== RELEASE CHECK OK ==="
 
-t/00util/test_benchmark: t/00util/test_benchmark.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_tc_benchmark: t/00util/test_tc_benchmark.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_tc_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_multipath: t/00util/test_multipath.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_multipath.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_multipath_nack: t/00util/test_multipath_nack.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_multipath_nack.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_operational: t/00util/test_operational.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_operational.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_tls: t/00util/test_tls.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_tls.o $(COMMON_OBJS) $(LDFLAGS)
-
-t/00util/test_rateless_benchmark: t/00util/test_rateless_benchmark.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_rateless_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
-
 benchmark: t/00util/test_benchmark
 	./t/00util/test_benchmark
 
@@ -298,7 +266,7 @@ CHECK_BINARIES = t/00util/test_fec \
 	t/00util/test_stream_budget t/00util/test_transport \
 	t/00util/test_reliable_bidirectional t/00util/test_tund \
 	t/00util/test_data_uds t/00util/test_transport_wire \
-	t/00util/test_transport_components t/00util/test_udp_gso_prefix \
+	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_ifmon \
 	t/00util/test_multipath \
 	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
 
@@ -344,8 +312,11 @@ t/assets/unsafe.key: t/assets/verified.key
 
 gencerts: t/assets/server.crt t/assets/server.key t/assets/verified.crt t/assets/verified.key t/assets/verified-v6.crt t/assets/verified-v6.key t/assets/untrusted.crt t/assets/untrusted.key t/assets/unsafe.key
 
+FORMAT_SOURCES := $(shell find src examples t/00util -type f \
+	\( -name '*.c' -o -name '*.h' \))
+
 indent:
-	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
+	clang-format -style=file -i $(FORMAT_SOURCES)
 
 .PHONY: all clean check benchmark fuzz-wire check-submodules FORCE \
 	check-multipath-demo check-multipath-bw-demo check-sanitize soak release-check indent gencerts

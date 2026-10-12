@@ -54,6 +54,11 @@ idle timeout, machine-readable counter snapshots, and `--pv` for pv-style wire
 throughput per physical interface. Run `qlinq-app --help` for the complete
 interface.
 
+Delivery mode names are shared by `qlinq-app`, `qlinqd`, and `qlinq-tun`:
+`datagram`, `reliable`, `fixed-fec` (also accepted as `fec`), and `rateless`.
+The daemon also retains its `--reliable` and `--rateless` aliases. Each tool
+keeps its existing default mode.
+
 ## Direct packet tunnel
 
 `qlinq-tun` maps each IP packet to one `QLINQ_CONTENT_DATA` record and
@@ -104,3 +109,5 @@ To run the test suite:
 make check
 ```
 
+Run `make indent` to format first-party C sources and headers using the
+repository's `.clang-format` configuration.

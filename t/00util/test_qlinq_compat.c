@@ -64,6 +64,10 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   assert(ep);
   qlinq_stream_config_t sc = {
       .content_type = QLINQ_CONTENT_DATA, .delivery = mode, .name = "compat"};
+  qlinq_stream_config_t invalid = sc;
+  invalid.content_type = (qlinq_content_type_t)(256 + QLINQ_CONTENT_DATA);
+  assert(!qlinq_publish(ep, &invalid) &&
+         qlinq_context_last_status(ctx) == QLINQ_STATUS_INVALID);
   qlinq_stream_t *pub = qlinq_publish(ep, &sc), *sub = qlinq_subscribe(ep, &sc);
   assert(pub && sub);
   bool ready = false, joined = false;

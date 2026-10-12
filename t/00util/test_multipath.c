@@ -237,7 +237,8 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
                          .data = payload,
                          .size = 12 * symbol_size};
   size_t received_before = client->objects_received;
-  memset(conn->path_states, 0, sizeof(conn->path_states));
+  for (size_t i = 0; i < t->socket_count; i++)
+    conn->paths[i].state = (path_state_t){0};
   /* A short object's shrunken payload must not seed inflated rate units. */
   object.size = 1;
   bool ok = transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED;
@@ -249,17 +250,18 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
   fp_t initial_rate[TRANSPORT_MAX_PATHS] = {0};
   for (size_t publication = 0; publication < 2 && ok; publication++) {
     size_t queued = 0;
-    for (size_t i = 0; i < t->num_fds; i++) {
+    for (size_t i = 0; i < t->socket_count; i++) {
       quicly_path_stats_t stats;
-      size_t mapped = transport_path_get_stats_by_link(
-          conn->quic, t->local_addrs, t->num_fds, i, &stats);
+      size_t mapped = transport_path_get_stats_by_local(
+          conn->quic, &t->sockets[i].local_addr, &stats);
       if (mapped == SIZE_MAX || !quicly_is_path_available(conn->quic, mapped)) {
         ok = false;
         break;
       }
       path_t expected = transport_path_estimate(
           &stats, quicly_get_num_datagram_frames_path(conn->quic, mapped),
-          t->egress[i].bytes, symbol_size, conn->latest_owd_fp[i]);
+          t->sockets[i].egress.bytes, symbol_size,
+          conn->paths[i].latest_owd_fp);
       expected.q += stats.bytes_in_flight / symbol_size +
                     (stats.bytes_in_flight % symbol_size != 0);
       check.expected_queue[i] = expected.q;
@@ -272,11 +274,11 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
     }
     check.events = 0;
     ok = transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED;
-    for (size_t i = 0; i < t->num_fds; i++)
-      ok &= conn->path_states[i].initialized &&
-            conn->path_states[i].b_ewma == initial_rate[i] &&
-            conn->path_states[i].q_ewma == check.expected_queue[i];
-    ok &= check.valid && check.events == t->num_fds;
+    for (size_t i = 0; i < t->socket_count; i++)
+      ok &= conn->paths[i].state.initialized &&
+            conn->paths[i].state.b_ewma == initial_rate[i] &&
+            conn->paths[i].state.q_ewma == check.expected_queue[i];
+    ok &= check.valid && check.events == t->socket_count;
     object.object_id++;
   }
   t->log_callback = NULL;
@@ -294,11 +296,11 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
    * Admission must replan onto an empty alternate, without partially filling
    * the preferred path or requiring an event-loop tick first. */
   if (ok) {
-    for (size_t i = 0; i < t->num_fds; i++)
+    for (size_t i = 0; i < t->socket_count; i++)
       ok &= transport_mock_path_state(t, i, i == 0 ? 10000 : 1000,
                                       i == 0 ? 1.0 : 100.0, 0);
     size_t primary =
-        transport_path_find_by_link(conn->quic, t->local_addrs, t->num_fds, 0);
+        transport_path_find_by_local(conn->quic, &t->sockets[0].local_addr);
     uint8_t ignored = 0xff;
     ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
     while (ok && quicly_get_num_datagram_frames_path(conn->quic, primary) < 63)
@@ -637,8 +639,8 @@ int main(void) {
      * packet counters also include ACKs, control traffic and PTO probes. */
     size_t mapped[4], queued_before[4];
     for (size_t i = 0; i < 4; ++i) {
-      mapped[i] = transport_path_find_by_link(
-          server_state.conn->quic, server->local_addrs, server->num_fds, i);
+      mapped[i] = transport_path_find_by_local(server_state.conn->quic,
+                                               &server->sockets[i].local_addr);
       queued_before[i] = quicly_get_num_datagram_frames_path(
           server_state.conn->quic, mapped[i]);
     }

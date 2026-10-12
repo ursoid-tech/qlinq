@@ -2,6 +2,7 @@
 #include "portable_sockets.h"
 #include <assert.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdint.h>
@@ -57,13 +58,15 @@ static int read_exact(int fd, void *buf, size_t size) {
 
 typedef struct {
   bool ready, retry;
-  unsigned calls, accepted[2];
+  unsigned calls, accepted[2], ready_calls;
   uint64_t first_id;
 } retry_state_t;
 
 static bool ready(void *arg, const moq_track_id_t *track) {
   (void)track;
-  return ((retry_state_t *)arg)->ready;
+  retry_state_t *state = arg;
+  state->ready_calls++;
+  return state->ready;
 }
 
 static data_uds_result_t retry_packet(void *arg, data_uds_record_t *record) {
@@ -95,6 +98,9 @@ static void retry_and_ownership(void) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   assert(fd >= 0 && connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
   data_uds_tick(uds);
+  struct pollfd fds[2];
+  assert(data_uds_get_poll_fds(uds, fds, 2) == 2);
+  assert(fds[1].events == POLLIN && state.ready_calls == 0);
   uint8_t registration[] = {MOQ_TRACK_DATA, MOQ_TRACK_FLAG_RELIABLE, 1, 'r'};
   assert(write(fd, registration, sizeof(registration)) == sizeof(registration));
   uint8_t frames[12] = {0};
@@ -105,14 +111,41 @@ static void retry_and_ownership(void) {
   assert(write(fd, frames, sizeof(frames)) == sizeof(frames));
   data_uds_tick(uds);
   assert(state.accepted[0] == 1 && state.accepted[1] == 0);
-  data_uds_tick(uds); /* Retry without another socket write. */
+  unsigned ready_calls = state.ready_calls;
+  assert(data_uds_get_poll_fds(uds, fds, 2) == 1);
+  assert(state.ready_calls ==
+         ready_calls); /* Pending records suppress POLLIN. */
+  data_uds_tick(uds);  /* Retry without another socket write. */
   assert(state.calls == 2 && state.accepted[0] == 1);
+  assert(state.ready_calls == ready_calls + 1);
   state.retry = false;
   data_uds_tick(uds);
   assert(state.accepted[0] == 1 && state.accepted[1] == 1);
   data_uds_tick(uds);
   assert(state.calls == 3); /* Readiness is checked between records. */
+  assert(data_uds_get_poll_fds(uds, fds, 2) == 1);
+
+  /* Output remains pollable while input is paused for backpressure. */
+  int send_buffer = 1024;
+  assert(setsockopt(fds[1].fd, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                    sizeof(send_buffer)) == 0);
+  uint8_t output[65536] = {0};
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA, .name = "r"};
+  assert(data_uds_send(uds, &track, output, sizeof(output), 1));
+  assert(data_uds_get_poll_fds(uds, fds, 2) == 2 && fds[1].events == POLLOUT);
+  uint8_t chunk[4096];
+  size_t remaining = sizeof(output) + 5;
+  while (remaining != 0) {
+    ssize_t count =
+        read(fd, chunk, remaining < sizeof(chunk) ? remaining : sizeof(chunk));
+    assert(count > 0);
+    remaining -= (size_t)count;
+    data_uds_tick(uds);
+    assert(state.calls == 3);
+  }
+  assert(data_uds_get_poll_fds(uds, fds, 2) == 1);
   state.ready = true;
+  assert(data_uds_get_poll_fds(uds, fds, 2) == 2 && fds[1].events == POLLIN);
   data_uds_tick(uds);
   assert(state.accepted[0] == 2 && state.accepted[1] == 2);
   close(fd);
@@ -134,6 +167,76 @@ static void retry_and_ownership(void) {
   assert(lstat(addr.sun_path, &after) != 0 && errno == ENOENT);
 }
 
+/* Exact names outrank earlier DATA fallbacks; duplicate names retain the first
+ * registration. Accepting on descriptor zero exercises client lifetime state.
+ */
+static void routing_and_zero_descriptor(void) {
+  pid_t child = fork();
+  assert(child >= 0);
+  if (child == 0) {
+    test_state_t state = {0};
+    data_uds_t *uds =
+        data_uds_create("qlinq-data-uds-routing-test", on_packet, NULL, &state);
+    assert(uds);
+    struct sockaddr_un addr = {.sun_family = AF_UNIX};
+    strcpy(addr.sun_path, "/tmp/qlinq-data-uds-routing-test.sock");
+    const uint8_t types[] = {MOQ_TRACK_DATA, MOQ_TRACK_DATA, MOQ_TRACK_DATA,
+                             MOQ_TRACK_VIDEO};
+    const char names[] = {'a', 'b', 'b', 'v'};
+    int clients[4];
+    for (size_t i = 0; i < 4; i++) {
+      clients[i] = socket(AF_UNIX, SOCK_STREAM, 0);
+      assert(clients[i] >= 0);
+      assert(connect(clients[i], (struct sockaddr *)&addr, sizeof(addr)) == 0);
+      if (i == 0)
+        close(STDIN_FILENO);
+      data_uds_tick(uds);
+      uint8_t registration[] = {types[i], 0, 1, (uint8_t)names[i]};
+      assert(write_bytewise(clients[i], uds, registration,
+                            sizeof(registration)) == 0);
+    }
+    struct pollfd fds[5];
+    assert(data_uds_get_poll_fds(uds, fds, 5) == 5 && fds[1].fd == 0);
+    assert(data_uds_get_poll_fds(uds, fds, 1) == 1);
+    assert(data_uds_get_poll_fds(uds, fds, 0) == 0);
+    const struct {
+      uint8_t type;
+      char name;
+      int destination;
+    } cases[] = {{MOQ_TRACK_DATA, 'b', 1},
+                 {MOQ_TRACK_DATA, 'x', 0},
+                 {MOQ_TRACK_VIDEO, 'v', 3},
+                 {MOQ_TRACK_VIDEO, 'x', -1},
+                 {MOQ_TRACK_INPUT, 'a', -1}};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+      moq_track_id_t track = {.type = cases[i].type,
+                              .name = {cases[i].name, '\0'}};
+      assert(data_uds_send(uds, &track, (const uint8_t *)"z", 1, 2) ==
+             (cases[i].destination >= 0));
+      for (int j = 0; j < 4; j++) {
+        struct pollfd incoming = {.fd = clients[j], .events = POLLIN};
+        assert(poll(&incoming, 1, 0) == (j == cases[i].destination));
+      }
+      if (cases[i].destination >= 0) {
+        uint8_t frame[6];
+        uint32_t size;
+        assert(read_exact(clients[cases[i].destination], frame,
+                          sizeof(frame)) == 0);
+        memcpy(&size, frame, sizeof(size));
+        assert(size == 1 && frame[4] == 2 && frame[5] == 'z');
+      }
+    }
+    data_uds_destroy(uds);
+    assert(fcntl(STDIN_FILENO, F_GETFD) == -1 && errno == EBADF);
+    for (size_t i = 0; i < 4; i++)
+      close(clients[i]);
+    _exit(0);
+  }
+  int status;
+  assert(waitpid(child, &status, 0) == child);
+  assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static void broken_pipe(void) {
   int pair[2];
   assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
@@ -153,6 +256,7 @@ static void broken_pipe(void) {
 
 int main(void) {
   retry_and_ownership();
+  routing_and_zero_descriptor();
   broken_pipe();
   if (data_uds_create("../invalid", on_packet, NULL, NULL) != NULL) {
     fprintf(stderr, "unsafe socket name was accepted\n");

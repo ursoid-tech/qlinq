@@ -1,4 +1,5 @@
 #include "transport_fec_state.h"
+#include "transport_tracks.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -8,11 +9,6 @@ static uint64_t get_time_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
-}
-
-static bool track_equal(const moq_track_id_t *a, const moq_track_id_t *b) {
-  return a && b && a->type == b->type && a->flags == b->flags &&
-         strcmp(a->name, b->name) == 0;
 }
 
 static size_t cache_capacity(const transport_sent_cache_t *cache) {
@@ -56,7 +52,7 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
     return NULL;
   for (size_t i = 0; i < cache_capacity(cache); i++) {
     sent_object_cache_t *entry = &cache->entries[i];
-    if (entry->data && track_equal(&entry->track_id, track) &&
+    if (entry->data && transport_track_id_equal(&entry->track_id, track) &&
         entry->group_id == group_id && entry->object_id == object_id)
       return entry;
   }
@@ -97,7 +93,7 @@ bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
     const sent_object_cache_t *entry = &cache->entries[i];
     if (!entry->data) {
       slot_available = true;
-    } else if (track_equal(&entry->track_id, &object->track_id) &&
+    } else if (transport_track_id_equal(&entry->track_id, &object->track_id) &&
                entry->group_id == object->group_id &&
                entry->object_id == object->object_id) {
       return entry->size == object->size &&
@@ -222,7 +218,7 @@ size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
     return 0;
   for (size_t i = 0; i < cache_capacity(cache); i++) {
     sent_object_cache_t *entry = &cache->entries[i];
-    if (entry->data && track_equal(&entry->track_id, track) &&
+    if (entry->data && transport_track_id_equal(&entry->track_id, track) &&
         entry->group_id == group_id && entry->object_id <= object_id) {
       release_entry(cache, entry);
       released++;
@@ -240,7 +236,7 @@ size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
     return 0;
   for (size_t i = 0; i < cache_capacity(cache); i++) {
     sent_object_cache_t *entry = &cache->entries[i];
-    if (entry->data && track_equal(&entry->track_id, track)) {
+    if (entry->data && transport_track_id_equal(&entry->track_id, track)) {
       release_entry(cache, entry);
       released++;
     }

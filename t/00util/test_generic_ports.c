@@ -1,7 +1,7 @@
 #include "cli_parse.h"
 #include "transport_config.h"
 #include "transport_internal.h"
-#include "transport_protocol.h"
+#include "transport_recovery.h"
 #include "transport_stream.h"
 #include "transport_wire.h"
 
@@ -79,6 +79,35 @@ static void parsers_and_limits(void) {
         !cli_parse_endpoint(bad_endpoints[i], host, sizeof(host), &port, NULL));
   assert(!cli_parse_endpoint("long", host, 4, &port, NULL));
 
+  const struct {
+    const char *name;
+    qlinq_delivery_t delivery;
+    uint8_t flags;
+  } modes[] = {
+      {"datagram", QLINQ_DELIVERY_DATAGRAM, 0},
+      {"reliable", QLINQ_DELIVERY_RELIABLE, MOQ_TRACK_FLAG_RELIABLE},
+      {"fixed-fec", QLINQ_DELIVERY_FIXED_FEC, MOQ_TRACK_FLAG_FEC_ENABLED},
+      {"fec", QLINQ_DELIVERY_FIXED_FEC, MOQ_TRACK_FLAG_FEC_ENABLED},
+      {"rateless", QLINQ_DELIVERY_RATELESS, MOQ_TRACK_FLAG_FEC_RATELESS}};
+  for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+    qlinq_delivery_t delivery;
+    uint8_t flags;
+    assert(cli_parse_delivery(modes[i].name, &delivery) &&
+           delivery == modes[i].delivery);
+    assert(cli_parse_track_mode(modes[i].name, &flags) &&
+           flags == modes[i].flags);
+  }
+  qlinq_delivery_t delivery = QLINQ_DELIVERY_RELIABLE;
+  uint8_t flags = MOQ_TRACK_FLAG_RELIABLE;
+  assert(!cli_parse_delivery("FEC", &delivery) &&
+         delivery == QLINQ_DELIVERY_RELIABLE);
+  assert(!cli_parse_track_mode("unknown", &flags) &&
+         flags == MOQ_TRACK_FLAG_RELIABLE);
+  assert(!cli_parse_delivery("", &delivery));
+  assert(!cli_parse_delivery(NULL, &delivery));
+  assert(!cli_parse_delivery("fec", NULL));
+  assert(!cli_parse_track_mode("fec", NULL));
+
   transport_repair_limiter_t limiter = {0};
   assert(transport_repair_limiter_wait_ms(&limiter, 2, 1000) == 0);
   assert(transport_repair_limiter_take(&limiter, 2, 1000));
@@ -111,35 +140,36 @@ static void receive_telemetry(transport_t *t, transport_conn_t *conn,
 
 static void telemetry_and_wakeup(transport_t *t, transport_conn_t *conn) {
   quicly_path_stats_t path;
-  size_t wire = transport_path_get_stats_by_link(conn->quic, t->local_addrs,
-                                                 t->num_fds, 0, &path);
+  size_t wire = transport_path_get_stats_by_local(
+      conn->quic, &t->sockets[0].local_addr, &path);
   assert(wire < UINT8_MAX && quicly_is_path_available(conn->quic, wire));
   /* Deliberately separate physical and QUIC indices, as after compaction. */
-  struct sockaddr_storage saved = t->local_addrs[0];
-  memset(&t->local_addrs[0], 0, sizeof(saved));
-  t->local_addrs[1] = saved;
-  size_t count = t->num_fds;
-  t->num_fds = 2;
+  struct sockaddr_storage saved = t->sockets[0].local_addr;
+  memset(&t->sockets[0].local_addr, 0, sizeof(saved));
+  t->sockets[1].local_addr = saved;
+  size_t count = t->socket_count;
+  t->socket_count = 2;
   receive_telemetry(t, conn, wire, 10000000, 1000000);
-  assert(conn->owd_initialized[1] && conn->min_owd_ns[1] == -9000000);
+  assert(conn->paths[1].owd_initialized &&
+         conn->paths[1].min_owd_ns == -9000000);
   receive_telemetry(t, conn, wire, 20000000, 12000000);
-  assert(conn->latest_owd_fp[1] > 0);
-  int64_t latest = conn->latest_owd_fp[1];
+  assert(conn->paths[1].latest_owd_fp > 0);
+  int64_t latest = conn->paths[1].latest_owd_fp;
   receive_telemetry(t, conn, wire, 15000000, 1000000);
-  assert(conn->latest_owd_fp[1] == latest &&
-         conn->last_telemetry_s_ns[1] == 20000000);
+  assert(conn->paths[1].latest_owd_fp == latest &&
+         conn->paths[1].last_telemetry_s_ns == 20000000);
   uint64_t invalid = t->stats.malformed_datagrams;
   receive_telemetry(t, conn, wire, UINT64_C(1) << 63, 1);
   receive_telemetry(t, conn, wire, 1, UINT64_MAX);
   assert(t->stats.malformed_datagrams == invalid + 2);
-  conn->owd_initialized[1] = false;
+  conn->paths[1].owd_initialized = false;
   receive_telemetry(t, conn, wire, INT64_MAX - 1, 0);
   receive_telemetry(t, conn, wire, INT64_MAX, INT64_MAX);
-  assert(conn->latest_owd_fp[1] == 0 && conn->min_owd_ns[1] == 0);
-  assert(!conn->owd_initialized[0]);
-  t->num_fds = count;
-  t->local_addrs[0] = saved;
-  memset(&t->local_addrs[1], 0, sizeof(saved));
+  assert(conn->paths[1].latest_owd_fp == 0 && conn->paths[1].min_owd_ns == 0);
+  assert(!conn->paths[0].owd_initialized);
+  t->socket_count = count;
+  t->sockets[0].local_addr = saved;
+  memset(&t->sockets[1].local_addr, 0, sizeof(saved));
 
   struct pollfd fds[TRANSPORT_MAX_POLL_FDS];
   size_t n = transport_get_poll_fds(t, fds, TRANSPORT_MAX_POLL_FDS);
@@ -154,7 +184,7 @@ static void telemetry_and_wakeup(transport_t *t, transport_conn_t *conn) {
     char byte;
     assert(read(t->ifmon_pipe[0], &byte, 1) == 1);
   }
-  assert(found && n == t->num_fds + 1);
+  assert(found && n == t->socket_count + 1);
 }
 
 static void receive_fairness(void) {
@@ -167,19 +197,20 @@ static void receive_fairness(void) {
                                .key_file = "t/assets/server.key",
                                .limits = {.max_packets_per_tick = 2}};
   transport_t *t = transport_create(&config);
-  assert(t && t->num_fds == 2);
+  assert(t && t->socket_count == 2);
   int sender = socket(AF_INET, SOCK_DGRAM, 0);
   assert(sender >= 0);
   for (size_t i = 0; i < 2; i++) {
     for (size_t j = 0; j < 8; j++)
-      assert(sendto(sender, "x", 1, 0, (struct sockaddr *)&t->local_addrs[i],
+      assert(sendto(sender, "x", 1, 0,
+                    (struct sockaddr *)&t->sockets[i].local_addr,
                     sizeof(struct sockaddr_in)) == 1);
   }
   for (size_t turn = 0; turn < 2; turn++) {
     transport_tick(t);
     /* A budget of two services both busy sockets on each sweep. */
     for (size_t i = 0; i < 2; i++)
-      assert(t->udp_bytes_received[i] == turn + 1);
+      assert(t->sockets[i].bytes_received == turn + 1);
   }
   close(sender);
   transport_destroy(t);
@@ -249,12 +280,11 @@ static void transport_regressions(void) {
   assert(transport_connection_cache_find(t, &cid) == NULL);
 
   quicly_path_stats_t stats;
-  size_t index = transport_path_get_stats_by_link(a->quic, t->local_addrs,
-                                                  t->num_fds, 0, &stats);
+  size_t index = transport_path_get_stats_by_local(
+      a->quic, &t->sockets[0].local_addr, &stats);
   assert(index != SIZE_MAX &&
-         transport_path_matches_local(&stats, &t->local_addrs[0]));
-  assert(transport_path_get_stats_by_link(a->quic, t->local_addrs, t->num_fds,
-                                          t->num_fds, &stats) == SIZE_MAX);
+         transport_path_matches_local(&stats, &t->sockets[0].local_addr));
+  assert(transport_path_get_stats_by_local(a->quic, NULL, &stats) == SIZE_MAX);
   struct sockaddr_storage v6 = {0};
   struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&v6;
   addr6->sin6_family = AF_INET6;
@@ -268,15 +298,15 @@ static void transport_regressions(void) {
     assert(transport_subscriptions_add(
         &t->conns[i]->receive_subscriptions, MOQ_TRACK_DATA,
         MOQ_TRACK_FLAG_FEC_RATELESS, "recovery", 8));
-  assert(transport_protocol_send_nack(a, 8, 0, 100, NULL, 0, true));
+  assert(transport_recovery_send_nack(a, 8, 0, 100, NULL, 0, true));
   uint64_t b_tokens = b->nack_request_limiter.tokens_milli;
-  assert(!transport_protocol_send_nack(b, 8, 0, 100, NULL, 0, true));
+  assert(!transport_recovery_send_nack(b, 8, 0, 100, NULL, 0, true));
   /* Inspection may initialize the peer bucket, but aggregate rejection spends
    * nothing. */
   assert(b->nack_request_limiter.tokens_milli == b_tokens ||
          b->nack_request_limiter.tokens_milli ==
              t->limits.max_repair_requests_per_second * 1000);
-  assert(transport_protocol_send_nack(a, 8, 0, 100, NULL, 0, true));
+  assert(transport_recovery_send_nack(a, 8, 0, 100, NULL, 0, true));
   assert(t->stats.repair_requests_sent == 1 &&
          t->stats.repair_requests_coalesced == 1);
 

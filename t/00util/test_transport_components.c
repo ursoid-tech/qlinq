@@ -210,6 +210,8 @@ static int test_subscription_state_lifetime(void) {
   transport_subscription_state_t *state =
       transport_subscriptions_get_state(&table, 8);
   CHECK(state != NULL, "active state exists");
+  CHECK(transport_subscriptions_next_alias(&table, 8) == 9,
+        "active alias is unavailable");
   state->object_gap.pending_mask = 3;
   CHECK(!transport_subscriptions_add(&table, MOQ_TRACK_DATA, 0, "other", 8) &&
             transport_subscriptions_get_state(&table, 8) == state &&
@@ -221,8 +223,12 @@ static int test_subscription_state_lifetime(void) {
             transport_subscriptions_get_state(&table, 9)
                     ->object_gap.pending_mask == 0,
         "alias remap retires obsolete recovery state");
+  CHECK(transport_subscriptions_next_alias(&table, 8) == 8 &&
+            transport_subscriptions_next_alias(&table, 9) == 10,
+        "alias remap releases the old alias and reserves the new one");
   transport_subscriptions_remove(&table, MOQ_TRACK_DATA, "one");
-  CHECK(!transport_subscriptions_get_state(&table, 9),
+  CHECK(!transport_subscriptions_get_state(&table, 9) &&
+            transport_subscriptions_next_alias(&table, 9) == 9,
         "unsubscribe releases recovery state");
   CHECK(transport_subscriptions_add(&table, MOQ_TRACK_DATA, 0, "two", 9) &&
             transport_subscriptions_get_state(&table, 9)
@@ -231,6 +237,13 @@ static int test_subscription_state_lifetime(void) {
   CHECK(transport_subscriptions_init(&table, 1) &&
             !transport_subscriptions_get_state(&table, 9),
         "reinitialization releases prior active state");
+  CHECK(transport_subscriptions_add(&table, MOQ_TRACK_DATA, 0, "last",
+                                    UINT8_MAX) &&
+            transport_subscriptions_next_alias(&table, UINT8_MAX) == -1,
+        "last occupied alias has no successor");
+  transport_subscriptions_remove(&table, MOQ_TRACK_DATA, "last");
+  CHECK(transport_subscriptions_next_alias(&table, UINT8_MAX) == UINT8_MAX,
+        "last alias can be reused");
   transport_subscriptions_destroy(&table);
   return 0;
 }
@@ -355,6 +368,39 @@ static int test_stream_path_selection(void) {
   return 0;
 }
 
+static int test_address_identity(void) {
+  struct sockaddr_in6 a = {
+      .sin6_family = AF_INET6, .sin6_port = htons(443), .sin6_scope_id = 4};
+  a.sin6_addr.s6_addr[0] = 0xfe;
+  a.sin6_addr.s6_addr[1] = 0x80;
+  a.sin6_addr.s6_addr[15] = 1;
+  struct sockaddr_in6 b = a;
+  const struct sockaddr *sa = (const struct sockaddr *)&a;
+  const struct sockaddr *sb = (const struct sockaddr *)&b;
+  CHECK(transport_address_equal(sa, sb) && transport_endpoint_equal(sa, sb),
+        "identical scoped IPv6 endpoints match");
+  b.sin6_scope_id++;
+  CHECK(!transport_address_equal(sa, sb) && !transport_endpoint_equal(sa, sb),
+        "same link-local IP on distinct interfaces identifies distinct paths");
+  b.sin6_scope_id = a.sin6_scope_id;
+  b.sin6_port = htons(444);
+  CHECK(transport_address_equal(sa, sb) && !transport_endpoint_equal(sa, sb),
+        "ports distinguish QUIC endpoints but not physical sockets");
+  struct sockaddr_storage local = {0};
+  memcpy(&local, &b, sizeof(b));
+  quicly_path_stats_t stats = {0};
+  memcpy(&stats.local, &a, sizeof(a));
+  CHECK(transport_path_matches_local(&stats, &local),
+        "path lookup uses the same scoped address identity");
+  ((struct sockaddr_in6 *)&local)->sin6_scope_id++;
+  CHECK(!transport_path_matches_local(&stats, &local),
+        "path lookup rejects another interface with the same link-local IP");
+  CHECK(!transport_address_equal(sa, NULL) &&
+            !transport_endpoint_equal(NULL, sb),
+        "absent addresses cannot identify a path");
+  return 0;
+}
+
 static int test_path_estimates(void) {
   quicly_path_stats_t fast = {
       .cwnd = 100000, .rtt_smoothed = 100, .sent = 100, .lost = 0};
@@ -463,6 +509,7 @@ static int test_path_estimates(void) {
 }
 
 int main(void) {
+  CHECK(test_address_identity() == 0, "scoped address and endpoint identity");
   CHECK(test_stream_path_selection() == 0,
         "reliable stream path selection without FEC parity");
   CHECK(test_path_pacing_inputs() == 0, "per-path ACK probing and pacing");

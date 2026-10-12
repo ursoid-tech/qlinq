@@ -1,6 +1,7 @@
 /* Exercise the real queue and public ownership operations without socket I/O.
  * Including the implementation exposes allocation charges for this audit. */
 #include "../../src/common/qlinq.c"
+#include "transport_internal.h"
 
 #include <stdio.h>
 
@@ -106,9 +107,81 @@ cleanup:
   return failed;
 }
 
+/* Exercise real readiness and send admission with bounded in-memory transport
+ * queues. No sockets or peer timing are needed to test notification edges. */
+static int writable_notifications(void) {
+  int failed = 0;
+  qlinq_event_t event = {0};
+  qlinq_context_config_t config = {.max_queued_events = 1};
+  qlinq_context_t *context = qlinq_context_create(&config);
+  transport_t transport = {.owner_thread = pthread_self(),
+                           .socket_count = 1,
+                           .limits = {.max_fec_object_size = 1024},
+                           .sent_cache = {.max_payload_bytes = 1}};
+  transport.sockets[0].egress.capacity = 4;
+  transport.sockets[0].egress.max_bytes = 1024;
+  qlinq_endpoint_t endpoint = {
+      .context = context, .transport = &transport, .active = true};
+  qlinq_stream_t stream = {.endpoint = &endpoint,
+                           .track = {.type = MOQ_TRACK_DATA,
+                                     .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                     .name = "writable"},
+                           .direction = QLINQ_STREAM_PUBLISH,
+                           .state = QLINQ_STREAM_OPEN};
+  CHECK(context);
+  context->endpoints = &endpoint;
+  endpoint.streams = &stream;
+  refresh_writable_events(context);
+  refresh_writable_events(context);
+  CHECK(qlinq_next_event(context, &event));
+  CHECK(event.type == QLINQ_EVENT_STREAM_WRITABLE && event.stream == &stream);
+  qlinq_event_release(&event);
+  refresh_writable_events(context);
+  CHECK(!qlinq_next_event(context, &event));
+
+  /* Losing readiness resets the edge. A full event queue must not consume it.
+   */
+  transport.sockets[0].egress.count = 3;
+  refresh_writable_events(context);
+  CHECK(!qlinq_next_event(context, &event));
+  CHECK(enqueue_record(context, 1));
+  transport.sockets[0].egress.count = 0;
+  refresh_writable_events(context);
+  CHECK(qlinq_context_last_status(context) == QLINQ_STATUS_RESOURCE_LIMIT);
+  CHECK(qlinq_next_event(context, &event) && event.type == QLINQ_EVENT_RECORD);
+  qlinq_event_release(&event);
+  refresh_writable_events(context);
+  CHECK(qlinq_next_event(context, &event));
+  CHECK(event.type == QLINQ_EVENT_STREAM_WRITABLE && event.stream == &stream);
+  qlinq_event_release(&event);
+  refresh_writable_events(context);
+  CHECK(!qlinq_next_event(context, &event));
+
+  /* A record can exceed the cache budget while the general readiness query
+   * still allows smaller records. Failed send admission must rearm the edge. */
+  qlinq_record_t record = {.data = "ab", .size = 2};
+  CHECK(qlinq_stream_is_writable(&stream));
+  CHECK(qlinq_stream_send(&stream, &record) == QLINQ_SEND_WOULD_BLOCK);
+  CHECK(qlinq_stream_is_writable(&stream));
+  refresh_writable_events(context);
+  CHECK(qlinq_next_event(context, &event));
+  CHECK(event.type == QLINQ_EVENT_STREAM_WRITABLE && event.stream == &stream);
+  qlinq_event_release(&event);
+  refresh_writable_events(context);
+  CHECK(!qlinq_next_event(context, &event));
+cleanup:
+  if (context)
+    context->endpoints =
+        NULL; /* The endpoint and transport are stack fixtures. */
+  qlinq_context_destroy(context);
+  qlinq_event_release(&event);
+  return failed;
+}
+
 int main(void) {
   for (size_t i = 0; i < 100; ++i)
-    if (count_and_ownership() || bytes_and_message())
+    if (count_and_ownership() || bytes_and_message() ||
+        writable_notifications())
       return 1;
   puts("===QLINQ EVENT OWNERSHIP OK===");
   return 0;

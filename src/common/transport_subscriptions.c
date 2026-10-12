@@ -48,6 +48,19 @@ static bool track_matches(const moq_track_id_t *track, moq_track_type_t type,
   return track && name && track->type == type && strcmp(track->name, name) == 0;
 }
 
+static size_t find_track_index(const transport_subscription_table_t *table,
+                               const moq_track_id_t *track) {
+  if (!table || !track)
+    return SIZE_MAX;
+  for (size_t i = 0; i < table->capacity; i++) {
+    const track_subscription_t *entry = &table->entries[i];
+    if (entry->active &&
+        track_matches(&entry->track_id, track->type, track->name))
+      return i;
+  }
+  return SIZE_MAX;
+}
+
 int transport_subscriptions_find_by_alias(
     const transport_subscription_table_t *table, uint8_t alias,
     moq_track_id_t *out_track) {
@@ -67,45 +80,26 @@ int transport_subscriptions_find_by_alias(
 int transport_subscriptions_find_alias(
     const transport_subscription_table_t *table, const moq_track_id_t *track,
     uint8_t *out_alias) {
-  if (!table || !track || !out_alias)
+  const track_subscription_t *entry =
+      transport_subscriptions_find_const(table, track);
+  if (!entry || !out_alias)
     return -1;
-  for (size_t i = 0; i < table->capacity; i++) {
-    const track_subscription_t *entry = &table->entries[i];
-    if (entry->active &&
-        track_matches(&entry->track_id, track->type, track->name)) {
-      *out_alias = entry->alias;
-      return 0;
-    }
-  }
-  return -1;
+  *out_alias = entry->alias;
+  return 0;
 }
 
 track_subscription_t *
 transport_subscriptions_find(transport_subscription_table_t *table,
                              const moq_track_id_t *track) {
-  if (!table || !track)
-    return NULL;
-  for (size_t i = 0; i < table->capacity; i++) {
-    track_subscription_t *entry = &table->entries[i];
-    if (entry->active &&
-        track_matches(&entry->track_id, track->type, track->name))
-      return entry;
-  }
-  return NULL;
+  size_t index = find_track_index(table, track);
+  return index == SIZE_MAX ? NULL : &table->entries[index];
 }
 
 const track_subscription_t *
 transport_subscriptions_find_const(const transport_subscription_table_t *table,
                                    const moq_track_id_t *track) {
-  if (!table || !track)
-    return NULL;
-  for (size_t i = 0; i < table->capacity; i++) {
-    const track_subscription_t *entry = &table->entries[i];
-    if (entry->active &&
-        track_matches(&entry->track_id, track->type, track->name))
-      return entry;
-  }
-  return NULL;
+  size_t index = find_track_index(table, track);
+  return index == SIZE_MAX ? NULL : &table->entries[index];
 }
 
 bool transport_subscriptions_contains(
@@ -116,9 +110,10 @@ bool transport_subscriptions_contains(
 bool transport_subscriptions_add(transport_subscription_table_t *table,
                                  moq_track_type_t type, uint8_t flags,
                                  const char *name, uint8_t alias) {
-  if (!ensure_initialized(table) || !name ||
-      strnlen(name, sizeof(table->entries[0].track_id.name)) >=
-          sizeof(table->entries[0].track_id.name))
+  if (!ensure_initialized(table) || !name)
+    return false;
+  size_t name_len = strnlen(name, sizeof(table->entries[0].track_id.name));
+  if (name_len >= sizeof(table->entries[0].track_id.name))
     return false;
   for (size_t i = 0; i < table->capacity; i++) {
     const track_subscription_t *entry = &table->entries[i];
@@ -138,7 +133,6 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
         table->states[alias]->generation = ++table->next_generation;
       }
       entry->alias = alias;
-      entry->track_id.flags = flags;
       return true;
     }
   }
@@ -153,9 +147,6 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
       memset(entry, 0, sizeof(*entry));
       entry->track_id.type = type;
       entry->track_id.flags = flags;
-      size_t name_len = strnlen(name, sizeof(entry->track_id.name));
-      if (name_len >= sizeof(entry->track_id.name))
-        return false;
       memcpy(entry->track_id.name, name, name_len + 1U);
       entry->alias = alias;
       entry->active = true;
@@ -218,15 +209,8 @@ int transport_subscriptions_next_alias(
     const transport_subscription_table_t *table, int first_dynamic_alias) {
   if (!table || first_dynamic_alias < 0 || first_dynamic_alias > UINT8_MAX)
     return -1;
-  for (int alias = first_dynamic_alias; alias <= UINT8_MAX; alias++) {
-    bool used = false;
-    for (size_t i = 0; i < table->capacity; i++)
-      if (table->entries[i].active && table->entries[i].alias == alias) {
-        used = true;
-        break;
-      }
-    if (!used)
+  for (int alias = first_dynamic_alias; alias <= UINT8_MAX; alias++)
+    if (!table->states[alias])
       return alias;
-  }
   return -1;
 }

@@ -20,7 +20,6 @@
 
 #define QLINQ_FEC_ASSEMBLER_TIMEOUT_MS 2000
 #define QLINQ_FEC_NACK_DELAY_MS 25
-#define QLINQ_FEC_REPAIR_DEDUP_MS 25
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
 #define QLINQ_CONNECTION_CACHE_SLOTS 256U
 /* Quicly's per-path queue, not its legacy connection-wide 256-frame queue.
@@ -40,6 +39,43 @@ typedef struct {
   uint64_t last_checkpoint_object_id;
 } transport_fec_track_state_t;
 
+typedef struct {
+  uint8_t *data;
+  size_t size, capacity;
+  uint64_t started_at_ms;
+  moq_track_id_t track_id;
+  uint32_t record_count;
+  uint8_t priority;
+  bool pending; /* Attempted bytes and identity stay fixed until completion. */
+} transport_pending_group_t;
+
+/* Physical sockets are shared by all peers. Connection path records use the
+ * same socket slot; QUIC path IDs are resolved separately and may differ. */
+typedef struct {
+  int fd;
+  struct sockaddr_storage local_addr;
+  socklen_t local_addr_len;
+  uint32_t interface_index;
+  char interface_name[64];
+  uint64_t bytes_received;
+  transport_egress_t egress;
+  size_t remote_index;
+  bool open_pending;
+  uint64_t open_retry_at_ms;
+} transport_socket_t;
+
+typedef struct {
+  path_state_t state;
+  transport_path_measurement_t measurement;
+  transport_path_budget_t budget;
+  int64_t min_owd_ns;
+  bool owd_initialized;
+  size_t telemetry_path;
+  fp_t latest_owd_fp;
+  uint64_t last_telemetry_s_ns;
+  bool state_overridden;
+} transport_conn_path_t;
+
 struct transport_t {
   transport_callback_t callback;
   void *user_data;
@@ -54,19 +90,11 @@ struct transport_t {
   uint32_t reconnect_current_delay_ms;
   int64_t reconnect_at_ms;
   char server_name[256];
-  int fds[TRANSPORT_MAX_PATHS];
-  size_t num_fds;
-  struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
-  socklen_t local_addrs_len[TRANSPORT_MAX_PATHS];
-  uint32_t local_ifindices[TRANSPORT_MAX_PATHS];
-  char local_ifnames[TRANSPORT_MAX_PATHS][64];
+  transport_socket_t sockets[TRANSPORT_MAX_PATHS];
+  size_t socket_count;
+  uint16_t bind_port; /* Stable while all local interfaces are unavailable. */
   char path_interface_names[TRANSPORT_MAX_PATHS][64];
   size_t num_path_interface_names;
-  uint64_t udp_bytes_received[TRANSPORT_MAX_PATHS];
-  transport_egress_t egress[TRANSPORT_MAX_PATHS];
-  size_t local_remote_indices[TRANSPORT_MAX_PATHS];
-  bool path_open_pending[TRANSPORT_MAX_PATHS];
-  uint64_t path_open_retry_at[TRANSPORT_MAX_PATHS];
   transport_limits_t limits;
   transport_stats_t stats;
   atomic_uint_fast64_t cross_thread_violations;
@@ -77,7 +105,6 @@ struct transport_t {
   size_t callback_depth;
 
   struct sockaddr_storage remote_addrs[TRANSPORT_MAX_PATHS];
-  socklen_t remote_addrs_len[TRANSPORT_MAX_PATHS];
   size_t num_remote_addrs;
   quicly_context_t quic_ctx;
   ptls_context_t tls_ctx;
@@ -106,16 +133,7 @@ struct transport_t {
   uint8_t simulated_loss_rate;
   arena_t arena;
 
-  uint8_t *fec_buf;
-  size_t fec_buf_len;
-  size_t fec_buf_cap;
-  uint64_t fec_first_pkt_time;
-  moq_track_id_t fec_track_id;
-  uint32_t fec_pkt_count;
-  uint8_t fec_priority;
-  bool fec_in_flush;
-  bool fec_flush_pending; /* Keep an attempted group's identity and bytes fixed.
-                           */
+  transport_pending_group_t pending_group;
   transport_fec_track_state_t fec_tracks[TRANSPORT_HARD_MAX_SUBSCRIPTIONS];
 
   ifmon_watcher_t ifmon_w;
@@ -161,28 +179,22 @@ struct transport_conn_t {
   } completed_objects[QLINQ_COMPLETED_OBJECTS];
   size_t completed_cursor;
   uint16_t completed_buckets[QLINQ_ASSEMBLER_BUCKETS];
-  uint16_t queued_datagrams[TRANSPORT_MAX_QUIC_PATHS];
-  transport_path_budget_t path_budgets[TRANSPORT_MAX_PATHS];
+  transport_conn_path_t paths[TRANSPORT_MAX_PATHS];
   uint64_t admission_retry_at_ns;
-  path_state_t path_states[TRANSPORT_MAX_PATHS];
-  transport_path_measurement_t path_measurements[TRANSPORT_MAX_PATHS];
-  int64_t min_owd_ns[TRANSPORT_MAX_PATHS];
-  bool owd_initialized[TRANSPORT_MAX_PATHS];
-  size_t telemetry_path[TRANSPORT_MAX_PATHS];
-  fp_t latest_owd_fp[TRANSPORT_MAX_PATHS];
-  uint64_t last_telemetry_s_ns[TRANSPORT_MAX_PATHS];
-  uint64_t last_telemetry_r_ns[TRANSPORT_MAX_PATHS];
-  bool path_state_overridden[TRANSPORT_MAX_PATHS];
   pathflow_context_t scheduler_context;
   size_t round_robin_path;
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
-  int64_t last_repair_ms;
-  uint64_t last_repair_group_id;
-  uint64_t last_repair_object_id;
-  uint8_t last_repair_alias;
-  uint8_t last_repair_flags;
 };
+
+static inline size_t transport_connection_count(const transport_t *t) {
+  return t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+}
+
+static inline transport_conn_t *transport_connection_at(const transport_t *t,
+                                                        size_t index) {
+  return t->is_server ? t->conns[index] : t->client_conn;
+}
 
 /* Master identity is stable across path changes and CID rotation. A cache hit
  * is only a routing hint: the caller must still call quicly_is_destination and

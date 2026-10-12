@@ -3,8 +3,8 @@
 The low-level public transport API remains in `transport.h`. The application
 wrapper in `qlinq.h` adds owned events and named streams; see
 [Native application API](application-api.md). The Quicly implementation is
-split into small internal modules with one-way dependencies toward shared data
-types and the wire codec.
+split into internal modules for connection lifecycle, publication, receive
+recovery, path scheduling, and bounded storage.
 
 | Module | Responsibility |
 | --- | --- |
@@ -13,14 +13,16 @@ types and the wire codec.
 | `transport_internal.h` | Private shared transport and connection state |
 | `cli_parse.c` | Shared bounded numeric and endpoint parsing for app and daemon |
 | `transport_config.c` | Default resolution and validation of resource limits |
-| `transport_protocol.c` | HELLO negotiation, stream dispatch, datagram receive, and FEC assembly |
+| `transport_protocol.c` | HELLO negotiation, stream dispatch, datagram receive, and FEC decoding |
 | `transport_publish.c` | Reliable/datagram publication, FEC generation, and grouped data flushes |
+| `transport_recovery.c` | Receive gaps, checkpoint acknowledgements, recovery requests, and assembler expiration |
 | `transport_tracks.c` | Small delivery-class validation and profile derivation |
 | `transport_wire.c` | Versioned, bounded byte-level encoding and decoding |
 | `transport_stream.c` | Bounded retained stream frames and QUIC acknowledgement accounting |
 | `transport_subscriptions.c` | Track/alias lookup, allocation, and stream binding |
 | `transport_memory.c` | Packet arena and FEC assembler allocation ownership |
 | `transport_fec_state.c` | Reusable FEC contexts and sent-object repair cache |
+| `fec.c` | Codec selection and Reed-Solomon/RaptorQ encode/decode operations |
 | `transport_paths.c` | QUIC-path mapping and physical-path selection |
 | `transport_repair.c` | Bounded NACK symbol reconstruction |
 | `transport_scheduler.c` | Per-connection path and redundancy planning |
@@ -32,6 +34,26 @@ The protocol and publication engines operate on private state but do not own the
 socket event loop. `transport_quicly.c` coordinates lifecycle and polling while
 each module owns its invariants. The public header continues to expose opaque
 handles.
+
+The event loop services recovery, grouped publication, interface changes,
+received packets, path measurements, and connections in that order. Receive
+recovery transitions and expiration deadlines live together; protocol parsing
+validates wire records before applying those transitions. The control-stream
+parser dispatches one complete frame at a time and consumes it only after its
+handler succeeds. Protocol-error closes share accounting; authentication and
+resource-limit failures retain their separate classifications. Publication routes
+a record into grouping or object delivery once. A group flush calls object
+delivery directly and retains its bytes and identity across partial retries.
+Recipients are evaluated on every retry, including new subscriptions, while
+peers that already accepted the group are skipped.
+
+Physical socket records own addresses, interface identity, egress queues, and
+path-open retries. Each connection keeps separate path measurements, telemetry,
+and admission budgets indexed by that socket slot. QUIC path IDs are resolved
+separately. Removing an interface moves complete records together.
+Configured and discovered sockets use the same setup and teardown routines.
+Transport creation has one failure cleanup path, including partially initialized
+connections, sockets, and caches.
 
 ## Timing and connection control
 
@@ -79,7 +101,8 @@ the scope ID.
 - `transport_egress` copies any QUIC packets not accepted immediately by the
   kernel. Quicly is not asked for another batch unless every possible output
   socket has room for one complete batch.
-- `transport_wire` is the only code that reads or writes multibyte wire fields.
+- `transport_wire` owns versioned frame encoding/decoding and grouped-record
+  decoding.
 - Path measurements and scheduler state belong to a connection; one client's
   RTT, loss, or telemetry must never determine another client's schedule.
   Each available path uses its own congestion-window/RTT rate proxy, expressed
@@ -107,9 +130,12 @@ the scope ID.
   `cwnd_rtt`, a cold-start `default`, or a test `override`; `mode` distinguishes
   pathflow from the non-FEC and single-symbol round-robin cases. These events
   describe scheduling decisions, including plans subsequently backpressured.
-- Incoming FEC assemblers share a 64 MiB transport-wide memory budget and each
-  connection has eight active assembler slots. Growth must fit both the old
-  buffers and their replacements within that budget until copying completes.
+- Incoming FEC assemblers share a 64 MiB transport-wide memory budget. Each
+  connection starts with a small receive window, with an eight-object floor
+  when the configured cap permits it, and grows according to observed receive
+  rate and RTT up to its configured cap (1,024 objects by default). Growth must
+  fit both the old buffers and their replacements within that budget until
+  copying completes.
   Rejected growth preserves partial data; reusing existing capacity requires
   no additional allocation allowance.
 - NACK handling sends at most 64 requested symbols per repair and accepts at
@@ -154,10 +180,11 @@ recognize grouped FEC data when either FEC flag is present.
 Finite rateless publishers call `transport_finish_track` after their final
 application record. Publication assigns internal FEC object IDs, emits a
 rolling checkpoint every 32 objects, and sends a reliable completion
-watermark. Receivers keep at most eight missing-window bitmaps and retry one
-absent object at a time. Cumulative ACKs release source repair-cache entries;
-if eight windows remain unacknowledged, publication reports backpressure rather
-than evicting recoverable objects. The source cache also has a configurable
+watermark. Receivers keep at most 128 missing-window bitmaps. Missing-object
+requests are pipelined within the per-tick, token, and control-queue budgets.
+Cumulative ACKs release source repair-cache entries. Publication reports
+backpressure when protected source entries exhaust the cache's entry or byte
+budget. The source cache also has a configurable
 `max_recovery_cache_bytes` payload budget, defaulting to 16 MiB, and admits new
 objects only when both byte and entry limits can be met without evicting
 protected objects. Configuration must hold a maximum FEC object and one
@@ -194,12 +221,14 @@ not capacity measurements. Reported QUIC RTT can include an ACK returned on
 another link, so it need not equal the configured same-link round-trip delay.
 
 `./examples/multipath_bw_demo` (or `make check-multipath-bw-demo`) is a separate
-bandwidth experiment. All four paths are validated before sending; each has a
-20 ms one-way delay and independent forward/reverse HTB caps of 1, 2, 4 and
-8 Mbps. There is no injected loss, though overflowing a bounded kernel queue
-can still drop packets. Offered application traffic ramps from 2 to 12 Mbps
-over four seconds, followed by eight seconds at 12 Mbps and a three-second
-drain. Publication backpressure is counted as undelivered offered traffic.
+bandwidth experiment. All three paths are validated before sending; each has a
+20 ms one-way delay and independent forward/reverse HTB caps of 250, 500 and
+1,000 Mbps. There is no injected loss, though overflowing a bounded kernel queue
+can still drop packets. The default rateless workload ramps from 250 to
+1,000 Mbps over four seconds, followed by eight seconds at 1,000 Mbps and a
+three-second drain. `--fixed-fec` and `--reliable` select other delivery modes;
+`--offered-mbps`, `--initial-mbps`, and `--single-path` vary the workload.
+Publication backpressure is counted as undelivered offered traffic.
 
 The demo records actual kernel dequeue rates, UDP send shares, sampled kernel
 queue occupancy and growth, queue drops, application goodput, delivery, and
@@ -211,7 +240,8 @@ The kernel samples omit an additional half-second at the start and quarter-
 second at the end of the steady window to allow for sampler timing.
 
 The explicit checks require cap compliance within 5%, increasing dequeue rates
-with increasing caps, goodput above the fastest individual link's 8 Mbps cap,
+with increasing caps among paths carrying material traffic, goodput of at least
+99% of the configured offer,
 at least 99% delivery of offered records, p99 latency at most 250 ms, no steady
 queue drops, and late median kernel queues at most 100 ms with growth at most
 50 ms. A failing check returns nonzero and preserves `benchmark.log`,

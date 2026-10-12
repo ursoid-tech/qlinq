@@ -30,6 +30,10 @@ struct fec_t {
   struct nanorq_core_mem_reqs rq_capacity;
 };
 
+fec_type_t fec_select_type(bool rateless, size_t total_symbols) {
+  return rateless || total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
+}
+
 static bool reserve_raptorq_workspace(fec_t *f, uint32_t overhead,
                                       struct nanorq_core_mem_reqs *reqs) {
   nanorq_core_get_memory_reqs(f->data_symbols, overhead, f->symbol_size, reqs);

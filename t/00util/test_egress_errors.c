@@ -11,7 +11,7 @@ static size_t calls;
 static bool inspect_payloads;
 static size_t send_allowance, next_sequence, expected_size;
 
-/* A deterministic socket boundary: no privileges or timing assumptions. */
+/* The UDP adapter returns zero for blocked sends and retries EINTR itself. */
 ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
                                  socklen_t destination_len,
                                  const struct iovec *datagrams, size_t count) {
@@ -20,9 +20,8 @@ ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
   calls++;
   if (failure == EAGAIN)
     return 0;
-  if (failure == EINTR ||
-      (failure == ENETUNREACH &&
-       ((const struct sockaddr_in *)destination)->sin_port == htons(1))) {
+  if (failure == ENETUNREACH &&
+      ((const struct sockaddr_in *)destination)->sin_port == htons(1)) {
     errno = failure;
     return -1;
   }
@@ -135,9 +134,9 @@ int main(void) {
   assert(transport_egress_submit(&egress, 1, (struct sockaddr *)&good,
                                  sizeof(good), &vec, 1));
   assert(egress.count == 2);
-  failure = EINTR;
   assert(transport_egress_flush(&egress, 1));
-  assert(egress.count == 2 && egress.packets_dropped == 0);
+  assert(egress.count == 2 && egress.packets_dropped == 0 &&
+         egress.send_errors == 0 && egress.would_block == 2);
   failure = ENETUNREACH;
   assert(!transport_egress_flush(&egress, 1));
   assert(egress.count == 0 && egress.bytes == 0);

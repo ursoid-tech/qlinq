@@ -10,6 +10,7 @@ typedef struct {
 } transport_track_profile_t;
 
 transport_track_profile_t transport_track_profile(const moq_track_id_t *track);
+bool transport_track_type_valid(uint8_t type);
 bool transport_track_id_valid(const moq_track_id_t *track);
 bool transport_track_id_equal(const moq_track_id_t *a, const moq_track_id_t *b);
 

@@ -4,6 +4,12 @@
 #include <stdint.h>
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  qlinq_wire_cursor_t cursor = {data, size};
+  const uint8_t *record;
+  size_t record_size;
+  while (qlinq_wire_next_record(&cursor, &record, &record_size))
+    ;
+
   qlinq_wire_frame_t frame;
   (void)qlinq_wire_decode_frame(data, size, 1024U * 1024U, &frame);
 

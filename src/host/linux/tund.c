@@ -82,6 +82,12 @@ static bool write_exact(int fd, const void *buf, size_t size) {
   return true;
 }
 
+static bool write_packet(int fd, const uint8_t *packet, uint32_t size) {
+  return write_exact(fd, &size, sizeof(size)) &&
+         write_exact(fd, &tund_priority, sizeof(tund_priority)) &&
+         write_exact(fd, packet, size);
+}
+
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -218,18 +224,7 @@ int main(int argc, char **argv) {
       mock_pkt[4] = (uint8_t)(seq & 0xFF);
       mock_pkt[5] = (uint8_t)((seq >> 8) & 0xFF);
 
-      uint32_t pkt_len = sizeof(mock_pkt);
-      if (!write_exact(uds_fd, &pkt_len, sizeof(pkt_len))) {
-        close(uds_fd);
-        uds_fd = -1;
-        continue;
-      }
-      if (!write_exact(uds_fd, &tund_priority, sizeof(tund_priority))) {
-        close(uds_fd);
-        uds_fd = -1;
-        continue;
-      }
-      if (!write_exact(uds_fd, mock_pkt, pkt_len)) {
+      if (!write_packet(uds_fd, mock_pkt, sizeof(mock_pkt))) {
         close(uds_fd);
         uds_fd = -1;
         continue;
@@ -244,10 +239,7 @@ int main(int argc, char **argv) {
       uint8_t packet[2048];
       ssize_t len = tun_read(tun_fd, packet, sizeof(packet));
       if (len > 0 && uds_fd != -1) {
-        uint32_t pkt_len = (uint32_t)len;
-        if (!write_exact(uds_fd, &pkt_len, sizeof(pkt_len)) ||
-            !write_exact(uds_fd, &tund_priority, sizeof(tund_priority)) ||
-            !write_exact(uds_fd, packet, (size_t)len)) {
+        if (!write_packet(uds_fd, packet, (uint32_t)len)) {
           close(uds_fd);
           uds_fd = -1;
           continue;
@@ -258,44 +250,21 @@ int main(int argc, char **argv) {
     if (fds[1].revents & POLLIN) {
       /* read packet from UDS, write to TUN interface */
       uint32_t pkt_len = 0;
-      if (!read_exact(uds_fd, &pkt_len, sizeof(pkt_len))) {
-        close(uds_fd);
-        uds_fd = -1;
-        continue;
-      }
-
       uint8_t rx_priority = 1;
-      if (!read_exact(uds_fd, &rx_priority, sizeof(rx_priority))) {
-        close(uds_fd);
-        uds_fd = -1;
-        continue;
-      }
-
       uint8_t packet[2048];
-      if (pkt_len > sizeof(packet)) {
-        /* drain and discard too-large packet */
-        uint8_t discard[1024];
-        size_t remaining = pkt_len;
-        while (remaining > 0) {
-          size_t chunk =
-              remaining > sizeof(discard) ? sizeof(discard) : remaining;
-          if (!read_exact(uds_fd, discard, chunk)) {
-            break;
-          }
-          remaining -= chunk;
-        }
-        close(uds_fd);
-        uds_fd = -1;
-        continue;
-      }
-
-      if (!read_exact(uds_fd, packet, pkt_len)) {
+      /* Reject impossible sizes before waiting for the rest of the frame. */
+      if (!read_exact(uds_fd, &pkt_len, sizeof(pkt_len)) ||
+          pkt_len > sizeof(packet) ||
+          !read_exact(uds_fd, &rx_priority, sizeof(rx_priority)) ||
+          !read_exact(uds_fd, packet, pkt_len)) {
         close(uds_fd);
         uds_fd = -1;
         continue;
       }
 
       if (mock_mode) {
+        if (pkt_len < 6)
+          continue;
         uint32_t rx_seq = ((uint32_t)packet[4]) | ((uint32_t)packet[5] << 8);
         printf("MOCK: received packet starting with 0x%02x seq=%u size=%u "
                "priority=%d\n",

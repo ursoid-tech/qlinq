@@ -145,6 +145,7 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
   if (!batch->symbols)
     return false;
 
+  bool encoded = false;
   uint8_t **data_blocks = calloc(object->data_symbols, sizeof(*data_blocks));
   uint8_t *data_storage = calloc(object->data_symbols, object->symbol_size);
   uint8_t **parity_blocks = parity_symbols > 0
@@ -153,14 +154,8 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
   uint8_t *parity_storage =
       parity_symbols > 0 ? calloc(parity_symbols, object->symbol_size) : NULL;
   if (!data_blocks || !data_storage ||
-      (parity_symbols > 0 && (!parity_blocks || !parity_storage))) {
-    free(data_blocks);
-    free(data_storage);
-    free(parity_blocks);
-    free(parity_storage);
-    transport_repair_batch_destroy(batch);
-    return false;
-  }
+      (parity_symbols > 0 && (!parity_blocks || !parity_storage)))
+    goto cleanup;
 
   for (size_t i = 0; i < object->data_symbols; i++) {
     data_blocks[i] = data_storage + i * object->symbol_size;
@@ -172,12 +167,11 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
       memcpy(data_blocks[i], object->data + offset, chunk);
   }
 
-  bool encoded = true;
+  encoded = true;
   if (parity_symbols > 0) {
     for (size_t i = 0; i < parity_symbols; i++)
       parity_blocks[i] = parity_storage + i * object->symbol_size;
-    fec_type_t type =
-        rateless || total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
+    fec_type_t type = fec_select_type(rateless, total_symbols);
     fec_t *fec = transport_fec_cache_get(fec_cache, type, object->data_symbols,
                                          parity_symbols, object->symbol_size);
     encoded = fec && fec_encode(fec, (const uint8_t *const *)data_blocks,
@@ -194,6 +188,7 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
              object->symbol_size);
     }
   }
+cleanup:
   free(data_blocks);
   free(data_storage);
   free(parity_blocks);
