@@ -166,9 +166,17 @@ static void release_vector_capacity(transport_stream_ctx_t *ctx, size_t count) {
 
 void transport_stream_egress_shift(quicly_stream_t *stream, size_t delta) {
   transport_stream_ctx_t *ctx = stream->data;
-  size_t capacity = ctx->streambuf.egress.vecs.capacity;
-  quicly_streambuf_egress_shift(stream, delta);
   quicly_sendbuf_t *sb = &ctx->streambuf.egress;
+  size_t capacity = sb->vecs.capacity, size = sb->vecs.size;
+  size_t first_offset = sb->off_in_first_vec;
+  quicly_streambuf_egress_shift(stream, delta);
+  size_t removed = size - sb->vecs.size;
+  if (ctx->emit_index < removed) {
+    ctx->emit_index = ctx->emit_prefix = 0;
+  } else {
+    ctx->emit_index -= removed;
+    ctx->emit_prefix -= first_offset + delta - sb->off_in_first_vec;
+  }
   /* Quicly keeps a vector array at its historical high-water capacity until
    * the stream becomes empty. Many concurrent control streams can accumulate
    * that slack across peers. */
@@ -187,6 +195,84 @@ void transport_stream_egress_shift(quicly_stream_t *stream, size_t delta) {
    * retains its vector array until the last entry is released unless the
    * compaction above reclaims its unused tail. */
   release_vector_capacity(ctx, capacity - sb->vecs.capacity);
+}
+
+void transport_stream_egress_emit(quicly_stream_t *stream, size_t off,
+                                  void *dst, size_t *len, int *wrote_all) {
+  transport_stream_ctx_t *ctx = stream->data;
+  quicly_sendbuf_t *sb = &ctx->streambuf.egress;
+  if (*len == 0) {
+    quicly_sendbuf_emit(stream, sb, off, dst, len, wrote_all);
+    return;
+  }
+  size_t position = off + sb->off_in_first_vec;
+  size_t index = 0, prefix = 0;
+  if (position >= ctx->emit_prefix) {
+    index = ctx->emit_index;
+    prefix = ctx->emit_prefix;
+  }
+  while (index < sb->vecs.size &&
+         position - prefix >= sb->vecs.entries[index].len) {
+    prefix += sb->vecs.entries[index++].len;
+  }
+  /* Retransmitting older bytes must not discard the forward-send cursor.
+   * Indices also survive append reallocations and ACK-driven compaction. */
+  if (prefix >= ctx->emit_prefix) {
+    ctx->emit_index = index;
+    ctx->emit_prefix = prefix;
+  }
+  quicly_sendbuf_t suffix = *sb;
+  if (index != 0)
+    suffix.vecs.entries += index;
+  suffix.vecs.size -= index;
+  suffix.vecs.capacity -= index;
+  suffix.off_in_first_vec = 0;
+  quicly_sendbuf_emit(stream, &suffix, position - prefix, dst, len, wrote_all);
+}
+
+ptls_iovec_t transport_stream_ingress_get(quicly_stream_t *stream) {
+  transport_stream_ctx_t *ctx = stream->data;
+  ptls_buffer_t remaining = ctx->streambuf.ingress;
+  if (ctx->ingress_prefix != 0)
+    remaining.base += ctx->ingress_prefix;
+  remaining.off -= ctx->ingress_prefix;
+  return quicly_recvbuf_get(stream, &remaining);
+}
+
+int transport_stream_ingress_receive(quicly_stream_t *stream, size_t off,
+                                     const void *src, size_t len) {
+  transport_stream_ctx_t *ctx = stream->data;
+  if (len == 0)
+    return 0;
+  if (off > SIZE_MAX - ctx->ingress_prefix ||
+      len > SIZE_MAX - ctx->ingress_prefix - off) {
+    transport_t *t = stream_owner(stream);
+    if (t)
+      t->stats.resource_limit_errors++;
+    quicly_close(stream->conn, TRANSPORT_APP_ERROR_RESOURCE_LIMIT,
+                 "stream receive offset overflow");
+    return -1;
+  }
+  return quicly_recvbuf_receive(stream, &ctx->streambuf.ingress,
+                                off + ctx->ingress_prefix, src, len);
+}
+
+void transport_stream_ingress_shift(quicly_stream_t *stream, size_t delta) {
+  transport_stream_ctx_t *ctx = stream->data;
+  ptls_buffer_t *buffer = &ctx->streambuf.ingress;
+  assert(delta <= buffer->off - ctx->ingress_prefix);
+  ctx->ingress_prefix += delta;
+  size_t remaining = buffer->off - ctx->ingress_prefix;
+  /* Copy no more bytes than were consumed since the last compaction. The
+   * retained prefix stays smaller than the live span, bounding used storage
+   * below twice the receive window even when out-of-order data fills it. */
+  if (ctx->ingress_prefix >= remaining) {
+    if (remaining != 0)
+      memmove(buffer->base, buffer->base + ctx->ingress_prefix, remaining);
+    buffer->off = remaining;
+    ctx->ingress_prefix = 0;
+  }
+  quicly_stream_sync_recvbuf(stream, delta);
 }
 
 void transport_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {

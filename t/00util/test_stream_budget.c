@@ -66,6 +66,81 @@ static bool acknowledge(quicly_stream_t *stream, size_t bytes) {
   return true;
 }
 
+static bool emission_matches(quicly_stream_t *stream, size_t off, size_t size) {
+  uint8_t expected[1536], actual[1536];
+  if (size > sizeof(actual))
+    return false;
+  memset(expected, 0xa5, sizeof(expected));
+  memset(actual, 0xa5, sizeof(actual));
+  size_t expected_size = size, actual_size = size;
+  int expected_all = -1, actual_all = -1;
+  quicly_streambuf_egress_emit(stream, off, expected, &expected_size,
+                               &expected_all);
+  stream->callbacks->on_send_emit(stream, off, actual, &actual_size,
+                                  &actual_all);
+  return expected_size == actual_size && expected_all == actual_all &&
+         memcmp(expected, actual, sizeof(actual)) == 0;
+}
+
+static bool replay_emissions(quicly_stream_t *stream) {
+  quicly_sendbuf_t *sb =
+      &((transport_stream_ctx_t *)stream->data)->streambuf.egress;
+  size_t remaining = sb->bytes_written - stream->sendstate.acked.ranges[0].end;
+  for (size_t off = 0; off < remaining; off += 733)
+    if (!emission_matches(stream, off, 1536))
+      return false;
+  /* Retransmit backwards after the forward pass, revisit newer bytes, and
+   * check both exact exhaustion and a zero-capacity request. */
+  return emission_matches(stream, 0, 1536) &&
+         emission_matches(stream, remaining / 2, 1) &&
+         emission_matches(stream, remaining / 3, 1200) &&
+         emission_matches(stream, remaining ? remaining - 1 : 0, 1) &&
+         emission_matches(stream, remaining, 1536) &&
+         emission_matches(stream, remaining, 0);
+}
+
+static bool append_emission_frames(quicly_stream_t *stream, size_t count) {
+  uint8_t payload[4096];
+  for (size_t i = 0; i < count; i++) {
+    size_t size = 1 + i * 997 % sizeof(payload);
+    for (size_t j = 0; j < size; j++)
+      payload[j] = (uint8_t)(i + j);
+    if (!transport_stream_write_frame(stream, QLINQ_WIRE_UNICAST, payload,
+                                      size))
+      return false;
+  }
+  return true;
+}
+
+static int stream_emission_cursor(void) {
+  int failed = 0;
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn && t->client_conn->stream);
+  quicly_stream_t *stream = t->client_conn->stream;
+  quicly_sendbuf_t *sb =
+      &((transport_stream_ctx_t *)stream->data)->streambuf.egress;
+  CHECK(append_emission_frames(stream, 8) && replay_emissions(stream));
+  CHECK(acknowledge(stream, 1) && replay_emissions(stream));
+  CHECK(acknowledge(stream, sb->vecs.entries[0].len - 1 +
+                                sb->vecs.entries[1].len + 3) &&
+        replay_emissions(stream));
+  size_t old_capacity = sb->vecs.capacity;
+  CHECK(append_emission_frames(stream, 40) &&
+        sb->vecs.capacity > old_capacity && replay_emissions(stream));
+  size_t remaining = sb->bytes_written - stream->sendstate.acked.ranges[0].end;
+  CHECK(acknowledge(stream, remaining - 1) && replay_emissions(stream));
+  CHECK(acknowledge(stream, 1) && replay_emissions(stream));
+  /* ACK past a cursor near the beginning, retaining later vectors. */
+  CHECK(append_emission_frames(stream, 8) && emission_matches(stream, 0, 1));
+  CHECK(acknowledge(stream,
+                    sb->vecs.entries[0].len + sb->vecs.entries[1].len + 1) &&
+        replay_emissions(stream));
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
 static int entry_limit_and_control_failure(void) {
   int failed = 0;
   transport_t *t = fixture();
@@ -531,7 +606,7 @@ cleanup:
 
 static bool receive_bytes(quicly_stream_t *stream, const uint8_t *data,
                           size_t size) {
-  size_t offset = quicly_streambuf_ingress_get(stream).len;
+  size_t offset = transport_stream_ingress_get(stream).len;
   size_t received = size;
   if (quicly_recvstate_update(&stream->recvstate,
                               stream->recvstate.data_off + offset, &received, 0,
@@ -540,6 +615,78 @@ static bool receive_bytes(quicly_stream_t *stream, const uint8_t *data,
     return false;
   stream->callbacks->on_receive(stream, offset, data, size);
   return true;
+}
+
+static bool receive_ingress_range(quicly_stream_t *stream, size_t off,
+                                  const uint8_t *data, size_t size, bool fin) {
+  size_t received = size;
+  return quicly_recvstate_update(&stream->recvstate, off, &received, fin, 32) ==
+             0 &&
+         received == size &&
+         transport_stream_ingress_receive(
+             stream, off - stream->recvstate.data_off, data, size) == 0;
+}
+
+static bool ingress_matches(quicly_stream_t *stream, const uint8_t *data,
+                            size_t off, size_t size) {
+  ptls_iovec_t input = transport_stream_ingress_get(stream);
+  return stream->recvstate.data_off == off && input.len == size &&
+         (size == 0 || memcmp(input.base, data + off, size) == 0);
+}
+
+static int ingress_compaction(void) {
+  int failed = 0;
+  transport_t *t = fixture();
+  uint8_t *data = malloc(98304);
+  CHECK(t && t->client_conn && data);
+  for (size_t i = 0; i < 98304; i++)
+    data[i] = (uint8_t)(i * 37 + (i >> 8));
+  quicly_stream_t *stream = NULL;
+  CHECK(quicly_get_or_open_stream(t->client_conn->quic, 3, &stream) == 0 &&
+        stream);
+  transport_stream_ctx_t *ctx = stream->data;
+  ptls_buffer_t *buffer = &ctx->streambuf.ingress;
+  CHECK(receive_ingress_range(stream, 0, data, 4096, false));
+  CHECK(receive_ingress_range(stream, 8192, data + 8192, 57344, false));
+  CHECK(ingress_matches(stream, data, 0, 4096));
+  /* Retire the available prefix without moving the large sparse tail. QUIC
+   * receives consumption credit immediately, before physical compaction. */
+  transport_stream_ingress_shift(stream, 4096);
+  CHECK(ctx->ingress_prefix == 4096 && buffer->off == 65536 &&
+        ingress_matches(stream, data, 4096, 0));
+  CHECK(receive_ingress_range(stream, 4096, data + 4096, 4096, false));
+  CHECK(ingress_matches(stream, data, 4096, 61440));
+  transport_stream_ingress_shift(stream, 8192);
+  CHECK(ctx->ingress_prefix == 12288 &&
+        ingress_matches(stream, data, 12288, 53248));
+  /* Growing an allocation with a retained prefix must preserve both offsets
+   * and bytes. The next shift crosses the amortized compaction threshold. */
+  size_t capacity = buffer->capacity;
+  CHECK(receive_ingress_range(stream, 65536, data + 65536, 32768, false));
+  CHECK(buffer->capacity > capacity &&
+        ingress_matches(stream, data, 12288, 86016));
+  transport_stream_ingress_shift(stream, 40960);
+  CHECK(ctx->ingress_prefix == 0 && buffer->off == 45056 &&
+        ingress_matches(stream, data, 53248, 45056));
+  /* FIN uses the physical buffer extent in Quicly; the virtual view must
+   * exclude consumed bytes even when receive ranges become empty. */
+  transport_stream_ingress_shift(stream, 4096);
+  CHECK(ctx->ingress_prefix == 4096);
+  CHECK(receive_ingress_range(stream, 98304, NULL, 0, true));
+  CHECK(ingress_matches(stream, data, 57344, 40960));
+  transport_stream_ingress_shift(stream, 40960);
+  CHECK(ctx->ingress_prefix == 0 && buffer->off == 0 &&
+        ingress_matches(stream, data, 98304, 0));
+  CHECK(transport_stream_ingress_receive(stream, SIZE_MAX, data, 1) == -1 &&
+        quicly_get_state(stream->conn) >= QUICLY_STATE_CLOSING);
+  CHECK(t->stats.resource_limit_errors == 1 &&
+        QUICLY_ERROR_GET_ERROR_CODE(
+            quicly_get_close_reason(stream->conn, NULL, NULL, NULL)) == 0x102);
+cleanup:
+  free(data);
+  if (!dispose(t))
+    failed = 1;
+  return failed;
 }
 
 static bool receive_control(quicly_stream_t *stream, uint8_t type,
@@ -567,6 +714,91 @@ static bool receive_control(quicly_stream_t *stream, uint8_t type,
 static void count_objects(void *data, const transport_event_t *event) {
   if (event->type == TRANSPORT_EVENT_OBJECT)
     (*(size_t *)data)++;
+}
+
+typedef struct {
+  transport_t *transport;
+  size_t received;
+  bool invalid;
+} track_dispatch_state_t;
+
+static void check_track_object(void *data, const transport_event_t *event) {
+  if (event->type != TRANSPORT_EVENT_OBJECT)
+    return;
+  track_dispatch_state_t *state = data;
+  const moq_object_t *object = &event->object;
+  state->invalid |=
+      object->group_id != 7 || object->object_id != state->received ||
+      object->size != 8192 || strcmp(event->track_id.name, "burst") != 0;
+  /* Publishing is allowed from a callback and must leave its borrowed input
+   * valid until return, even with later objects waiting in the same buffer. */
+  if (!transport_send_unicast(state->transport, event->conn, object->data,
+                              object->size))
+    state->invalid = true;
+  for (size_t i = 0; i < object->size; i++)
+    state->invalid |= object->data[i] != (uint8_t)state->received;
+  state->received++;
+}
+
+static int track_dispatch_consumption(void) {
+  int failed = 0;
+  const size_t frame_size =
+      QLINQ_WIRE_FRAME_HEADER_SIZE + QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE + 8192;
+  uint8_t *frames = malloc(131 * frame_size);
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn && frames);
+  track_dispatch_state_t state = {.transport = t};
+  t->callback = check_track_object;
+  t->user_data = &state;
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = conn->protocol_ready = true;
+  conn->negotiated_limits = t->limits;
+  CHECK(transport_subscriptions_add(&conn->receive_subscriptions,
+                                    MOQ_TRACK_DATA, MOQ_TRACK_FLAG_RELIABLE,
+                                    "burst", 7));
+  quicly_stream_t *stream = NULL;
+  CHECK(quicly_get_or_open_stream(conn->quic, 3, &stream) == 0 && stream);
+  for (size_t i = 0; i < 131; i++) {
+    uint8_t *frame = frames + i * frame_size;
+    qlinq_wire_track_object_t object = {
+        .alias = i == 130 ? 8 : 7, .group_id = 7, .object_id = i};
+    CHECK(qlinq_wire_encode_frame_header(
+              frame, frame_size, QLINQ_WIRE_TRACK_OBJECT,
+              frame_size - QLINQ_WIRE_FRAME_HEADER_SIZE,
+              TRANSPORT_WIRE_MAX_STREAM_PAYLOAD) == QLINQ_WIRE_OK);
+    CHECK(qlinq_wire_encode_track_object(frame + QLINQ_WIRE_FRAME_HEADER_SIZE,
+                                         QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE,
+                                         &object) == QLINQ_WIRE_OK);
+    memset(frame + frame_size - 8192, (uint8_t)i, 8192);
+  }
+  /* A large contiguous burst ends first in a partial header, then in a
+   * partial payload. Neither may repeat callbacks for the consumed prefix. */
+  size_t first = 128 * frame_size + 3;
+  CHECK(receive_bytes(stream, frames, first));
+  CHECK(!state.invalid && state.received == 128 &&
+        stream->recvstate.data_off == 128 * frame_size &&
+        transport_stream_ingress_get(stream).len == 3);
+  size_t second = frame_size - 8;
+  CHECK(receive_bytes(stream, frames + first, second));
+  ptls_iovec_t tail = transport_stream_ingress_get(stream);
+  CHECK(!state.invalid && state.received == 128 && tail.len == frame_size - 5 &&
+        memcmp(tail.base, frames + 128 * frame_size, tail.len) == 0);
+  /* An invalid alias after two complete objects must close the connection
+   * while retiring only the accepted prefix, including the previous tail. */
+  CHECK(receive_bytes(stream, frames + first + second, 2 * frame_size + 5));
+  tail = transport_stream_ingress_get(stream);
+  CHECK(!state.invalid && state.received == 130 &&
+        stream->recvstate.data_off == 130 * frame_size &&
+        tail.len == frame_size &&
+        memcmp(tail.base, frames + 130 * frame_size, tail.len) == 0);
+  CHECK(quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING &&
+        t->stats.protocol_errors == 1 &&
+        t->stats.stream_frames_received == 131);
+cleanup:
+  free(frames);
+  if (!dispose(t))
+    failed = 1;
+  return failed;
 }
 
 /* A fragmented request and the next frame must each be consumed exactly once,
@@ -607,7 +839,7 @@ static int control_dispatch_consumption(void) {
   CHECK(t->stats.stream_frames_received == 0 && delivered == 0);
   CHECK(receive_bytes(conn->stream, frames + 3, first_size + second_size - 3));
   CHECK(quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
-        quicly_streambuf_ingress_get(conn->stream).len == 0);
+        transport_stream_ingress_get(conn->stream).len == 0);
   CHECK(t->stats.stream_frames_received == 2 && delivered == 1 &&
         t->stats.repair_requests_received == 1 &&
         t->stats.repair_requests_aggregate_throttled == 1 &&
@@ -923,12 +1155,14 @@ cleanup:
 
 int main(void) {
   int failed =
-      control_dispatch_consumption() || control_error_accounting() ||
-      checkpoint_ack_pressure() || checkpoint_repair_batch(1024, 1024) ||
-      checkpoint_repair_batch(2, 1024) || checkpoint_repair_batch(1024, 3) ||
-      entry_limit_and_control_failure() || byte_limits_and_recovery() ||
-      endpoint_vector_limit() || vector_capacity_compaction() ||
-      configurable_limits() || configured_frame_capacity(128U * 1024U, 2048) ||
+      stream_emission_cursor() || ingress_compaction() ||
+      track_dispatch_consumption() || control_dispatch_consumption() ||
+      control_error_accounting() || checkpoint_ack_pressure() ||
+      checkpoint_repair_batch(1024, 1024) || checkpoint_repair_batch(2, 1024) ||
+      checkpoint_repair_batch(1024, 3) || entry_limit_and_control_failure() ||
+      byte_limits_and_recovery() || endpoint_vector_limit() ||
+      vector_capacity_compaction() || configurable_limits() ||
+      configured_frame_capacity(128U * 1024U, 2048) ||
       configured_frame_capacity(256U * 1024U, 4096) ||
       retained_nack_retries(false) || retained_nack_retries(true) ||
       retained_nack_ack_gap(false) || retained_nack_ack_gap(true) ||

@@ -397,10 +397,11 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
       if (state->q_ewma > sample.q)
         sample.q = state->q_ewma;
     }
-    /* Stream frames have no per-path qlinq queue. Account for QUIC's
-     * in-flight stream packets so Pathflow sees their serialized work. */
-    size_t in_flight = stats.bytes_in_flight / symbol_size +
-                       (stats.bytes_in_flight % symbol_size != 0);
+    /* Estimate forward-flight pressure using the same symmetric RTT/2
+     * assumption as latency; unacknowledged bytes also span the ACK return
+     * trip. Quicly still enforces the full congestion window. */
+    size_t in_flight = stats.bytes_in_flight / (2 * symbol_size) +
+                       (stats.bytes_in_flight % (2 * symbol_size) != 0);
     sample.q = in_flight > FP_SAFE_WHOLE - sample.q ? FP_SAFE_WHOLE
                                                     : sample.q + in_flight;
     /* Quicly emits at most one path per send call.  A stream call can consume

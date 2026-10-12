@@ -52,8 +52,16 @@ bool transport_schedule_build(pathflow_context_t *context,
   }
 
   if (!fec_enabled) {
-    for (size_t symbol = 0; symbol < data_symbols; symbol++)
-      schedule->paths[symbol % num_paths].x++;
+    path_t pending[TRANSPORT_MAX_PATHS];
+    memcpy(pending, schedule->paths, num_paths * sizeof(*pending));
+    for (size_t symbol = 0; symbol < data_symbols; symbol++) {
+      size_t selected = transport_stream_select_path(pending, num_paths, 0);
+      if (selected == SIZE_MAX)
+        return false;
+      schedule->paths[selected].x++;
+      if (pending[selected].q < FP_SAFE_WHOLE)
+        pending[selected].q++;
+    }
     return true;
   }
 

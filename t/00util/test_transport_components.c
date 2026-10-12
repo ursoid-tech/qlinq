@@ -73,6 +73,84 @@ static int test_recovery_cache_protection(void) {
   return 0;
 }
 
+static int check_cache_lookups(transport_sent_cache_t *cache,
+                               const moq_track_id_t tracks[2]) {
+  size_t count = 0, bytes = 0;
+  for (size_t i = 0; i < cache->capacity; i++) {
+    count += cache->entries[i].data != NULL;
+    if (cache->entries[i].data)
+      bytes += cache->entries[i].size;
+  }
+  CHECK(cache->count == count && cache->payload_bytes == bytes,
+        "cache live count and byte accounting match occupied entries");
+  for (size_t track = 0; track < 2; track++)
+    for (uint64_t group = 0; group < 3; group++)
+      for (uint64_t object = 0; object < 8; object++) {
+        sent_object_cache_t *expected = NULL;
+        for (size_t i = 0; i < cache->capacity; i++) {
+          sent_object_cache_t *entry = &cache->entries[i];
+          if (entry->data && entry->group_id == group &&
+              entry->object_id == object &&
+              entry->track_id.type == tracks[track].type &&
+              entry->track_id.flags == tracks[track].flags &&
+              strcmp(entry->track_id.name, tracks[track].name) == 0) {
+            expected = entry;
+            break;
+          }
+        }
+        CHECK(transport_sent_cache_find(cache, &tracks[track], group, object) ==
+                  expected,
+              "wrapped sparse cache lookup matches full linear reference");
+      }
+  return 0;
+}
+
+static int test_recovery_cache_lookup(void) {
+  /* A small ring makes wraparound, protected old entries and release holes
+   * explicit while exercising the ordinary store/release implementation. */
+  transport_sent_cache_t cache = {.capacity = 16, .max_payload_bytes = 64};
+  cache.entries = calloc(cache.capacity, sizeof(*cache.entries));
+  CHECK(cache.entries, "lookup cache allocation");
+  const moq_track_id_t tracks[2] = {{.type = MOQ_TRACK_DATA,
+                                     .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                     .name = "lookup"},
+                                    {.type = MOQ_TRACK_DATA,
+                                     .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                                     .name = "lookup"}};
+  uint8_t payload = 7;
+  moq_object_t object = {.data = &payload, .size = 1};
+  for (size_t i = 0; i < 23; i++) {
+    object.track_id = tracks[i % 2];
+    object.group_id = i % 3;
+    object.object_id = i / 6;
+    CHECK(transport_sent_cache_store(&cache, &object, 1, 1, 1, i != 0),
+          "fill and wrap cache around protected oldest entry");
+  }
+  CHECK(cache.count == 16 && cache.next_entry == 8 &&
+            check_cache_lookups(&cache, tracks) == 0,
+        "full wrapped lookup retains protected old identity");
+  CHECK(transport_sent_cache_release_track(&cache, &tracks[0]) > 0 &&
+            transport_sent_cache_release_through(&cache, &tracks[1], 1, 3) >
+                0 &&
+            check_cache_lookups(&cache, tracks) == 0,
+        "lookup skips holes from track and checkpoint releases");
+  for (size_t i = 23; i < 39; i++) {
+    object.track_id = tracks[i % 2];
+    object.group_id = i % 3;
+    object.object_id = i / 6;
+    CHECK(transport_sent_cache_store(&cache, &object, 1, 1, 1, true),
+          "refill released holes and wrap again");
+  }
+  CHECK(check_cache_lookups(&cache, tracks) == 0,
+        "lookup agrees after hole reuse and eviction");
+  transport_sent_cache_release_track(&cache, &tracks[0]);
+  transport_sent_cache_release_track(&cache, &tracks[1]);
+  CHECK(cache.count == 0 && check_cache_lookups(&cache, tracks) == 0,
+        "empty cache lookups preserve a nonzero insertion cursor");
+  transport_sent_cache_destroy(&cache);
+  return 0;
+}
+
 static int test_udp_batch_boundaries(void) {
   static const struct {
     size_t count;
@@ -368,6 +446,44 @@ static int test_stream_path_selection(void) {
   return 0;
 }
 
+static int test_datagram_schedule(void) {
+  path_state_t states[3] = {
+      {.b_ewma = FP_FROM_INT(100), .q_ewma = 5, .initialized = true},
+      {.b_ewma = FP_FROM_INT(200), .q_ewma = 10, .initialized = true},
+      {.b_ewma = FP_FROM_INT(400), .q_ewma = 20, .initialized = true}};
+  pathflow_context_t context = {0};
+  transport_schedule_t schedule;
+  size_t round_robin = 0;
+  CHECK(transport_schedule_build(&context, states, 3, 7, 1200, false, 1,
+                                 &round_robin, &schedule) &&
+            schedule.paths[0].x == 1 && schedule.paths[1].x == 2 &&
+            schedule.paths[2].x == 4 && schedule.parity_symbols == 0,
+        "datagrams distribute every symbol by capacity without parity");
+  for (size_t i = 0; i < 3; i++) {
+    CHECK(schedule.paths[i].b == states[i].b_ewma &&
+              schedule.paths[i].l == states[i].l_ewma &&
+              schedule.paths[i].p == states[i].p_ewma &&
+              schedule.paths[i].q == states[i].q_ewma &&
+              schedule.paths[i].m == 0,
+          "planned datagram work does not alter path samples");
+  }
+  CHECK(round_robin == 0, "datagrams preserve the FEC round-robin cursor");
+
+  states[0].p_ewma = states[1].p_ewma = FP_ONE;
+  CHECK(transport_schedule_build(&context, states, 3, 7, 1200, false, 1,
+                                 &round_robin, &schedule) &&
+            schedule.paths[0].x == 0 && schedule.paths[1].x == 0 &&
+            schedule.paths[2].x == 7 && schedule.parity_symbols == 0,
+        "datagrams skip paths without an effective delivery rate");
+  states[2].p_ewma = FP_ONE;
+  CHECK(!transport_schedule_build(&context, states, 3, 7, 1200, false, 1,
+                                  &round_robin, &schedule) &&
+            schedule.paths[0].x == 0 && schedule.paths[1].x == 0 &&
+            schedule.paths[2].x == 0 && schedule.parity_symbols == 0,
+        "datagram scheduling fails when no path can deliver");
+  return 0;
+}
+
 static int test_address_identity(void) {
   struct sockaddr_in6 a = {
       .sin6_family = AF_INET6, .sin6_port = htons(443), .sin6_scope_id = 4};
@@ -512,6 +628,8 @@ int main(void) {
   CHECK(test_address_identity() == 0, "scoped address and endpoint identity");
   CHECK(test_stream_path_selection() == 0,
         "reliable stream path selection without FEC parity");
+  CHECK(test_datagram_schedule() == 0,
+        "capacity-aware datagram scheduling without FEC parity");
   CHECK(test_path_pacing_inputs() == 0, "per-path ACK probing and pacing");
   CHECK(test_path_estimates() == 0,
         "heterogeneous path inputs and allocations");
@@ -521,6 +639,7 @@ int main(void) {
         "assembler transient allocation budget");
   CHECK(test_udp_batch_boundaries() == 0, "UDP batch boundaries");
   CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
+  CHECK(test_recovery_cache_lookup() == 0, "sparse wrapped cache lookup");
   transport_limits_t configured = {0};
   transport_limits_t resolved_limits;
   char limit_error[128];
@@ -642,9 +761,9 @@ int main(void) {
   transport_schedule_t schedule;
   CHECK(transport_schedule_build(&scheduler_context, path_states, 2, 5, 1100,
                                  false, 1, &round_robin, &schedule) &&
-            schedule.paths[0].x == 3 && schedule.paths[1].x == 2 &&
+            schedule.paths[0].x == 4 && schedule.paths[1].x == 1 &&
             schedule.parity_symbols == 0,
-        "non-FEC schedule distribution");
+        "non-FEC schedule follows estimated completion time");
   CHECK(transport_schedule_build(&scheduler_context, path_states, 2, 1, 1100,
                                  true, 1, &round_robin, &schedule) &&
             schedule.paths[0].x == 1 && round_robin == 1,

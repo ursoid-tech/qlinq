@@ -287,7 +287,9 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
           "raw_b_pps=%.3f raw_l_ms=%.3f raw_loss=%.5f raw_q=%zu "
           "b_pps=%.3f l_ms=%.3f loss=%.5f q=%zu data=%zu total=%zu",
           obj->group_id, obj->object_id,
-          use_fec && data_symbols > 1 ? "pathflow" : "round_robin",
+          !use_fec           ? "completion"
+          : data_symbols > 1 ? "pathflow"
+                             : "round_robin",
           conn->paths[paths[i].physical].state_overridden
               ? "override"
               : (paths[i].rate_known ? "cwnd_rtt" : "default"),

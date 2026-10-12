@@ -19,6 +19,7 @@ else
 endif
 
 # Default CFLAGS for our code
+CFLAGS ?= -O2
 CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
 # Match the codec libraries' optimization settings only for their own sources.
 # These follow CFLAGS; override FEC_CFLAGS for debug/sanitizer builds. Native
@@ -225,7 +226,7 @@ check-multipath-bw-demo:
 	@if [ "$${QLINQ_SKIP_PRIVILEGED:-0}" = 1 ]; then \
 		echo "SKIP privileged bandwidth demo (QLINQ_SKIP_PRIVILEGED=1)"; \
 	else \
-		./examples/multipath_bw_demo; \
+		./examples/multipath_bw_demo --all-modes; \
 	fi
 
 check-sanitize:

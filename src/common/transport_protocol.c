@@ -487,7 +487,7 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
 static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                                    quicly_stream_t *stream) {
   while (true) {
-    ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
+    ptls_iovec_t input = transport_stream_ingress_get(stream);
     if (input.len == 0)
       return;
     qlinq_wire_frame_t frame;
@@ -507,7 +507,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
     }
     if (!receive_control_frame(t, conn, &frame))
       return;
-    quicly_streambuf_ingress_shift(stream, frame.consumed);
+    transport_stream_ingress_shift(stream, frame.consumed);
   }
 }
 
@@ -523,14 +523,13 @@ static void on_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
 static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
                                         quicly_stream_t *stream) {
   transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
-  while (1) {
-    ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
-    if (input.len == 0)
-      break;
-
+  ptls_iovec_t input = transport_stream_ingress_get(stream);
+  size_t consumed = 0;
+  while (consumed < input.len) {
     qlinq_wire_frame_t frame;
-    qlinq_wire_result_t result = qlinq_wire_decode_frame(
-        input.base, input.len, TRANSPORT_WIRE_MAX_STREAM_PAYLOAD, &frame);
+    qlinq_wire_result_t result =
+        qlinq_wire_decode_frame(input.base + consumed, input.len - consumed,
+                                TRANSPORT_WIRE_MAX_STREAM_PAYLOAD, &frame);
     if (result == QLINQ_WIRE_NEED_MORE)
       break;
     if (result != QLINQ_WIRE_OK) {
@@ -604,14 +603,18 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
       transport_emit_event(t, &ev);
     }
 
-    quicly_streambuf_ingress_shift(stream, frame.consumed);
+    consumed += frame.consumed;
   }
+  /* A repaired gap can release many objects at once. Keep callback payloads
+   * borrowed until dispatch returns, then compact the unconsumed tail once. */
+  if (consumed != 0)
+    transport_stream_ingress_shift(stream, consumed);
 }
 
 /* control stream receive callbacks */
 static void on_receive(quicly_stream_t *stream, size_t off, const void *src,
                        size_t len) {
-  if (quicly_streambuf_ingress_receive(stream, off, src, len) != 0)
+  if (transport_stream_ingress_receive(stream, off, src, len) != 0)
     return;
 
   transport_conn_t *conn = *quicly_get_data(stream->conn);
@@ -649,7 +652,7 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
   static const quicly_stream_callbacks_t stream_callbacks = {
       on_stream_destroy,
       transport_stream_egress_shift,
-      quicly_streambuf_egress_emit,
+      transport_stream_egress_emit,
       on_stop_sending,
       on_receive,
       on_receive_reset};

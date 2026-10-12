@@ -12,11 +12,11 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_PACKETS 262144
+#define MAX_PACKETS 524288
 #define MAX_FPS 50000
 #define PACKET_SIZE 8000 /* 8KB general data payload */
-#define GIGABIT_STREAM_EGRESS_BYTES (16U * 1024U * 1024U)
-#define GIGABIT_TOTAL_STREAM_EGRESS_BYTES (32U * 1024U * 1024U)
+#define BENCHMARK_STREAM_EGRESS_BYTES (32U * 1024U * 1024U)
+#define BENCHMARK_TOTAL_STREAM_EGRESS_BYTES (64U * 1024U * 1024U)
 #define BENCHMARK_RECOVERY_CACHE_FLOOR (16U * 1024U * 1024U)
 #define BENCHMARK_RECOVERY_CACHE_MAX (128U * 1024U * 1024U)
 
@@ -31,14 +31,14 @@ typedef struct {
   bool connected;
   bool disconnected;
   bool subscribed;
-  bool use_reliable;
+  bool grouped;
   frame_metrics_t packets[MAX_PACKETS];
   int frames_received;
   transport_t *transport;
 } benchmark_state_t;
 
 typedef struct {
-  double all_active_at, start_ms, end_ms;
+  double all_active_at, sampled_at_ms, start_ms, end_ms;
   transport_path_stats_t start[4], end[4];
   bool started, interrupted;
 } path_window_t;
@@ -55,6 +55,9 @@ static void sample_path_window(transport_t *transport, size_t expected_paths,
                                double warmup_ms, path_window_t *window) {
   transport_path_stats_t current[4];
   double now = get_time_ms();
+  if (now - window->sampled_at_ms < 1)
+    return;
+  window->sampled_at_ms = now;
   for (size_t i = 0; i < expected_paths; i++) {
     if (!transport_get_path_stats(transport, i, &current[i]) ||
         current[i].lifecycle != TRANSPORT_PATH_ACTIVE) {
@@ -86,7 +89,8 @@ static void report_window_delivery(const path_window_t *window,
                                    int packets_sent) {
   if (!window->started || window->end_ms <= window->start_ms)
     return;
-  double latencies[MAX_PACKETS], total_latency = 0;
+  static double latencies[MAX_PACKETS];
+  double total_latency = 0;
   size_t sent = 0, admitted = 0, received = 0, completed_in_window = 0;
   for (int i = 0; i < packets_sent; i++) {
     const frame_metrics_t *packet = &client->packets[i];
@@ -109,6 +113,7 @@ static void report_window_delivery(const path_window_t *window,
   printf("window_goodput_mbps: %.3f\n",
          completed_in_window * (double)PACKET_SIZE * 8 /
              ((window->end_ms - window->start_ms) * 1000));
+  printf("window_duration_ms: %.3f\n", window->end_ms - window->start_ms);
   printf("window_mean_latency_ms: %.3f\n",
          received ? total_latency / received : 0);
   printf("window_p95_latency_ms: %.3f\n",
@@ -258,9 +263,9 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_OBJECT:
     if (strcmp(event->track_id.name, "data_benchmark") == 0) {
-      if (state->use_reliable) {
+      if (!state->grouped) {
         uint64_t fid;
-        if (event->object.size >= sizeof(fid)) {
+        if (event->object.size == PACKET_SIZE) {
           memcpy(&fid, event->object.data, sizeof(fid));
           if (fid < MAX_PACKETS && !state->packets[fid].arrived) {
             state->packets[fid].recv_time = get_time_ms();
@@ -279,7 +284,7 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
         if (remaining < 2 + (size_t)pkt_len) {
           break;
         }
-        if (pkt_len >= sizeof(uint64_t)) {
+        if (pkt_len == PACKET_SIZE) {
           uint64_t fid;
           memcpy(&fid, ptr + 2, sizeof(uint64_t));
           if (fid < MAX_PACKETS && !state->packets[fid].arrived) {
@@ -312,6 +317,7 @@ int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);
   bool use_reliable = false;
   bool use_rateless = false;
+  bool use_datagram = false;
   const char *server_bind_hosts[4] = {"0.0.0.0"};
   int num_server_bind = 1;
   const char *client_bind_hosts[4] = {"0.0.0.0"};
@@ -329,12 +335,15 @@ int main(int argc, char **argv) {
   double warmup_fps = 0;
   bool wait_all_paths = false;
   bool continue_backpressure = false;
+  size_t udp_payload_size = 1280;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--reliable") == 0) {
       use_reliable = true;
     } else if (strcmp(argv[i], "--rateless") == 0) {
       use_rateless = true;
+    } else if (strcmp(argv[i], "--datagram") == 0) {
+      use_datagram = true;
     } else if (strcmp(argv[i], "--server-bind") == 0 && i + 1 < argc) {
       server_bind_hosts[0] = argv[++i];
       num_server_bind = 1;
@@ -379,6 +388,11 @@ int main(int argc, char **argv) {
       warmup_ms = numeric_argument(argv[++i], 0, 30000);
     } else if (strcmp(argv[i], "--warmup-fps") == 0 && i + 1 < argc) {
       warmup_fps = numeric_argument(argv[++i], 1, MAX_FPS);
+    } else if (strcmp(argv[i], "--udp-payload-size") == 0 && i + 1 < argc) {
+      double value = numeric_argument(argv[++i], 1200, 1500);
+      if (value != floor(value))
+        return 2;
+      udp_payload_size = (size_t)value;
     } else if (strcmp(argv[i], "--drain-ms") == 0 && i + 1 < argc) {
       drain_ms = numeric_argument(argv[++i], 0, 10000);
     } else if (strcmp(argv[i], "--wait-all-paths") == 0) {
@@ -400,13 +414,14 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (use_reliable && use_rateless) {
-    fprintf(stderr, "--reliable and --rateless cannot be combined\n");
+  if (use_reliable + use_rateless + use_datagram > 1) {
+    fprintf(stderr, "delivery modes cannot be combined\n");
     return 2;
   }
   printf("starting data multipath benchmark (%s mode)...\n",
          use_reliable   ? "reliable stream"
          : use_rateless ? "rateless fec"
+         : use_datagram ? "datagram"
                         : "fixed fec");
   size_t recovery_cache_bytes = benchmark_recovery_cache_bytes(fps);
 
@@ -414,7 +429,7 @@ int main(int argc, char **argv) {
    * process stack when both endpoint states are automatic variables. */
   static benchmark_state_t server_state;
   static benchmark_state_t client_state;
-  client_state.use_reliable = use_reliable;
+  client_state.grouped = !use_reliable && !use_datagram;
 
   /* create server transport config */
   transport_config_t server_cfg = {
@@ -422,9 +437,10 @@ int main(int argc, char **argv) {
       .cert_file = "t/assets/server.crt",
       .key_file = "t/assets/server.key",
       .callback = on_server_event,
-      .limits = {.max_stream_egress_bytes = GIGABIT_STREAM_EGRESS_BYTES,
+      .limits = {.max_stream_egress_bytes = BENCHMARK_STREAM_EGRESS_BYTES,
                  .max_total_stream_egress_bytes =
-                     GIGABIT_TOTAL_STREAM_EGRESS_BYTES,
+                     BENCHMARK_TOTAL_STREAM_EGRESS_BYTES,
+                 .max_udp_payload_size = udp_payload_size,
                  .max_recovery_cache_bytes = recovery_cache_bytes},
       .allow_insecure_peer = true,
       .user_data = &server_state};
@@ -441,9 +457,10 @@ int main(int argc, char **argv) {
       .cert_file = NULL,
       .key_file = NULL,
       .callback = on_client_event,
-      .limits = {.max_stream_egress_bytes = GIGABIT_STREAM_EGRESS_BYTES,
+      .limits = {.max_stream_egress_bytes = BENCHMARK_STREAM_EGRESS_BYTES,
                  .max_total_stream_egress_bytes =
-                     GIGABIT_TOTAL_STREAM_EGRESS_BYTES,
+                     BENCHMARK_TOTAL_STREAM_EGRESS_BYTES,
+                 .max_udp_payload_size = udp_payload_size,
                  .max_recovery_cache_bytes = recovery_cache_bytes},
       .allow_insecure_peer = true,
       .user_data = &client_state};
@@ -492,6 +509,7 @@ int main(int argc, char **argv) {
   moq_track_id_t track = {.type = MOQ_TRACK_DATA,
                           .flags = use_reliable   ? MOQ_TRACK_FLAG_RELIABLE
                                    : use_rateless ? MOQ_TRACK_FLAG_FEC_RATELESS
+                                   : use_datagram ? 0
                                                   : MOQ_TRACK_FLAG_FEC_ENABLED};
   strcpy(track.name, "data_benchmark");
 
@@ -610,9 +628,13 @@ int main(int argc, char **argv) {
     }
     packets_sent++;
 
-    transport_tick(server);
-    transport_tick(client);
-    sample_path_window(server, expected_paths, warmup_ms, &path_window);
+    /* Amortize socket service over at most 32 KB of queued records. Pacing
+     * waits above still service both endpoints when publications are sparse. */
+    if ((f + 1) % 4 == 0 || f + 1 == packet_count) {
+      transport_tick(server);
+      transport_tick(client);
+      sample_path_window(server, expected_paths, warmup_ms, &path_window);
+    }
     if (server_state.disconnected || client_state.disconnected)
       break;
   }
@@ -668,6 +690,7 @@ int main(int argc, char **argv) {
   printf("--- RESULTS ---\n");
   printf("mode: %s\n", use_reliable   ? "reliable"
                        : use_rateless ? "rateless"
+                       : use_datagram ? "datagram"
                                       : "fixed-fec");
   printf("offered: %d\nsent: %d\nbackpressured: %d\n", packets_sent,
          packets_admitted, backpressured);

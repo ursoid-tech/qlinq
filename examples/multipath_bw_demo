@@ -13,13 +13,16 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-# Three heterogeneous transit capacities. The 1 Gbps offered load requires
-# aggregation once fixed-FEC wire overhead is included.
-RATES = (250, 500, 1000)
+# Three heterogeneous transit capacities. The 2 Gbps offered load requires
+# aggregation once wire overhead is included.
+RATES = (500, 1000, 2000)
 WARMUP = 4.0
 DURATION = 12.0
-DEFAULT_OFFERED_MBPS = 1000.0
+DEFAULT_OFFERED_MBPS = 2000.0
 DEFAULT_INITIAL_MBPS = 250.0
+UDP_PAYLOAD_SIZE = 1452
+LINK_MTU = 1500
+DELIVERY_MODES = ("datagram", "fixed-fec", "rateless", "reliable")
 
 
 def command(*args):
@@ -34,18 +37,16 @@ def setup_links():
         for direction, interface in ((1, f"bw{n}"), (2, f"bw{n}_peer")):
             address = f"10.40.{n}.{direction}"
             command("ip", "addr", "add", address + "/24", "dev", interface)
-            command("ip", "link", "set", interface, "up")
+            command("ip", "link", "set", interface, "mtu", str(LINK_MTU), "up")
             handle = f"{n}{direction}"
             # Separate forward/reverse classes avoid sharing a cap with ACKs.
             command("tc", "class", "add", "dev", "lo", "parent", "1:",
                     "classid", "1:" + handle, "htb", "rate", f"{rate}mbit",
                     "ceil", f"{rate}mbit", "burst", "32kb", "cburst", "32kb")
-            # The queue must cover the shaped link's 20 ms delay window. 128
-            # packets is below the 200 Mbps BDP and manufactures drops from
-            # otherwise harmless scheduler bursts; report-side gates still
-            # bound the observed backlog.
+            # Cover the fastest link's 20 ms delay window at 2 Gbps.
+            # Report-side gates still bound the observed backlog.
             command("tc", "qdisc", "add", "dev", "lo", "parent", "1:" + handle,
-                    "handle", handle + ":", "netem", "delay", "20ms", "limit", "2048")
+                    "handle", handle + ":", "netem", "delay", "20ms", "limit", "4096")
             command("tc", "filter", "add", "dev", "lo", "protocol", "ip", "parent", "1:",
                     "prio", "1", "u32", "match", "ip", "dst", address + "/32",
                     "flowid", "1:" + handle)
@@ -109,10 +110,12 @@ def analyze(output, samples, exit_code, offered_mbps, initial_mbps):
     checks["p99_at_most_250ms"] = (metrics.get("window_received", 0) > 0 and
                                     metrics.get("window_p99_latency_ms", float("inf")) <= 250)
     delivery_mode = ("reliable" if "mode: reliable" in output else
+                     "datagram" if "mode: datagram" in output else
                      "rateless" if "mode: rateless" in output else "fixed-fec")
     return {"rates_mbps": RATES, "delivery_mode": delivery_mode,
             "offered_mbps": offered_mbps,
             "initial_offered_mbps": initial_mbps,
+            "udp_payload_size": UDP_PAYLOAD_SIZE, "link_mtu": LINK_MTU,
             "one_way_delay_ms": 20, "warmup_seconds": WARMUP,
             "duration_seconds": DURATION, "metrics": metrics,
             "paths": paths, "checks": checks, "passed": all(checks.values())}
@@ -134,11 +137,13 @@ def run(args):
             "--wait-all-paths", "--continue-backpressure",
             "--packets", str(packets), "--warmup-fps", str(initial_fps),
             "--fps", str(fps), "--warmup-ms", str(round(WARMUP * 1000)),
-            "--drain-ms", "3000"]
+            "--drain-ms", "3000", "--udp-payload-size", str(UDP_PAYLOAD_SIZE)]
     if args.delivery_mode == "rateless":
         argv.append("--rateless")
     elif args.delivery_mode == "reliable":
         argv.append("--reliable")
+    elif args.delivery_mode == "datagram":
+        argv.append("--datagram")
     rates_text = "/".join(str(rate) for rate in RATES)
     print(f"Bandwidth demo: {rates_text} Mbps per direction, 20 ms one-way delay, no injected loss, "
           f"{args.delivery_mode.replace('-', ' ')} delivery.", flush=True)
@@ -185,6 +190,34 @@ def run(args):
     return 0 if report["passed"] else 1
 
 
+def run_namespaces(args):
+    modes = DELIVERY_MODES if args.delivery_mode == "all" else (args.delivery_mode,)
+    results = Path(args.output_dir)
+    reports = {}
+    env = dict(os.environ, QLINQ_BW_PARENT_NETNS=str(os.stat("/proc/self/ns/net").st_ino))
+    for mode in modes:
+        output_dir = results / mode if args.delivery_mode == "all" else results
+        output_dir.mkdir(parents=True, exist_ok=True)
+        argv = ["unshare", "-Urn", sys.executable, str(Path(__file__).resolve()),
+                "--in-namespace", "--output-dir", str(output_dir), "--" + mode,
+                "--offered-mbps", str(args.offered_mbps),
+                "--initial-mbps", str(args.initial_mbps)]
+        if args.benchmark:
+            argv += ["--benchmark", str(Path(args.benchmark).resolve())]
+        if args.single_path:
+            argv.append("--single-path")
+        exit_code = subprocess.call(argv, env=env)
+        reports[mode] = {"exit_code": exit_code,
+                         "report_path": str(output_dir / "report.json")}
+    if args.delivery_mode == "all":
+        passed = all(report["exit_code"] == 0 for report in reports.values())
+        report = {"delivery_mode": "all", "modes": reports, "passed": passed}
+        (results / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        print(f"All-mode results: {results}")
+        return 0 if passed else 1
+    return reports[args.delivery_mode]["exit_code"]
+
+
 def main():
     global RATES
     parser = argparse.ArgumentParser(description=__doc__)
@@ -197,19 +230,25 @@ def main():
     parser.add_argument("--single-path", action="store_true",
                         help="run only the largest configured link")
     parser.set_defaults(delivery_mode="rateless")
-    parser.add_argument("--rateless", dest="delivery_mode", action="store_const",
-                        const="rateless",
-                        help=argparse.SUPPRESS)
-    parser.add_argument("--fixed-fec", dest="delivery_mode", action="store_const",
-                        const="fixed-fec",
-                        help="use finite fixed FEC instead of rateless repair")
-    parser.add_argument("--reliable", dest="delivery_mode", action="store_const",
-                        const="reliable",
-                        help="use reliable QUIC streams instead of FEC datagrams")
+    delivery = parser.add_mutually_exclusive_group()
+    delivery.add_argument("--all-modes", dest="delivery_mode", action="store_const",
+                          const="all", help="qualify every delivery mode in a fresh namespace")
+    delivery.add_argument("--datagram", dest="delivery_mode", action="store_const",
+                          const="datagram", help="use datagrams without FEC")
+    delivery.add_argument("--rateless", dest="delivery_mode", action="store_const",
+                          const="rateless", help=argparse.SUPPRESS)
+    delivery.add_argument("--fixed-fec", dest="delivery_mode", action="store_const",
+                          const="fixed-fec",
+                          help="use finite fixed FEC instead of rateless repair")
+    delivery.add_argument("--reliable", dest="delivery_mode", action="store_const",
+                          const="reliable",
+                          help="use reliable QUIC streams instead of FEC datagrams")
     parser.add_argument("--in-namespace", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.initial_mbps <= 0 or args.offered_mbps <= 0 or args.initial_mbps > args.offered_mbps:
         parser.error("initial and steady offered rates must be positive, with initial <= steady")
+    if args.in_namespace and args.delivery_mode == "all":
+        parser.error("all modes must be launched from the parent namespace")
     if args.single_path:
         RATES = (RATES[-1],)
     os.chdir(ROOT)
@@ -220,20 +259,7 @@ def main():
         subprocess.run(["make", "examples/data_multipath_benchmark", "gencerts"], check=True)
         args.output_dir = str(Path(args.output_dir).resolve()) if args.output_dir else tempfile.mkdtemp(prefix="qlinq-bw-")
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-        argv = ["unshare", "-Urn", sys.executable, str(Path(__file__).resolve()),
-                "--in-namespace", "--output-dir", args.output_dir]
-        if args.benchmark:
-            argv += ["--benchmark", str(Path(args.benchmark).resolve())]
-        argv += ["--offered-mbps", str(args.offered_mbps),
-                 "--initial-mbps", str(args.initial_mbps)]
-        if args.single_path:
-            argv.append("--single-path")
-        if args.delivery_mode == "fixed-fec":
-            argv.append("--fixed-fec")
-        elif args.delivery_mode == "reliable":
-            argv.append("--reliable")
-        env = dict(os.environ, QLINQ_BW_PARENT_NETNS=str(os.stat("/proc/self/ns/net").st_ino))
-        return subprocess.call(argv, env=env)
+        return run_namespaces(args)
     if os.environ.get("QLINQ_BW_PARENT_NETNS") in (None, str(os.stat("/proc/self/ns/net").st_ino)):
         parser.error("network setup must be launched through the isolated namespace")
     return run(args)

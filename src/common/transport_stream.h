@@ -30,6 +30,8 @@ typedef struct {
   quicly_streambuf_t streambuf;
   transport_t *owner;
   size_t retained_frame_bytes;
+  size_t emit_index, emit_prefix; /* vector index and bytes before it */
+  size_t ingress_prefix;          /* consumed bytes awaiting compaction */
   bool is_control;
   bool alias_bound;
   uint8_t alias;
@@ -51,6 +53,12 @@ bool transport_stream_has_retained_frame(quicly_stream_t *stream, uint8_t type,
                                          const void *payload,
                                          size_t payload_len);
 void transport_stream_egress_shift(quicly_stream_t *stream, size_t delta);
+void transport_stream_egress_emit(quicly_stream_t *stream, size_t off,
+                                  void *dst, size_t *len, int *wrote_all);
+ptls_iovec_t transport_stream_ingress_get(quicly_stream_t *stream);
+int transport_stream_ingress_receive(quicly_stream_t *stream, size_t off,
+                                     const void *src, size_t len);
+void transport_stream_ingress_shift(quicly_stream_t *stream, size_t delta);
 void transport_stream_destroy(quicly_stream_t *stream, quicly_error_t err);
 
 bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,

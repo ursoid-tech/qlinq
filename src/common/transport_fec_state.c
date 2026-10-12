@@ -1,6 +1,7 @@
 #include "transport_fec_state.h"
 #include "transport_tracks.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -50,12 +51,22 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
     return NULL;
   if (!cache->entries)
     return NULL;
-  for (size_t i = 0; i < cache_capacity(cache); i++) {
-    sent_object_cache_t *entry = &cache->entries[i];
-    if (entry->data && transport_track_id_equal(&entry->track_id, track) &&
-        entry->group_id == group_id && entry->object_id == object_id)
+  size_t capacity = cache_capacity(cache), remaining = cache->count;
+  size_t index = cache->next_entry;
+  assert(remaining <= capacity && index < capacity);
+  /* Recent unacknowledged objects usually occupy the tail before next_entry.
+   * Count live entries so a missing identity need not scan the empty rest. */
+  for (size_t scanned = 0; remaining != 0 && scanned < capacity; scanned++) {
+    index = index != 0 ? index - 1U : capacity - 1U;
+    sent_object_cache_t *entry = &cache->entries[index];
+    if (!entry->data)
+      continue;
+    remaining--;
+    if (entry->group_id == group_id && entry->object_id == object_id &&
+        transport_track_id_equal(&entry->track_id, track))
       return entry;
   }
+  assert(remaining == 0);
   return NULL;
 }
 
@@ -93,9 +104,9 @@ bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
     const sent_object_cache_t *entry = &cache->entries[i];
     if (!entry->data) {
       slot_available = true;
-    } else if (transport_track_id_equal(&entry->track_id, &object->track_id) &&
-               entry->group_id == object->group_id &&
-               entry->object_id == object->object_id) {
+    } else if (entry->group_id == object->group_id &&
+               entry->object_id == object->object_id &&
+               transport_track_id_equal(&entry->track_id, &object->track_id)) {
       return entry->size == object->size &&
              memcmp(entry->data, object->data, object->size) == 0;
     } else if (allow_evict && !entry->recovery_protected &&
@@ -218,8 +229,9 @@ size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
     return 0;
   for (size_t i = 0; i < cache_capacity(cache); i++) {
     sent_object_cache_t *entry = &cache->entries[i];
-    if (entry->data && transport_track_id_equal(&entry->track_id, track) &&
-        entry->group_id == group_id && entry->object_id <= object_id) {
+    if (entry->data && entry->group_id == group_id &&
+        entry->object_id <= object_id &&
+        transport_track_id_equal(&entry->track_id, track)) {
       release_entry(cache, entry);
       released++;
     }

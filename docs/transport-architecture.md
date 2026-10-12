@@ -97,7 +97,12 @@ the scope ID.
 - `transport_stream` emits complete frames in one Quicly egress operation.
   Retained allocations include frame payloads, ownership headers, and vector
   capacity. Partial ACKs keep the entire frame charged until QUIC releases it;
-  unused vector capacity is compacted as frames drain.
+  unused vector capacity is compacted as frames drain. A vector cursor avoids
+  rescanning queued output for each packet. Receive
+  consumption returns QUIC credit immediately and defers physical compaction
+  until the consumed prefix reaches the remaining span. Larger reliable
+  windows increase receive memory: used storage can approach twice a stream
+  window, with rounded allocation capacity retained until the stream closes.
 - `transport_egress` copies any QUIC packets not accepted immediately by the
   kernel. Quicly is not asked for another batch unless every possible output
   socket has room for one complete batch.
@@ -111,6 +116,10 @@ the scope ID.
   estimate is never substituted. Rate, RTT/2 plus relative one-way delay, and
   cumulative loss are smoothed every 25 ms. The rate is a sending-rate proxy,
   not a measured link capacity.
+  QUIC path ranking also uses half of unacknowledged flight as a load-pressure
+  estimate, following the same symmetric RTT/2 assumption. This is a heuristic:
+  asymmetric ACK routes and bursts need not split flight equally. Quicly still
+  enforces the full congestion window.
   At publication, uninitialized paths are sampled immediately and unsent queue
   inputs are refreshed even between ticks: the path's QUIC DATAGRAM frame count
   plus `ceil(socket_egress_bytes / full_symbol_size)`. The socket backlog is
@@ -128,7 +137,8 @@ the scope ID.
   path identity, object identity, symbol size, raw and used bandwidth/latency/
   loss/queue inputs, and planned data/total symbol allocation. `source` identifies
   `cwnd_rtt`, a cold-start `default`, or a test `override`; `mode` distinguishes
-  pathflow from the non-FEC and single-symbol round-robin cases. These events
+  pathflow, non-FEC earliest-completion placement, and single-symbol FEC
+  round-robin placement. These events
   describe scheduling decisions, including plans subsequently backpressured.
 - Incoming FEC assemblers share a 64 MiB transport-wide memory budget. Each
   connection starts with a small receive window, with an eight-object floor
@@ -220,15 +230,32 @@ paths that joined at different times. Rates include protocol traffic and are
 not capacity measurements. Reported QUIC RTT can include an ACK returned on
 another link, so it need not equal the configured same-link round-trip delay.
 
-`./examples/multipath_bw_demo` (or `make check-multipath-bw-demo`) is a separate
-bandwidth experiment. All three paths are validated before sending; each has a
-20 ms one-way delay and independent forward/reverse HTB caps of 250, 500 and
-1,000 Mbps. There is no injected loss, though overflowing a bounded kernel queue
-can still drop packets. The default rateless workload ramps from 250 to
-1,000 Mbps over four seconds, followed by eight seconds at 1,000 Mbps and a
-three-second drain. `--fixed-fec` and `--reliable` select other delivery modes;
+`./examples/multipath_bw_demo --all-modes` (or `make check-multipath-bw-demo`)
+runs a separate bandwidth experiment for each delivery mode. All three paths
+are validated before sending; each has a 20 ms one-way delay and independent
+forward/reverse HTB caps of 500, 1,000 and 2,000 Mbps. The veth MTU is 1,500 bytes;
+the benchmark's UDP payload ceiling is 1,452 bytes, leaving room for IPv6 and
+UDP headers within that MTU. Shaping is applied to loopback by destination
+address. There is no injected loss, though overflowing a bounded kernel queue
+can still drop packets. The workload ramps from 250 to 2,000 Mbps over four
+seconds, followed by eight seconds at 2,000 Mbps and a three-second drain.
 `--offered-mbps`, `--initial-mbps`, and `--single-path` vary the workload.
 Publication backpressure is counted as undelivered offered traffic.
+
+All four public delivery modes use 8,000-byte DATA records: `--datagram`
+corresponds to `QLINQ_DELIVERY_DATAGRAM`, `--fixed-fec` to
+`QLINQ_DELIVERY_FIXED_FEC`, `--rateless` to `QLINQ_DELIVERY_RATELESS`, and
+`--reliable` to `QLINQ_DELIVERY_RELIABLE`. Without a delivery flag the demo runs
+rateless only. `--all-modes` builds once and runs the four modes sequentially,
+each in a fresh user/network namespace, continuing after a failed mode.
+
+Default builds use `-O2`. Run `make clean` before rebuilding after changing
+compiler flags, because Make does not track flag changes as dependencies.
+The benchmark explicitly configures bounded retained stream budgets of
+32 MiB per stream and 64 MiB per transport. The UDP ceiling and stream budgets
+are benchmark settings, reported or configured explicitly for this profile.
+The producer services both endpoints after at most four records (32 KB),
+and during pacing waits; path statistics are sampled at most once per ms.
 
 The demo records actual kernel dequeue rates, UDP send shares, sampled kernel
 queue occupancy and growth, queue drops, application goodput, delivery, and
@@ -241,14 +268,19 @@ second at the end of the steady window to allow for sampler timing.
 
 The explicit checks require cap compliance within 5%, increasing dequeue rates
 with increasing caps among paths carrying material traffic, goodput of at least
-99% of the configured offer,
-at least 99% delivery of offered records, p99 latency at most 250 ms, no steady
+99% of the configured offer (1,980 Mbps at the default target), at least 99%
+delivery of offered records, p99 latency at most 250 ms, no steady
 queue drops, and late median kernel queues at most 100 ms with growth at most
 50 ms. A failing check returns nonzero and preserves `benchmark.log`,
 `queues.json`, and `report.json` in a printed temporary directory. Use
 `--output-dir PATH` to choose it, or `--benchmark PATH` to compare a compatible
 benchmark built with another transport version. Run the report-validator tests
 with `python3 examples/test_multipath_bw_demo.py`.
+
+With `--all-modes`, each mode keeps those files in `PATH/<mode>/`; the parent
+`PATH/report.json` records each exit status and report path. The overall command
+returns nonzero if any mode fails. A successful all-mode qualification requires
+all four per-mode reports to pass.
 
 This is a diagnostic target, not part of `release-check`. The benchmark is
 intended to expose capacity-estimation and backpressure behavior.
