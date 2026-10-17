@@ -63,11 +63,19 @@ static int check_interleaved_records(void) {
     for (unsigned i = 0; i < 24; i++)
       receive_symbol(conn, 9, i, 0, 1);
     receive_symbol(conn, 8, 0, 1, 2);
-    failed = records != 25 || t->stats.fec_objects_lost != 0;
+    failed = records != 25 || t->stats.fec_objects_lost != 0 ||
+             t->stats.fec_objects_recovered != 25 ||
+             t->stats.fec_objects_decoded != 0;
+    /* Repeated source symbols must not count another completion or decode. */
+    receive_symbol(conn, 8, 0, 1, 2);
+    failed |= records != 25 || t->stats.fec_objects_recovered != 25 ||
+              t->stats.fec_objects_decoded != 0;
     /* Exhausting every live slot still enforces the bounded receive policy. */
     for (unsigned i = 1; i <= 9; i++)
       receive_symbol(conn, 8, i, 0, 2);
-    failed |= t->stats.fec_objects_lost != 1;
+    failed |= t->stats.fec_objects_lost != 1 ||
+              t->stats.fec_objects_recovered != 25 ||
+              t->stats.fec_objects_decoded != 0;
   }
   transport_destroy(t);
   return failed;
@@ -191,6 +199,8 @@ static int check_fec_loss_recovery(void) {
     fec_destroy(fec);
 
     for (size_t type = 0; type < sizeof(types) / sizeof(types[0]); type++) {
+      uint64_t completed_before = t->stats.fec_objects_recovered;
+      uint64_t decoded_before = t->stats.fec_objects_decoded;
       record.records = 0;
       record.corrupted = false;
       if (!transport_subscriptions_add(&conn->receive_subscriptions,
@@ -219,8 +229,16 @@ static int check_fec_loss_recovery(void) {
                index < 4 ? data_blocks[index] : parity_blocks[index - 4], 64);
         t->receive_datagram.cb(&t->receive_datagram, conn->quic,
                                ptls_iovec_init(packet, sizeof(packet)));
+        if (record.records != 0) {
+          /* Replay the completing symbol to check duplicate suppression does
+           * not inflate either successful-completion counter. */
+          t->receive_datagram.cb(&t->receive_datagram, conn->quic,
+                                 ptls_iovec_init(packet, sizeof(packet)));
+        }
       }
-      if (record.records != 1 || record.corrupted) {
+      if (record.records != 1 || record.corrupted ||
+          t->stats.fec_objects_recovered != completed_before + 1 ||
+          t->stats.fec_objects_decoded != decoded_before + 1) {
         fprintf(stderr,
                 "FEC receive failed: type=%d rateless=%u records=%u "
                 "corrupted=%d\n",

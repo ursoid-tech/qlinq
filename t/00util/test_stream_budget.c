@@ -711,6 +711,70 @@ static bool receive_control(quicly_stream_t *stream, uint8_t type,
   return true;
 }
 
+static int repair_response_outcomes(void) {
+  int failed = 0;
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn && t->client_conn->stream);
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = conn->protocol_ready = conn->hello_received = true;
+  conn->negotiated_limits = t->limits;
+  CHECK(transport_subscriptions_add(&conn->send_subscriptions, MOQ_TRACK_DATA,
+                                    MOQ_TRACK_FLAG_FEC_RATELESS, "repair", 7));
+  uint8_t payload[32];
+  size_t payload_size;
+  uint16_t missing = 0;
+  /* An unknown track is not a source-cache miss. */
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 8, 0, 3, 9, &missing,
+                               1, &payload_size) == QLINQ_WIRE_OK);
+  CHECK(receive_control(conn->stream, QLINQ_WIRE_NACK, payload, payload_size));
+  CHECK(t->stats.repair_requests_received == 1 &&
+        t->stats.repair_cache_misses == 0);
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 7, 0, 3, 9, &missing,
+                               1, &payload_size) == QLINQ_WIRE_OK);
+  CHECK(receive_control(conn->stream, QLINQ_WIRE_NACK, payload, payload_size));
+  CHECK(t->stats.repair_cache_misses == 1 &&
+        t->stats.repair_build_failures == 0 &&
+        t->stats.repair_queue_failures == 0);
+
+  const uint8_t data[] = {1, 2, 3, 4};
+  moq_object_t object = {.track_id = {.type = MOQ_TRACK_DATA,
+                                      .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                      .name = "repair"},
+                         .group_id = 3,
+                         .object_id = 9,
+                         .data = data,
+                         .size = sizeof(data)};
+  CHECK(transport_sent_cache_store(&t->sent_cache, &object, 2, 2, 2, false));
+  /* The frame is valid, but its requested symbol cannot be produced. */
+  missing = QLINQ_FEC_MAX_TOTAL_SYMBOLS;
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 7, 0, 3, 9, &missing,
+                               1, &payload_size) == QLINQ_WIRE_OK);
+  CHECK(receive_control(conn->stream, QLINQ_WIRE_NACK, payload, payload_size));
+  CHECK(t->stats.repair_build_failures == 1 &&
+        t->stats.repair_symbols_sent == 0 &&
+        t->stats.repair_queue_failures == 0);
+  /* A later valid response queues normally without another failure. */
+  missing = 0;
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 7, 0, 3, 9, &missing,
+                               1, &payload_size) == QLINQ_WIRE_OK);
+  CHECK(receive_control(conn->stream, QLINQ_WIRE_NACK, payload, payload_size));
+  CHECK(t->stats.repair_symbols_sent == 1 &&
+        quicly_get_num_datagram_frames_path(conn->quic, 0) == 1);
+
+  transport_stats_t stats;
+  CHECK(transport_get_stats(t, &stats));
+  CHECK(stats.repair_requests_received == 4 &&
+        stats.repair_indexed_requests_received == 3 &&
+        stats.repair_requests_throttled == 0 &&
+        stats.repair_cache_misses == 1 && stats.repair_build_failures == 1 &&
+        stats.repair_queue_failures == 0 && stats.repair_symbols_sent == 1 &&
+        stats.protocol_errors == 0);
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
 /* repair queue preflight when datagram queue is full */
 static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
   int failed = 0;
@@ -773,6 +837,9 @@ static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
           t->stats.repair_symbols_sent == admitted &&
           t->stats.repair_rateless_symbols_sent == admitted &&
           t->stats.repair_rateless_exhausted == (fallback ? request + 1 : 0) &&
+          t->stats.repair_queue_failures == request + 1 &&
+          t->stats.repair_cache_misses == 0 &&
+          t->stats.repair_build_failures == 0 &&
           t->stats.repair_requests_throttled == 0 &&
           t->stats.repair_requests_aggregate_throttled == 0 &&
           t->stats.protocol_errors == 0);
@@ -1242,8 +1309,8 @@ int main(void) {
       stream_emission_cursor() || ingress_compaction() ||
       track_dispatch_consumption() || control_dispatch_consumption() ||
       control_error_accounting() || checkpoint_ack_pressure() ||
-      repair_queue_preflight(64, 24) || repair_queue_preflight(64, 1000) ||
-      repair_queue_preflight(63, 24) ||
+      repair_response_outcomes() || repair_queue_preflight(64, 24) ||
+      repair_queue_preflight(64, 1000) || repair_queue_preflight(63, 24) ||
       repair_queue_preflight(64, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
       repair_queue_preflight(63, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
       checkpoint_repair_batch(1024, 1024) || checkpoint_repair_batch(2, 1024) ||

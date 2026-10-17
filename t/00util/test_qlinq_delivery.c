@@ -69,6 +69,17 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
   qlinq_endpoint_t *client = qlinq_connect(context, &receiver);
   if (!listener || !client)
     goto Exit;
+  qlinq_endpoint_stats_t initial;
+  memset(&initial, 0xa5, sizeof(initial));
+  if (!qlinq_endpoint_get_stats(listener, &initial) ||
+      initial.publish_delivered != 0 || initial.publish_buffered != 0 ||
+      initial.publish_no_recipients != 0 || initial.fec_objects_decoded != 0 ||
+      initial.repair_cache_misses != 0 || initial.repair_build_failures != 0 ||
+      initial.repair_queue_failures != 0 ||
+      initial.recovery_checkpoints_pending != 0 ||
+      initial.recovery_oldest_checkpoint_age_ms != 0 ||
+      initial.assembler_memory_bytes != 0)
+    goto Exit;
   qlinq_stream_config_t config = {
       .content_type = content, .delivery = delivery, .name = "delivery"};
   qlinq_stream_t *publisher = qlinq_publish(listener, &config);
@@ -109,8 +120,28 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
                            .group_id = 17,
                            .sequence = 23,
                            .priority = 1};
+  qlinq_stream_config_t unmatched_config = {.content_type = QLINQ_CONTENT_DATA,
+                                            .delivery = QLINQ_DELIVERY_DATAGRAM,
+                                            .name = "no-subscribers"};
+  qlinq_stream_t *unmatched = qlinq_publish(listener, &unmatched_config);
+  if (!unmatched ||
+      qlinq_stream_send(unmatched, &record) != QLINQ_SEND_NO_SUBSCRIBERS)
+    goto Exit;
+  qlinq_endpoint_stats_t before_receive;
+  if (!qlinq_endpoint_get_stats(client, &before_receive))
+    goto Exit;
   qlinq_send_result_t sent = qlinq_stream_send(publisher, &record);
   if (sent != QLINQ_SEND_SENT && sent != QLINQ_SEND_BUFFERED)
+    goto Exit;
+  qlinq_endpoint_stats_t published;
+  if (!qlinq_endpoint_get_stats(listener, &published) ||
+      published.publish_delivered != (sent == QLINQ_SEND_SENT) ||
+      published.publish_buffered != (sent == QLINQ_SEND_BUFFERED) ||
+      published.publish_no_recipients != 1 || published.publish_partial != 0 ||
+      published.publish_backpressure != 0 || published.publish_invalid != 0 ||
+      published.publish_errors != 0 ||
+      published.egress_peak_packets < published.queued_packets ||
+      published.egress_peak_bytes < published.queued_bytes)
     goto Exit;
   bool finite =
       content == QLINQ_CONTENT_DATA && (delivery == QLINQ_DELIVERY_FIXED_FEC ||
@@ -146,6 +177,30 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
   }
   qlinq_endpoint_stats_t stats;
   if (!qlinq_endpoint_get_stats(client, &stats))
+    goto Exit;
+  /* Ordered loopback delivery completes datagram objects using their original
+   * symbols; completion alone must not report a successful FEC decode. */
+  if (stats.fec_objects_recovered != (delivery != QLINQ_DELIVERY_RELIABLE) ||
+      stats.fec_objects_decoded != 0 || stats.assembler_memory_bytes != 0 ||
+      stats.malformed_datagrams != 0 || stats.resource_limit_errors != 0)
+    goto Exit;
+  if (delivery == QLINQ_DELIVERY_RELIABLE) {
+    if (stats.stream_frames_received <= before_receive.stream_frames_received)
+      goto Exit;
+  } else if (stats.datagrams_received <= before_receive.datagrams_received) {
+    goto Exit;
+  }
+  /* Reading a snapshot must not consume the counters or turn a buffered
+   * publication into an additional publication when its group is flushed. */
+  qlinq_endpoint_stats_t repeated, after_publish;
+  if (!qlinq_endpoint_get_stats(client, &repeated) ||
+      !qlinq_endpoint_get_stats(listener, &after_publish) ||
+      repeated.datagrams_received != stats.datagrams_received ||
+      repeated.stream_frames_received != stats.stream_frames_received ||
+      repeated.fec_objects_recovered != stats.fec_objects_recovered ||
+      after_publish.publish_delivered != published.publish_delivered ||
+      after_publish.publish_buffered != published.publish_buffered ||
+      after_publish.publish_no_recipients != published.publish_no_recipients)
     goto Exit;
   if (callback_delivery)
     failed = !received || saw_queued_record || !callback.valid ||
@@ -209,6 +264,7 @@ static int run_reliable_boundaries(void) {
   if (joined != 2)
     goto Exit;
   for (size_t direction = 0; direction < 2; direction++) {
+    uint64_t blocked = 0;
     qlinq_record_t record = {.data = payload,
                              .size = TRANSPORT_MAX_RELIABLE_OBJECT_SIZE + 1U};
     if (qlinq_stream_send(publishers[direction], &record) != QLINQ_SEND_INVALID)
@@ -224,6 +280,7 @@ static int run_reliable_boundaries(void) {
           sent = result == QLINQ_SEND_SENT;
           if (!sent && result != QLINQ_SEND_WOULD_BLOCK)
             goto Exit;
+          blocked += result == QLINQ_SEND_WOULD_BLOCK;
         }
         if (qlinq_service(context, 5) < QLINQ_STATUS_OK)
           goto Exit;
@@ -245,6 +302,12 @@ static int run_reliable_boundaries(void) {
       if (!received)
         goto Exit;
     }
+    qlinq_endpoint_stats_t stats;
+    if (!qlinq_endpoint_get_stats(direction == 0 ? server : client, &stats) ||
+        stats.publish_delivered != 3 || stats.publish_invalid != 1 ||
+        stats.publish_backpressure != blocked || stats.publish_buffered != 0 ||
+        stats.publish_partial != 0 || stats.publish_errors != 0)
+      goto Exit;
   }
   failed = 0;
 Exit:

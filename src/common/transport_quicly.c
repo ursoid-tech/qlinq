@@ -355,7 +355,8 @@ typedef struct {
 static void copy_interface_name(char destination[64], const char *name) {
   if (!destination || !name)
     return;
-  snprintf(destination, 64, "%s", name);
+  strncpy(destination, name, 63);
+  destination[63] = '\0';
 }
 
 static void refresh_scheduler_paths(transport_conn_t *conn) {

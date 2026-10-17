@@ -1345,7 +1345,58 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
       .stream_control_failures = transport_stats.stream_control_failures,
       .active_connections = transport_stats.active_connections,
       .queued_packets = transport_stats.egress_current_packets,
-      .queued_bytes = transport_stats.egress_current_bytes};
+      .queued_bytes = transport_stats.egress_current_bytes,
+      .repair_indexed_requests_sent =
+          transport_stats.repair_indexed_requests_sent,
+      .repair_indexed_requests_received =
+          transport_stats.repair_indexed_requests_received,
+      .repair_rateless_requests_sent =
+          transport_stats.repair_rateless_requests_sent,
+      .repair_rateless_requests_received =
+          transport_stats.repair_rateless_requests_received,
+      .repair_whole_object_requests_sent =
+          transport_stats.repair_whole_object_requests_sent,
+      .repair_rateless_symbols_sent =
+          transport_stats.repair_rateless_symbols_sent,
+      .repair_requests_throttled = transport_stats.repair_requests_throttled,
+      .repair_requests_aggregate_throttled =
+          transport_stats.repair_requests_aggregate_throttled,
+      .repair_rateless_exhausted = transport_stats.repair_rateless_exhausted,
+      .repair_cache_misses = transport_stats.repair_cache_misses,
+      .repair_build_failures = transport_stats.repair_build_failures,
+      .repair_queue_failures = transport_stats.repair_queue_failures,
+      .fec_objects_decoded = transport_stats.fec_objects_decoded,
+      .recovery_checkpoints_sent = transport_stats.recovery_checkpoints_sent,
+      .recovery_checkpoints_received =
+          transport_stats.recovery_checkpoints_received,
+      .recovery_checkpoint_acks_sent =
+          transport_stats.recovery_checkpoint_acks_sent,
+      .recovery_checkpoint_acks_received =
+          transport_stats.recovery_checkpoint_acks_received,
+      .recovery_cache_releases = transport_stats.recovery_cache_releases,
+      .recovery_cache_backpressure =
+          transport_stats.recovery_cache_backpressure,
+      .recovery_checkpoints_pending =
+          transport_stats.recovery_checkpoints_pending,
+      .recovery_oldest_checkpoint_age_ms =
+          transport_stats.recovery_oldest_checkpoint_age_ms,
+      .udp_would_block = transport_stats.udp_would_block,
+      .udp_send_errors = transport_stats.udp_send_errors,
+      .egress_packets_dropped = transport_stats.egress_packets_dropped,
+      .egress_peak_packets = transport_stats.egress_peak_packets,
+      .egress_peak_bytes = transport_stats.egress_peak_bytes,
+      .publish_delivered = transport_stats.publish_delivered,
+      .publish_buffered = transport_stats.publish_buffered,
+      .publish_no_recipients = transport_stats.publish_no_recipients,
+      .publish_partial = transport_stats.publish_partial,
+      .publish_backpressure = transport_stats.publish_backpressure,
+      .publish_invalid = transport_stats.publish_invalid,
+      .publish_errors = transport_stats.publish_errors,
+      .assembler_memory_bytes = transport_stats.assembler_memory_bytes,
+      .resource_limit_errors = transport_stats.resource_limit_errors,
+      .malformed_datagrams = transport_stats.malformed_datagrams,
+      .datagrams_received = transport_stats.datagrams_received,
+      .stream_frames_received = transport_stats.stream_frames_received};
   return true;
 }
 

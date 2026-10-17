@@ -276,12 +276,14 @@ typedef struct {
   uint64_t record_payload_bytes_copied;
   uint64_t record_callbacks_accepted;
   uint64_t record_callbacks_rejected;
+  /* All completed datagram objects, including those needing no FEC decode. */
   uint64_t fec_objects_recovered;
   uint64_t fec_objects_lost;
   uint64_t repair_requests_sent;
   uint64_t repair_requests_coalesced;
   uint64_t repair_requests_deferred;
   uint64_t repair_requests_received;
+  /* Symbols admitted to the QUIC datagram queue, not delivery confirmations. */
   uint64_t repair_symbols_sent;
   /* Retained source payload allocations; excludes the fixed inline table. */
   size_t recovery_cache_payload_bytes;
@@ -301,6 +303,68 @@ typedef struct {
   size_t active_connections;
   size_t queued_packets;
   size_t queued_bytes;
+
+  /* Repair request modes. Received mode counts exclude requests rejected by
+   * the per-peer limiter or lacking a known subscription. Whole-object
+   * requests are a subset of sent indexed/rateless requests. */
+  uint64_t repair_indexed_requests_sent;
+  uint64_t repair_indexed_requests_received;
+  uint64_t repair_rateless_requests_sent;
+  uint64_t repair_rateless_requests_received;
+  uint64_t repair_whole_object_requests_sent;
+  uint64_t repair_rateless_symbols_sent;
+  /* Incoming requests refused by per-peer or endpoint-wide rate limits. */
+  uint64_t repair_requests_throttled;
+  uint64_t repair_requests_aggregate_throttled;
+  /* Requests exhausting fresh parity IDs; systematic fallback may succeed. */
+  uint64_t repair_rateless_exhausted;
+  /* Requests for a known track whose source object is no longer cached. */
+  uint64_t repair_cache_misses;
+  /* Requests whose repair batch could not be built, including invalid symbol
+   * selections and failure of any systematic fallback. */
+  uint64_t repair_build_failures;
+  /* Requests whose response could not be fully queued, including a full queue
+   * before generation or partial admission. Counts requests, not symbols. */
+  uint64_t repair_queue_failures;
+  /* Subset of fec_objects_recovered that required successful FEC decoding. */
+  uint64_t fec_objects_decoded;
+
+  uint64_t recovery_checkpoints_sent;
+  uint64_t recovery_checkpoints_received;
+  uint64_t recovery_checkpoint_acks_sent;
+  uint64_t recovery_checkpoint_acks_received;
+  /* Released source objects, including releases when subscribers leave. */
+  uint64_t recovery_cache_releases;
+  /* Publish attempts blocked because their source object could not be cached.
+   */
+  uint64_t recovery_cache_backpressure;
+  /* Connection/track states awaiting checkpoint ACK progress, not frames. */
+  size_t recovery_checkpoints_pending;
+  /* Maximum pending age in milliseconds, reset by partial ACK progress. */
+  uint64_t recovery_oldest_checkpoint_age_ms;
+
+  uint64_t udp_would_block;
+  uint64_t udp_send_errors;
+  uint64_t egress_packets_dropped;
+  /* Maximum individual socket queue peaks, not aggregate endpoint peaks. */
+  size_t egress_peak_packets;
+  size_t egress_peak_bytes;
+  /* Transport publication results; excludes public API prevalidation failures
+   * and later group flushes. Delivered means accepted for sending to every
+   * eligible recipient, not acknowledged application delivery. */
+  uint64_t publish_delivered;
+  uint64_t publish_buffered;
+  uint64_t publish_no_recipients;
+  uint64_t publish_partial;
+  uint64_t publish_backpressure;
+  uint64_t publish_invalid;
+  uint64_t publish_errors;
+
+  size_t assembler_memory_bytes;
+  uint64_t resource_limit_errors;
+  uint64_t malformed_datagrams;
+  uint64_t datagrams_received;
+  uint64_t stream_frames_received;
 } qlinq_endpoint_stats_t;
 
 typedef struct {
@@ -434,6 +498,9 @@ bool qlinq_next_event(qlinq_context_t *context, qlinq_event_t *event);
 void qlinq_event_release(qlinq_event_t *event);
 
 qlinq_status_t qlinq_context_last_status(const qlinq_context_t *context);
+/* Copies a snapshot without resetting counters. Call on the creating thread
+ * before endpoint close. Counters last for the endpoint's lifetime; occupancy
+ * and pending fields are gauges. The caller owns the copied values. */
 bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
                               qlinq_endpoint_stats_t *stats);
 bool qlinq_stream_get_stats(qlinq_stream_t *stream,

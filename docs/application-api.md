@@ -73,6 +73,55 @@ while (qlinq_next_event(context, &event)) {
 subscriber counts and stream readiness. `qlinq_context_last_status` reports
 operation errors, including failures that could not be queued as events.
 
+`qlinq_endpoint_get_stats` copies a snapshot into a caller-owned
+`qlinq_endpoint_stats_t` without resetting counters. Read it on the context's
+creating thread before closing the endpoint; a synchronized copy can then be
+consumed by an application's metrics exporter. The library requires no metrics
+backend or serialization. Rebuild callers when updating the public stats
+structure.
+
+The endpoint snapshot includes:
+
+- Repair requests by indexed/rateless mode, whole-object requests, coalescing,
+  deferral, per-peer/aggregate throttling, source-cache misses, generation
+  failures, queue failures and rateless parity exhaustion.
+- Recovery checkpoint and ACK totals, cache releases/backpressure, pending
+  connection/track states and their maximum age without ACK progress.
+- UDP send pressure/errors, dropped queued packets, socket queue peaks, and
+  publication outcomes, including buffering, partial acceptance and backpressure.
+- Receive assembler memory, resource-limit errors, malformed datagrams, received
+  datagrams/stream frames and FEC-assisted completions.
+
+Counters accumulate for the endpoint's lifetime. Occupancy, pending counts and
+ages are gauges; peak fields are high-water marks. `egress_peak_packets` and
+`egress_peak_bytes` are the maximum individual socket queue peaks, rather than
+simultaneous totals across sockets. Field comments in `qlinq.h` define the
+individual units and scopes. In particular:
+
+- `repair_symbols_sent` and `repair_rateless_symbols_sent` count symbols admitted
+  to the QUIC datagram queue. They do not confirm UDP transmission or delivery.
+  `repair_queue_failures` counts requests whose response could not be fully
+  queued, including partial responses. `repair_build_failures` includes invalid
+  symbol selections and failure after attempting systematic fallback.
+- Received indexed/rateless request counts exclude requests rejected by the
+  per-peer limiter or without a known subscription, so their sum need not equal
+  `repair_requests_received`. `repair_rateless_exhausted` counts attempts that
+  exhaust fresh parity IDs; systematic source-symbol fallback may still succeed.
+  Coalesced/deferred counts describe request attempts, not unique lost objects.
+- `recovery_checkpoints_pending` counts connection/track states awaiting ACK
+  progress, not individual checkpoint frames. Partial ACK progress resets the
+  pending state's age, so `recovery_oldest_checkpoint_age_ms` is a stall
+  indicator rather than a repair-latency measurement. Cache releases also include
+  objects released when subscribers leave.
+- `fec_objects_recovered` retains its existing meaning: all completed datagram
+  objects, including those assembled entirely from original data symbols.
+  `fec_objects_decoded` is the subset that required successful FEC decoding.
+- `publish_*` fields count calls reaching transport publication. Public API
+  prevalidation failures, such as a null record or closed stream, are excluded;
+  later group flushes do not count as additional publications.
+  `publish_delivered` means accepted for sending to eligible recipients, not
+  remote application delivery.
+
 `qlinq_endpoint_get_path_stats` exposes active/validated state, interface/address,
 wire byte counters, packet-loss counters and RTT in milliseconds for each path.
 Slots can move when interfaces disappear; use interface/address as identity.

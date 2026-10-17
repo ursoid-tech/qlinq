@@ -258,8 +258,10 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
     t->stats.repair_indexed_requests_received++;
   sent_object_cache_t *cached = transport_sent_cache_find(
       &t->sent_cache, &track, nack.group_id, nack.object_id);
-  if (!cached)
+  if (!cached) {
+    t->stats.repair_cache_misses++;
     return true;
+  }
 
   uint16_t missing[TRANSPORT_REPAIR_MAX_SYMBOLS] = {0};
   size_t missing_count = nack.missing_count;
@@ -299,8 +301,10 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
           QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY) {
     quicly_path_health_t health;
     if (quicly_get_path_health(conn->quic, 0, &health) == 0 &&
-        !health.abandoned)
+        !health.abandoned) {
+      t->stats.repair_queue_failures++;
       return true;
+    }
   }
 
   transport_repair_batch_t repair;
@@ -318,10 +322,14 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
                                                        missing_count, &repair);
     systematic_fallback = built;
   }
-  if (!built)
+  if (!built) {
+    t->stats.repair_build_failures++;
     return true;
+  }
 
   size_t queued = queue_repairs(conn, nack.alias, cached, &repair);
+  if (queued < repair.count)
+    t->stats.repair_queue_failures++;
   if (queued != 0 && rateless) {
     bool committed =
         systematic_fallback
@@ -1047,6 +1055,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
         transport_recovery_delivered(tconn, track_id, group_id, object_id);
       }
       t->stats.fec_objects_recovered++;
+      if (!got_all_data)
+        t->stats.fec_objects_decoded++;
       transport_emit_event(t, &ev);
       free(full_data);
       transport_release_assembler(t, asm_slot);

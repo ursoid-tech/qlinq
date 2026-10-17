@@ -391,6 +391,8 @@ typedef struct {
   uint64_t datagrams_received;
   uint64_t malformed_datagrams;
   uint64_t fec_objects_recovered;
+  /* Completed objects that required successful FEC decoding. */
+  uint64_t fec_objects_decoded;
   uint64_t fec_objects_lost;
   uint64_t fec_duplicate_objects_suppressed;
   uint64_t repair_requests_received;
@@ -398,6 +400,11 @@ typedef struct {
   uint64_t repair_rateless_requests_received;
   uint64_t repair_requests_throttled;
   uint64_t repair_requests_aggregate_throttled;
+  /* Request outcomes after admission and track validation. Queue failures
+   * include partially admitted responses and count once per request. */
+  uint64_t repair_cache_misses;
+  uint64_t repair_build_failures;
+  uint64_t repair_queue_failures;
   uint64_t repair_requests_sent;
   uint64_t repair_indexed_requests_sent;
   uint64_t repair_rateless_requests_sent;
