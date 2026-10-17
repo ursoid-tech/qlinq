@@ -1,4 +1,12 @@
 #include "transport_tls.h"
+#include "transport_internal.h"
+
+#include <pthread.h>
+#include <stdlib.h>
+#include <string.h>
+#if QLINQ_WITH_FUSION
+#include "picotls/fusion.h"
+#endif
 
 #include <openssl/pem.h>
 #include <stdbool.h>
@@ -7,6 +15,79 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #endif
+
+#if QLINQ_WITH_FUSION
+static pthread_once_t fusion_cpu_once = PTHREAD_ONCE_INIT;
+static bool fusion_cpu_supported;
+
+static void detect_fusion_cpu(void) {
+  /* This generic translation unit guards every ISA enabled for fusion.o.
+   * The AVX2 builtin also checks OS support for saving the vector state. */
+  if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("aes") &&
+      __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("vaes") &&
+      __builtin_cpu_supports("vpclmulqdq"))
+    fusion_cpu_supported = ptls_fusion_is_supported_by_cpu() != 0;
+}
+
+static ptls_cipher_suite_t fusion_aes128 = {
+    .id = PTLS_CIPHER_SUITE_AES_128_GCM_SHA256,
+    .aead = &ptls_fusion_aes128gcm,
+    .hash = &ptls_openssl_sha256,
+    .name = PTLS_CIPHER_SUITE_NAME_AES_128_GCM_SHA256};
+static ptls_cipher_suite_t fusion_aes256 = {
+    .id = PTLS_CIPHER_SUITE_AES_256_GCM_SHA384,
+    .aead = &ptls_fusion_aes256gcm,
+    .hash = &ptls_openssl_sha384,
+    .name = PTLS_CIPHER_SUITE_NAME_AES_256_GCM_SHA384};
+/* Preserve the pinned OpenSSL cipher order. These Fusion engines implement
+ * QUIC packet AEAD, not incremental TLS record encryption. */
+static ptls_cipher_suite_t *fusion_cipher_suites[] = {
+    &fusion_aes256, &fusion_aes128,
+#if PTLS_OPENSSL_HAVE_CHACHA20_POLY1305
+    &ptls_openssl_chacha20poly1305sha256,
+#endif
+    NULL};
+#endif
+
+bool transport_tls_configure_crypto_backend(transport_t *t) {
+  const char *requested = getenv("QLINQ_CRYPTO_BACKEND");
+  const char *selected = "openssl";
+  const char *fallback = NULL;
+  t->tls_ctx.cipher_suites = ptls_openssl_cipher_suites;
+  if (!requested || !*requested)
+    requested = "openssl";
+  if (strcmp(requested, "fusion") == 0) {
+#if QLINQ_WITH_FUSION
+    pthread_once(&fusion_cpu_once, detect_fusion_cpu);
+    if (fusion_cpu_supported) {
+      t->tls_ctx.cipher_suites = fusion_cipher_suites;
+      selected = "fusion";
+    } else {
+      fallback = "cpu-unsupported";
+    }
+#else
+    fallback = "not-built";
+#endif
+  } else if (strcmp(requested, "openssl") != 0) {
+    transport_log(
+        t, TRANSPORT_LOG_ERROR, "crypto", 0, SIZE_MAX,
+        "invalid QLINQ_CRYPTO_BACKEND=%s (expected openssl or fusion)",
+        requested);
+    return false;
+  }
+  transport_log(
+      t, fallback ? TRANSPORT_LOG_WARNING : TRANSPORT_LOG_INFO, "crypto", 0,
+      SIZE_MAX,
+      "backend=%s requested=%s fallback=%s aes_preference=AES-256-GCM",
+      selected, requested, fallback ? fallback : "none");
+  /* Report an explicit selection even without a structured log consumer. */
+  if (!t->log_callback && !fallback && getenv("QLINQ_CRYPTO_BACKEND"))
+    fprintf(stderr,
+            "qlinq[crypto] backend=%s requested=%s fallback=none "
+            "aes_preference=AES-256-GCM\n",
+            selected, requested);
+  return true;
+}
 
 static const uint16_t insecure_verify_algorithms[] = {
     PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256, PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,

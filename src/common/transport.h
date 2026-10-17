@@ -136,6 +136,17 @@ typedef void (*transport_callback_t)(void *user_data,
 
 #define TRANSPORT_MAX_PATHS 4
 #define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 1U)
+enum {
+  TRANSPORT_CC_DEFAULT,
+  TRANSPORT_CC_RENO,
+  TRANSPORT_CC_PICO,
+  TRANSPORT_CC_CUBIC
+};
+enum {
+  TRANSPORT_PACING_DEFAULT,
+  TRANSPORT_PACING_DISABLED,
+  TRANSPORT_PACING_ENABLED
+};
 
 /* Zero-valued limit fields select these defaults. Limits are deliberately
  * transport-level bounds, not application schemas or track hierarchies. */
@@ -196,6 +207,7 @@ typedef struct {
 #define TRANSPORT_MAX_FEC_OBJECT_SIZE (1024U * 1024U)
 #define TRANSPORT_MAX_FEC_RECORD_SIZE UINT16_MAX
 #define TRANSPORT_MAX_FEC_GROUP_SIZE (32U * 1024U)
+#define TRANSPORT_MAX_INITIAL_CWND_PACKETS 65535U
 
 #define TRANSPORT_APP_ERROR_PROTOCOL                                           \
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x100U)
@@ -245,7 +257,13 @@ typedef struct {
   uint32_t reconnect_initial_delay_ms;
   uint32_t reconnect_max_delay_ms;
   transport_repair_mode_t repair_mode;
+  unsigned congestion_control;
+  unsigned pacing;
   transport_limits_t limits; /* zero fields select documented defaults */
+  /* Zero selects 100 packets per QUIC path; explicit range 1..65535.
+   * Quicly floors the effective window at two packets and reuses this value
+   * as the temporary flight cap during path recovery. */
+  uint32_t initial_cwnd_packets;
 } transport_config_t;
 
 /* create and destroy transport instances */
@@ -344,8 +362,12 @@ typedef struct {
   uint64_t bytes_sent;
   uint64_t bytes_received;
   uint64_t sent;
+  uint64_t acked;
   uint64_t lost;
+  uint64_t bytes_acked;
   uint32_t rtt;
+  uint32_t cwnd;
+  uint32_t bytes_in_flight;
   double relative_owd;
   double ewma_latency;
 } transport_path_stats_t;

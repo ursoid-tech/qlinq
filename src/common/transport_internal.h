@@ -183,6 +183,10 @@ struct transport_conn_t {
   uint64_t admission_retry_at_ns;
   pathflow_context_t scheduler_context;
   size_t round_robin_path;
+  size_t feedback_path;
+  /* Owned QUIC slots refreshed once per service pass, not per packet batch. */
+  uint64_t scheduler_paths;
+  uint8_t scheduler_sockets[TRANSPORT_MAX_QUIC_PATHS];
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
 };

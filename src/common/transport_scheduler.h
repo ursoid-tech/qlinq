@@ -20,7 +20,7 @@ typedef struct {
  * Bit i in excluded_paths skips a previously attempted path. SIZE_MAX means
  * no candidate has a positive effective delivery rate. */
 size_t transport_stream_select_path(const path_t *paths, size_t num_paths,
-                                    uint32_t excluded_paths);
+                                    uint64_t excluded_paths);
 
 bool transport_schedule_build(pathflow_context_t *context,
                               const path_state_t *states, size_t num_paths,

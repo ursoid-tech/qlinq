@@ -82,6 +82,10 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
         qlinq_peer_info_t info;
         assert(qlinq_endpoint_get_peer(ep, event.peer_id, &info));
         assert(info.ready && info.outgoing && info.authenticated);
+        qlinq_path_info_t path_info;
+        assert(qlinq_endpoint_get_path(ep, 0, &path_info));
+        assert(path_info.state == QLINQ_PATH_ACTIVE ||
+               path_info.state == QLINQ_PATH_VALIDATING);
         ready = true;
       }
       if (event.type == QLINQ_EVENT_SUBSCRIBER_JOINED)
@@ -115,6 +119,17 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   qlinq_path_stats_t path;
   assert(qlinq_endpoint_get_path_stats(ep, 0, &path));
   assert(strcmp(path.local_address, "127.0.0.1") == 0);
+  qlinq_path_info_t snapshot;
+  assert(qlinq_endpoint_get_path(ep, 0, &snapshot));
+  assert(snapshot.bytes_sent == path.bytes_sent &&
+         snapshot.bytes_received == path.bytes_received &&
+         snapshot.packets_sent == path.packets_sent &&
+         snapshot.packets_lost == path.packets_lost &&
+         snapshot.smoothed_rtt_ms == path.rtt_ms &&
+         (snapshot.state == QLINQ_PATH_ACTIVE) == path.active);
+  assert(!qlinq_endpoint_get_path(ep, QLINQ_MAX_PATHS, &snapshot));
+  assert(!qlinq_endpoint_get_path(NULL, 0, &snapshot));
+  assert(!qlinq_endpoint_get_path(ep, 0, NULL));
   assert(!qlinq_endpoint_get_path_stats(ep, QLINQ_MAX_PATHS, &path));
   qlinq_record_t record = {.group_id = 1,
                            .sequence = 2,
@@ -176,6 +191,8 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   }
   assert(qlinq_endpoint_is_drained(ep));
   qlinq_endpoint_close(ep);
+  assert(!qlinq_endpoint_get_path(ep, 0, &snapshot));
+  assert(!qlinq_endpoint_get_path_stats(ep, 0, &path));
   qlinq_context_destroy(ctx);
   assert(held.record.size == sizeof(legacy.payload) &&
          memcmp(held.record.data, legacy.payload, sizeof(legacy.payload)) == 0);

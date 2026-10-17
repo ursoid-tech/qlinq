@@ -291,6 +291,18 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
     t->stats.repair_requests_aggregate_throttled++;
     return true;
   }
+  /* charge request but avoid encoding parity if repair queue is full */
+  if (rateless && indices_valid && missing_count != 0 &&
+      cached->next_repair_symbol >= cached->data_symbols &&
+      cached->next_repair_symbol < QLINQ_FEC_MAX_TOTAL_SYMBOLS &&
+      quicly_get_num_datagram_frames_path(conn->quic, 0) >=
+          QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY) {
+    quicly_path_health_t health;
+    if (quicly_get_path_health(conn->quic, 0, &health) == 0 &&
+        !health.abandoned)
+      return true;
+  }
+
   transport_repair_batch_t repair;
   bool systematic_fallback = false;
   bool built =

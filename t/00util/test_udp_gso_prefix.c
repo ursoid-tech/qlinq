@@ -32,7 +32,10 @@ enum fault {
 static enum fault fault;
 static struct iovec expected[64];
 static uint8_t payload[64][1500];
+static uint8_t contiguous_payload[64 * 1500];
+static bool contiguous_layout;
 static size_t accepted, expected_count, gso_calls, ordinary_calls;
+static size_t direct_calls, packed_calls;
 static size_t groups[64], group_count;
 
 static void accept_datagram(const void *data, size_t len) {
@@ -45,6 +48,10 @@ static void accept_datagram(const void *data, size_t len) {
 static ssize_t mock_sendmsg(int fd, const struct msghdr *msg, int flags) {
   assert(fd == 7 && flags == 0 && msg->msg_iovlen == 1);
   gso_calls++;
+  if (msg->msg_iov[0].iov_base == expected[accepted].iov_base)
+    direct_calls++;
+  else
+    packed_calls++;
   if (fault == INTERRUPTED_BLOCK) {
     errno = gso_calls == 1 ? EINTR : EAGAIN;
     return -1;
@@ -109,10 +116,15 @@ static int mock_sendmmsg(int fd, struct mmsghdr *messages, unsigned int count,
 static void setup(size_t count, size_t size, enum fault which) {
   fault = which;
   accepted = gso_calls = ordinary_calls = group_count = 0;
+  direct_calls = packed_calls = 0;
   expected_count = count;
   for (size_t i = 0; i < count; i++) {
     memset(payload[i], (int)i + 1, sizeof(payload[i]));
     expected[i] = (struct iovec){payload[i], size};
+    if (contiguous_layout) {
+      expected[i].iov_base = contiguous_payload + i * size;
+      memcpy(expected[i].iov_base, payload[i], size);
+    }
   }
 }
 
@@ -123,13 +135,16 @@ static ssize_t send_suffix(void) {
                                   expected_count - accepted);
 }
 
-int main(void) {
+static void run_layout(void) {
   setup(64, 1280, NONE);
   assert(send_suffix() == 64 && accepted == 64);
   assert(gso_calls == 2 && ordinary_calls == 0 && groups[0] == 51 &&
          groups[1] == 13);
+  assert(direct_calls == (contiguous_layout ? 2 : 0) &&
+         packed_calls == (contiguous_layout ? 0 : 2));
   setup(64, 1500, NONE);
   assert(send_suffix() == 64 && groups[0] == 43 && groups[1] == 21);
+  assert(direct_calls == 2 && packed_calls == 0);
   setup(64, 1280, NONE);
   expected[20].iov_len = 13;
   assert(send_suffix() == 64 && group_count == 2 && groups[0] == 21);
@@ -141,6 +156,7 @@ int main(void) {
   assert(send_suffix() == 64 && accepted == 64);
   setup(64, 1280, UNSUPPORTED);
   assert(send_suffix() == 64 && gso_calls == 1 && ordinary_calls == 1);
+  assert(direct_calls == (contiguous_layout ? 1 : 0));
   setup(64, 1280, SECOND_BLOCK);
   assert(send_suffix() == 51 && accepted == 51);
   fault = NONE;
@@ -170,6 +186,19 @@ int main(void) {
   setup(2, 1280, INTERRUPTED);
   expected[0].iov_len = 0;
   assert(send_suffix() == 2 && ordinary_calls == 2);
+}
+
+int main(void) {
+  /* exercise contiguous and separately retained layouts */
+  contiguous_layout = false;
+  run_layout();
+  contiguous_layout = true;
+  run_layout();
+  /* gap in contiguous group must use packed path */
+  setup(6, 1280, NONE);
+  expected[4].iov_base = payload[4];
+  assert(send_suffix() == 6 && accepted == 6 && direct_calls == 0 &&
+         packed_calls == 1 && ordinary_calls == 0);
   puts("UDP GSO grouping and partial-send fault injection passed");
   return 0;
 }

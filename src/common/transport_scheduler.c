@@ -4,14 +4,14 @@
 #include <string.h>
 
 size_t transport_stream_select_path(const path_t *paths, size_t num_paths,
-                                    uint32_t excluded_paths) {
-  if (!paths || num_paths > TRANSPORT_MAX_PATHS)
+                                    uint64_t excluded_paths) {
+  if (!paths || num_paths > TRANSPORT_MAX_QUIC_PATHS)
     return SIZE_MAX;
 
   size_t selected = SIZE_MAX;
   fp_t earliest = FP_MAX;
   for (size_t i = 0; i < num_paths; i++) {
-    if ((excluded_paths & (1U << i)) != 0)
+    if ((excluded_paths & (UINT64_C(1) << i)) != 0)
       continue;
     fp_t success = FP_ONE - paths[i].p;
     if (success <= 0)

@@ -202,6 +202,14 @@ static void test_slow_group_admission(void) {
         .type = MOQ_TRACK_DATA, .flags = modes[mode], .name = "slow-group"};
     fixture_subscribe(&f, &f.client, track);
     transport_conn_t *conn = f.server.conn;
+    /* Seed a measured rate for this native path. An automatic EWMA without
+     * native ownership must not override a freshly selected path's estimate. */
+    quicly_path_stats_t stats;
+    size_t mapped = transport_path_get_eligible_by_local(
+        conn->quic, &f.server.transport->sockets[0].local_addr, &stats);
+    assert(mapped != SIZE_MAX);
+    (void)transport_path_measure(&conn->paths[0].measurement, &stats, mapped, 0,
+                                 (uint64_t)transport_get_time_ms());
     conn->paths[0].state.initialized = true;
     conn->paths[0].state.b_ewma = FP_FROM_INT(100);
     uint8_t payload[8000] = {42};

@@ -83,6 +83,13 @@ size_t transport_path_find_by_local(quicly_conn_t *quic,
 size_t transport_path_get_stats_by_local(quicly_conn_t *quic,
                                          const struct sockaddr_storage *local,
                                          quicly_path_stats_t *stats);
+/* Snapshot an available, non-suspect path belonging to this local address.
+ * Returns SIZE_MAX when it is ineligible for new application traffic. */
+size_t
+transport_path_get_eligible_by_local(quicly_conn_t *quic,
+                                     const struct sockaddr_storage *local,
+                                     quicly_path_stats_t *stats);
+
 /* SIZE_MAX means the symbol has no allocation; never fall back to path zero. */
 size_t transport_path_select_physical(const path_t *paths, size_t num_paths,
                                       size_t packet_index);

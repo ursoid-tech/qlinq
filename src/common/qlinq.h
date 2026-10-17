@@ -24,6 +24,7 @@ extern "C" {
 
 #define QLINQ_MAX_PATHS 4U
 #define QLINQ_STREAM_NAME_CAPACITY 64U
+#define QLINQ_MAX_INITIAL_CWND_PACKETS 65535U
 
 typedef struct qlinq_context qlinq_context_t;
 typedef struct qlinq_endpoint qlinq_endpoint_t;
@@ -65,6 +66,18 @@ typedef enum {
   QLINQ_REPAIR_INDEXED = 1,
   QLINQ_REPAIR_RATELESS = 2
 } qlinq_repair_mode_t;
+
+typedef enum {
+  QLINQ_CC_DEFAULT = 0,
+  QLINQ_CC_RENO,
+  QLINQ_CC_PICO,
+  QLINQ_CC_CUBIC
+} qlinq_congestion_control_t;
+typedef enum {
+  QLINQ_PACING_DEFAULT = 0,
+  QLINQ_PACING_DISABLED,
+  QLINQ_PACING_ENABLED
+} qlinq_pacing_t;
 
 typedef enum {
   QLINQ_LOG_DEBUG = 0,
@@ -140,11 +153,18 @@ typedef struct {
   uint32_t reconnect_max_delay_ms;
   qlinq_security_config_t security;
   qlinq_repair_mode_t repair_mode;
+  qlinq_congestion_control_t congestion_control;
+  qlinq_pacing_t pacing;
   qlinq_limits_t limits;
   /* exact interface allowlist for paths discovered after startup. initial
    * bind addresses must also belong to the selected interfaces. */
   const char *path_interface_names[QLINQ_MAX_PATHS];
   size_t path_interface_count;
+  /* Initial congestion window per QUIC path. Zero preserves the default of
+   * 100 packets; explicit values are 1..QLINQ_MAX_INITIAL_CWND_PACKETS.
+   * Quicly applies a two-packet minimum and also uses this window as the
+   * temporary flight cap during path recovery. Fixed at endpoint creation. */
+  uint32_t initial_cwnd_packets;
 } qlinq_endpoint_config_t;
 
 typedef struct {
@@ -299,6 +319,38 @@ typedef struct {
 
 bool qlinq_endpoint_get_peer(qlinq_endpoint_t *endpoint, uint32_t peer_id,
                              qlinq_peer_info_t *info);
+
+typedef enum {
+  QLINQ_PATH_DISCOVERED,
+  QLINQ_PATH_OPENING,
+  QLINQ_PATH_VALIDATING,
+  QLINQ_PATH_ACTIVE,
+  QLINQ_PATH_DRAINING,
+  QLINQ_PATH_FAILED
+} qlinq_path_state_t;
+
+/* Physical socket wire counters plus a connection snapshot. On listeners,
+ * connection fields describe the first connected peer. Path indexes are
+ * physical socket slots and can move after interface removal. Congestion-window
+ * and in-flight values are QUIC packet bytes; timing fields are milliseconds.
+ */
+typedef struct {
+  qlinq_path_state_t state;
+  uint64_t bytes_sent;
+  uint64_t bytes_received;
+  uint64_t packets_sent;
+  uint64_t packets_acked;
+  uint64_t packets_lost;
+  uint64_t bytes_acked;
+  uint32_t smoothed_rtt_ms;
+  uint32_t congestion_window_bytes;
+  uint32_t bytes_in_flight;
+  double relative_one_way_delay_ms;
+  double ewma_latency_ms;
+} qlinq_path_info_t;
+
+bool qlinq_endpoint_get_path(qlinq_endpoint_t *endpoint, size_t path_index,
+                             qlinq_path_info_t *info);
 /* Starts an orderly close while leaving the endpoint serviceable until its
  * QUIC close packets and socket queues drain. Automatic reconnect is stopped.
  */

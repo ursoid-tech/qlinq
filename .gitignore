@@ -4,6 +4,7 @@ qlinq-app
 qlinq-tund
 qlinq-tun
 qlinq-tun-engine
+qlinq-cast
 libqlinq.a
 t/00util/test_fec
 t/00util/test_transport
@@ -51,6 +52,8 @@ host_helpers/
 logs/
 crash-*
 examples/data_multipath_benchmark
+examples/transit_benchmark
+examples/transit_udp_calibration
 tmp/
 .tmp.dprobes.h
 
@@ -72,6 +75,20 @@ t/00util/test_stream_budget
 /t/00util/test_qlinq_compat
 /t/00util/test_qlinq_reconnect
 /t/00util/test_tun_json
+/t/00util/test_qlinq_policy
+/t/00util/test_crypto_backend
+/t/00util/test_multipath_failover
+/t/00util/test_multipath_feedback
+/t/00util/test_multipath_publication
+/t/00util/test_udp_receive
+/t/00util/test_flexicast_regressions
+/t/00util/test_flexicast_scale
+/t/00util/test_flexicast_transport
+/t/00util/test_qlinq_api
+/t/00util/test_quicly_flexicast
+
+# Isolated validation snapshots
+/.work/
 
 # Python
 __pycache__/

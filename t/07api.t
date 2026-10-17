@@ -3,7 +3,8 @@ use strict;
 use warnings;
 use Test::More;
 use t::Util;
-for my $test (['qlinq_delivery', 'QLINQ DELIVERY MATRIX'],
+for my $test (['qlinq_policy', 'QLINQ POLICY'],
+              ['qlinq_delivery', 'QLINQ DELIVERY MATRIX'],
               ['qlinq_event_ownership', 'QLINQ EVENT OWNERSHIP'],
               ['qlinq_event_overflow', 'QLINQ EVENT OVERFLOW'],
               ['qlinq_compat', 'QLINQ COMPATIBILITY'],

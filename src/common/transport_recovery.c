@@ -481,7 +481,9 @@ void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
          slot++) {
       const track_subscription_t *sub =
           &conn->receive_subscriptions.entries[slot];
-      if (!sub->active)
+      /* object gaps and checkpoint windows exist only for rateless data */
+      if (!sub->active || sub->track_id.type != MOQ_TRACK_DATA ||
+          (sub->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
         continue;
       uint8_t alias = sub->alias;
       transport_object_gap_state_t *gap = transport_object_gap(conn, alias);

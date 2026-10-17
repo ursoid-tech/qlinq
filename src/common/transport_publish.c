@@ -144,21 +144,33 @@ static size_t collect_paths(transport_t *t, transport_conn_t *conn,
   uint64_t measure_now = ptls_get_time.cb(&ptls_get_time);
   for (size_t physical = 0; physical < t->socket_count; physical++) {
     quicly_path_stats_t stats;
-    size_t mapped = transport_path_get_stats_by_local(
+    size_t mapped = transport_path_get_eligible_by_local(
         conn->quic, &t->sockets[physical].local_addr, &stats);
-    if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
-        !quicly_is_path_available(conn->quic, mapped))
+    if (mapped == SIZE_MAX)
       continue;
     size_t queued = quicly_get_num_datagram_frames_path(conn->quic, mapped);
     if (queued >= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY)
       continue;
     publication_path_t *candidate = &paths[active_paths];
     transport_conn_path_t *path = &conn->paths[physical];
+    /* Publications can precede the first periodic measurement. Establish its
+     * native owner now so the sampled state and queue remain available to the
+     * next publication; an unowned automatic EWMA is not usable history. */
+    if (!path->state_overridden && !path->measurement.initialized) {
+      (void)transport_path_measure(&path->measurement, &stats, mapped, queued,
+                                   measure_now);
+      memset(&path->state, 0, sizeof(path->state));
+    }
+    bool measured =
+        path->measurement.initialized && path->measurement.quic_path == mapped;
+    fp_t relative_owd = path->owd_initialized && path->telemetry_path == mapped
+                            ? path->latest_owd_fp
+                            : 0;
     candidate->quic = mapped;
     candidate->available = QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - queued;
     candidate->sample = transport_path_estimate(
         &stats, queued, t->sockets[physical].egress.bytes, estimate_symbol_size,
-        path->latest_owd_fp);
+        relative_owd);
     /* Datagram groups leave QLINQ's queue quickly, but remain serialized by
      * QUIC until the path ACKs them.  Include that outstanding work in the
      * Pathflow input, as the stream scheduler does, so a fast path is not
@@ -169,12 +181,13 @@ static size_t collect_paths(transport_t *t, transport_conn_t *conn,
                               ? FP_SAFE_WHOLE
                               : candidate->sample.q + in_flight;
     if (!path->state_overridden) {
-      fp_t cap = transport_path_probe_cap(&path->measurement, &stats,
-                                          estimate_symbol_size, measure_now);
+      fp_t cap =
+          transport_path_probe_cap(measured ? &path->measurement : NULL, &stats,
+                                   estimate_symbol_size, measure_now);
       if (candidate->sample.b > cap)
         candidate->sample.b = cap;
-      fp_t rate =
-          path->state.initialized ? path->state.b_ewma : candidate->sample.b;
+      fp_t rate = measured && path->state.initialized ? path->state.b_ewma
+                                                      : candidate->sample.b;
       if (rate > cap)
         rate = cap;
       size_t reserved =
@@ -183,10 +196,17 @@ static size_t collect_paths(transport_t *t, transport_conn_t *conn,
         candidate->sample.q = reserved;
     }
     candidate->rate_known = stats.cwnd > 0 && stats.rtt_smoothed > 0;
-    if (!path->state_overridden)
-      transport_path_update_state(&path->state, &candidate->sample, false);
     candidate->physical = physical;
-    candidate->state = path->state;
+    /* A healthy alternate can share the failed path's socket. Its native
+     * measurements are independent; only the physical egress budget is shared.
+     * Do not overwrite the history still owned by the measured native path. */
+    candidate->state =
+        path->state_overridden || measured ? path->state : (path_state_t){0};
+    if (!path->state_overridden) {
+      transport_path_update_state(&candidate->state, &candidate->sample, false);
+      if (measured)
+        path->state = candidate->state;
+    }
     if (!path->state_overridden &&
         candidate->state.b_ewma > candidate->sample.b)
       candidate->state.b_ewma = candidate->sample.b;

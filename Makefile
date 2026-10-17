@@ -1,4 +1,5 @@
 # Makefile for qlinq
+.DEFAULT_GOAL := all
 
 CC = gcc
 ARCH = $(shell uname -m)
@@ -35,6 +36,20 @@ SANITIZER_FLAGS = -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-
 # build. Use -MD so ABI-affecting Quicly and picotls headers remain tracked.
 DEPFLAGS = -MD -MP
 
+# Compile Fusion only when this compiler accepts its ISA and runtime guards.
+# All transport code remains generic; the ISA flags apply only to fusion.o.
+FUSION_CFLAGS = -mavx2 -maes -mpclmul -mvaes -mvpclmulqdq
+ifndef WITH_FUSION
+WITH_FUSION := $(shell printf '%s\n' '#include <immintrin.h>' \
+  'int main(void) { __m256i x = _mm256_setzero_si256(); x = _mm256_aesenc_epi128(x, x); x = _mm256_clmulepi64_epi128(x, x, 0); return _mm_extract_epi64(_mm256_castsi256_si128(x), 0) + (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("aes") && __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("vaes") && __builtin_cpu_supports("vpclmulqdq")); }' \
+  | $(CC) $(CFLAGS) $(FUSION_CFLAGS) -x c -c -o /dev/null - >/dev/null 2>&1 && echo 1 || echo 0)
+endif
+ifneq ($(WITH_FUSION),0)
+ifneq ($(WITH_FUSION),1)
+$(error WITH_FUSION must be 0 or 1)
+endif
+endif
+
 # Include paths: use -isystem for quicly and picotls to suppress warning headers
 INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
 
@@ -57,6 +72,11 @@ QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/deps/picotls/lib/pembase64.c \
               deps/quicly/deps/picotls/lib/hpke.c \
               deps/quicly/deps/picotls/lib/asn1.c
+
+ifeq ($(WITH_FUSION),1)
+QUICLY_SRCS += deps/quicly/deps/picotls/lib/fusion.c
+src/common/transport_tls.o t/00util/test_crypto_backend.o: private CFLAGS_COMMON += -DQLINQ_WITH_FUSION=1
+endif
 
 NANORQ_SRCS = deps/nanorq/lib/chooser.c \
               deps/nanorq/lib/nanorq_core.c \
@@ -138,8 +158,25 @@ deps/%.o: deps/%.c
 
 all: qlinqd qlinq-app qlinq-tund qlinq-tun
 
+# Track only backend inclusion here; other compiler flag changes still require
+# a clean build. Switching WITH_FUSION must rebuild its dispatch and tests.
+.PHONY: FORCE_FUSION_CONFIG
+FORCE_FUSION_CONFIG:
+
+tmp/fusion-config: FORCE_FUSION_CONFIG
+	@mkdir -p $(@D)
+	@printf 'WITH_FUSION=%s\n' '$(WITH_FUSION)' >$@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
+src/common/transport_tls.o t/00util/test_crypto_backend.o: tmp/fusion-config Makefile
+
+deps/quicly/deps/picotls/lib/fusion.o: deps/quicly/deps/picotls/lib/fusion.c Makefile
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(FUSION_CFLAGS) -w -c $< -o $@
+
 libqlinq.a: $(TRANSPORT_OBJS)
-	$(AR) rcs $@ $(TRANSPORT_OBJS)
+	rm -f $@.tmp
+	$(AR) rcs $@.tmp $(TRANSPORT_OBJS)
+	mv $@.tmp $@
 
 qlinqd: $(DAEMON_OBJS)
 	$(CC) -o $@ $(DAEMON_OBJS) $(LDFLAGS)
@@ -183,6 +220,7 @@ t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 TRANSPORT_TESTS = t/00util/test_transport_bind \
+	t/00util/test_crypto_backend \
 	t/00util/test_interleaved_receive \
 	t/00util/test_publication_limits \
 	t/00util/test_directional_subscriptions \
@@ -194,16 +232,19 @@ TRANSPORT_TESTS = t/00util/test_transport_bind \
 	t/00util/test_transport_components \
 	t/00util/test_benchmark \
 	t/00util/test_tc_benchmark \
-	t/00util/test_multipath \
+	t/00util/test_multipath t/00util/test_multipath_failover \
+	t/00util/test_multipath_feedback \
+	t/00util/test_multipath_publication \
 	t/00util/test_multipath_nack \
 	t/00util/test_operational \
 	t/00util/test_tls \
 	t/00util/test_rateless_benchmark
 
-$(TRANSPORT_TESTS): %: %.o $(COMMON_OBJS)
+$(filter-out t/00util/test_multipath_failover,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-API_TESTS = t/00util/test_qlinq_event_overflow \
+API_TESTS = t/00util/test_qlinq_policy \
+	t/00util/test_qlinq_event_overflow \
 	t/00util/test_qlinq_compat \
 	t/00util/test_qlinq_reconnect \
 	t/00util/test_qlinq_delivery \
@@ -220,6 +261,9 @@ t/00util/test_transport_wire: t/00util/test_transport_wire.o src/common/transpor
 
 t/00util/test_udp_gso_prefix: t/00util/test_udp_gso_prefix.o
 	$(CC) -o $@ $< $(LDFLAGS)
+
+t/00util/test_udp_receive: t/00util/test_udp_receive.o src/common/transport_udp.o
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_ifmon: t/00util/test_ifmon.o
 	$(CC) -o $@ $< $(LDFLAGS)
@@ -278,6 +322,8 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json \
+	t/00util/test_crypto_backend \
+	t/00util/test_qlinq_policy \
 	t/00util/test_egress_errors t/00util/test_transport_bind \
 	t/00util/test_interleaved_receive t/00util/test_publication_limits \
 	t/00util/test_directional_subscriptions \
@@ -287,9 +333,14 @@ CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json \
 	t/00util/test_stream_budget t/00util/test_transport \
 	t/00util/test_reliable_bidirectional t/00util/test_tund \
 	t/00util/test_data_uds t/00util/test_transport_wire \
-	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_ifmon \
-	t/00util/test_multipath \
+	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_udp_receive t/00util/test_ifmon \
+	t/00util/test_multipath t/00util/test_multipath_failover \
+	t/00util/test_multipath_feedback \
+	t/00util/test_multipath_publication \
 	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
+
+t/00util/test_multipath_failover: t/00util/test_multipath_failover.o $(filter-out src/common/transport_udp.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 check: all $(CHECK_BINARIES) gencerts
 	prove -I. -v t/*.t

@@ -354,8 +354,28 @@ typedef struct {
 static void copy_interface_name(char destination[64], const char *name) {
   if (!destination || !name)
     return;
-  strncpy(destination, name, 63);
-  destination[63] = '\0';
+  snprintf(destination, 64, "%s", name);
+}
+
+static void refresh_scheduler_paths(transport_conn_t *conn) {
+  transport_t *t = conn->transport;
+  conn->scheduler_paths = 0;
+  /* The pinned QUIC API has no path iterator. Snapshot slot ownership once
+   * before a service pass; each send batch refreshes only these paths' live
+   * congestion and health state. Multiple remote paths may share one socket. */
+  for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+    quicly_path_stats_t stats;
+    if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
+        !quicly_is_path_available(conn->quic, path))
+      continue;
+    for (size_t physical = 0; physical < t->socket_count; physical++)
+      if (transport_path_matches_local(&stats,
+                                       &t->sockets[physical].local_addr)) {
+        conn->scheduler_paths |= UINT64_C(1) << path;
+        conn->scheduler_sockets[path] = (uint8_t)physical;
+        break;
+      }
+  }
 }
 
 static quicly_error_t
@@ -367,26 +387,68 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
   if (!conn || !conn->transport)
     return 0;
   transport_t *t = conn->transport;
-  size_t quic_paths[TRANSPORT_MAX_PATHS];
-  path_t paths[TRANSPORT_MAX_PATHS];
+
+  /* Datagram publication has already assigned a QUIC path. Several remote
+   * paths can share one local socket. In particular, a listener's telemetry on
+   * its second remote path must not remain runnable but permanently unsent. */
+  if (quicly_has_datagram_frames(quic)) {
+    size_t first = conn->feedback_path % TRANSPORT_MAX_QUIC_PATHS;
+    for (size_t offset = 0; offset < TRANSPORT_MAX_QUIC_PATHS; offset++) {
+      size_t path = (first + offset) % TRANSPORT_MAX_QUIC_PATHS;
+      if ((conn->scheduler_paths & (UINT64_C(1) << path)) == 0 ||
+          quicly_get_num_datagram_frames_path(quic, path) == 0 ||
+          !quicly_is_path_available(quic, path))
+        continue;
+      quicly_path_stats_t stats;
+      quicly_path_health_t health;
+      if (quicly_get_path_stats(quic, path, &stats) != 0 ||
+          (quicly_get_path_health(quic, path, &health) == 0 &&
+           health.state == QUICLY_PATH_SUSPECT))
+        continue;
+      size_t packets_sent = 0;
+      quicly_error_t ret =
+          quicly_send_on_path(quic, send_context, path, &packets_sent);
+      if (ret != 0)
+        return ret;
+      if (packets_sent != 0) {
+        conn->feedback_path = (path + 1U) % TRANSPORT_MAX_QUIC_PATHS;
+        return 0;
+      }
+    }
+  }
+
+  size_t quic_paths[TRANSPORT_MAX_QUIC_PATHS];
+  path_t paths[TRANSPORT_MAX_QUIC_PATHS];
   size_t count = 0;
   size_t symbol_size = transport_get_datagram_symbol_size(t);
   if (symbol_size == 0)
     symbol_size = 1200;
 
-  for (size_t physical = 0; physical < t->socket_count; physical++) {
+  uint64_t remaining = conn->scheduler_paths;
+  while (remaining != 0) {
+    size_t path = (size_t)__builtin_ctzll(remaining);
+    remaining &= remaining - 1U;
+    size_t physical = conn->scheduler_sockets[path];
     quicly_path_stats_t stats;
-    size_t path = transport_path_get_stats_by_local(
-        quic, &t->sockets[physical].local_addr, &stats);
-    if (path >= TRANSPORT_MAX_QUIC_PATHS ||
-        !quicly_is_path_available(quic, path))
+    quicly_path_health_t health;
+    if (quicly_get_path_stats(quic, path, &stats) != 0 ||
+        !quicly_is_path_available(quic, path) ||
+        (quicly_get_path_health(quic, path, &health) == 0 &&
+         health.state == QUICLY_PATH_SUSPECT))
       continue;
+    const transport_conn_path_t *physical_path = &conn->paths[physical];
+    fp_t relative_owd =
+        physical_path->owd_initialized && physical_path->telemetry_path == path
+            ? physical_path->latest_owd_fp
+            : 0;
     path_t sample = transport_path_estimate(
         &stats, quicly_get_num_datagram_frames_path(quic, path),
-        t->sockets[physical].egress.bytes, symbol_size,
-        conn->paths[physical].latest_owd_fp);
-    const path_state_t *state = &conn->paths[physical].state;
-    if (state->initialized) {
+        t->sockets[physical].egress.bytes, symbol_size, relative_owd);
+    const path_state_t *state = &physical_path->state;
+    if (state->initialized &&
+        (physical_path->state_overridden ||
+         (physical_path->measurement.initialized &&
+          physical_path->measurement.quic_path == path))) {
       /* Delivery-rate EWMA is demand-limited when this path has been
        * underused. Keep the live cwnd / RTT rate for stream scheduling, while
        * retaining conservative history for latency, loss, and queued work. */
@@ -426,19 +488,29 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
    * plan can reserve a fictitious parity packet even for tiny loss rates.
    * Use expected transmission cost for both the first choice and fallbacks;
    * Quicly still enforces congestion, pacing, and stream eligibility. */
-  uint32_t attempted_paths = 0;
+  bool feedback_only = !quicly_has_pending_stream_data(quic) &&
+                       !quicly_has_datagram_frames(quic);
+  size_t feedback_start = conn->feedback_path % count;
+  uint64_t attempted_paths = 0;
   for (size_t attempt = 0; attempt < count; attempt++) {
-    size_t index = transport_stream_select_path(paths, count, attempted_paths);
+    size_t index =
+        feedback_only
+            ? (feedback_start + attempt) % count
+            : transport_stream_select_path(paths, count, attempted_paths);
     if (index == SIZE_MAX)
       break;
-    attempted_paths |= 1U << index; /* do not retry an empty send path */
+    attempted_paths |= UINT64_C(1)
+                       << index; /* do not retry an empty send path */
     size_t packets_sent = 0;
     quicly_error_t ret = quicly_send_on_path(quic, send_context,
                                              quic_paths[index], &packets_sent);
     if (ret != 0)
       return ret;
-    if (packets_sent != 0)
+    if (packets_sent != 0) {
+      if (feedback_only)
+        conn->feedback_path = (index + 1U) % count;
       break;
+    }
   }
   return 0;
 }
@@ -768,10 +840,22 @@ static void try_open_pending_paths(transport_t *t, transport_conn_t *conn,
   if (!t || !conn || t->is_server || !conn->quic_ready)
     return;
 
+  bool handshake_confirmed = false;
   for (size_t local_index = 0; local_index < t->socket_count; local_index++) {
     if (!t->sockets[local_index].open_pending ||
         now < t->sockets[local_index].open_retry_at_ms)
       continue;
+    if (!handshake_confirmed) {
+      /* Application keys can exist before the peer receives ClientFinished.
+       * An early secondary probe can then be discarded without the primary
+       * path's reordered-handshake buffering, charging setup loss to its CC.
+       * Query only while a path is pending; established sends need no stats. */
+      quicly_stats_t stats;
+      if (quicly_get_stats(conn->quic, &stats) != 0 ||
+          stats.handshake_confirmed_msec == UINT64_MAX)
+        return;
+      handshake_confirmed = true;
+    }
     size_t remote_index = t->sockets[local_index].remote_index;
     if (!path_endpoint_families_match(t, local_index, remote_index)) {
       t->sockets[local_index].open_pending = false;
@@ -874,12 +958,17 @@ static void schedule_client_reconnect(transport_t *t, int64_t now_ms) {
 }
 
 transport_t *transport_create(const transport_config_t *config) {
+  if (config &&
+      config->initial_cwnd_packets > TRANSPORT_MAX_INITIAL_CWND_PACKETS)
+    return NULL;
   if (!config || !config->callback || config->port == 0 ||
       config->num_bind_hosts == 0 ||
       config->num_bind_hosts > TRANSPORT_MAX_PATHS ||
       config->num_path_interface_names > TRANSPORT_MAX_PATHS ||
       config->num_remote_hosts > TRANSPORT_MAX_PATHS ||
       config->simulated_loss_rate > 100 ||
+      config->congestion_control > TRANSPORT_CC_CUBIC ||
+      config->pacing > TRANSPORT_PACING_ENABLED ||
       (config->num_remote_hosts != 0 &&
        (config->reconnect_initial_delay_ms != 0
             ? config->reconnect_initial_delay_ms
@@ -1012,12 +1101,21 @@ transport_t *transport_create(const transport_config_t *config) {
   t->tls_ctx.random_bytes = ptls_openssl_random_bytes;
   t->tls_ctx.get_time = &ptls_get_time;
   t->tls_ctx.key_exchanges = ptls_openssl_key_exchanges;
-  t->tls_ctx.cipher_suites = ptls_openssl_cipher_suites;
+  if (!transport_tls_configure_crypto_backend(t))
+    goto Fail;
 
   transport_protocol_setup(t);
   t->verifier_initialized = false;
 
   t->quic_ctx = quicly_spec_context;
+  if (config->congestion_control == TRANSPORT_CC_RENO)
+    t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_reno_init;
+  else if (config->congestion_control == TRANSPORT_CC_PICO)
+    t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_pico_init;
+  else if (config->congestion_control == TRANSPORT_CC_CUBIC)
+    t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_cubic_init;
+  if (config->pacing != TRANSPORT_PACING_DEFAULT)
+    t->quic_ctx.egress[0].pacing = config->pacing == TRANSPORT_PACING_ENABLED;
   if (config->initial_rtt_ms != 0)
     t->quic_ctx.egress[0].loss.default_initial_rtt = config->initial_rtt_ms;
   if (config->handshake_timeout_rtt_multiplier != 0)
@@ -1039,8 +1137,12 @@ transport_t *transport_create(const transport_config_t *config) {
   /* Never select a validated QUIC path after its owning physical socket has
    * been removed. Datagram scheduling applies the same invariant. */
   t->quic_ctx.path_scheduler = &qlinq_path_scheduler;
+  /* QLINQ selects the failover policy; Quicly owns the sent ranges, PTOs and
+   * fresh-ACK recovery. Zero remains the native library's opt-out default. */
+  t->quic_ctx.multipath_failover_pto_threshold = 2;
 
-  t->quic_ctx.egress[0].cc.initcwnd_packets = 100;
+  t->quic_ctx.egress[0].cc.initcwnd_packets =
+      config->initial_cwnd_packets != 0 ? config->initial_cwnd_packets : 100;
   t->quic_ctx.initial_egress_max_udp_payload_size =
       t->limits.max_udp_payload_size;
   t->quic_ctx.transport_params.max_datagram_frame_size =
@@ -1342,6 +1444,99 @@ static void service_interfaces(transport_t *t) {
   }
 }
 
+static void transport_receive_datagram(transport_t *t, size_t fd_idx,
+                                       const uint8_t *buf, size_t len,
+                                       struct sockaddr_storage *source) {
+  t->sockets[fd_idx].bytes_received += len;
+
+  struct sockaddr *psa = (struct sockaddr *)source;
+
+  quicly_decoded_packet_t decoded;
+  size_t off = 0;
+  while (off < len) {
+    if (quicly_decode_packet(&t->quic_ctx, &decoded, buf, len, &off) ==
+        SIZE_MAX)
+      break;
+
+    transport_conn_t *target = NULL;
+    if (t->is_server) {
+      /* Ordinary short-header traffic carries our stable master CID.
+       * Avoid testing every earlier peer's reset tokens for each packet.
+       * Initials, unknown CIDs and cache collisions retain the full path.
+       */
+      if (t->quic_ctx.cid_encryptor != NULL &&
+          !QUICLY_PACKET_IS_LONG_HEADER(decoded.octets.base[0])) {
+        transport_conn_t *hint =
+            transport_connection_cache_find(t, &decoded.cid.dest.plaintext);
+        if (hint &&
+            quicly_is_destination(
+                hint->quic, (struct sockaddr *)&t->sockets[fd_idx].local_addr,
+                psa, &decoded))
+          target = hint;
+      }
+      for (size_t i = 0; !target && i < t->conn_count; ++i) {
+        if (quicly_is_destination(
+                t->conns[i]->quic,
+                (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
+                &decoded)) {
+          target = t->conns[i];
+          transport_connection_cache_remember(t, target);
+          break;
+        }
+      }
+      if (!target && !t->shutting_down &&
+          t->conn_count < t->limits.max_connections) {
+        quicly_conn_t *new_quic = NULL;
+        quicly_cid_plaintext_t connection_cid = t->next_cid;
+        int accept_res =
+            quicly_accept(&new_quic, &t->quic_ctx,
+                          (struct sockaddr *)&t->sockets[fd_idx].local_addr,
+                          psa, &decoded, NULL, &connection_cid, NULL, NULL);
+        if (accept_res == 0 && new_quic) {
+          t->next_cid.master_id++;
+          target = calloc(1, sizeof(transport_conn_t));
+          if (!target) {
+            quicly_free(new_quic);
+            t->stats.connections_rejected++;
+            continue;
+          }
+          target->transport = t;
+          target->quic = new_quic;
+          target->id = t->next_conn_id++;
+          if (!init_connection_subscriptions(
+                  target, t->limits.max_subscriptions_per_connection)) {
+            quicly_free(new_quic);
+            free(target);
+            target = NULL;
+            t->stats.connections_rejected++;
+            continue;
+          }
+          *quicly_get_data(new_quic) = target;
+          t->conns[t->conn_count++] = target;
+          transport_connection_cache_remember(t, target);
+          t->stats.connections_accepted++;
+        }
+      } else if (!target && !t->shutting_down) {
+        t->stats.connections_rejected++;
+      }
+    } else {
+      target = t->client_conn;
+    }
+
+    if (target && target->authenticated && t->simulated_loss_rate > 0 &&
+        (rand() % 100) < t->simulated_loss_rate) {
+      continue; /* simulate packet loss on wire after connection is
+                   established */
+    }
+
+    if (target) {
+      quicly_receive(target->quic,
+                     (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
+                     &decoded);
+    }
+  }
+}
+
 static void receive_packets(transport_t *t) {
   size_t receive_budget = t->limits.max_packets_per_tick;
   size_t receive_start =
@@ -1356,108 +1551,24 @@ static void receive_packets(transport_t *t) {
     size_t fd_idx = (receive_start + visited) % t->socket_count;
     size_t serviced = 0;
     while (receive_budget > 0 && serviced < quantum) {
-      uint8_t buf[2048];
-      struct sockaddr_storage sa;
-      socklen_t sa_len = sizeof(sa);
-      ssize_t rret = recvfrom(t->sockets[fd_idx].fd, buf, sizeof(buf), 0,
-                              (struct sockaddr *)&sa, &sa_len);
-      if (rret == -1) {
-        if (SOCKET_ERROR_CODE == SOCKET_EAGAIN ||
-            SOCKET_ERROR_CODE == SOCKET_EWOULDBLOCK)
-          break;
-        if (SOCKET_ERROR_CODE == SOCKET_EINTR)
-          continue;
-        break; /* A persistent socket error must not spin the owner thread. */
-      }
-      receive_budget--;
-      serviced++;
-      t->sockets[fd_idx].bytes_received += (uint64_t)rret;
-
-      struct sockaddr *psa = (struct sockaddr *)&sa;
-
-      quicly_decoded_packet_t decoded;
-      size_t off = 0;
-      while (off < (size_t)rret) {
-        if (quicly_decode_packet(&t->quic_ctx, &decoded, buf, rret, &off) ==
-            SIZE_MAX)
-          break;
-
-        transport_conn_t *target = NULL;
-        if (t->is_server) {
-          /* Ordinary short-header traffic carries our stable master CID.
-           * Avoid testing every earlier peer's reset tokens for each packet.
-           * Initials, unknown CIDs and cache collisions retain the full path.
-           */
-          if (t->quic_ctx.cid_encryptor != NULL &&
-              !QUICLY_PACKET_IS_LONG_HEADER(decoded.octets.base[0])) {
-            transport_conn_t *hint =
-                transport_connection_cache_find(t, &decoded.cid.dest.plaintext);
-            if (hint && quicly_is_destination(
-                            hint->quic,
-                            (struct sockaddr *)&t->sockets[fd_idx].local_addr,
-                            psa, &decoded))
-              target = hint;
-          }
-          for (size_t i = 0; !target && i < t->conn_count; ++i) {
-            if (quicly_is_destination(
-                    t->conns[i]->quic,
-                    (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
-                    &decoded)) {
-              target = t->conns[i];
-              transport_connection_cache_remember(t, target);
-              break;
-            }
-          }
-          if (!target && !t->shutting_down &&
-              t->conn_count < t->limits.max_connections) {
-            quicly_conn_t *new_quic = NULL;
-            quicly_cid_plaintext_t connection_cid = t->next_cid;
-            int accept_res =
-                quicly_accept(&new_quic, &t->quic_ctx,
-                              (struct sockaddr *)&t->sockets[fd_idx].local_addr,
-                              psa, &decoded, NULL, &connection_cid, NULL, NULL);
-            if (accept_res == 0 && new_quic) {
-              t->next_cid.master_id++;
-              target = calloc(1, sizeof(transport_conn_t));
-              if (!target) {
-                quicly_free(new_quic);
-                t->stats.connections_rejected++;
-                continue;
-              }
-              target->transport = t;
-              target->quic = new_quic;
-              target->id = t->next_conn_id++;
-              if (!init_connection_subscriptions(
-                      target, t->limits.max_subscriptions_per_connection)) {
-                quicly_free(new_quic);
-                free(target);
-                target = NULL;
-                t->stats.connections_rejected++;
-                continue;
-              }
-              *quicly_get_data(new_quic) = target;
-              t->conns[t->conn_count++] = target;
-              transport_connection_cache_remember(t, target);
-              t->stats.connections_accepted++;
-            }
-          } else if (!target && !t->shutting_down) {
-            t->stats.connections_rejected++;
-          }
-        } else {
-          target = t->client_conn;
-        }
-
-        if (target && target->authenticated && t->simulated_loss_rate > 0 &&
-            (rand() % 100) < t->simulated_loss_rate) {
-          continue; /* simulate packet loss on wire after connection is
-                       established */
-        }
-
-        if (target) {
-          quicly_receive(target->quic,
-                         (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
-                         &decoded);
-        }
+      size_t batch = quantum - serviced;
+      if (batch > receive_budget)
+        batch = receive_budget;
+      if (batch > TRANSPORT_UDP_RECEIVE_BATCH)
+        batch = TRANSPORT_UDP_RECEIVE_BATCH;
+      transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
+      ssize_t received =
+          transport_udp_receive_batch(t->sockets[fd_idx].fd, datagrams, batch);
+      if (received <= 0)
+        break; /* Empty or persistently failing sockets cannot spin the owner.
+                */
+      for (ssize_t i = 0; i < received; i++) {
+        /* Preserve recvfrom/recvmmsg's original copied-prefix dispatch. The
+         * decoder validates each complete QUIC packet in that prefix. */
+        transport_receive_datagram(t, fd_idx, datagrams[i].data,
+                                   datagrams[i].size, &datagrams[i].source);
+        receive_budget--;
+        serviced++;
       }
     }
   }
@@ -1480,7 +1591,7 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
         if (target->paths[i].state_overridden)
           continue;
         quicly_path_stats_t stats;
-        size_t mapped = transport_path_get_stats_by_local(
+        size_t mapped = transport_path_get_eligible_by_local(
             target->quic, &t->sockets[i].local_addr, &stats);
         if (mapped == SIZE_MAX ||
             !quicly_is_path_available(target->quic, mapped)) {
@@ -1494,11 +1605,17 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
         size_t queued =
             quicly_get_num_datagram_frames_path(target->quic, mapped);
         if (transport_path_measure(&target->paths[i].measurement, &stats,
-                                   mapped, queued, now))
+                                   mapped, queued, now)) {
+          memset(&target->paths[i].state, 0, sizeof(target->paths[i].state));
           memset(&target->paths[i].budget, 0, sizeof(target->paths[i].budget));
-        path_t sample = transport_path_estimate(
-            &stats, queued, t->sockets[i].egress.bytes, symbol_size,
-            target->paths[i].latest_owd_fp);
+        }
+        fp_t relative_owd = target->paths[i].owd_initialized &&
+                                    target->paths[i].telemetry_path == mapped
+                                ? target->paths[i].latest_owd_fp
+                                : 0;
+        path_t sample =
+            transport_path_estimate(&stats, queued, t->sockets[i].egress.bytes,
+                                    symbol_size, relative_owd);
         fp_t cap = transport_path_probe_cap(&target->paths[i].measurement,
                                             &stats, symbol_size, now);
         if (sample.b > cap)
@@ -1523,6 +1640,7 @@ static void service_connections(transport_t *t, uint64_t now) {
     if (conn->quic_ready)
       (void)transport_protocol_send_hello(conn);
     transport_protocol_maybe_emit_connected(conn);
+    refresh_scheduler_paths(conn);
 
     while (1) {
       bool egress_has_room = true;
@@ -1544,7 +1662,8 @@ static void service_connections(transport_t *t, uint64_t now) {
        * Quicly may consume the whole output batch on that path, so bound
        * stream-only multipath batches to keep a single decision from steering
        * 64 packets. Datagram publication retains its 64-packet queue batch. */
-      if (t->socket_count > 1 && !quicly_has_datagram_frames(conn->quic))
+      if ((conn->scheduler_paths & (conn->scheduler_paths - 1U)) != 0 &&
+          !quicly_has_datagram_frames(conn->quic))
         num_dgrams = QLINQ_STREAM_MULTIPATH_SEND_BATCH;
       int send_res = quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams,
                                  dgrams_buf, sizeof(dgrams_buf));
@@ -2114,6 +2233,10 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
     } else {
       stats->lifecycle = TRANSPORT_PATH_ACTIVE;
       stats->sent = path_stats.sent;
+      stats->acked = path_stats.acked;
+      stats->bytes_acked = path_stats.bytes_acked;
+      stats->cwnd = path_stats.cwnd;
+      stats->bytes_in_flight = path_stats.bytes_in_flight;
       stats->lost = path_stats.lost;
       stats->rtt = path_stats.rtt_smoothed;
     }

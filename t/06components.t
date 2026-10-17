@@ -18,7 +18,13 @@ subtest 'UDP GSO grouping and partial sends' => sub {
          'datagrams remain ordered and accepted prefixes are never replayed') or diag($stderr);
 };
 
-subtest 'interface snapshots' => sub {
+subtest 'UDP batch receive boundaries' => sub {
+    my ($stderr, $stdout) = run_prog('./t/00util/test_udp_receive');
+    like($stdout, qr/===UDP RECEIVE OK===/,
+         'native and portable receive preserve boundaries, empty packets and truncation') or diag($stderr);
+};
+
+subtest 'interface snapshots'  => sub {
     my ($stderr, $stdout) = run_prog('./t/00util/test_ifmon');
     like($stdout, qr/===IFMON SNAPSHOTS OK===/,
          'interface changes and missing IPv4/IPv6 prefixes retain their semantics') or diag($stderr);

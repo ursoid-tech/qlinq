@@ -51,6 +51,13 @@ Physical socket records own addresses, interface identity, egress queues, and
 path-open retries. Each connection keeps separate path measurements, telemetry,
 and admission budgets indexed by that socket slot. QUIC path IDs are resolved
 separately. Removing an interface moves complete records together.
+Several remote QUIC paths may share one local socket. The send loop snapshots
+their socket ownership once per connection service pass, then scores every
+owned QUIC path using live congestion and health information. Physical-path
+history is applied only to the QUIC path that produced it. Path-bound datagrams
+are serviced across all eligible QUIC paths, so a listener's feedback cannot
+remain queued behind a different path sharing its socket. Reliable multipath
+batches remain bounded even when all remote paths share one local socket.
 Configured and discovered sockets use the same setup and teardown routines.
 Transport creation has one failure cleanup path, including partially initialized
 connections, sockets, and caches.
@@ -67,6 +74,13 @@ and deferred aggregate-budget retries.
 `handshake_timeout_rtt_multiplier` sets its handshake timeout in RTT multiples.
 Zero preserves each Quicly default. Neither changes the configured QUIC idle
 timeout.
+
+Qlinq enables multipath suspicion after two probe timeouts when a healthy
+alternative exists. Suspect paths are excluded from new application placement;
+Quicly retains retransmission ownership and recovery probes and requires fresh
+acknowledgment progress before normal reuse. Congestion control and pacing can
+be selected explicitly through the transport and application configuration.
+Zero-valued options retain the pinned Quicly defaults.
 
 `transport_close_conn_with_error` accepts zero or a tagged
 `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE` value and an optional reason.

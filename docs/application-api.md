@@ -76,6 +76,43 @@ operation errors, including failures that could not be queued as events.
 `qlinq_endpoint_get_path_stats` exposes active/validated state, interface/address,
 wire byte counters, packet-loss counters and RTT in milliseconds for each path.
 Slots can move when interfaces disappear; use interface/address as identity.
+`qlinq_endpoint_get_path` adds lifecycle, ACK counts, congestion window,
+bytes in flight and delay estimates. Both queries read the same underlying
+snapshot. Wire byte counters belong to the physical socket; on listeners,
+connection fields describe the first connected peer. Congestion window and
+in-flight values count QUIC packet bytes; timing fields use milliseconds.
+
+`congestion_control` selects the default, Reno, Pico or Cubic controller;
+`pacing` selects the default, disabled or enabled policy. Zero-initialized
+configuration retains the transport defaults (Reno with pacing disabled).
+These endpoint settings are fixed at creation and need not match the peer.
+To use the explicit CUBIC and pacing configuration measured in the
+[MPTCP comparison](mtcp-performance-progress.md), set these fields on the
+endpoint configuration before calling `qlinq_listen` or `qlinq_connect`:
+
+```c
+config.congestion_control = QLINQ_CC_CUBIC;
+config.pacing = QLINQ_PACING_ENABLED;
+/* Leave initial_cwnd_packets at zero to retain the 100-packet default. */
+```
+
+`initial_cwnd_packets` sets the initial congestion window independently for each
+QUIC path. Zero preserves QLINQ's existing **100-packet default**; explicit
+values from 1 through `QLINQ_MAX_INITIAL_CWND_PACKETS` (65,535) are accepted.
+Quicly applies a two-packet minimum, so a request of 1 produces an effective
+two-packet window. The bounded packet count keeps the initial byte-window
+calculation within 32 bits. Values outside that range are rejected with
+`QLINQ_STATUS_INVALID`; parse signed external input before assigning this
+unsigned field. This setting is fixed at endpoint creation and may differ
+between peers. It permits controlled configuration experiments; it does not
+change the default controller, pacing or window.
+
+Multipath endpoints stop assigning new traffic to a path after two ordinary
+probe timeouts when another path has recent progress. QUIC retransmits retained
+reliable data on the remaining eligible paths and probes for recovery.
+The pinned QUIC implementation also uses `initial_cwnd_packets` as the temporary
+flight cap for a recovering path. Reducing it therefore affects both startup
+and recovery; evaluate outage behavior as well as initial transfer latency.
 
 ## Record compatibility and ownership
 

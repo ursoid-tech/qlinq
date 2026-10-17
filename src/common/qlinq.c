@@ -84,6 +84,21 @@ struct qlinq_context {
   size_t poll_endpoint_capacity;
 };
 
+_Static_assert((int)QLINQ_CC_DEFAULT == TRANSPORT_CC_DEFAULT,
+               "public and transport policy values must match");
+_Static_assert((int)QLINQ_CC_RENO == TRANSPORT_CC_RENO,
+               "public and transport policy values must match");
+_Static_assert((int)QLINQ_CC_PICO == TRANSPORT_CC_PICO,
+               "public and transport policy values must match");
+_Static_assert((int)QLINQ_CC_CUBIC == TRANSPORT_CC_CUBIC,
+               "public and transport policy values must match");
+_Static_assert((int)QLINQ_PACING_DEFAULT == TRANSPORT_PACING_DEFAULT,
+               "public and transport policy values must match");
+_Static_assert((int)QLINQ_PACING_DISABLED == TRANSPORT_PACING_DISABLED,
+               "public and transport policy values must match");
+_Static_assert((int)QLINQ_PACING_ENABLED == TRANSPORT_PACING_ENABLED,
+               "public and transport policy values must match");
+
 static bool context_access(const qlinq_context_t *context) {
   return context && pthread_equal(context->owner_thread, pthread_self()) &&
          !context->in_log;
@@ -582,6 +597,9 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
       (config->security.shared_secret_size != 0 &&
        !config->security.shared_secret) ||
       config->security.shared_secret_size > UINT16_MAX ||
+      (unsigned)config->congestion_control > QLINQ_CC_CUBIC ||
+      (unsigned)config->pacing > QLINQ_PACING_ENABLED ||
+      config->initial_cwnd_packets > QLINQ_MAX_INITIAL_CWND_PACKETS ||
       (config->repair_mode != QLINQ_REPAIR_AUTO &&
        config->repair_mode != QLINQ_REPAIR_INDEXED &&
        config->repair_mode != QLINQ_REPAIR_RATELESS)) {
@@ -657,6 +675,9 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.verify_peer =
       config->security.verify_peer || !config->security.allow_insecure_peer;
   transport_config.repair_mode = map_repair_mode(config->repair_mode);
+  transport_config.congestion_control = config->congestion_control;
+  transport_config.pacing = config->pacing;
+  transport_config.initial_cwnd_packets = config->initial_cwnd_packets;
   map_limits(&config->limits, &transport_config.limits);
   transport_config.callback = on_transport_event;
   transport_config.user_data = endpoint;
@@ -782,6 +803,33 @@ bool qlinq_endpoint_get_peer(qlinq_endpoint_t *endpoint, uint32_t id,
     return true;
   }
   return false;
+}
+
+static bool read_endpoint_path(qlinq_endpoint_t *endpoint, size_t index,
+                               transport_path_stats_t *stats) {
+  return endpoint_access(endpoint) && endpoint->active && endpoint->transport &&
+         stats && transport_get_path_stats(endpoint->transport, index, stats);
+}
+
+bool qlinq_endpoint_get_path(qlinq_endpoint_t *endpoint, size_t path_index,
+                             qlinq_path_info_t *info) {
+  transport_path_stats_t stats;
+  if (!info || !read_endpoint_path(endpoint, path_index, &stats))
+    return false;
+  memset(info, 0, sizeof(*info));
+  info->state = (qlinq_path_state_t)stats.lifecycle;
+  info->bytes_sent = stats.bytes_sent;
+  info->bytes_received = stats.bytes_received;
+  info->packets_sent = stats.sent;
+  info->packets_acked = stats.acked;
+  info->packets_lost = stats.lost;
+  info->bytes_acked = stats.bytes_acked;
+  info->smoothed_rtt_ms = stats.rtt;
+  info->congestion_window_bytes = stats.cwnd;
+  info->bytes_in_flight = stats.bytes_in_flight;
+  info->relative_one_way_delay_ms = stats.relative_owd;
+  info->ewma_latency_ms = stats.ewma_latency;
+  return true;
 }
 
 qlinq_status_t qlinq_endpoint_shutdown(qlinq_endpoint_t *endpoint,
@@ -1241,11 +1289,8 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
 
 bool qlinq_endpoint_get_path_stats(qlinq_endpoint_t *endpoint, size_t index,
                                    qlinq_path_stats_t *stats) {
-  if (!endpoint_access(endpoint) || !endpoint || !endpoint->active ||
-      !endpoint->transport || !stats)
-    return false;
   transport_path_stats_t source;
-  if (!transport_get_path_stats(endpoint->transport, index, &source))
+  if (!stats || !read_endpoint_path(endpoint, index, &source))
     return false;
   *stats =
       (qlinq_path_stats_t){.bytes_sent = source.bytes_sent,

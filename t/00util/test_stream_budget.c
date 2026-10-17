@@ -711,6 +711,90 @@ static bool receive_control(quicly_stream_t *stream, uint8_t type,
   return true;
 }
 
+/* repair queue preflight when datagram queue is full */
+static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
+  int failed = 0;
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn && t->client_conn->stream);
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = conn->protocol_ready = conn->hello_received = true;
+  conn->negotiated_limits = t->limits;
+  conn->peer_capabilities |= QLINQ_WIRE_CAP_RATELESS_REPAIR;
+  CHECK(transport_subscriptions_add(&conn->send_subscriptions, MOQ_TRACK_DATA,
+                                    MOQ_TRACK_FLAG_FEC_RATELESS, "repair", 7));
+
+  uint8_t data[32008] = {0};
+  moq_object_t object = {.track_id = {.type = MOQ_TRACK_DATA,
+                                      .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                      .name = "repair"},
+                         .group_id = 3,
+                         .object_id = 9,
+                         .data = data,
+                         .size = sizeof(data)};
+  CHECK(
+      transport_sent_cache_store(&t->sent_cache, &object, 24, 24, 1372, false));
+  sent_object_cache_t *cached =
+      transport_sent_cache_find(&t->sent_cache, &object.track_id, 3, 9);
+  CHECK(cached);
+  cached->next_repair_symbol = first_esi;
+  const uint8_t filler = 0;
+  for (size_t i = 0; i < queued; i++)
+    CHECK(transport_queue_datagram(conn, 0, ptls_iovec_init(&filler, 1)));
+  CHECK(quicly_get_num_datagram_frames_path(conn->quic, 0) == queued);
+
+  uint8_t payload[32];
+  size_t payload_size;
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 7,
+                               QLINQ_WIRE_NACK_RATELESS |
+                                   QLINQ_WIRE_NACK_WHOLE_OBJECT,
+                               3, 9, NULL, 0, &payload_size) == QLINQ_WIRE_OK);
+  bool fallback = first_esi == QLINQ_FEC_MAX_TOTAL_SYMBOLS;
+  size_t admitted = QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - queued;
+  for (size_t request = 0; request < 2; request++) {
+    /* start full so token spending does not depend on clock */
+    uint64_t peer_tokens = t->limits.max_repair_requests_per_second * 1000U;
+    uint64_t aggregate_tokens =
+        t->limits.max_aggregate_repair_requests_per_second * 1000U;
+    int64_t now = transport_get_time_ms();
+    conn->repair_request_limiter =
+        (transport_repair_limiter_t){peer_tokens, now};
+    t->aggregate_repair_limiter =
+        (transport_repair_limiter_t){aggregate_tokens, now};
+    CHECK(
+        receive_control(conn->stream, QLINQ_WIRE_NACK, payload, payload_size));
+    CHECK(conn->repair_request_limiter.tokens_milli == peer_tokens - 1000U &&
+          t->aggregate_repair_limiter.tokens_milli == aggregate_tokens - 1000U);
+    CHECK(quicly_get_num_datagram_frames_path(conn->quic, 0) ==
+          QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
+    CHECK(cached->next_repair_symbol == first_esi + (fallback ? 0 : admitted) &&
+          cached->next_systematic_repair_symbol == (fallback ? admitted : 0));
+    CHECK(t->stats.repair_requests_received == request + 1 &&
+          t->stats.repair_rateless_requests_received == request + 1 &&
+          t->stats.repair_symbols_sent == admitted &&
+          t->stats.repair_rateless_symbols_sent == admitted &&
+          t->stats.repair_rateless_exhausted == (fallback ? request + 1 : 0) &&
+          t->stats.repair_requests_throttled == 0 &&
+          t->stats.repair_requests_aggregate_throttled == 0 &&
+          t->stats.protocol_errors == 0);
+    size_t fec_contexts = 0;
+    for (size_t i = 0; i < TRANSPORT_FEC_CACHE_SIZE; i++) {
+      const transport_fec_cache_entry_t *entry = &t->fec_cache.entries[i];
+      if (entry->fec) {
+        fec_contexts++;
+        CHECK(!fallback && admitted == 1 && entry->type == FEC_RAPTORQ &&
+              entry->data_symbols == 24 && entry->parity_symbols == 24 &&
+              entry->symbol_size == 1372);
+      }
+    }
+    /* second request after partial admission does not re-encode */
+    CHECK(fec_contexts == (!fallback && admitted == 1 ? 1U : 0U));
+  }
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
 static void count_objects(void *data, const transport_event_t *event) {
   if (event->type == TRANSPORT_EVENT_OBJECT)
     (*(size_t *)data)++;
@@ -1158,6 +1242,10 @@ int main(void) {
       stream_emission_cursor() || ingress_compaction() ||
       track_dispatch_consumption() || control_dispatch_consumption() ||
       control_error_accounting() || checkpoint_ack_pressure() ||
+      repair_queue_preflight(64, 24) || repair_queue_preflight(64, 1000) ||
+      repair_queue_preflight(63, 24) ||
+      repair_queue_preflight(64, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
+      repair_queue_preflight(63, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
       checkpoint_repair_batch(1024, 1024) || checkpoint_repair_batch(2, 1024) ||
       checkpoint_repair_batch(1024, 3) || entry_limit_and_control_failure() ||
       byte_limits_and_recovery() || endpoint_vector_limit() ||

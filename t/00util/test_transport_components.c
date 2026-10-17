@@ -443,6 +443,18 @@ static int test_stream_path_selection(void) {
         "maximum bounded queue does not wrap into an early completion");
   CHECK(transport_stream_select_path(paths, 0, 0) == SIZE_MAX,
         "empty path list has no selection");
+  path_t many[TRANSPORT_MAX_QUIC_PATHS] = {0};
+  many[0].b = FP_ONE;
+  many[63].b = 2 * FP_ONE;
+  CHECK(transport_stream_select_path(many, TRANSPORT_MAX_QUIC_PATHS, 0) == 63 &&
+            transport_stream_select_path(many, TRANSPORT_MAX_QUIC_PATHS,
+                                         UINT64_C(1) << 63) == 0 &&
+            transport_stream_select_path(many, TRANSPORT_MAX_QUIC_PATHS,
+                                         UINT64_MAX) == SIZE_MAX,
+        "all QUIC path slots participate in selection and exclusion");
+  CHECK(transport_stream_select_path(many, TRANSPORT_MAX_QUIC_PATHS + 1U, 0) ==
+            SIZE_MAX,
+        "out-of-range path count cannot overflow the exclusion mask");
   return 0;
 }
 

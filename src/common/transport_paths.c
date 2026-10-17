@@ -257,3 +257,21 @@ size_t transport_path_select_physical(const path_t *paths, size_t num_paths,
   }
   return SIZE_MAX;
 }
+
+size_t
+transport_path_get_eligible_by_local(quicly_conn_t *quic,
+                                     const struct sockaddr_storage *local,
+                                     quicly_path_stats_t *stats) {
+  if (!quic || !local || !stats)
+    return SIZE_MAX;
+  for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+    quicly_path_health_t health;
+    if (quicly_get_path_stats(quic, path, stats) == 0 &&
+        transport_path_matches_local(stats, local) &&
+        quicly_is_path_available(quic, path) &&
+        (quicly_get_path_health(quic, path, &health) != 0 ||
+         health.state != QUICLY_PATH_SUSPECT))
+      return path;
+  }
+  return SIZE_MAX;
+}
