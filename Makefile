@@ -22,12 +22,17 @@ endif
 # Default CFLAGS for our code
 CFLAGS ?= -O2
 CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
-# Match the codec libraries' optimization settings only for their own sources.
-# These follow CFLAGS; override FEC_CFLAGS for debug/sanitizer builds. Native
-# CPU targeting is opt-in: FEC_NATIVE_CFLAGS=-march=native. Clean when changing
-# flags, since Make does not track compiler command lines as dependencies.
+# CODEC_TARGET=portable disables native nanorq/shared OBL targeting.
+# Keep explicit FEC_NATIVE_CFLAGS and NANORQ_NATIVE_CFLAGS overrides supported.
+CODEC_TARGET ?= native
+ifneq ($(CODEC_TARGET),native)
+ifneq ($(CODEC_TARGET),portable)
+$(error CODEC_TARGET must be native or portable)
+endif
+endif
 FEC_CFLAGS ?= -O3 -funroll-loops -ftree-vectorize
 FEC_NATIVE_CFLAGS ?=
+NANORQ_NATIVE_CFLAGS ?= $(if $(filter native,$(CODEC_TARGET)),-march=native)
 # Quicly's encoder capacity helpers intentionally perform arithmetic from a
 # null base pointer. Exclude that one UBSan check while retaining ASan and all
 # other undefined-behavior checks across qlinq and its linked dependencies.
@@ -93,6 +98,9 @@ IFMON_SRCS = src/common/ifmon.c
 
 QUICLY_OBJS = $(QUICLY_SRCS:.c=.o)
 NANORQ_OBJS = $(NANORQ_SRCS:.c=.o)
+# nanorq shares linked obl kernels with nanors
+NANORQ_CODEC_OBJS = $(NANORQ_OBJS) deps/nanors/deps/obl/oblas_common.o \
+                   deps/nanors/deps/obl/oblas_lite.o
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
@@ -139,21 +147,43 @@ FEC_OBJS = src/common/fec.o \
            $(NANORQ_OBJS) \
            $(PATHFLOW_OBJS)
 
+# Change the stamp only when effective build inputs change. All objects then
+# rebuild together, including tests that include implementations directly.
+define BUILD_CONFIG
+CC=$(CC)
+AR=$(AR)
+CFLAGS=$(CFLAGS)
+CFLAGS_COMMON=$(CFLAGS_COMMON)
+DEPFLAGS=$(DEPFLAGS)
+INCLUDES=$(INCLUDES)
+FEC_CFLAGS=$(FEC_CFLAGS)
+FEC_NATIVE_CFLAGS=$(FEC_NATIVE_CFLAGS)
+NANORQ_NATIVE_CFLAGS=$(NANORQ_NATIVE_CFLAGS)
+WITH_FUSION=$(WITH_FUSION)
+FUSION_CFLAGS=$(FUSION_CFLAGS)
+LDFLAGS=$(LDFLAGS)
+TRANSPORT_OBJS=$(TRANSPORT_OBJS)
+endef
+
+.build-config: FORCE
+	$(file >$@.tmp,$(BUILD_CONFIG))
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
 # Rules to compile our source files with full warnings
-src/%.o: src/%.c
+src/%.o: src/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
-examples/%.o: examples/%.c
+examples/%.o: examples/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
-t/%.o: t/%.c
+t/%.o: t/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
 # Rule to compile third-party deps and suppress all warnings with -w
 
 deps/nanors/%.o deps/nanorq/%.o: private CODEC_CFLAGS = $(FEC_CFLAGS) $(FEC_NATIVE_CFLAGS)
 
-deps/%.o: deps/%.c
+deps/%.o: deps/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(CODEC_CFLAGS) -w -c $< -o $@
 
 all: qlinqd qlinq-app qlinq-tund qlinq-tun
@@ -173,7 +203,10 @@ src/common/transport_tls.o t/00util/test_crypto_backend.o: tmp/fusion-config Mak
 deps/quicly/deps/picotls/lib/fusion.o: deps/quicly/deps/picotls/lib/fusion.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(FUSION_CFLAGS) -w -c $< -o $@
 
-libqlinq.a: $(TRANSPORT_OBJS)
+$(NANORQ_CODEC_OBJS): private CODEC_CFLAGS = $(FEC_CFLAGS) $(NANORQ_NATIVE_CFLAGS) -fstack-protector-strong
+$(NANORQ_CODEC_OBJS): Makefile deps/nanorq/Makefile
+
+libqlinq.a: $(TRANSPORT_OBJS) .build-config
 	rm -f $@.tmp
 	$(AR) rcs $@.tmp $(TRANSPORT_OBJS)
 	mv $@.tmp $@
@@ -302,7 +335,7 @@ check-sanitize:
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	$(MAKE) check CC=clang CFLAGS="$(SANITIZER_FLAGS)" \
-		FEC_CFLAGS="$(SANITIZER_FLAGS)" FEC_NATIVE_CFLAGS= \
+		FEC_CFLAGS="$(SANITIZER_FLAGS)" FEC_NATIVE_CFLAGS= NANORQ_NATIVE_CFLAGS= \
 		LDFLAGS="$(SANITIZER_FLAGS) $(LDFLAGS)"
 
 soak: t/00util/test_operational t/00util/test_transport \

@@ -20,6 +20,11 @@ git submodule update --init --recursive
 make
 ```
 
+The default build uses native CPU targeting for nanorq and its shared OBL
+kernels. Use `make CODEC_TARGET=portable` for binaries intended for other CPUs.
+Changes to compiler, flags, codec targeting or `WITH_FUSION` rebuild objects
+through a configuration stamp; `libqlinq.a` is recreated when its members change.
+
 This produces the following tools and an embeddable transport library:
 
 - `qlinqd`: The background peer-to-peer network daemon.

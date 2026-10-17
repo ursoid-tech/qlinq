@@ -6,6 +6,9 @@ qlinq-tun
 qlinq-tun-engine
 qlinq-cast
 libqlinq.a
+/.build-config
+/.build-config.tmp
+/libqlinq.a.tmp
 t/00util/test_fec
 t/00util/test_transport
 t/00util/test_uds
@@ -24,9 +27,11 @@ t/00util/test_benchmark
 t/00util/test_rateless_benchmark
 t/00util/test_tc_benchmark
 t/00util/test_multipath
+t/00util/test_multipath_failover
 t/00util/test_multipath_nack
 t/00util/test_operational
 t/00util/test_tls
+t/00util/test_crypto_backend
 t/assets/
 *.o
 *.d
@@ -54,6 +59,7 @@ crash-*
 examples/data_multipath_benchmark
 examples/transit_benchmark
 examples/transit_udp_calibration
+examples/__pycache__/
 tmp/
 .tmp.dprobes.h
 
@@ -97,3 +103,6 @@ __pycache__/
 *.py[cod]
 qlinq-tun-engine
 /dist/
+
+/t/00util/test_udp_receive
+/t/00util/test_qlinq_policy
