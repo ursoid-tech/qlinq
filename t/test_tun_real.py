@@ -56,6 +56,22 @@ def main():
                     time.sleep(0.1)
                 raise RuntimeError(f"{name}: no authenticated connection: {status}")
 
+            def wait_traffic(label):
+                # A remaining path may still be recovering from the earlier
+                # blackhole. Allow its backed-off PTO probes (or idle timeout
+                # and reconnect) to restore traffic within a bounded window.
+                started = time.monotonic()
+                for _ in range(20):
+                    probe = subprocess.run([*ns, "ping", "-c", "1", "-W", "1",
+                                            "10.88.0.1"], capture_output=True,
+                                           text=True, timeout=2)
+                    if probe.returncode == 0:
+                        print(f"{label} recovered in {time.monotonic() - started:.2f}s")
+                        return
+                    time.sleep(0.2)
+                raise AssertionError(f"traffic did not recover after {label}: "
+                                     f"{probe.stdout}\n{probe.stderr}")
+
             cli("init", "server", "--listen", "172.30.77.1:19888", "--uplink", "veth_a",
                 "--interface", "qt_a", "--run-as", "nobody")
             cli("init", "client", "--invite", directory / "server/invite.json",
@@ -133,8 +149,7 @@ def main():
                 finally:
                     run("tc", "qdisc", "del", "dev", "veth_b", "root", prefix=ns)
                 run("ip", "link", "del", "veth_d")
-                time.sleep(0.5)
-                run("ping", "-c", "2", "-W", "2", "10.88.0.1", prefix=ns)
+                wait_traffic("Secondary uplink removal")
                 # Uplink outage and return must recover without restarting the app.
                 run("ip", "link", "set", "veth_b", "down", prefix=ns)
                 time.sleep(1)
@@ -142,17 +157,7 @@ def main():
                 # A total-path outage may require the 10-second QUIC idle
                 # timeout followed by reconnect. Verify traffic, not a stale
                 # authenticated-state snapshot from the old connection.
-                recovered = False
-                started = time.monotonic()
-                for _ in range(20):
-                    probe_result = subprocess.run([*ns, "ping", "-c", "1", "-W", "1",
-                                                   "10.88.0.1"], capture_output=True)
-                    if probe_result.returncode == 0:
-                        recovered = True
-                        break
-                    time.sleep(0.2)
-                assert recovered, "traffic did not recover after total uplink outage"
-                print(f"Total uplink outage recovered in {time.monotonic() - started:.2f}s")
+                wait_traffic("Total uplink outage")
             finally:
                 for name, is_client in (("server", False), ("client", True)):
                     try:

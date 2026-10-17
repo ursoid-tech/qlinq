@@ -359,6 +359,35 @@ static void copy_interface_name(char destination[64], const char *name) {
   destination[63] = '\0';
 }
 
+static int qlinq_path_is_eligible(quicly_path_scheduler_t *scheduler,
+                                  quicly_conn_t *quic, size_t path_index) {
+  (void)scheduler;
+  transport_conn_t *conn = *(transport_conn_t **)quicly_get_data(quic);
+  quicly_tuple_t tuple;
+  if (!conn || !conn->transport ||
+      quicly_get_path_tuple(quic, path_index, &tuple) != 0)
+    return 0;
+  transport_t *t = conn->transport;
+  for (size_t i = 0; i < t->socket_count; i++)
+    if (transport_address_equal(
+            (const struct sockaddr *)&t->sockets[i].local_addr,
+            &tuple.address.local.sa))
+      return 1;
+  return 0;
+}
+
+static void abandon_removed_paths(transport_conn_t *conn) {
+  /* closing a socket must retire its QUIC paths and notify peer */
+  for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+    quicly_path_health_t health;
+    if (quicly_get_path_health(conn->quic, path, &health) != 0 ||
+        health.abandoned || qlinq_path_is_eligible(NULL, conn->quic, path))
+      continue;
+    (void)quicly_abandon_path(conn->quic, health.path_id,
+                              QUICLY_PATH_ABANDON_ERROR_APPLICATION);
+  }
+}
+
 static void refresh_scheduler_paths(transport_conn_t *conn) {
   transport_t *t = conn->transport;
   conn->scheduler_paths = 0;
@@ -527,7 +556,8 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
 }
 
 static quicly_path_scheduler_t qlinq_path_scheduler = {
-    .do_send = qlinq_path_scheduler_send};
+    .do_send = qlinq_path_scheduler_send,
+    .is_path_eligible = qlinq_path_is_eligible};
 
 static socklen_t ifmon_socket_address(struct sockaddr_storage *out,
                                       const ifmon_addr_t *address,
@@ -1689,6 +1719,7 @@ static void service_connections(transport_t *t, uint64_t now) {
     if (!conn->quic_ready && quicly_connection_is_ready(conn->quic)) {
       conn->quic_ready = true;
     }
+    abandon_removed_paths(conn);
     try_open_pending_paths(t, conn, now);
     if (conn->quic_ready)
       (void)transport_protocol_send_hello(conn);

@@ -125,6 +125,30 @@ static void drain_qlog(int log_fd) {
   }
 }
 
+static bool removed_paths_retired(transport_conn_t *conn) {
+  transport_t *t = conn->transport;
+  for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+    quicly_path_stats_t stats;
+    quicly_path_health_t health;
+    if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
+        quicly_get_path_health(conn->quic, path, &health) != 0)
+      continue;
+    bool has_socket = false;
+    for (size_t i = 0; i < t->socket_count; i++)
+      has_socket |=
+          transport_path_matches_local(&stats, &t->sockets[i].local_addr);
+    if (!has_socket &&
+        (!health.abandoned || !t->quic_ctx.path_scheduler->is_path_eligible ||
+         t->quic_ctx.path_scheduler->is_path_eligible(
+             t->quic_ctx.path_scheduler, conn->quic, path))) {
+      fprintf(stderr, "removed path %zu remained eligible or unretired\n",
+              path);
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool test_single_remote_fanout(void) {
   test_state_t server_state = {0};
   test_state_t client_state = {0};
@@ -721,8 +745,10 @@ int main(void) {
   }
   transport_path_stats_t removed_path_stats = {0};
   if (transport_get_path_stats(server, 3, &removed_path_stats) ||
-      transport_get_path_stats(client, 3, &removed_path_stats)) {
-    fprintf(stderr, "removed interface remained scheduler-visible\n");
+      transport_get_path_stats(client, 3, &removed_path_stats) ||
+      !removed_paths_retired(server_state.conn) ||
+      !removed_paths_retired(client_state.conn)) {
+    fprintf(stderr, "removed interface remained QUIC- or scheduler-visible\n");
     close(log_fd);
     transport_destroy(client);
     transport_destroy(server);

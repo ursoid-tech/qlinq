@@ -94,6 +94,11 @@ t/00util/test_stream_budget
 /t/00util/test_flexicast_transport
 /t/00util/test_qlinq_api
 /t/00util/test_quicly_flexicast
+/t/00util/test_recovery_schedule
+/t/00util/test_rx_cadence
+/t/00util/test_rx_cadence_backlog
+/t/00util/test_rx_cadence_real
+/t/00util/test_service_schedule
 
 # Isolated validation snapshots
 /.work/
