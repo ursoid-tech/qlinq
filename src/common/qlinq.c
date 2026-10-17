@@ -54,6 +54,10 @@ struct qlinq_endpoint {
   uint8_t *shared_secret;
   size_t shared_secret_size;
   uint64_t records_received;
+  uint64_t record_events_queued;
+  uint64_t record_payload_bytes_copied;
+  uint64_t record_callbacks_accepted;
+  uint64_t record_callbacks_rejected;
   bool service_pending;
   bool listener;
   bool active;
@@ -68,6 +72,8 @@ typedef struct {
 struct qlinq_context {
   pthread_t owner_thread;
   bool in_log;
+  bool in_record_callback;
+  bool record_callback_delivered;
   qlinq_endpoint_t *endpoints;
   qlinq_event_node_t *event_head;
   qlinq_event_node_t *event_tail;
@@ -77,6 +83,8 @@ struct qlinq_context {
   size_t max_queued_event_bytes;
   qlinq_log_callback_t log_callback;
   void *log_user_data;
+  qlinq_record_callback_t record_callback;
+  void *record_user_data;
   qlinq_status_t last_status;
   struct pollfd *poll_fds;
   qlinq_endpoint_poll_t *endpoint_polls;
@@ -100,7 +108,7 @@ _Static_assert((int)QLINQ_PACING_ENABLED == TRANSPORT_PACING_ENABLED,
 
 static bool context_access(const qlinq_context_t *context) {
   return context && pthread_equal(context->owner_thread, pthread_self()) &&
-         !context->in_log;
+         !context->in_log && !context->in_record_callback;
 }
 
 static bool endpoint_access(const qlinq_endpoint_t *endpoint) {
@@ -169,6 +177,18 @@ static qlinq_stream_t *find_stream(qlinq_endpoint_t *endpoint,
 static void set_status(qlinq_context_t *context, qlinq_status_t status) {
   if (context)
     context->last_status = status;
+}
+
+static void increment_counter(uint64_t *counter) {
+  if (*counter != UINT64_MAX)
+    (*counter)++;
+}
+
+static void add_counter(uint64_t *counter, size_t value) {
+  if (value > UINT64_MAX - *counter)
+    *counter = UINT64_MAX;
+  else
+    *counter += value;
 }
 
 static void on_transport_log(void *user_data,
@@ -324,10 +344,10 @@ static void fill_event_stream(qlinq_event_t *event, const moq_track_id_t *track,
   event->stream_name[sizeof(event->stream_name) - 1U] = '\0';
 }
 
-static bool queue_record(qlinq_endpoint_t *endpoint, transport_conn_t *conn,
-                         const moq_track_id_t *track,
-                         const moq_object_t *object, const uint8_t *data,
-                         size_t size) {
+static bool deliver_record(qlinq_endpoint_t *endpoint, transport_conn_t *conn,
+                           const moq_track_id_t *track,
+                           const moq_object_t *object, const uint8_t *data,
+                           size_t size) {
   qlinq_stream_t *stream = find_stream(endpoint, track, QLINQ_STREAM_SUBSCRIBE);
   if (!stream)
     return true;
@@ -343,19 +363,36 @@ static bool queue_record(qlinq_endpoint_t *endpoint, transport_conn_t *conn,
                          .status = QLINQ_STATUS_OK};
   fill_event_stream(&event, track, stream);
 
-  bool queued = queue_event(endpoint->context, &event, event.record.data,
-                            event.record.size, NULL);
-  if (queued) {
-    endpoint->records_received++;
-    stream->records_received++;
+  qlinq_context_t *context = endpoint->context;
+  if (context->record_callback) {
+    context->in_record_callback = true;
+    bool accepted = context->record_callback(context->record_user_data, &event);
+    context->in_record_callback = false;
+    context->record_callback_delivered = true;
+    if (!accepted) {
+      increment_counter(&endpoint->record_callbacks_rejected);
+      return false;
+    }
+    increment_counter(&endpoint->record_callbacks_accepted);
+  } else {
+    if (!queue_event(context, &event, event.record.data, event.record.size,
+                     NULL))
+      return false;
+    increment_counter(&endpoint->record_events_queued);
+    add_counter(&endpoint->record_payload_bytes_copied, event.record.size);
   }
-  return queued;
+  increment_counter(&endpoint->records_received);
+  increment_counter(&stream->records_received);
+  return true;
 }
 
 static void reject_received_record(qlinq_endpoint_t *endpoint,
                                    const transport_event_t *source,
                                    const char *reason) {
   queue_error(endpoint, QLINQ_STATUS_RESOURCE_LIMIT, reason);
+  /* Error-event admission can fail under the same pressure. The receiver's
+   * rejection remains observable through this service call either way. */
+  set_status(endpoint->context, QLINQ_STATUS_RESOURCE_LIMIT);
   if ((source->track_id.flags &
        (MOQ_TRACK_FLAG_RELIABLE | MOQ_TRACK_FLAG_FEC_ENABLED |
         MOQ_TRACK_FLAG_FEC_RATELESS)) != 0) {
@@ -376,11 +413,13 @@ static void queue_received_object(qlinq_endpoint_t *endpoint,
       (source->track_id.flags &
        (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
   if (!grouped_data) {
-    if (!queue_record(endpoint, source->conn, &source->track_id,
-                      &source->object, source->object.data,
-                      source->object.size))
+    if (!deliver_record(endpoint, source->conn, &source->track_id,
+                        &source->object, source->object.data,
+                        source->object.size))
       reject_received_record(endpoint, source,
-                             "unable to queue received record");
+                             endpoint->context->record_callback
+                                 ? "record callback rejected received record"
+                                 : "unable to queue received record");
     return;
   }
 
@@ -399,10 +438,12 @@ static void queue_received_object(qlinq_endpoint_t *endpoint,
                   "malformed grouped record length");
       return;
     }
-    if (!queue_record(endpoint, source->conn, &source->track_id,
-                      &source->object, data, size)) {
+    if (!deliver_record(endpoint, source->conn, &source->track_id,
+                        &source->object, data, size)) {
       reject_received_record(endpoint, source,
-                             "unable to queue recovered record");
+                             endpoint->context->record_callback
+                                 ? "record callback rejected recovered record"
+                                 : "unable to queue recovered record");
       return;
     }
   }
@@ -717,6 +758,8 @@ qlinq_context_t *qlinq_context_create(const qlinq_context_config_t *config) {
           : QLINQ_DEFAULT_EVENT_BYTES;
   context->log_callback = config ? config->log_callback : NULL;
   context->log_user_data = config ? config->log_user_data : NULL;
+  context->record_callback = config ? config->record_callback : NULL;
+  context->record_user_data = config ? config->record_user_data : NULL;
   if (context->max_queued_events == 0 ||
       context->max_queued_event_bytes < sizeof(qlinq_event_node_t) ||
       portable_socket_init() != 0) {
@@ -1198,6 +1241,7 @@ qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
   if (context->event_head)
     return context->last_status < 0 ? context->last_status : QLINQ_STATUS_OK;
   set_status(context, QLINQ_STATUS_OK);
+  context->record_callback_delivered = false;
 
   size_t endpoint_count = count_active_endpoints(context);
   if (endpoint_count == 0) {
@@ -1272,6 +1316,10 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
       .reconnect_failed = transport_stats.reconnect_failed,
       .protocol_errors = transport_stats.protocol_errors,
       .records_received = endpoint->records_received,
+      .record_events_queued = endpoint->record_events_queued,
+      .record_payload_bytes_copied = endpoint->record_payload_bytes_copied,
+      .record_callbacks_accepted = endpoint->record_callbacks_accepted,
+      .record_callbacks_rejected = endpoint->record_callbacks_rejected,
       .fec_objects_recovered = transport_stats.fec_objects_recovered,
       .fec_objects_lost = transport_stats.fec_objects_lost,
       .repair_requests_sent = transport_stats.repair_requests_sent,

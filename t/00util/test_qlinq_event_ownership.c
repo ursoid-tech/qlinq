@@ -390,10 +390,91 @@ cleanup:
   return failed;
 }
 
+typedef struct {
+  qlinq_context_t *context;
+  const uint8_t *payload;
+  size_t size;
+  uint64_t group_id, sequence;
+  size_t calls;
+  bool accept, valid;
+} callback_audit_t;
+
+static bool audit_record_callback(void *user_data, const qlinq_event_t *event) {
+  callback_audit_t *audit = user_data;
+  audit->valid &= event && event->type == QLINQ_EVENT_RECORD &&
+                  event->record.data == audit->payload &&
+                  event->record.size == audit->size &&
+                  event->record.group_id == audit->group_id &&
+                  event->record.sequence == audit->sequence &&
+                  event->_private == NULL;
+  /* The delivering context is unavailable while the borrowed event is live. */
+  audit->valid &=
+      qlinq_service(audit->context, 0) == QLINQ_STATUS_STATE &&
+      qlinq_context_last_status(audit->context) == QLINQ_STATUS_INVALID;
+  audit->calls++;
+  return audit->accept;
+}
+
+static int borrowed_callback_bridge(void) {
+  int failed = 0;
+  uint8_t payload[] = {1, 2, 3, 4};
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA, .name = "callback"};
+  transport_conn_t *connection = (transport_conn_t *)(uintptr_t)1;
+  callback_audit_t audit = {.payload = payload,
+                            .size = sizeof(payload),
+                            .group_id = 7,
+                            .sequence = 9,
+                            .accept = true,
+                            .valid = true};
+  qlinq_context_config_t config = {.record_callback = audit_record_callback,
+                                   .record_user_data = &audit};
+  qlinq_context_t *context = qlinq_context_create(&config);
+  qlinq_endpoint_t endpoint = {.context = context};
+  qlinq_stream_t stream = {.endpoint = &endpoint,
+                           .track = track,
+                           .direction = QLINQ_STREAM_SUBSCRIBE,
+                           .state = QLINQ_STREAM_OPEN};
+  qlinq_peer_state_t peer = {.connection = connection, .id = 11};
+  moq_object_t object = {.group_id = audit.group_id,
+                         .object_id = audit.sequence,
+                         .data = payload,
+                         .size = sizeof(payload)};
+  CHECK(context);
+  audit.context = context;
+  endpoint.streams = &stream;
+  endpoint.peers = &peer;
+  CHECK(deliver_record(&endpoint, connection, &track, &object, payload,
+                       sizeof(payload)));
+  CHECK(audit.valid && audit.calls == 1 && endpoint.records_received == 1 &&
+        stream.records_received == 1 && endpoint.record_events_queued == 0 &&
+        endpoint.record_payload_bytes_copied == 0 &&
+        endpoint.record_callbacks_accepted == 1 &&
+        endpoint.record_callbacks_rejected == 0 && context->event_head == NULL);
+
+  audit.accept = false;
+  transport_event_t source = {.type = TRANSPORT_EVENT_OBJECT,
+                              .conn = connection,
+                              .track_id = track,
+                              .object = object};
+  queue_received_object(&endpoint, &source);
+  CHECK(audit.valid && audit.calls == 2 && endpoint.records_received == 1 &&
+        endpoint.record_callbacks_accepted == 1 &&
+        endpoint.record_callbacks_rejected == 1 &&
+        qlinq_context_last_status(context) == QLINQ_STATUS_RESOURCE_LIMIT);
+  qlinq_event_t error = {0};
+  CHECK(qlinq_next_event(context, &error));
+  CHECK(error.type == QLINQ_EVENT_ERROR &&
+        error.status == QLINQ_STATUS_RESOURCE_LIMIT);
+  qlinq_event_release(&error);
+cleanup:
+  qlinq_context_destroy(context);
+  return failed;
+}
+
 int main(void) {
   for (size_t i = 0; i < 100; ++i)
     if (count_and_ownership() || bytes_and_message() ||
-        writable_notifications())
+        writable_notifications() || borrowed_callback_bridge())
       return 1;
   if (service_progress())
     return 1;

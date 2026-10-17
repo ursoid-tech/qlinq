@@ -7,8 +7,8 @@
  * publish or subscribe to named streams on an endpoint. No stream operation
  * starts a private worker thread; the creating thread drives progress with
  * qlinq_service(). All context/endpoint/stream operations use the creating
- * thread. Logging callbacks must not call the API. Closed endpoint and stream
- * handles remain valid until context destruction.
+ * thread. Logging and experimental record callbacks must not call the API.
+ * Closed endpoint and stream handles remain valid until context destruction.
  */
 
 #ifndef QLINQ_H
@@ -29,6 +29,7 @@ extern "C" {
 typedef struct qlinq_context qlinq_context_t;
 typedef struct qlinq_endpoint qlinq_endpoint_t;
 typedef struct qlinq_stream qlinq_stream_t;
+typedef struct qlinq_event qlinq_event_t;
 
 typedef enum {
   QLINQ_STATUS_OK = 0,
@@ -96,6 +97,15 @@ typedef struct {
 
 typedef void (*qlinq_log_callback_t)(void *user_data,
                                      const qlinq_log_event_t *event);
+
+/* Experimental synchronous record delivery. The event and its record payload
+ * are borrowed and valid only for this call. The callback must consume or copy
+ * them before returning, must not release the event, and must not call QLINQ.
+ * The context owner thread invokes the callback from qlinq_service(). Return
+ * true after consuming the record; false applies the normal resource-limit
+ * rejection policy for the delivery mode. */
+typedef bool (*qlinq_record_callback_t)(void *user_data,
+                                        const qlinq_event_t *event);
 
 typedef struct {
   /* Zero selects the documented transport default for every limit. */
@@ -175,6 +185,9 @@ typedef struct {
   /* Log strings are borrowed and valid only during the callback. */
   qlinq_log_callback_t log_callback;
   void *log_user_data;
+  /* Experimental opt-in alternative to queued QLINQ_EVENT_RECORD events. */
+  qlinq_record_callback_t record_callback;
+  void *record_user_data;
 } qlinq_context_config_t;
 
 typedef struct {
@@ -232,7 +245,7 @@ typedef struct {
   const char *reason;
 } qlinq_disconnect_t;
 
-typedef struct {
+struct qlinq_event {
   qlinq_event_type_t type;
   qlinq_endpoint_t *endpoint;
   qlinq_stream_t *stream;
@@ -246,7 +259,7 @@ typedef struct {
   const char *message;
   /* Private ownership token used by qlinq_event_release(). */
   void *_private;
-} qlinq_event_t;
+};
 
 typedef struct {
   uint64_t connections_accepted;
@@ -257,6 +270,12 @@ typedef struct {
   uint64_t reconnect_failed;
   uint64_t protocol_errors;
   uint64_t records_received;
+  /* Public receive-bridge totals. queued/copy fields count successful queued
+   * records only; callback fields count synchronous record callbacks only. */
+  uint64_t record_events_queued;
+  uint64_t record_payload_bytes_copied;
+  uint64_t record_callbacks_accepted;
+  uint64_t record_callbacks_rejected;
   uint64_t fec_objects_recovered;
   uint64_t fec_objects_lost;
   uint64_t repair_requests_sent;
@@ -381,8 +400,9 @@ qlinq_send_result_t qlinq_stream_send(qlinq_stream_t *stream,
                                       const qlinq_record_t *record);
 
 /* Drives network and timer progress for at most timeout_ms. A negative timeout
- * waits until network/timer activity. Pending events make this return
- * immediately. No application callback is made from another thread. */
+ * waits until network/timer activity. Pending events and synchronous record
+ * callbacks make this return immediately. No application callback is made from
+ * another thread. */
 qlinq_status_t qlinq_service(qlinq_context_t *context, int timeout_ms);
 
 /* wake for one application fd (poll event bits). the fd is borrowed;

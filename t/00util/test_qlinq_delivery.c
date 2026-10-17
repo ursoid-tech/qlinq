@@ -5,11 +5,45 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+  qlinq_context_t *context;
+  qlinq_endpoint_t *endpoint;
+  qlinq_stream_t *stream;
+  const uint8_t *payload;
+  size_t payload_size;
+  qlinq_delivery_t delivery;
+  qlinq_content_type_t content;
+  size_t received;
+  bool valid;
+} callback_state_t;
+
+static bool receive_callback(void *user_data, const qlinq_event_t *event) {
+  callback_state_t *state = user_data;
+  state->valid &=
+      event && event->type == QLINQ_EVENT_RECORD &&
+      event->stream == state->stream && event->delivery == state->delivery &&
+      event->content_type == state->content &&
+      event->record.size == state->payload_size &&
+      memcmp(event->record.data, state->payload, state->payload_size) == 0;
+  /* The borrowed event is delivered with this context's API guarded. */
+  state->valid &= qlinq_service(state->context, 0) == QLINQ_STATUS_STATE;
+  qlinq_endpoint_stats_t stats;
+  state->valid &= !qlinq_endpoint_get_stats(state->endpoint, &stats);
+  state->received++;
+  return true;
+}
+
 /* Exercise the public event boundary: transport-only tests cannot detect a
  * received object's descriptor no longer matching its application stream. */
-static int run_delivery(qlinq_delivery_t delivery,
-                        qlinq_content_type_t content) {
-  qlinq_context_t *context = qlinq_context_create(NULL);
+static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
+                        bool callback_delivery) {
+  callback_state_t callback = {
+      .delivery = delivery, .content = content, .valid = true};
+  qlinq_context_config_t context_config = {
+      .record_callback = callback_delivery ? receive_callback : NULL,
+      .record_user_data = callback_delivery ? &callback : NULL};
+  qlinq_context_t *context =
+      qlinq_context_create(callback_delivery ? &context_config : NULL);
   if (!context)
     return 1;
   int failed = 1;
@@ -81,7 +115,12 @@ static int run_delivery(qlinq_delivery_t delivery,
   bool finite =
       content == QLINQ_CONTENT_DATA && (delivery == QLINQ_DELIVERY_FIXED_FEC ||
                                         delivery == QLINQ_DELIVERY_RATELESS);
-  bool received = false;
+  callback.context = context;
+  callback.endpoint = client;
+  callback.stream = subscriber;
+  callback.payload = payload;
+  callback.payload_size = sizeof(payload);
+  bool received = false, saw_queued_record = false;
   for (size_t attempt = 0; attempt < 500 && !received; attempt++) {
     if (qlinq_service(context, -1) < QLINQ_STATUS_OK)
       goto Exit;
@@ -89,8 +128,9 @@ static int run_delivery(qlinq_delivery_t delivery,
     while (qlinq_next_event(context, &event)) {
       bool valid = true;
       if (event.type == QLINQ_EVENT_RECORD) {
-        valid = event.stream == subscriber && event.delivery == delivery &&
-                event.content_type == content &&
+        saw_queued_record = true;
+        valid = !callback_delivery && event.stream == subscriber &&
+                event.delivery == delivery && event.content_type == content &&
                 (finite || (event.record.sequence == 23 &&
                             event.record.group_id == 17)) &&
                 event.record.size == sizeof(payload) &&
@@ -101,12 +141,29 @@ static int run_delivery(qlinq_delivery_t delivery,
       if (!valid)
         goto Exit;
     }
+    if (callback_delivery && callback.received != 0)
+      received = callback.valid;
   }
-  failed = !received;
+  qlinq_endpoint_stats_t stats;
+  if (!qlinq_endpoint_get_stats(client, &stats))
+    goto Exit;
+  if (callback_delivery)
+    failed = !received || saw_queued_record || !callback.valid ||
+             stats.records_received != callback.received ||
+             stats.record_events_queued != 0 ||
+             stats.record_payload_bytes_copied != 0 ||
+             stats.record_callbacks_accepted != callback.received ||
+             stats.record_callbacks_rejected != 0;
+  else
+    failed = !received || stats.record_events_queued != 1 ||
+             stats.record_payload_bytes_copied != sizeof(payload) ||
+             stats.record_callbacks_accepted != 0 ||
+             stats.record_callbacks_rejected != 0;
 Exit:
   qlinq_context_destroy(context);
   if (failed)
-    fprintf(stderr, "delivery failed: mode=%d content=%d\n", delivery, content);
+    fprintf(stderr, "delivery failed: mode=%d content=%d callback=%d\n",
+            delivery, content, callback_delivery);
   return failed;
 }
 
@@ -208,8 +265,9 @@ int main(void) {
                                           QLINQ_CONTENT_VIDEO};
   for (size_t c = 0; c < sizeof(content) / sizeof(content[0]); c++)
     for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++)
-      if (run_delivery(modes[m], content[c]))
-        return 1;
+      for (size_t callback = 0; callback < 2; callback++)
+        if (run_delivery(modes[m], content[c], callback != 0))
+          return 1;
   puts("===QLINQ DELIVERY MATRIX OK===");
   return 0;
 }

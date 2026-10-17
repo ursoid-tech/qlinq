@@ -133,6 +133,25 @@ cannot be retained, the affected connection closes with a resource-limit error;
 plain datagram delivery can drop under pressure. A full queue may have no room
 for an error event, so applications must inspect service status as well.
 
+`qlinq_context_config_t.record_callback` is an experimental, opt-in receive
+mode for single-threaded consumers that can process each record from inside
+`qlinq_service`. When it is NULL, the owned queued-event behavior above is
+unchanged. When non-NULL, `QLINQ_EVENT_RECORD` is delivered synchronously to
+the callback and is absent from `qlinq_next_event`; peer, control, writable,
+loss, and error events remain queued.
+
+The callback event, record payload, and strings are borrowed and valid only
+during that callback. Do not retain their pointers, call `qlinq_event_release`,
+or call QLINQ through the delivering context while it runs. Copy data needed
+after return. A true callback result accepts the record. A false result drops a
+datagram record; reliable and FEC delivery closes the affected connection with
+the existing resource-limit error. Existing queue users retain their owned
+payloads until release, including after context destruction.
+
+Endpoint statistics separately expose successful queued record events and
+their copied payload bytes, accepted callbacks, and rejected callbacks. These
+are cumulative receive-bridge counts, not transport/FEC copy counts.
+
 FEC DATA publication uses the transport's existing grouped-record format.
 The API splits recovered groups into individual payload events without adding
 or interpreting a private record envelope. Consequently, received group and
@@ -157,10 +176,12 @@ handshakes. Closing an endpoint closes its stream handles. Closed handles remain
 allocated until `qlinq_context_destroy`, which releases endpoints, streams and
 unpopped events.
 
-All context, endpoint and stream operations use the creating thread. Logging
-callbacks execute synchronously and must not call the API. Cross-thread access
-and API calls from logging callbacks are rejected. An independently owned,
-popped event can be transferred to another thread for consumption and release.
+All context, endpoint and stream operations use the creating thread. QLINQ does
+not create worker threads or perform multi-core receive processing. Logging and
+experimental record callbacks execute synchronously on that creating thread.
+Cross-thread access and calls through the delivering context from either
+callback are rejected. An independently owned, popped event can be transferred
+to another thread for consumption and release.
 
 This interface covers unicast use. It does not expose multicast configuration,
 listener-initiated mesh connections, or finite-transfer finish/drain/abort
