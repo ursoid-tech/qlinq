@@ -1,6 +1,7 @@
 /* examples/data_multipath_benchmark.c */
 
 #include "transport.h"
+#include "transport_internal.h" /* benchmark-only native ABBA selection */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -12,8 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_PACKETS 524288
-#define MAX_FPS 50000
+#define BENCHMARK_MAX_PACKETS 1048576
+#define BENCHMARK_MAX_FPS 100000
 #define PACKET_SIZE 8000 /* 8KB general data payload */
 #define BENCHMARK_STREAM_EGRESS_BYTES (32U * 1024U * 1024U)
 #define BENCHMARK_TOTAL_STREAM_EGRESS_BYTES (64U * 1024U * 1024U)
@@ -21,10 +22,12 @@
 #define BENCHMARK_RECOVERY_CACHE_MAX (128U * 1024U * 1024U)
 
 typedef struct {
+  double scheduled_time;
   double send_time;
   double recv_time;
   bool arrived;
   bool admitted;
+  bool attempted;
 } frame_metrics_t;
 
 typedef struct {
@@ -32,13 +35,14 @@ typedef struct {
   bool disconnected;
   bool subscribed;
   bool grouped;
-  frame_metrics_t packets[MAX_PACKETS];
+  frame_metrics_t packets[BENCHMARK_MAX_PACKETS];
   int frames_received;
   transport_t *transport;
 } benchmark_state_t;
 
 typedef struct {
   double all_active_at, sampled_at_ms, start_ms, end_ms;
+  double fixed_start_ms, fixed_end_ms;
   transport_path_stats_t start[4], end[4];
   bool started, interrupted;
 } path_window_t;
@@ -55,6 +59,9 @@ static void sample_path_window(transport_t *transport, size_t expected_paths,
                                double warmup_ms, path_window_t *window) {
   transport_path_stats_t current[4];
   double now = get_time_ms();
+  if (window->fixed_end_ms &&
+      (now < window->fixed_start_ms || now >= window->fixed_end_ms))
+    return;
   if (now - window->sampled_at_ms < 1)
     return;
   window->sampled_at_ms = now;
@@ -68,7 +75,7 @@ static void sample_path_window(transport_t *transport, size_t expected_paths,
   }
   if (window->all_active_at == 0)
     window->all_active_at = now;
-  if (now - window->all_active_at < warmup_ms)
+  if (!window->fixed_end_ms && now - window->all_active_at < warmup_ms)
     return;
   if (!window->started) {
     memcpy(window->start, current, expected_paths * sizeof(current[0]));
@@ -87,39 +94,87 @@ static int compare_latency(const void *a, const void *b) {
 static void report_window_delivery(const path_window_t *window,
                                    const benchmark_state_t *client,
                                    int packets_sent) {
-  if (!window->started || window->end_ms <= window->start_ms)
+  double start =
+      window->fixed_end_ms ? window->fixed_start_ms : window->start_ms;
+  double end = window->fixed_end_ms ? window->fixed_end_ms : window->end_ms;
+  if ((!window->fixed_end_ms && !window->started) || end <= start)
     return;
-  static double latencies[MAX_PACKETS];
+  static double latencies[BENCHMARK_MAX_PACKETS];
   double total_latency = 0;
   size_t sent = 0, admitted = 0, received = 0, completed_in_window = 0;
+  size_t attempted = 0, attempted_in_window = 0;
   for (int i = 0; i < packets_sent; i++) {
     const frame_metrics_t *packet = &client->packets[i];
-    if (packet->arrived && packet->recv_time >= window->start_ms &&
-        packet->recv_time < window->end_ms)
+    double offered_at =
+        window->fixed_end_ms ? packet->scheduled_time : packet->send_time;
+    if (packet->arrived && packet->recv_time >= start &&
+        packet->recv_time < end)
       completed_in_window++;
-    if (packet->send_time < window->start_ms ||
-        packet->send_time >= window->end_ms)
+    if (offered_at < start || offered_at >= end)
       continue;
     sent++;
+    attempted += packet->attempted;
+    attempted_in_window += packet->attempted && packet->send_time >= start &&
+                           packet->send_time < end;
     admitted += packet->admitted;
     if (packet->arrived) {
-      latencies[received] = packet->recv_time - packet->send_time;
+      /* fixed-time source measures latency from scheduled publication */
+      latencies[received] = packet->recv_time - offered_at;
       total_latency += latencies[received++];
     }
   }
   qsort(latencies, received, sizeof(latencies[0]), compare_latency);
   printf("window_offered: %zu\nwindow_admitted: %zu\nwindow_received: %zu\n",
          sent, admitted, received);
-  printf("window_goodput_mbps: %.3f\n",
-         completed_in_window * (double)PACKET_SIZE * 8 /
-             ((window->end_ms - window->start_ms) * 1000));
-  printf("window_duration_ms: %.3f\n", window->end_ms - window->start_ms);
+  printf("window_goodput_mbps: %.3f\n", completed_in_window *
+                                            (double)PACKET_SIZE * 8 /
+                                            ((end - start) * 1000));
+  printf("window_duration_ms: %.3f\n", end - start);
+  printf("window_completed_in_interval: %zu\n", completed_in_window);
   printf("window_mean_latency_ms: %.3f\n",
          received ? total_latency / received : 0);
   printf("window_p95_latency_ms: %.3f\n",
          received ? latencies[(received * 95 + 99) / 100 - 1] : 0);
   printf("window_p99_latency_ms: %.3f\n",
          received ? latencies[(received * 99 + 99) / 100 - 1] : 0);
+  if (window->fixed_end_ms) {
+    size_t count = 0;
+    for (int i = 0; i < packets_sent; i++) {
+      const frame_metrics_t *packet = &client->packets[i];
+      if (packet->scheduled_time >= start && packet->scheduled_time < end &&
+          packet->attempted)
+        latencies[count++] =
+            fmax(0, packet->send_time - packet->scheduled_time);
+    }
+    qsort(latencies, count, sizeof(latencies[0]), compare_latency);
+    printf("window_attempted: %zu\nwindow_attempted_in_interval: %zu\n"
+           "window_unattempted: %zu\nwindow_source_deadline_misses: %zu\n",
+           attempted, attempted_in_window, sent - attempted,
+           sent - attempted_in_window);
+    printf("window_source_p99_lateness_ms: %.3f\n"
+           "window_source_max_lateness_ms: %.3f\n",
+           count ? latencies[(count * 99 + 99) / 100 - 1] : 0,
+           count ? latencies[count - 1] : 0);
+    printf("window_source_mbps: %.3f\n", attempted_in_window *
+                                             (double)PACKET_SIZE * 8 /
+                                             ((end - start) * 1000));
+  }
+}
+
+/* invert cumulative linear-ramp schedule for scheduled record f */
+static double scheduled_offset_ms(int f, double fps, double warmup_fps,
+                                  double warmup_ms) {
+  if (warmup_fps > 0 && warmup_ms > 0) {
+    double seconds = warmup_ms / 1000;
+    double ramp_packets = (warmup_fps + fps) * seconds / 2;
+    if (f < ramp_packets) {
+      double slope = (fps - warmup_fps) / seconds;
+      return 2000.0 * f /
+             (warmup_fps + sqrt(warmup_fps * warmup_fps + 2 * slope * f));
+    }
+    return warmup_ms + (f - ramp_packets) * 1000.0 / fps;
+  }
+  return f * 1000.0 / fps;
 }
 
 static double numeric_argument(const char *text, double minimum,
@@ -133,6 +188,47 @@ static double numeric_argument(const char *text, double minimum,
     exit(2);
   }
   return value;
+}
+
+static int named_argument(const char *value, const char *const *names,
+                          size_t count) {
+  for (size_t i = 0; i < count; i++)
+    if (strcmp(value, names[i]) == 0)
+      return (int)i;
+  fprintf(stderr, "invalid selection: %s\n", value);
+  exit(2);
+}
+
+static bool select_cipher(transport_t *transport, int cipher,
+                          ptls_cipher_suite_t **selected, size_t capacity) {
+  if (!cipher)
+    return true;
+  uint16_t id = cipher == 1 ? PTLS_CIPHER_SUITE_AES_128_GCM_SHA256
+                            : PTLS_CIPHER_SUITE_AES_256_GCM_SHA384;
+  ptls_cipher_suite_t **available = transport->tls_ctx.cipher_suites;
+  for (ptls_cipher_suite_t **suite = available; *suite != NULL; suite++) {
+    if ((*suite)->id == id) {
+      selected[0] = *suite;
+      size_t count = 1;
+      for (ptls_cipher_suite_t **other = available; *other != NULL; other++) {
+        if (*other == *suite)
+          continue;
+        if (count + 1 >= capacity) {
+          fprintf(stderr, "benchmark cipher preference array is too small\n");
+          return false;
+        }
+        selected[count++] = *other;
+      }
+      selected[count] = NULL;
+      /* set server cipher preference while retaining suites for initial packets
+       */
+      transport->tls_ctx.cipher_suites = selected;
+      transport->tls_ctx.server_cipher_preference = 1;
+      return true;
+    }
+  }
+  fprintf(stderr, "requested cipher is unavailable in selected backend\n");
+  return false;
 }
 
 static size_t benchmark_recovery_cache_bytes(double fps) {
@@ -267,7 +363,7 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
         uint64_t fid;
         if (event->object.size == PACKET_SIZE) {
           memcpy(&fid, event->object.data, sizeof(fid));
-          if (fid < MAX_PACKETS && !state->packets[fid].arrived) {
+          if (fid < BENCHMARK_MAX_PACKETS && !state->packets[fid].arrived) {
             state->packets[fid].recv_time = get_time_ms();
             state->packets[fid].arrived = true;
             state->frames_received++;
@@ -287,7 +383,7 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
         if (pkt_len == PACKET_SIZE) {
           uint64_t fid;
           memcpy(&fid, ptr + 2, sizeof(uint64_t));
-          if (fid < MAX_PACKETS && !state->packets[fid].arrived) {
+          if (fid < BENCHMARK_MAX_PACKETS && !state->packets[fid].arrived) {
             state->packets[fid].recv_time = get_time_ms();
             state->packets[fid].arrived = true;
             state->frames_received++;
@@ -332,10 +428,16 @@ int main(int argc, char **argv) {
   const char *preferred_interface = NULL;
   int packet_count = 600;
   double fps = 60, warmup_ms = 500, drain_ms = 1500;
-  double warmup_fps = 0;
+  double warmup_fps = 0, duration_ms = 0;
   bool wait_all_paths = false;
   bool continue_backpressure = false;
+  bool packet_count_explicit = false;
   size_t udp_payload_size = 1280;
+  size_t source_batch = 4;
+  const char *const cc_names[] = {"default", "reno", "pico", "cubic"};
+  const char *const toggle_names[] = {"default", "off", "on"};
+  const char *const cipher_names[] = {"default", "aes128gcm", "aes256gcm"};
+  int congestion_control = 0, pacing = 0, abba = 0, cipher = 0;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--reliable") == 0) {
@@ -378,16 +480,32 @@ int main(int argc, char **argv) {
                i + 1 < argc) {
       preferred_interface = argv[++i];
     } else if (strcmp(argv[i], "--packets") == 0 && i + 1 < argc) {
-      double value = numeric_argument(argv[++i], 1, MAX_PACKETS);
+      double value = numeric_argument(argv[++i], 1, BENCHMARK_MAX_PACKETS);
       if (value != floor(value))
         return 2;
       packet_count = (int)value;
+      packet_count_explicit = true;
     } else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) {
-      fps = numeric_argument(argv[++i], 1, MAX_FPS);
+      fps = numeric_argument(argv[++i], 1, BENCHMARK_MAX_FPS);
     } else if (strcmp(argv[i], "--warmup-ms") == 0 && i + 1 < argc) {
       warmup_ms = numeric_argument(argv[++i], 0, 30000);
+    } else if (strcmp(argv[i], "--duration-ms") == 0 && i + 1 < argc) {
+      duration_ms = numeric_argument(argv[++i], 1, 60000);
+    } else if (strcmp(argv[i], "--source-batch") == 0 && i + 1 < argc) {
+      double value = numeric_argument(argv[++i], 1, 64);
+      if (value != floor(value))
+        return 2;
+      source_batch = (size_t)value;
+    } else if (strcmp(argv[i], "--congestion-control") == 0 && i + 1 < argc) {
+      congestion_control = named_argument(argv[++i], cc_names, 4);
+    } else if (strcmp(argv[i], "--pacing") == 0 && i + 1 < argc) {
+      pacing = named_argument(argv[++i], toggle_names, 3);
+    } else if (strcmp(argv[i], "--abba") == 0 && i + 1 < argc) {
+      abba = named_argument(argv[++i], toggle_names, 3);
+    } else if (strcmp(argv[i], "--cipher") == 0 && i + 1 < argc) {
+      cipher = named_argument(argv[++i], cipher_names, 3);
     } else if (strcmp(argv[i], "--warmup-fps") == 0 && i + 1 < argc) {
-      warmup_fps = numeric_argument(argv[++i], 1, MAX_FPS);
+      warmup_fps = numeric_argument(argv[++i], 1, BENCHMARK_MAX_FPS);
     } else if (strcmp(argv[i], "--udp-payload-size") == 0 && i + 1 < argc) {
       double value = numeric_argument(argv[++i], 1200, 1500);
       if (value != floor(value))
@@ -403,6 +521,29 @@ int main(int argc, char **argv) {
       fprintf(stderr, "unknown or incomplete option: %s\n", argv[i]);
       return 2;
     }
+  }
+
+  if (duration_ms) {
+    if (duration_ms <= warmup_ms) {
+      fprintf(stderr, "fixed duration requires duration > warmup\n");
+      return 2;
+    }
+    double ramp_count = warmup_fps > 0 ? (warmup_fps + fps) * warmup_ms / 2000.0
+                                       : fps * warmup_ms / 1000.0;
+    double count = ceil(ramp_count + fps * (duration_ms - warmup_ms) / 1000.0);
+    if (count > BENCHMARK_MAX_PACKETS ||
+        (packet_count_explicit && packet_count != (int)count)) {
+      fprintf(stderr,
+              "duration schedule needs %.0f records (limit %d); "
+              "--packets must match when supplied\n",
+              count, BENCHMARK_MAX_PACKETS);
+      return 2;
+    }
+    packet_count = (int)count;
+  }
+  if (abba == 2 && congestion_control != TRANSPORT_CC_CUBIC) {
+    fprintf(stderr, "--abba on requires --congestion-control cubic\n");
+    return 2;
   }
 
   if (qlog_socket) {
@@ -423,6 +564,10 @@ int main(int argc, char **argv) {
          : use_rateless ? "rateless fec"
          : use_datagram ? "datagram"
                         : "fixed fec");
+  printf("benchmark_options: cc=%s pacing=%s abba=%s cipher=%s "
+         "source_batch=%zu duration_ms=%.3f\n",
+         cc_names[congestion_control], toggle_names[pacing], toggle_names[abba],
+         cipher_names[cipher], source_batch, duration_ms);
   size_t recovery_cache_bytes = benchmark_recovery_cache_bytes(fps);
 
   /* The gigabit benchmark retains enough per-object metrics to exceed the
@@ -443,6 +588,8 @@ int main(int argc, char **argv) {
                  .max_udp_payload_size = udp_payload_size,
                  .max_recovery_cache_bytes = recovery_cache_bytes},
       .allow_insecure_peer = true,
+      .congestion_control = (unsigned)congestion_control,
+      .pacing = (unsigned)pacing,
       .user_data = &server_state};
   server_cfg.num_bind_hosts = num_server_bind;
   for (int i = 0; i < num_server_bind; i++)
@@ -463,6 +610,8 @@ int main(int argc, char **argv) {
                  .max_udp_payload_size = udp_payload_size,
                  .max_recovery_cache_bytes = recovery_cache_bytes},
       .allow_insecure_peer = true,
+      .congestion_control = (unsigned)congestion_control,
+      .pacing = (unsigned)pacing,
       .user_data = &client_state};
   client_cfg.num_bind_hosts = num_client_bind;
   for (int i = 0; i < num_client_bind; i++)
@@ -480,6 +629,14 @@ int main(int argc, char **argv) {
     return 1;
   }
   server_state.transport = server;
+  ptls_cipher_suite_t *server_suites[8];
+  if (!select_cipher(server, cipher, server_suites,
+                     sizeof(server_suites) / sizeof(server_suites[0]))) {
+    transport_destroy(server);
+    return 2;
+  }
+  if (abba)
+    server->quic_ctx.egress[0].cc.abba = abba == 2;
 
   transport_t *client = transport_create(&client_cfg);
   if (!client) {
@@ -488,6 +645,9 @@ int main(int argc, char **argv) {
     return 1;
   }
   client_state.transport = client;
+  /* client handshake already started; server preference selects cipher */
+  if (abba)
+    client->quic_ctx.egress[0].cc.abba = abba == 2;
 
   /* wait for connection */
   int retries = 200;
@@ -561,6 +721,29 @@ int main(int argc, char **argv) {
   }
   printf("handshake established. streaming %d packets at %.3ffps...\n",
          packet_count, fps);
+  if (transport_connection_count(server)) {
+    transport_conn_t *conn = transport_connection_at(server, 0);
+    ptls_cipher_suite_t *negotiated =
+        ptls_get_cipher(quicly_get_tls(conn->quic));
+    printf("negotiated_cipher: %s\n",
+           negotiated ? negotiated->name : "unknown");
+    if (cipher && (!negotiated ||
+                   negotiated->id !=
+                       (cipher == 1 ? PTLS_CIPHER_SUITE_AES_128_GCM_SHA256
+                                    : PTLS_CIPHER_SUITE_AES_256_GCM_SHA384))) {
+      fprintf(stderr, "negotiated cipher does not match requested control\n");
+      transport_destroy(client);
+      transport_destroy(server);
+      return 2;
+    }
+  }
+  const char *effective_cc =
+      server->quic_ctx.egress[0].cc.init_cc == &quicly_cc_cubic_init  ? "cubic"
+      : server->quic_ctx.egress[0].cc.init_cc == &quicly_cc_reno_init ? "reno"
+      : server->quic_ctx.egress[0].cc.init_cc == &quicly_cc_pico_init ? "pico"
+                                                                      : "other";
+  printf("effective_controller: cc=%s pacing=%u abba=%u\n", effective_cc,
+         server->quic_ctx.egress[0].pacing, server->quic_ctx.egress[0].cc.abba);
 
   uint8_t *frame_payload = malloc(PACKET_SIZE);
   if (!frame_payload) {
@@ -570,36 +753,45 @@ int main(int argc, char **argv) {
   }
   memset(frame_payload, 0xAA, PACKET_SIZE);
 
+  /* initialize scheduled cohort before starting clock */
+  for (int f = 0; f < packet_count; f++)
+    client_state.packets[f].scheduled_time =
+        scheduled_offset_ms(f, fps, warmup_fps, warmup_ms);
   double start_benchmark = get_time_ms();
-  double frame_interval = 1000.0 / fps;
+  for (int f = 0; f < packet_count; f++)
+    client_state.packets[f].scheduled_time += start_benchmark;
   int packets_sent = 0;
   int packets_admitted = 0, backpressured = 0;
+  uint64_t retry_attempts = 0;
   bool publish_failed = false;
   path_window_t path_window = {0};
+  if (duration_ms) {
+    path_window.fixed_start_ms = start_benchmark + warmup_ms;
+    path_window.fixed_end_ms = start_benchmark + duration_ms;
+    printf("benchmark_start_monotonic_ms: %.6f\n"
+           "window_start_monotonic_ms: %.6f\n"
+           "window_end_monotonic_ms: %.6f\n",
+           start_benchmark, path_window.fixed_start_ms,
+           path_window.fixed_end_ms);
+    printf("latency_origin: scheduled\n");
+  } else {
+    printf("latency_origin: submitted\n");
+  }
 
   for (int f = 0; f < packet_count; f++) {
-    double publish_target = start_benchmark + f * frame_interval;
-    if (warmup_fps > 0 && warmup_ms > 0) {
-      double seconds = warmup_ms / 1000;
-      double ramp_packets = (warmup_fps + fps) * seconds / 2;
-      if (f < ramp_packets) {
-        double slope = (fps - warmup_fps) / seconds;
-        publish_target =
-            start_benchmark +
-            2000.0 * f /
-                (warmup_fps + sqrt(warmup_fps * warmup_fps + 2 * slope * f));
-      } else {
-        publish_target =
-            start_benchmark + warmup_ms + (f - ramp_packets) * frame_interval;
-      }
-    }
+    double publish_target = client_state.packets[f].scheduled_time;
     while (get_time_ms() < publish_target) {
       transport_tick(server);
       transport_tick(client);
+      sample_path_window(server, expected_paths, warmup_ms, &path_window);
       usleep(500);
     }
 
-    client_state.packets[f].send_time = get_time_ms();
+    double submitted_at = get_time_ms();
+    if (duration_ms && submitted_at >= path_window.fixed_end_ms)
+      break;
+    client_state.packets[f].send_time = submitted_at;
+    client_state.packets[f].attempted = true;
 
     uint64_t *payload_fid = (uint64_t *)frame_payload;
     *payload_fid = f;
@@ -615,8 +807,26 @@ int main(int argc, char **argv) {
     };
 
     transport_publish_result_t result = transport_publish_ex(server, &obj);
-    if (result == TRANSPORT_PUBLISH_BACKPRESSURE && continue_backpressure) {
+    if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
       backpressured++;
+    /* retry backpressure until deadline unless discarding */
+    double retry_until = client_state.packets[f].send_time + drain_ms;
+    if (duration_ms)
+      retry_until = fmin(retry_until, path_window.fixed_end_ms);
+    while (result == TRANSPORT_PUBLISH_BACKPRESSURE && !continue_backpressure &&
+           get_time_ms() < retry_until && !server_state.disconnected &&
+           !client_state.disconnected) {
+      transport_tick(server);
+      transport_tick(client);
+      sample_path_window(server, expected_paths, warmup_ms, &path_window);
+      usleep(500);
+      retry_attempts++;
+      result = transport_publish_ex(server, &obj);
+    }
+    if (result == TRANSPORT_PUBLISH_BACKPRESSURE &&
+        (continue_backpressure ||
+         (duration_ms && get_time_ms() >= path_window.fixed_end_ms))) {
+      /* counted as offered but unadmitted below */
     } else if (result != TRANSPORT_PUBLISH_DELIVERED &&
                result != TRANSPORT_PUBLISH_BUFFERED) {
       fprintf(stderr, "publish failed at packet %d (result=%d)\n", f, result);
@@ -628,9 +838,8 @@ int main(int argc, char **argv) {
     }
     packets_sent++;
 
-    /* Amortize socket service over at most 32 KB of queued records. Pacing
-     * waits above still service both endpoints when publications are sparse. */
-    if ((f + 1) % 4 == 0 || f + 1 == packet_count) {
+    /* source batching is independent of native packet batch */
+    if ((f + 1) % source_batch == 0 || f + 1 == packet_count) {
       transport_tick(server);
       transport_tick(client);
       sample_path_window(server, expected_paths, warmup_ms, &path_window);
@@ -639,8 +848,16 @@ int main(int argc, char **argv) {
       break;
   }
 
+  printf("source_finished_monotonic_ms: %.6f\n", get_time_ms());
+  /* service endpoints until fixed measurement window ends */
+  while (duration_ms && get_time_ms() < path_window.fixed_end_ms) {
+    transport_tick(server);
+    transport_tick(client);
+    sample_path_window(server, expected_paths, warmup_ms, &path_window);
+  }
+
   /* drain/wait for final packets to arrive */
-  double drain_start = get_time_ms();
+  double drain_start = duration_ms ? path_window.fixed_end_ms : get_time_ms();
   while (get_time_ms() < drain_start + drain_ms) {
     transport_tick(server);
     transport_tick(client);
@@ -656,8 +873,9 @@ int main(int argc, char **argv) {
 
   for (int f = 0; f < packets_sent; f++) {
     if (client_state.packets[f].arrived) {
-      double lat =
-          client_state.packets[f].recv_time - client_state.packets[f].send_time;
+      double lat = client_state.packets[f].recv_time -
+                   (duration_ms ? client_state.packets[f].scheduled_time
+                                : client_state.packets[f].send_time);
       total_latency += lat;
       if (lat > max_latency) {
         max_latency = lat;
@@ -680,8 +898,9 @@ int main(int argc, char **argv) {
   double sum_sq_diff = 0;
   for (int f = 0; f < packets_sent; f++) {
     if (client_state.packets[f].arrived) {
-      double lat =
-          client_state.packets[f].recv_time - client_state.packets[f].send_time;
+      double lat = client_state.packets[f].recv_time -
+                   (duration_ms ? client_state.packets[f].scheduled_time
+                                : client_state.packets[f].send_time);
       sum_sq_diff += pow(lat - mean_latency, 2);
     }
   }
@@ -694,6 +913,10 @@ int main(int argc, char **argv) {
                                       : "fixed-fec");
   printf("offered: %d\nsent: %d\nbackpressured: %d\n", packets_sent,
          packets_admitted, backpressured);
+  if (duration_ms)
+    printf("scheduled: %d\nunattempted: %d\n", packet_count,
+           packet_count - packets_sent);
+  printf("retry_attempts: %" PRIu64 "\n", retry_attempts);
   printf("received: %d\n", samples);
   printf("loss_pct: %.1f%%\n",
          packets_sent > 0
@@ -709,7 +932,8 @@ int main(int argc, char **argv) {
 
   bool path_check_passed =
       report_path_window(&path_window, expected_paths, preferred_interface);
-  report_window_delivery(&path_window, &client_state, packets_sent);
+  report_window_delivery(&path_window, &client_state,
+                         duration_ms ? packet_count : packets_sent);
 
   /* print multipath path statistics for client and server */
   printf("\nLifetime totals include different path join times.\n");
@@ -744,7 +968,7 @@ int main(int argc, char **argv) {
   free(frame_payload);
   bool failed = !path_check_passed || publish_failed ||
                 server_state.disconnected || client_state.disconnected ||
-                packets_sent != packet_count;
+                (!duration_ms && packets_sent != packet_count);
   transport_destroy(client);
   transport_destroy(server);
   return failed ? 1 : 0;

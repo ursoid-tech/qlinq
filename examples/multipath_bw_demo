@@ -2,6 +2,7 @@
 """Bandwidth-only multipath experiment; all network changes stay in a namespace."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,16 +24,30 @@ DEFAULT_INITIAL_MBPS = 250.0
 UDP_PAYLOAD_SIZE = 1452
 LINK_MTU = 1500
 DELIVERY_MODES = ("datagram", "fixed-fec", "rateless", "reliable")
+MAX_RECORDS = 1048576
+MAX_FPS = 100000
 
 
 def command(*args):
     return subprocess.run(args, check=True, text=True, capture_output=True).stdout
 
 
-def setup_links():
+def profile(args):
+    rates = getattr(args, "path_rates_mbps", None)
+    if rates is None:
+        rates = tuple(rate * args.offered_mbps / DEFAULT_OFFERED_MBPS for rate in RATES)
+    if getattr(args, "single_path", False):
+        rates = (rates[-1],)
+    queue_packets = getattr(args, "queue_packets", None)
+    if queue_packets is None:
+        queue_packets = math.ceil(4096 * max(rates) / RATES[-1])
+    return tuple(rates), queue_packets
+
+
+def setup_links(rates=RATES, queue_packets=4096):
     command("ip", "link", "set", "lo", "up")
     command("tc", "qdisc", "add", "dev", "lo", "root", "handle", "1:", "htb")
-    for n, rate in enumerate(RATES, 1):
+    for n, rate in enumerate(rates, 1):
         command("ip", "link", "add", f"bw{n}", "type", "veth", "peer", "name", f"bw{n}_peer")
         for direction, interface in ((1, f"bw{n}"), (2, f"bw{n}_peer")):
             address = f"10.40.{n}.{direction}"
@@ -43,10 +58,9 @@ def setup_links():
             command("tc", "class", "add", "dev", "lo", "parent", "1:",
                     "classid", "1:" + handle, "htb", "rate", f"{rate}mbit",
                     "ceil", f"{rate}mbit", "burst", "32kb", "cburst", "32kb")
-            # Cover the fastest link's 20 ms delay window at 2 Gbps.
-            # Report-side gates still bound the observed backlog.
+            # scale storage for 20 ms delay window
             command("tc", "qdisc", "add", "dev", "lo", "parent", "1:" + handle,
-                    "handle", handle + ":", "netem", "delay", "20ms", "limit", "4096")
+                    "handle", handle + ":", "netem", "delay", "20ms", "limit", str(queue_packets))
             command("tc", "filter", "add", "dev", "lo", "protocol", "ip", "parent", "1:",
                     "prio", "1", "u32", "match", "ip", "dst", address + "/32",
                     "flowid", "1:" + handle)
@@ -59,24 +73,31 @@ def read_queues():
             for c in classes if c.get("class", c.get("kind")) == "htb"}
 
 
-def analyze(output, samples, exit_code, offered_mbps, initial_mbps):
+def analyze(output, samples, exit_code, offered_mbps, initial_mbps,
+            rates=RATES, require_fixed=False):
     metrics = {name: float(value) for name, value in
                re.findall(r"^(window_\w+): ([\d.]+)$", output, re.M)}
     shares = {int(index): {"rate_mbps": float(rate) * 8 / 1e6, "share_pct": float(share)}
               for index, rate, share in re.findall(
                   r"^path (\d+): .*?rate=([\d.]+) B/s share=([\d.]+)%", output, re.M)}
-    steady = [s for s in samples if WARMUP + 0.5 <= s["time"] <= DURATION - 0.25]
-    expected_keys = {f"1:{n}2" for n in range(1, len(RATES) + 1)}
+    fixed = "window_start_monotonic_ms" in metrics and "window_end_monotonic_ms" in metrics
+    if fixed:
+        start, end = metrics["window_start_monotonic_ms"], metrics["window_end_monotonic_ms"]
+        steady = [s for s in samples if start + 500 <= s.get("monotonic_ms", -1) <= end - 250]
+    else:
+        steady = [s for s in samples if WARMUP + 0.5 <= s["time"] <= DURATION - 0.25]
+    expected_keys = {f"1:{n}2" for n in range(1, len(rates) + 1)}
     checks = {"benchmark_completed": exit_code == 0,
-              "measurement_available": len(steady) >= 16 and len(shares) == len(RATES) and
+              "measurement_available": len(steady) >= 16 and len(shares) == len(rates) and
                   all(expected_keys <= s["queues"].keys() for s in steady),
               "caps_respected": False, "traffic_matches_capabilities": False,
               "queues_bounded": False, "no_steady_queue_drops": False}
     paths = []
     if checks["measurement_available"]:
         first, last = steady[0], steady[-1]
-        elapsed = last["time"] - first["time"]
-        for n, cap in enumerate(RATES, 1):
+        elapsed = ((last["monotonic_ms"] - first["monotonic_ms"]) / 1000 if fixed
+                   else last["time"] - first["time"])
+        for n, cap in enumerate(rates, 1):
             key = f"1:{n}2"  # server -> client
             snapshots = [s["queues"][key] for s in steady]
             rate = (snapshots[-1]["bytes"] - snapshots[0]["bytes"]) * 8 / elapsed / 1e6
@@ -109,26 +130,40 @@ def analyze(output, samples, exit_code, offered_mbps, initial_mbps):
         metrics.get("window_received", 0) / metrics["window_offered"] >= 0.99)
     checks["p99_at_most_250ms"] = (metrics.get("window_received", 0) > 0 and
                                     metrics.get("window_p99_latency_ms", float("inf")) <= 250)
+    if require_fixed or fixed:
+        fps = offered_mbps * 1e6 / (8000 * 8)
+        initial_fps = initial_mbps * 1e6 / (8000 * 8)
+        ramp_records = (initial_fps + fps) * WARMUP / 2
+        expected = math.ceil(ramp_records + fps * (DURATION - WARMUP)) - math.ceil(ramp_records)
+        checks["fixed_measurement_interval"] = (fixed and
+            math.isclose(end - start, (DURATION - WARMUP) * 1000, abs_tol=.001) and
+            math.isclose(metrics.get("window_duration_ms", 0), end - start, abs_tol=.001) and
+            "latency_origin: scheduled" in output)
+        checks["scheduled_source_accounted"] = metrics.get("window_offered", 0) == expected
+        checks["source_kept_up"] = (expected > 0 and
+            expected * .99 <= metrics.get("window_attempted_in_interval", 0) <= expected)
     delivery_mode = ("reliable" if "mode: reliable" in output else
                      "datagram" if "mode: datagram" in output else
                      "rateless" if "mode: rateless" in output else "fixed-fec")
-    return {"rates_mbps": RATES, "delivery_mode": delivery_mode,
+    return {"rates_mbps": rates, "delivery_mode": delivery_mode,
             "offered_mbps": offered_mbps,
             "initial_offered_mbps": initial_mbps,
             "udp_payload_size": UDP_PAYLOAD_SIZE, "link_mtu": LINK_MTU,
             "one_way_delay_ms": 20, "warmup_seconds": WARMUP,
-            "duration_seconds": DURATION, "metrics": metrics,
+            "duration_seconds": DURATION, "fixed_wall_clock": fixed,
+            "latency_origin": "scheduled" if fixed else "submitted", "metrics": metrics,
             "paths": paths, "checks": checks, "passed": all(checks.values())}
 
 
 def run(args):
-    setup_links()
+    rates, queue_packets = profile(args)
+    setup_links(rates, queue_packets)
     results = Path(args.output_dir)
     executable = args.benchmark or str(ROOT / "examples/data_multipath_benchmark")
     fps = args.offered_mbps * 1e6 / (8000 * 8)
     initial_fps = args.initial_mbps * 1e6 / (8000 * 8)
-    packets = round((initial_fps + fps) * WARMUP / 2 + fps * (DURATION - WARMUP))
-    path_count = len(RATES)
+    packets = math.ceil((initial_fps + fps) * WARMUP / 2 + fps * (DURATION - WARMUP))
+    path_count = len(rates)
     argv = [executable, "--server-bind", *[f"10.40.{n}.1" for n in range(1, path_count + 1)],
             "--client-bind", *[f"10.40.{n}.2" for n in range(1, path_count + 1)],
             "--client-remote", *[f"10.40.{n}.1" for n in range(1, path_count + 1)],
@@ -137,18 +172,22 @@ def run(args):
             "--wait-all-paths", "--continue-backpressure",
             "--packets", str(packets), "--warmup-fps", str(initial_fps),
             "--fps", str(fps), "--warmup-ms", str(round(WARMUP * 1000)),
+            "--duration-ms", str(round(DURATION * 1000)),
             "--drain-ms", "3000", "--udp-payload-size", str(UDP_PAYLOAD_SIZE)]
+    for option, default in (("congestion_control", "default"), ("pacing", "default"),
+                             ("abba", "default"), ("cipher", "default"), ("source_batch", 4)):
+        argv += ["--" + option.replace("_", "-"), str(getattr(args, option, default))]
     if args.delivery_mode == "rateless":
         argv.append("--rateless")
     elif args.delivery_mode == "reliable":
         argv.append("--reliable")
     elif args.delivery_mode == "datagram":
         argv.append("--datagram")
-    rates_text = "/".join(str(rate) for rate in RATES)
+    rates_text = "/".join(f"{rate:g}" for rate in rates)
     print(f"Bandwidth demo: {rates_text} Mbps per direction, 20 ms one-way delay, no injected loss, "
           f"{args.delivery_mode.replace('-', ' ')} delivery.", flush=True)
     print(f"Offer ramps from {args.initial_mbps:g} to {args.offered_mbps:g} Mbps over "
-          f"{WARMUP:g} s, then measures about {DURATION - WARMUP:g} s at "
+          f"{WARMUP:g} s, then measures exactly {DURATION - WARMUP:g} s at "
           f"{args.offered_mbps:g} Mbps.", flush=True)
     print("Queues are kernel backlog converted to milliseconds at each configured cap.", flush=True)
     samples, started = [], None
@@ -164,7 +203,8 @@ def run(args):
                 if started is None and "handshake established. streaming" in log.read_text():
                     started = now
                 if started is not None:
-                    samples.append({"time": now - started, "queues": read_queues()})
+                    samples.append({"time": now - started, "monotonic_ms": now * 1000,
+                                    "queues": read_queues()})
                 time.sleep(0.25)
         finally:
             if proc.poll() is None:
@@ -176,7 +216,15 @@ def run(args):
                     proc.wait()
     (results / "queues.json").write_text(json.dumps(samples, indent=2) + "\n")
     report = analyze(log.read_text(), samples, proc.returncode,
-                     args.offered_mbps, args.initial_mbps)
+                     args.offered_mbps, args.initial_mbps, rates, require_fixed=True)
+    report["queue_limit_packets"] = queue_packets
+    report["benchmark_command"] = argv
+    report["configuration"] = {option: getattr(args, option, default) for option, default in
+        (("congestion_control", "default"), ("pacing", "default"), ("abba", "default"),
+         ("cipher", "default"), ("source_batch", 4))}
+    for label in ("negotiated_cipher", "effective_controller", "benchmark_options"):
+        match = re.search(r"^" + label + r": (.*)$", log.read_text(), re.M)
+        report[label] = match.group(1) if match else None
     (results / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("\nPath  Cap Mbps  Dequeued Mbps  Share   Late queue ms  Queue growth ms  Drops")
     for p in report["paths"]:
@@ -206,6 +254,12 @@ def run_namespaces(args):
             argv += ["--benchmark", str(Path(args.benchmark).resolve())]
         if args.single_path:
             argv.append("--single-path")
+        for option in ("profile", "queue_packets", "congestion_control", "pacing", "abba", "cipher", "source_batch"):
+            value = getattr(args, option, None)
+            if value is not None:
+                argv += ["--" + option.replace("_", "-"), str(value)]
+        if getattr(args, "path_rates_mbps", None) is not None:
+            argv += ["--path-rates-mbps", *map(str, args.path_rates_mbps)]
         exit_code = subprocess.call(argv, env=env)
         reports[mode] = {"exit_code": exit_code,
                          "report_path": str(output_dir / "report.json")}
@@ -219,16 +273,27 @@ def run_namespaces(args):
 
 
 def main():
-    global RATES
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", help="directory for benchmark.log, queues.json and report.json")
     parser.add_argument("--benchmark", help="alternate compatible benchmark executable for before/after runs")
-    parser.add_argument("--offered-mbps", type=float, default=DEFAULT_OFFERED_MBPS,
-                        help="steady application payload offer (default: %(default)g)")
+    parser.add_argument("--profile", choices=("2g", "5g"), default="2g",
+                        help="select the default offer and scaled link/queue profile (default: %(default)s)")
+    parser.add_argument("--offered-mbps", type=float,
+                        help="steady application payload offer; defaults to selected profile")
     parser.add_argument("--initial-mbps", type=float, default=DEFAULT_INITIAL_MBPS,
                         help="initial application payload offer during the ramp (default: %(default)g)")
     parser.add_argument("--single-path", action="store_true",
                         help="run only the largest configured link")
+    parser.add_argument("--path-rates-mbps", type=float, nargs=3,
+                        help="explicit three increasing link caps; default scales 500/1000/2000 with offer")
+    parser.add_argument("--queue-packets", type=int,
+                        help="netem packet limit; default scales 4096 with fastest link")
+    parser.add_argument("--congestion-control", choices=("default", "reno", "pico", "cubic"), default="default")
+    parser.add_argument("--pacing", choices=("default", "off", "on"), default="default")
+    parser.add_argument("--abba", choices=("default", "off", "on"), default="default")
+    parser.add_argument("--cipher", choices=("default", "aes128gcm", "aes256gcm"), default="default")
+    parser.add_argument("--source-batch", type=int, default=4,
+                        help="records between service calls, independently of native packet batching")
     parser.set_defaults(delivery_mode="rateless")
     delivery = parser.add_mutually_exclusive_group()
     delivery.add_argument("--all-modes", dest="delivery_mode", action="store_const",
@@ -245,12 +310,24 @@ def main():
                           help="use reliable QUIC streams instead of FEC datagrams")
     parser.add_argument("--in-namespace", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.initial_mbps <= 0 or args.offered_mbps <= 0 or args.initial_mbps > args.offered_mbps:
+    if args.offered_mbps is None:
+        args.offered_mbps = 5000.0 if args.profile == "5g" else DEFAULT_OFFERED_MBPS
+    if (not math.isfinite(args.initial_mbps) or not math.isfinite(args.offered_mbps) or
+        args.initial_mbps <= 0 or args.offered_mbps <= 0 or args.initial_mbps > args.offered_mbps):
         parser.error("initial and steady offered rates must be positive, with initial <= steady")
+    fps, initial_fps = args.offered_mbps * 1e6 / 64000, args.initial_mbps * 1e6 / 64000
+    if fps > MAX_FPS or math.ceil((initial_fps + fps) * WARMUP / 2 + fps * (DURATION - WARMUP)) > MAX_RECORDS:
+        parser.error("offer exceeds bounded benchmark source or metric storage")
+    if args.path_rates_mbps and (any(not math.isfinite(rate) or rate <= 0 for rate in args.path_rates_mbps) or
+                                  any(a >= b for a, b in zip(args.path_rates_mbps, args.path_rates_mbps[1:]))):
+        parser.error("path rates must be finite, positive, and strictly increasing")
+    _, queue_packets = profile(args)
+    if not 1 <= queue_packets <= 65536 or not 1 <= args.source_batch <= 64:
+        parser.error("queue limit must be in [1,65536] and source batch in [1,64]")
+    if args.abba == "on" and args.congestion_control != "cubic":
+        parser.error("ABBA requires --congestion-control cubic")
     if args.in_namespace and args.delivery_mode == "all":
         parser.error("all modes must be launched from the parent namespace")
-    if args.single_path:
-        RATES = (RATES[-1],)
     os.chdir(ROOT)
     if not args.in_namespace:
         for tool in ("unshare", "ip", "tc"):

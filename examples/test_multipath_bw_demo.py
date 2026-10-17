@@ -100,6 +100,70 @@ class BandwidthReportTests(unittest.TestCase):
         output, samples = self.fixture()
         self.assertFalse(analyze(output, samples, 1)['passed'])
 
+    def fixed_fixture(self):
+        rates = (1250, 2500, 5000)
+        output = ''.join(f'path {i}: rate={cap * .6 * 1e6 / 8:.0f} B/s share={cap / sum(rates) * 100:.1f}%\n'
+                         for i, cap in enumerate(rates))
+        output += ('window_offered: 625000\nwindow_admitted: 625000\nwindow_received: 625000\n'
+                   'window_attempted_in_interval: 625000\nwindow_goodput_mbps: 5000\n'
+                   'window_p99_latency_ms: 50\nwindow_duration_ms: 8000\n'
+                   'window_start_monotonic_ms: 104000\nwindow_end_monotonic_ms: 112000\n'
+                   'latency_origin: scheduled\n')
+        # queue alignment uses monotonic source origin
+        samples = [{'time': 100 + i * .25, 'monotonic_ms': 104500 + i * 250,
+                    'queues': {f'1:{n}2': {'bytes': int(cap * .6 * i * .25 * 1e6 / 8),
+                                           'packets': i, 'drops': 0, 'backlog': cap * 2500}
+                               for n, cap in enumerate(rates, 1)}} for i in range(29)]
+        return output, samples, rates
+
+    def fixed_analyze(self, output, samples, rates):
+        return demo['analyze'](output, samples, 0, 5000, 250, rates, require_fixed=True)
+
+    def test_fixed_five_gigabit_uses_monotonic_queue_interval(self):
+        output, samples, rates = self.fixed_fixture()
+        report = self.fixed_analyze(output, samples, rates)
+        self.assertTrue(report['passed'])
+        self.assertTrue(report['fixed_wall_clock'])
+        self.assertEqual(report['latency_origin'], 'scheduled')
+
+    def test_stretched_fixed_window_cannot_pass(self):
+        output, samples, rates = self.fixed_fixture()
+        output = output.replace('window_end_monotonic_ms: 112000',
+                                'window_end_monotonic_ms: 117000')
+        output = output.replace('window_duration_ms: 8000', 'window_duration_ms: 13000')
+        checks = self.fixed_analyze(output, samples, rates)['checks']
+        self.assertFalse(checks['fixed_measurement_interval'])
+
+    def test_unattempted_records_cannot_disappear_from_source(self):
+        output, samples, rates = self.fixed_fixture()
+        output = output.replace('window_offered: 625000', 'window_offered: 300000')
+        output = output.replace('window_received: 625000', 'window_received: 300000')
+        output = output.replace('window_attempted_in_interval: 625000',
+                                'window_attempted_in_interval: 300000')
+        checks = self.fixed_analyze(output, samples, rates)['checks']
+        self.assertTrue(checks['delivery_at_least_99pct'])
+        self.assertFalse(checks['scheduled_source_accounted'])
+        self.assertFalse(checks['source_kept_up'])
+
+    def test_late_or_unattempted_source_records_fail_rate_gate(self):
+        output, samples, rates = self.fixed_fixture()
+        for attempted, expected in ((618750, True), (618749, False), (625001, False)):
+            with self.subTest(attempted=attempted):
+                measured = output.replace('window_attempted_in_interval: 625000',
+                                          f'window_attempted_in_interval: {attempted}')
+                self.assertEqual(self.fixed_analyze(measured, samples, rates)['checks']['source_kept_up'], expected)
+
+    def test_fixed_latency_must_include_source_lateness(self):
+        output, samples, rates = self.fixed_fixture()
+        output = output.replace('latency_origin: scheduled', 'latency_origin: submitted')
+        self.assertFalse(self.fixed_analyze(output, samples, rates)['checks']['fixed_measurement_interval'])
+
+    def test_legacy_executable_cannot_pass_fixed_qualification(self):
+        output, samples = self.fixture()
+        report = demo['analyze'](output, samples, 0, 2000, 250, require_fixed=True)
+        self.assertFalse(report['passed'])
+        self.assertFalse(report['checks']['fixed_measurement_interval'])
+
 
 class BandwidthNamespaceTests(unittest.TestCase):
     def setUp(self):
@@ -194,6 +258,59 @@ class BandwidthNamespaceTests(unittest.TestCase):
         argv = run.call_args.args[0]
         self.assertEqual(argv[argv.index('--udp-payload-size') + 1], '1452')
         self.assertIn('--datagram', argv)
+
+    def test_five_gigabit_profile_scales_capacity_and_propagation_storage(self):
+        args = SimpleNamespace(offered_mbps=5000, single_path=False)
+        self.assertEqual(demo['profile'](args), ((1250, 2500, 5000), 10240))
+        args.single_path = True
+        self.assertEqual(demo['profile'](args), ((5000,), 10240))
+
+    def test_five_gigabit_command_preserves_all_controls(self):
+        args = SimpleNamespace(output_dir=str(self.output), benchmark=None,
+                               offered_mbps=5000, initial_mbps=250,
+                               delivery_mode='reliable', congestion_control='cubic',
+                               pacing='on', abba='on', cipher='aes128gcm', source_batch=8)
+        proc = mock.Mock(returncode=0)
+        proc.poll.return_value = 0
+        with mock.patch.dict(demo['run'].__globals__, setup_links=mock.Mock()), \
+             mock.patch.object(demo['subprocess'], 'Popen', return_value=proc) as run, \
+             redirect_stdout(io.StringIO()):
+            demo['run'](args)
+        argv = run.call_args.args[0]
+        for option, value in (('--duration-ms', '12000'), ('--packets', '789063'),
+                              ('--fps', '78125.0'), ('--source-batch', '8'),
+                              ('--congestion-control', 'cubic'), ('--pacing', 'on'),
+                              ('--abba', 'on'), ('--cipher', 'aes128gcm')):
+            self.assertEqual(argv[argv.index(option) + 1], value)
+
+    def test_profile_and_controls_propagate_to_namespace(self):
+        args = SimpleNamespace(output_dir=str(self.output), benchmark=None,
+                               offered_mbps=5000, initial_mbps=250,
+                               delivery_mode='reliable', single_path=False, profile='5g',
+                               path_rates_mbps=(1000, 3000, 6000), queue_packets=12000,
+                               congestion_control='cubic', pacing='on', abba='on',
+                               cipher='aes256gcm', source_batch=4)
+        with mock.patch.object(demo['subprocess'], 'call', return_value=0) as run:
+            demo['run_namespaces'](args)
+        argv = run.call_args.args[0]
+        for option, value in (('--profile', '5g'), ('--queue-packets', '12000'),
+                              ('--abba', 'on'), ('--cipher', 'aes256gcm')):
+            self.assertEqual(argv[argv.index(option) + 1], value)
+        at = argv.index('--path-rates-mbps')
+        self.assertEqual(argv[at + 1:at + 4], ['1000', '3000', '6000'])
+
+    def test_invalid_or_unbounded_profiles_fail_before_build(self):
+        for flags in (['--offered-mbps', 'nan'], ['--offered-mbps', '7000'],
+                      ['--source-batch', '0'], ['--queue-packets', '65537'],
+                      ['--path-rates-mbps', '1000', '900', '2000'], ['--abba', 'on']):
+            with self.subTest(flags=flags), \
+                 mock.patch.object(demo['sys'], 'argv', ['multipath_bw_demo', *flags]), \
+                 mock.patch.object(demo['subprocess'], 'run') as build, \
+                 redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as error:
+                demo['main']()
+            self.assertEqual(error.exception.code, 2)
+            build.assert_not_called()
 
 
 if __name__ == '__main__':
