@@ -332,9 +332,9 @@ submit_protected_packet(transport_t *t, size_t socket_index,
                         const struct sockaddr *destination,
                         const struct sockaddr *source,
                         const transport_flexicast_queued_payload_t *queued) {
-  if (socket_index == SIZE_MAX || t->fds[socket_index] < 0)
+  if (socket_index == SIZE_MAX || t->sockets[socket_index].fd < 0)
     return -1;
-  transport_egress_t *egress = &t->egress[socket_index];
+  transport_egress_t *egress = &t->sockets[socket_index].egress;
   if (egress->count != 0)
     return 0;
   struct iovec vec = {.iov_base = queued->packet,
@@ -344,10 +344,10 @@ submit_protected_packet(transport_t *t, size_t socket_index,
                                   : sizeof(struct sockaddr_in6);
   ssize_t sent =
       source
-          ? transport_udp_send_from(t->fds[socket_index], destination, source,
-                                    t->flexicast_interface_index, &vec)
-          : transport_udp_send_batch(t->fds[socket_index], destination,
-                                     destination_len, &vec, 1);
+          ? transport_udp_send_from(t->sockets[socket_index].fd, destination,
+                                    source, t->flexicast_interface_index, &vec)
+          : transport_udp_send_batch(t->sockets[socket_index].fd, destination,
+                                     destination_len, &vec, 1, 0);
   if (sent > 0) {
     egress->packets_sent++;
     egress->bytes_sent += queued->packet_size;
@@ -364,15 +364,15 @@ submit_protected_packet(transport_t *t, size_t socket_index,
 static void
 account_protected_packet(transport_t *t, transport_flexicast_flow_t *flow,
                          transport_flexicast_queued_payload_t *queued,
-                         bool native) {
+                         transport_flexicast_member_t *recipient) {
+  tf_record_delivery_submission(flow, recipient, !queued->counted);
   if (!queued->counted) {
-    tf_advance_delivery_epoch(flow);
     t->stats.flexicast_packets_sent++;
     t->stats.flexicast_paced_packets++;
     queued->counted = true;
   }
   t->stats.flexicast_physical_packets_sent++;
-  if (native)
+  if (!recipient)
     t->stats.flexicast_native_packets_sent++;
   flow->last_payload_sent_ms = transport_get_time_ms();
   flow->pacing_tokens -= queued->packet_size;
@@ -449,12 +449,15 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       t->flexicast_native_source) {
     struct sockaddr *group = (struct sockaddr *)&t->flexicast_group_addr;
     struct sockaddr_storage source = multicast_source_address(t);
+    struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
+    for (size_t i = 0; i < t->socket_count; i++)
+      local_addrs[i] = t->sockets[i].local_addr;
     size_t fd_index = transport_path_socket_for_source(
-        t->local_addrs, t->num_fds, (struct sockaddr *)&source);
+        local_addrs, t->socket_count, (struct sockaddr *)&source);
     int result = submit_protected_packet(t, fd_index, group,
                                          (struct sockaddr *)&source, queued);
     if (result > 0) {
-      account_protected_packet(t, flow, queued, true);
+      account_protected_packet(t, flow, queued, NULL);
       return FLEXICAST_DISPATCH_OK;
     }
     if (result == 0) {
@@ -476,8 +479,11 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     if (queued->packet_size > flow->pacing_tokens)
       return FLEXICAST_DISPATCH_BLOCKED;
     struct sockaddr_storage destination;
+    struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
+    for (size_t i = 0; i < t->socket_count; i++)
+      local_addrs[i] = t->sockets[i].local_addr;
     size_t fd_index = transport_path_socket_for_peer(
-        member->conn->quic, t->local_addrs, t->num_fds, &destination);
+        member->conn->quic, local_addrs, t->socket_count, &destination);
     int result = submit_protected_packet(
         t, fd_index, (struct sockaddr *)&destination, NULL, queued);
     if (result == 0) {
@@ -485,7 +491,7 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       return FLEXICAST_DISPATCH_BLOCKED;
     }
     if (result > 0) {
-      account_protected_packet(t, flow, queued, false);
+      account_protected_packet(t, flow, queued, member);
     } else {
       int complete;
       (void)quicly_flexicast_abandon_datagram(flow->crypto, member->conn->id,
@@ -752,6 +758,9 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
     for (size_t member_index = 0; member_index < flow->member_count;
          member_index++) {
       const transport_flexicast_member_t *member = &flow->members[member_index];
+      int64_t feedback_deadline = tf_member_feedback_deadline(flow, member);
+      if (feedback_deadline < first_timeout)
+        first_timeout = feedback_deadline;
       if (member->joined && !member->listening &&
           member->ready_deadline_ms > 0 &&
           member->ready_deadline_ms < first_timeout)

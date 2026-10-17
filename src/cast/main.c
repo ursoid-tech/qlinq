@@ -22,6 +22,7 @@
 #define CAST_DEFAULT_PORT 9000U
 #define CAST_DEFAULT_BLOCK_SIZE 16384U
 #define CAST_MAX_BLOCK_SIZE 60000U
+#define CAST_RECORD_HEADER_SIZE 8U
 #define CAST_DEFAULT_IDLE_TIMEOUT_MS 60000U
 #define CAST_REORDER_SLOTS 4096U
 #define CAST_REORDER_MAX_BYTES (64U * 1024U * 1024U)
@@ -496,7 +497,7 @@ static bool open_runtime(cast_runtime_t *runtime) {
   if (!runtime->file)
     return false;
   if (options->command == CAST_SEND) {
-    runtime->pending = malloc(options->block_size);
+    runtime->pending = malloc(options->block_size + CAST_RECORD_HEADER_SIZE);
     if (!runtime->pending)
       return false;
     int descriptor = fileno(runtime->file);
@@ -531,19 +532,33 @@ static void print_progress(cast_runtime_t *runtime, bool final) {
   (void)qlinq_endpoint_get_stats(runtime->endpoint, &endpoint_stats);
   fprintf(stderr,
           "qlinq-cast: %s records=%" PRIu64 " bytes=%" PRIu64
-          " peers=%zu group-members=%zu queued=%zu lost=%" PRIu64 "%s\n",
+          " peers=%zu group-members=%zu queued=%zu lost=%" PRIu64
+          " group-native-tx=%" PRIu64 " group-rx=%" PRIu64 "%s\n",
           runtime->options.command == CAST_SEND ? "sent" : "received",
           runtime->records, runtime->bytes,
           runtime->options.command == CAST_SEND
               ? stream_stats.subscribers
               : endpoint_stats.active_connections,
           stream_stats.group_members, endpoint_stats.queued_packets,
-          stream_stats.objects_lost, final ? " final" : "");
+          stream_stats.objects_lost, endpoint_stats.group_native_packets_sent,
+          endpoint_stats.group_packets_received, final ? " final" : "");
   runtime->next_stats_ms = now + runtime->options.stats_ms;
 }
 
+/* Cast owns its ordering metadata; the transport can group several records
+ * into one coding object with a shared transport sequence number. */
 static bool write_record(cast_runtime_t *runtime,
-                         const qlinq_record_t *record) {
+                         const qlinq_record_t *wire_record) {
+  if (wire_record->size < CAST_RECORD_HEADER_SIZE)
+    return false;
+  qlinq_record_t decoded = *wire_record;
+  const uint8_t *payload = wire_record->data;
+  decoded.sequence = 0;
+  for (size_t i = 0; i < CAST_RECORD_HEADER_SIZE; i++)
+    decoded.sequence = (decoded.sequence << 8) | payload[i];
+  decoded.data = payload + CAST_RECORD_HEADER_SIZE;
+  decoded.size -= CAST_RECORD_HEADER_SIZE;
+  const qlinq_record_t *record = &decoded;
   if (record->sequence < runtime->next_sequence)
     return true;
   uint64_t distance = record->sequence - runtime->next_sequence;
@@ -683,8 +698,9 @@ static bool pump_sender(cast_runtime_t *runtime) {
     return false;
 
   if (runtime->pending_size == 0 && !runtime->input_eof) {
-    ssize_t received = read(fileno(runtime->file), runtime->pending,
-                            runtime->options.block_size);
+    ssize_t received =
+        read(fileno(runtime->file), runtime->pending + CAST_RECORD_HEADER_SIZE,
+             runtime->options.block_size);
     if (received > 0) {
       runtime->pending_size = (size_t)received;
     } else if (received == 0) {
@@ -697,10 +713,16 @@ static bool pump_sender(cast_runtime_t *runtime) {
   }
 
   if (runtime->pending_size != 0) {
+    uint64_t sequence = runtime->next_sequence;
+    for (size_t i = 0; i < CAST_RECORD_HEADER_SIZE; i++) {
+      runtime->pending[CAST_RECORD_HEADER_SIZE - 1U - i] = (uint8_t)sequence;
+      sequence >>= 8;
+    }
     qlinq_record_t record = {.group_id = 0,
                              .sequence = runtime->next_sequence,
                              .data = runtime->pending,
-                             .size = runtime->pending_size,
+                             .size = runtime->pending_size +
+                                     CAST_RECORD_HEADER_SIZE,
                              .priority = 1};
     qlinq_send_result_t result = qlinq_stream_send(runtime->stream, &record);
     if (result == QLINQ_SEND_SENT || result == QLINQ_SEND_BUFFERED ||

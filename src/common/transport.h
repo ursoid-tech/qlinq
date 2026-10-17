@@ -155,7 +155,7 @@ typedef void (*transport_callback_t)(void *user_data,
                                      const transport_event_t *event);
 
 #define TRANSPORT_MAX_PATHS 4
-#define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 1U)
+#define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 3U)
 enum {
   TRANSPORT_CC_DEFAULT,
   TRANSPORT_CC_RENO,
@@ -667,8 +667,10 @@ int64_t transport_get_first_timeout(transport_t *t);
 struct pollfd;
 
 /* collect socket file descriptors for polling */
-/* Includes the interface monitor; reserve TRANSPORT_MAX_POLL_FDS entries. */
-/* Capacity TRANSPORT_MAX_POLL_FDS includes UDP sockets and interface wakeups.
+/* Includes the interface monitor and optional multicast sockets; reserve
+ * TRANSPORT_MAX_POLL_FDS entries. */
+/* Capacity TRANSPORT_MAX_POLL_FDS includes unicast/multicast UDP sockets and
+ * interface wakeups.
  */
 size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
                               size_t max_fds);

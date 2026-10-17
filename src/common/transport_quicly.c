@@ -1093,13 +1093,11 @@ transport_t *transport_create(const transport_config_t *config) {
   t->repair_mode = config->repair_mode;
   if (config->flexicast_cc_mode != TRANSPORT_FLEXICAST_CC_MULTICAST &&
       config->flexicast_cc_mode != TRANSPORT_FLEXICAST_CC_ADAPTIVE) {
-    free(t);
-    return NULL;
+    goto Fail;
   }
   if (config->flexicast_repair_route != TRANSPORT_FLEXICAST_REPAIR_SHARED &&
       config->flexicast_repair_route != TRANSPORT_FLEXICAST_REPAIR_UNICAST) {
-    free(t);
-    return NULL;
+    goto Fail;
   }
   if ((config->flexicast_cc_minimum_rate != 0 &&
        config->flexicast_cc_maximum_rate != 0 &&
@@ -1111,8 +1109,7 @@ transport_t *transport_create(const transport_config_t *config) {
        config->flexicast_cc_maximum_rate != 0 &&
        config->flexicast_cc_startup_rate > config->flexicast_cc_maximum_rate)) {
     fprintf(stderr, "transport: invalid Flexicast congestion-control rates\n");
-    free(t);
-    return NULL;
+    goto Fail;
   }
   t->flexicast_cc_mode = config->flexicast_cc_mode;
   t->flexicast_cc_startup_rate = config->flexicast_cc_startup_rate;
@@ -1138,8 +1135,7 @@ transport_t *transport_create(const transport_config_t *config) {
     if (!t->repair_shadow_log) {
       fprintf(stderr, "transport: unable to open repair shadow log '%s': %s\n",
               config->repair_shadow_log_file, strerror(errno));
-      free(t);
-      return NULL;
+      goto Fail;
     }
     setvbuf(t->repair_shadow_log, NULL, _IOLBF, 0);
   }
@@ -1501,56 +1497,6 @@ void transport_destroy(transport_t *t) {
   free(t);
 }
 
-static uint64_t mix_repair_feedback(uint64_t value) {
-  value ^= value >> 30;
-  value *= UINT64_C(0xbf58476d1ce4e5b9);
-  value ^= value >> 27;
-  value *= UINT64_C(0x94d049bb133111eb);
-  return value ^ (value >> 31);
-}
-
-uint64_t transport_multicast_nack_retry_backoff_ms(uint16_t attempt) {
-  if (attempt == 0)
-    return 0;
-  unsigned shift = attempt - 1U;
-  if (shift > 3U)
-    shift = 3U;
-  uint64_t delay = QLINQ_FEC_MULTICAST_NACK_RETRY_BASE_MS << shift;
-  return delay < QLINQ_FEC_MULTICAST_NACK_RETRY_MAX_MS
-             ? delay
-             : QLINQ_FEC_MULTICAST_NACK_RETRY_MAX_MS;
-}
-
-/* Flexicast receivers cannot overhear one another's encrypted control streams.
- * Spread their requests long enough for the first shared repair datagram to
- * suppress most of the cohort, while keeping ordinary unicast recovery at the
- * original prompt delay. */
-static int64_t repair_feedback_delay_ms(const transport_conn_t *conn,
-                                        bool shared_delivery, uint8_t alias,
-                                        uint64_t group_id, uint64_t object_id,
-                                        uint16_t salt, uint16_t retry_attempt) {
-  if (!shared_delivery)
-    return QLINQ_FEC_NACK_DELAY_MS;
-  uint64_t value = conn->transport->repair_feedback_nonce;
-  value ^= group_id + UINT64_C(0x9e3779b97f4a7c15);
-  value ^= object_id * UINT64_C(0xd6e8feb86659fd93);
-  value ^= (uint64_t)alias << 48;
-  value ^= (uint64_t)salt * UINT64_C(0xa0761d6478bd642f);
-  uint64_t span =
-      QLINQ_FEC_MULTICAST_NACK_BACKOFF_MAX_MS - QLINQ_FEC_NACK_DELAY_MS + 1U;
-  uint64_t delay =
-      QLINQ_FEC_NACK_DELAY_MS + (mix_repair_feedback(value) % span);
-  if (retry_attempt != 0) {
-    /* The first request remains prompt and independently randomized. Once a
-     * receiver has asked for shared repair, give multicast repair time to
-     * arrive before sending another encrypted unicast request. Without this
-     * retry backoff, every incomplete assembler can consume its full NACK
-     * allowance even though the source is already serving the cohort. */
-    delay += transport_multicast_nack_retry_backoff_ms(retry_attempt);
-  }
-  return delay > INT64_MAX ? INT64_MAX : (int64_t)delay;
-}
-
 static void add_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
   if (!path_interface_allowed(t, msg->name) ||
       t->socket_count >= TRANSPORT_MAX_PATHS)
@@ -1622,6 +1568,21 @@ static bool service_interfaces(transport_t *t) {
   ifmon_pipe_msg_t msg;
   while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
     consumed = true;
+    uint8_t version = msg.addr.ss_family == AF_INET    ? 4U
+                      : msg.addr.ss_family == AF_INET6 ? 6U
+                                                       : 0U;
+    const uint8_t *address =
+        msg.addr.ss_family == AF_INET
+            ? (const uint8_t *)&((struct sockaddr_in *)&msg.addr)->sin_addr
+        : msg.addr.ss_family == AF_INET6
+            ? (const uint8_t *)&((struct sockaddr_in6 *)&msg.addr)->sin6_addr
+            : NULL;
+    if (address) {
+      if (msg.is_added)
+        transport_flexicast_interface_added(t, version, address, msg.index);
+      else
+        transport_flexicast_interface_removed(t, version, address, msg.index);
+    }
     if (msg.is_added)
       add_interface(t, &msg);
     else
@@ -1631,10 +1592,22 @@ static bool service_interfaces(transport_t *t) {
 }
 
 static void transport_receive_datagram(transport_t *t, size_t fd_idx,
-                                       const uint8_t *buf, size_t len,
+                                       uint8_t *buf, size_t len,
                                        struct sockaddr_storage *source) {
   t->sockets[fd_idx].bytes_received += len;
 
+  transport_conn_t *flexicast_source = NULL;
+  ptls_iovec_t flexicast_payload = ptls_iovec_init(NULL, 0);
+  if (transport_flexicast_receive_unicast(
+          t, buf, len, (struct sockaddr *)source, &flexicast_source,
+          &flexicast_payload)) {
+    if (flexicast_source && flexicast_payload.base &&
+        !(flexicast_source->authenticated && t->simulated_loss_rate > 0 &&
+          (rand() % 100) < t->simulated_loss_rate))
+      transport_protocol_receive_datagram(flexicast_source, flexicast_payload,
+                                          false);
+    return;
+  }
   struct sockaddr *psa = (struct sockaddr *)source;
 
   quicly_decoded_packet_t decoded;
@@ -1738,34 +1711,29 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
                             size_t count) {
   size_t receive_budget = t->limits.max_packets_per_tick;
   size_t flexicast_receive_budget = (receive_budget + 1U) / 2U;
-  for (size_t slot = 0; slot < 2 && flexicast_receive_budget > 0; slot++) {
+  for (size_t slot = 0;
+       t->flexicast_enabled && slot < 2 && flexicast_receive_budget > 0;
+       slot++) {
     while (t->flexicast_fds[slot] >= 0 && flexicast_receive_budget > 0) {
       uint8_t buf[2048];
-      struct sockaddr_storage sa;
-      socklen_t sa_len = sizeof(sa);
-      ssize_t rret = recvfrom(t->flexicast_fds[slot], buf, sizeof(buf), 0,
-                              (struct sockaddr *)&sa, &sa_len);
+      transport_conn_t *flexicast_source = NULL;
+      ptls_iovec_t flexicast_payload = ptls_iovec_init(NULL, 0);
+      ssize_t rret = transport_flexicast_receive_native(
+          t, slot, buf, sizeof(buf), &flexicast_source, &flexicast_payload);
       if (rret == -1) {
-        if (SOCKET_ERROR_CODE == SOCKET_EAGAIN ||
-            SOCKET_ERROR_CODE == SOCKET_EWOULDBLOCK)
-          break;
-        continue;
+        if (SOCKET_ERROR_CODE == SOCKET_EINTR)
+          continue;
+        break;
       }
       receive_budget--;
       flexicast_receive_budget--;
-      t->stats.flexicast_multicast_datagrams_received++;
-      transport_conn_t *flexicast_source = NULL;
-      ptls_iovec_t flexicast_payload = ptls_iovec_init(NULL, 0);
-      if (transport_flexicast_receive_packet(
-              t, buf, (size_t)rret, &flexicast_source, &flexicast_payload) &&
-          flexicast_source && flexicast_payload.base) {
+      if (flexicast_source && flexicast_payload.base) {
         if (flexicast_source->authenticated && t->simulated_loss_rate > 0 &&
             (rand() % 100) < t->simulated_loss_rate)
           continue;
         transport_protocol_receive_datagram(flexicast_source, flexicast_payload,
                                             false);
-      } else
-        t->stats.flexicast_multicast_datagrams_rejected++;
+      }
     }
   }
   size_t receive_start =
@@ -2099,6 +2067,7 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
       t->pending_group.flush_retry_cache_releases !=
           t->stats.recovery_cache_releases)
     flush_group_on_timer(t);
+  transport_flexicast_tick(t);
   uint64_t now = ptls_get_time.cb(&ptls_get_time);
   update_path_measurements(t, now);
   service_connections(t, now);
@@ -2886,7 +2855,7 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
       count++;
     }
   }
-  for (size_t i = 0; i < 2 && count < max_fds; i++)
+  for (size_t i = 0; t->flexicast_enabled && i < 2 && count < max_fds; i++)
     if (t->flexicast_fds[i] >= 0) {
       fds[count].fd = t->flexicast_fds[i];
       fds[count].events = POLLIN;

@@ -331,13 +331,10 @@ API_TESTS = t/00util/test_qlinq_policy \
 $(API_TESTS): %: %.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
-	$(CC) -o $@ t/00util/test_flexicast_transport.o $(COMMON_OBJS) $(LDFLAGS)
-
 t/00util/test_flexicast_regressions: t/00util/test_flexicast_regressions.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_quicly_flexicast: deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
+t/00util/test_quicly_flexicast: deps/quicly/t/flexicast-cc-regression.c deps/quicly/t/flexicast-crypto.c deps/quicly/t/flexicast-packet.c deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
 	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -Ideps/quicly/deps/picotest -o $@ $^ $(LDFLAGS)
 
 t/00util/test_flexicast_scale: t/00util/test_flexicast_scale.o $(COMMON_OBJS)

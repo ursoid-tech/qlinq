@@ -1,9 +1,11 @@
 #!/bin/sh
 set -eu
+app_bin=${QLINQ_APP_BIN:-./qlinq-app}
 
 tmp_dir=$(mktemp -d /tmp/qlinq-app-test.XXXXXX)
 server_pid=
 client_pid=
+client2_pid=
 cleanup()
 {
     result=$?
@@ -14,11 +16,12 @@ cleanup()
     fi
     if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
     if [ -n "$client_pid" ]; then kill "$client_pid" 2>/dev/null || true; fi
+    if [ -n "$client2_pid" ]; then kill "$client2_pid" 2>/dev/null || true; fi
     rm -rf "$tmp_dir"
 }
 trap cleanup EXIT INT TERM
 
-timeout 8 ./qlinq-app \
+timeout 8 "$app_bin" \
     --listen 10093 --bind 127.0.0.1 \
     --idle-timeout-ms 60000 \
     --cert t/assets/server.crt --key t/assets/server.key \
@@ -33,7 +36,7 @@ timeout 8 ./qlinq-app \
     2>"$tmp_dir/server.log" &
 server_pid=$!
 
-timeout 3 ./qlinq-app \
+timeout 3 "$app_bin" \
     --peer 127.0.0.1:10093 \
     --idle-timeout-ms 60000 \
     --auth-token app-test --insecure-no-verify \
@@ -70,7 +73,7 @@ grep -Eq 'qlinq-app: pv .+ tx .+ \[[^]]+/s\] rx .+ \[[^]]+/s\]' \
 grep -Eq 'qlinq-app: pv .+ tx .+ \[[^]]+/s\] rx .+ \[[^]]+/s\]' \
     "$tmp_dir/client.log"
 
-timeout 12 ./qlinq-app \
+timeout 12 "$app_bin" \
     --listen 10094 --bind 127.0.0.1 \
     --cert t/assets/server.crt --key t/assets/server.key \
     --auth-token app-loss-test --insecure-no-verify \
@@ -85,7 +88,7 @@ timeout 12 ./qlinq-app \
     2>"$tmp_dir/loss-server.log" &
 server_pid=$!
 
-timeout 8 ./qlinq-app \
+timeout 8 "$app_bin" \
     --peer 127.0.0.1:10094 \
     --auth-token app-loss-test --insecure-no-verify \
     --output "$tmp_dir/loss-output.bin" --mode rateless \
@@ -110,6 +113,49 @@ test "$(wc -c < "$tmp_dir/loss-output.bin")" -eq 10240
 cmp -n 10240 src/app/main.c "$tmp_dir/loss-output.bin"
 awk -F '\t' '$2 == "loss-rx" && $3 == 0 && $4 == 20 && $5 == 10240 { ok=1 }
               END { exit !ok }' "$tmp_dir/loss-client.tsv"
+# Two clients exercise per-connection subscription targeting and distinct
+# server-issued connection IDs.
+timeout 8 "$app_bin" \
+    --listen 10094 --bind 127.0.0.1 \
+    --cert t/assets/server.crt --key t/assets/server.key \
+    --auth-token fanout-test --insecure-no-verify \
+    --input README.md --message-size 256 --count 1 \
+    --wait-subscribers 2 --one-shot --drain-ms 500 --mode reliable \
+    2>"$tmp_dir/fanout-server.log" &
+server_pid=$!
+
+timeout 4 "$app_bin" \
+    --peer 127.0.0.1:10094 \
+    --auth-token fanout-test --insecure-no-verify \
+    --output "$tmp_dir/fanout-a.bin" --mode reliable \
+    --receive-count 1 --drain-ms 100 \
+    2>"$tmp_dir/fanout-a.log" &
+client_pid=$!
+
+timeout 4 "$app_bin" \
+    --peer 127.0.0.1:10094 \
+    --auth-token fanout-test --insecure-no-verify \
+    --output "$tmp_dir/fanout-b.bin" --mode reliable \
+    --receive-count 1 --drain-ms 100 \
+    2>"$tmp_dir/fanout-b.log" &
+client2_pid=$!
+
+fanout_failed=0
+wait "$server_pid" || fanout_failed=1
+server_pid=
+wait "$client_pid" || fanout_failed=1
+client_pid=
+wait "$client2_pid" || fanout_failed=1
+client2_pid=
+if [ "$fanout_failed" -ne 0 ]; then
+    sed -n '1,80p' "$tmp_dir/fanout-server.log" >&2
+    sed -n '1,80p' "$tmp_dir/fanout-a.log" >&2
+    sed -n '1,80p' "$tmp_dir/fanout-b.log" >&2
+    exit 1
+fi
+cmp -n 256 README.md "$tmp_dir/fanout-a.bin"
+cmp -n 256 README.md "$tmp_dir/fanout-b.bin"
+
 # Small records reach stdio's buffer before /dev/full rejects the flush.
 # Exercise both payload layouts and both owned-file and stdout destinations.
 if [ -c /dev/full ]; then

@@ -285,7 +285,7 @@ transport_path_socket_for_source(const struct sockaddr_storage *local_addrs,
   size_t wildcard = SIZE_MAX;
   for (size_t i = 0; i < num_local_addrs; i++) {
     const struct sockaddr *local = (const struct sockaddr *)&local_addrs[i];
-    if (sockaddr_address_equal(local, source))
+    if (transport_address_equal(local, source))
       return i;
     if (local->sa_family != source->sa_family)
       continue;

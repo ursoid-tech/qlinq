@@ -24,6 +24,8 @@
 #include <net/if.h>
 #endif
 
+static bool admit_member_transition(transport_t *, transport_flexicast_flow_t *,
+                                    transport_flexicast_member_t *, int64_t);
 static bool set_multicast_fd_nonblocking(int fd) {
 #ifdef _WIN32
   u_long enabled = 1;
@@ -231,6 +233,9 @@ static bool create_crypto_with_secret(transport_flexicast_flow_t *flow,
                                       quicly_flexicast_flow_t **crypto) {
   quicly_flexicast_config_t config = {
       .flow_id = flow->flow_id,
+      .max_packet_size = flow->cc_config.maximum_datagram_size != 0
+                             ? flow->cc_config.maximum_datagram_size
+                             : QUICLY_FLEXICAST_MAX_PACKET_SIZE,
       .first_packet_number = first_packet_number,
       .cipher_suite = &ptls_openssl_aes128gcmsha256,
       .crypto_engine = &quicly_default_crypto_engine,
@@ -359,18 +364,18 @@ bool transport_flexicast_configure(transport_t *t, const char *group,
     return false;
   }
   bool usable_socket = false;
-  for (size_t i = 0; i < t->num_fds; i++) {
-    if (t->local_addrs[i].ss_family != family)
+  for (size_t i = 0; i < t->socket_count; i++) {
+    if (t->sockets[i].local_addr.ss_family != family)
       continue;
     bool matches;
     if (family == AF_INET) {
       const struct sockaddr_in *local =
-          (const struct sockaddr_in *)&t->local_addrs[i];
+          (const struct sockaddr_in *)&t->sockets[i].local_addr;
       matches = local->sin_addr.s_addr == htonl(INADDR_ANY) ||
                 local->sin_addr.s_addr == t->flexicast_interface_v4.s_addr;
     } else {
       const struct sockaddr_in6 *local =
-          (const struct sockaddr_in6 *)&t->local_addrs[i];
+          (const struct sockaddr_in6 *)&t->sockets[i].local_addr;
       matches = IN6_IS_ADDR_UNSPECIFIED(&local->sin6_addr) ||
                 memcmp(&local->sin6_addr, &t->flexicast_interface_v6,
                        sizeof(local->sin6_addr)) == 0;
@@ -382,13 +387,13 @@ bool transport_flexicast_configure(transport_t *t, const char *group,
        * resource. Wildcard binds remain unknown rather than assuming this. */
       bool concrete =
           family == AF_INET
-              ? ((const struct sockaddr_in *)&t->local_addrs[i])
+              ? ((const struct sockaddr_in *)&t->sockets[i].local_addr)
                         ->sin_addr.s_addr != htonl(INADDR_ANY)
               : !IN6_IS_ADDR_UNSPECIFIED(
-                    &((const struct sockaddr_in6 *)&t->local_addrs[i])
+                    &((const struct sockaddr_in6 *)&t->sockets[i].local_addr)
                          ->sin6_addr);
       if (concrete && t->flexicast_interface_index != 0)
-        t->local_ifindices[i] = t->flexicast_interface_index;
+        t->sockets[i].interface_index = t->flexicast_interface_index;
       break;
     }
   }
@@ -570,6 +575,16 @@ static int open_receive_socket(uint8_t ip_version, uint16_t port) {
       setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) == 0 &&
       setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer,
                  sizeof(receive_buffer)) == 0;
+#ifdef __linux__
+  if (configured)
+    configured = setsockopt(fd, family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
+                            family == AF_INET ? IP_PKTINFO : IPV6_RECVPKTINFO,
+                            &reuse, sizeof(reuse)) == 0;
+#else
+  /* Native delivery needs source, destination and interface metadata. Keep
+   * ordinary unicast available where the ancillary-data adapter is absent. */
+  configured = false;
+#endif
   if (configured && family == AF_INET6)
     configured = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only,
                             sizeof(v6_only)) == 0;
@@ -640,6 +655,13 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
     return false;
   }
 
+  /* An explicitly configured interface must not silently become the kernel's
+   * default interface when its address is absent, especially with IPv6 SSM. */
+  if (t->flexicast_interface_set &&
+      (interface_index == 0 ||
+       t->flexicast_interface_family !=
+           (announce->ip_version == 4 ? AF_INET : AF_INET6)))
+    return false;
   size_t slot = ip_version_slot(announce->ip_version);
   bool created = false;
   if (t->flexicast_fds[slot] < 0) {
@@ -849,6 +871,7 @@ static void set_member_listening(transport_t *t,
     flow->listening_count++;
     member->acknowledged_delivery_epoch = flow->delivery_epoch;
     member->last_ack_time_ms = now;
+    member->first_unacknowledged_ms = 0;
   } else {
     if (flow->listening_count == 0)
       inconsistent = true;
@@ -862,6 +885,7 @@ static void set_member_listening(transport_t *t,
     }
     member->acknowledged_delivery_epoch = flow->delivery_epoch;
     member->last_ack_time_ms = 0;
+    member->first_unacknowledged_ms = 0;
   }
   member->listening = listening;
   if (inconsistent) {
@@ -871,19 +895,44 @@ static void set_member_listening(transport_t *t,
   }
 }
 
-void tf_advance_delivery_epoch(transport_flexicast_flow_t *flow) {
-  if (flow->delivery_epoch != UINT64_MAX) {
-    flow->delivery_epoch++;
-    flow->feedback_outstanding_count = flow->listening_count;
+static void record_member_submission(transport_flexicast_flow_t *flow,
+                                     transport_flexicast_member_t *member,
+                                     int64_t now) {
+  if (!member->listening)
     return;
+  if (member->acknowledged_delivery_epoch == flow->delivery_epoch) {
+    member->acknowledged_delivery_epoch = flow->delivery_epoch - 1U;
+    member->first_unacknowledged_ms = now;
+    flow->feedback_outstanding_count++;
   }
-  /* This is unreachable at practical packet rates, but preserves comparison
-   * semantics without relying on unsigned wraparound. */
-  flow->delivery_epoch = 1;
-  flow->feedback_outstanding_count = flow->listening_count;
-  for (size_t i = 0; i < flow->member_count; i++)
-    if (flow->members[i].listening)
-      flow->members[i].acknowledged_delivery_epoch = 0;
+}
+
+void tf_record_delivery_submission(transport_flexicast_flow_t *flow,
+                                   transport_flexicast_member_t *recipient,
+                                   bool first_submission) {
+  if (first_submission) {
+    uint64_t previous = flow->delivery_epoch;
+    flow->delivery_epoch = previous == UINT64_MAX ? 1 : previous + 1U;
+    for (size_t i = 0; i < flow->member_count; ++i) {
+      transport_flexicast_member_t *member = &flow->members[i];
+      if (!member->listening)
+        continue;
+      /* Advancing the logical packet does not create debt for replicas still
+       * waiting on pacing or UDP backpressure. Preserve any older debt. */
+      if (member->acknowledged_delivery_epoch == previous)
+        member->acknowledged_delivery_epoch = flow->delivery_epoch;
+      else if (previous == UINT64_MAX)
+        member->acknowledged_delivery_epoch = 0;
+    }
+  }
+  int64_t now = transport_get_time_ms();
+  if (recipient) {
+    record_member_submission(flow, recipient, now);
+  } else {
+    /* One successful native multicast submission serves the whole cohort. */
+    for (size_t i = 0; i < flow->member_count; ++i)
+      record_member_submission(flow, &flow->members[i], now);
+  }
 }
 
 static uint64_t
@@ -905,32 +954,25 @@ feedback_demotion_timeout_ms(const transport_flexicast_flow_t *flow) {
                               : QUICLY_DEFAULT_MAX_ACK_DELAY;
   uint64_t interval =
       feedback_interval > ack_interval ? feedback_interval : ack_interval;
-  uint64_t timeout = interval * TRANSPORT_FLEXICAST_MISSED_FEEDBACK_WINDOWS;
+  /* This timer starts only after a protected datagram has been submitted to
+   * UDP. The receiver ACKs that packet on its time-based ACK deadline; it
+   * does not wait for ACK_PACKET_THRESHOLD more packets. Adding the time to
+   * serialize 32 packets at the controller floor delayed real path failures
+   * by 20 seconds (or over two minutes with adaptive CC). Pacing before the
+   * first submission remains outside the health deadline. */
+  return interval * TRANSPORT_FLEXICAST_MISSED_FEEDBACK_WINDOWS;
+}
 
-  /* Delivery debt is counted in packets, while the controller paces bytes.
-   * At a low rate, producing ACK_PACKET_THRESHOLD packets can itself take
-   * longer than the fixed missed-feedback window.  Give the member that
-   * serialization interval before declaring its feedback path unhealthy;
-   * otherwise a controller reduction can trigger false demotion, rekeying,
-   * and a self-sustaining unicast-repair storm. */
-  /* Base the health deadline on the slowest rate the controller is allowed
-   * to reach. Missing feedback can drive the controller down while this timer
-   * is running; using the instantaneous rate would make a fast controller
-   * demote members before it has had the same recovery opportunity as one
-   * that has already reached its floor. */
-  uint64_t rate = flow->cc_config.minimum_rate_bytes_per_second != 0
-                      ? flow->cc_config.minimum_rate_bytes_per_second
-                      : flow->pacing_rate_bytes_per_second;
-  if (rate != 0) {
-    uint64_t threshold_bytes =
-        (uint64_t)TRANSPORT_FLEXICAST_ACK_PACKET_THRESHOLD *
-        flow->cc_config.maximum_datagram_size;
-    uint64_t serialization_ms = (threshold_bytes * 1000U + rate - 1U) / rate;
-    if (serialization_ms > UINT64_MAX - timeout)
-      return UINT64_MAX;
-    timeout += serialization_ms;
-  }
-  return timeout;
+int64_t
+tf_member_feedback_deadline(const transport_flexicast_flow_t *flow,
+                            const transport_flexicast_member_t *member) {
+  if (!member_delivery_debt(flow, member) ||
+      member->first_unacknowledged_ms <= 0)
+    return INT64_MAX;
+  uint64_t interval = feedback_demotion_timeout_ms(flow);
+  return interval > (uint64_t)(INT64_MAX - member->first_unacknowledged_ms)
+             ? INT64_MAX
+             : member->first_unacknowledged_ms + (int64_t)interval;
 }
 
 bool transport_flexicast_member_remove(transport_t *t,
@@ -1072,6 +1114,13 @@ static bool rekey_source_flow(transport_t *t,
 
   for (size_t i = 0; i < flow->member_count; i++) {
     transport_flexicast_member_t *member = &flow->members[i];
+    if (member->reoffer_pending && member->conn) {
+      member->reoffer_pending = false;
+      member->offer_epoch = 0;
+      member->offer_bind_sent = false;
+      (void)transport_flexicast_offer(t, member->conn, &flow->track_id,
+                                      flow->alias);
+    }
     if (!member->conn || !member->joined)
       continue;
     set_member_listening(t, flow, member, false, 0);
@@ -1136,7 +1185,7 @@ static bool maybe_send_join(transport_flexicast_flow_t *flow) {
     return flow->join_sent;
   if (!send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
                   QUICLY_FLEXICAST_STATE_JOIN))
-    return false;
+    return true; /* Local backpressure is retried, not a peer protocol error. */
   flow->join_sent = true;
   return true;
 }
@@ -1300,8 +1349,24 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
       transport_flexicast_member_find(flow, conn);
   if (!member)
     return false;
-  if (member->offer_epoch != 0)
+  if (member->offer_epoch != 0) {
+    /* A repeated authenticated SUBSCRIBE requests a fresh delivery offer.
+     * Preserve ordinary recovery and batch a higher epoch before advertising
+     * it. A delayed LEAVE cannot detach the later JOIN at this new epoch. */
+    if (member->reoffer_pending ||
+        !admit_member_transition(t, flow, member, transport_get_time_ms()))
+      return true;
+    (void)quicly_flexicast_detach_at(flow->crypto, conn->id,
+                                     transport_get_time_ms());
+    member->joined = false;
+    member->key_pending = false;
+    member->offer_pending = false;
+    member->reoffer_pending = true;
+    member->rejoining = member->join_sequence != 0;
+    set_member_listening(t, flow, member, false, 0);
+    schedule_source_rekey(t, flow, transport_get_time_ms());
     return true;
+  }
 
   struct sockaddr *peer = quicly_get_peername(conn->quic);
   struct sockaddr *local = quicly_get_sockname(conn->quic);
@@ -1428,6 +1493,10 @@ bool transport_flexicast_receive_bind(transport_t *t, transport_conn_t *conn,
                                       const qlinq_wire_flexicast_bind_t *bind) {
   if (!t || !conn || !bind || !t->flexicast_enabled || t->is_server)
     return false;
+  uint32_t retired_epoch;
+  if (retired_flow_epoch(t, bind->flow_id, &retired_epoch) &&
+      bind->key_epoch <= retired_epoch)
+    return true;
   moq_track_id_t track;
   if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                             bind->alias, &track) != 0 ||
@@ -1494,6 +1563,7 @@ bool transport_flexicast_receive_path_ack(transport_t *t,
     }
     member->acknowledged_delivery_epoch = flow->delivery_epoch;
     member->last_ack_time_ms = transport_get_time_ms();
+    member->first_unacknowledged_ms = 0;
     if (recount || flow->feedback_outstanding_count > flow->listening_count)
       recount_member_feedback(flow);
   }
@@ -1508,9 +1578,13 @@ receive_quic_announce(transport_t *t, transport_conn_t *conn,
       !flexicast_host_id(&announce->flow_id, &flow_id) ||
       announce->sequence > UINT32_MAX)
     return false;
+  uint32_t retired_epoch = 0;
+  if (retired_flow_epoch(t, flow_id, &retired_epoch) &&
+      announce->sequence <= retired_epoch)
+    return true;
   transport_flexicast_flow_t *flow = find_flow(t, flow_id);
   if (!flow) {
-    uint32_t retired_epoch = 0;
+    retired_epoch = 0;
     if (retired_flow_epoch(t, flow_id, &retired_epoch) &&
         announce->sequence <= retired_epoch)
       return true;
@@ -1627,7 +1701,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     member->joined = true;
     member->key_pending = false;
     member->join_sequence = (uint32_t)state->sequence;
-    member->recovery_baseline_pending = true;
+    member->recovery_baseline_pending = !member->rejoining;
     /* Debounce concurrent membership changes. No protected payload is drained
      * until one new epoch has been distributed to the complete batch. */
     schedule_source_rekey(t, flow, transport_get_time_ms());
@@ -1647,12 +1721,17 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
       return false;
     set_member_listening(t, flow, member, true, transport_get_time_ms());
     member->ready_deadline_ms = 0;
+    member->rejoining = false;
     if (member->recovery_baseline_pending) {
       if (transport_subscriptions_find_alias(&conn->send_subscriptions,
                                              &flow->track_id, &alias) != 0)
         return false;
-      transport_publish_checkpoint_member_added(t, conn, &flow->track_id,
-                                                alias);
+      /* Ordinary unicast may already have enrolled this application
+       * subscription while tunnel setup was pending. READY must not reset its
+       * checkpoints or skip the records that it is still recovering. */
+      if (!transport_checkpoint_ack(conn, alias)->participating)
+        transport_publish_checkpoint_member_added(t, conn, &flow->track_id,
+                                                  alias);
       member->recovery_baseline_pending = false;
     }
   } else if (state->action == QUICLY_FLEXICAST_STATE_LEAVE) {
@@ -1669,10 +1748,10 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     member->key_pending = false;
     member->recovery_baseline_pending = false;
     set_member_listening(t, flow, member, false, 0);
-    if (transport_subscriptions_find_alias(&conn->send_subscriptions,
-                                           &flow->track_id, &alias) == 0)
-      transport_publish_checkpoint_member_removed(t, conn, &flow->track_id,
-                                                  alias);
+    /* LEAVE abandons the multicast backend, not the application subscription.
+     * UNSUBSCRIBE owns checkpoint removal; retain this receiver's recovery
+     * responsibility and cached history while ordinary unicast takes over. */
+    (void)alias;
     if (needs_rekey)
       schedule_source_rekey(t, flow, transport_get_time_ms());
   } else {
@@ -1693,6 +1772,10 @@ static bool receive_quic_key(transport_t *t, transport_conn_t *conn,
   transport_flexicast_flow_t *flow = find_flow(t, flow_id);
   if (!flow)
     return retired_flow_contains(t, flow_id);
+  uint32_t retired_epoch;
+  if (retired_flow_epoch(t, flow_id, &retired_epoch) &&
+      key->sequence <= retired_epoch)
+    return true;
   if (flow->source || flow->control_conn != conn || !flow->join_sent)
     return false;
   if (key->sequence < flow->key_epoch)
@@ -1738,6 +1821,153 @@ bool transport_flexicast_receive_quic_frame(
   default:
     return false;
   }
+}
+
+bool transport_flexicast_native_packet_valid(
+    transport_t *t, const uint8_t *packet, size_t size,
+    const transport_flexicast_ingress_t *ingress) {
+  if (!t || !packet || size < 9 || !ingress || ingress->truncated ||
+      !ingress->interface_index || !t->flexicast_enabled)
+    return false;
+  const uint8_t *at = packet + 1;
+  transport_flexicast_flow_t *flow = find_flow(t, quicly_decode64(&at));
+  size_t address_size = ip_address_size(ingress->ip_version);
+  return address_size && flow && !flow->source && flow->native_multicast &&
+         flow->membership_acquired && flow->join_sent &&
+         !flow->multicast_unavailable && flow->crypto && flow->control_conn &&
+         flow->ip_version == ingress->ip_version &&
+         flow->udp_port == ingress->destination_port &&
+         (!flow->interface_index ||
+          flow->interface_index == ingress->interface_index) &&
+         !memcmp(flow->source_ip, ingress->source_ip, address_size) &&
+         !memcmp(flow->group_ip, ingress->group_ip, address_size);
+}
+
+ssize_t transport_flexicast_receive_native(transport_t *t, size_t slot,
+                                           uint8_t *packet, size_t capacity,
+                                           transport_conn_t **source,
+                                           ptls_iovec_t *payload) {
+  if (!t || slot >= 2 || !source || !payload) {
+    errno = EINVAL;
+    return -1;
+  }
+  *source = NULL;
+  *payload = ptls_iovec_init(NULL, 0);
+#ifdef __linux__
+  struct sockaddr_storage peer = {0};
+  struct iovec vector = {.iov_base = packet, .iov_len = capacity};
+  union {
+    struct cmsghdr align;
+    uint8_t bytes[CMSG_SPACE(sizeof(struct in_pktinfo)) +
+                  CMSG_SPACE(sizeof(struct in6_pktinfo))];
+  } control = {0};
+  struct msghdr message = {.msg_name = &peer,
+                           .msg_namelen = sizeof(peer),
+                           .msg_iov = &vector,
+                           .msg_iovlen = 1,
+                           .msg_control = control.bytes,
+                           .msg_controllen = sizeof(control.bytes)};
+  ssize_t received = recvmsg(t->flexicast_fds[slot], &message, 0);
+  if (received < 0)
+    return received;
+  transport_flexicast_ingress_t ingress = {
+      .ip_version = slot == 0 ? 4 : 6,
+      .destination_port = t->flexicast_receive_ports[slot],
+      .truncated = (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) != 0};
+  bool source_valid = false, destination_valid = false;
+  if (slot == 0 && peer.ss_family == AF_INET &&
+      message.msg_namelen >= sizeof(struct sockaddr_in)) {
+    memcpy(ingress.source_ip, &((struct sockaddr_in *)&peer)->sin_addr, 4);
+    source_valid = true;
+  } else if (slot == 1 && peer.ss_family == AF_INET6 &&
+             message.msg_namelen >= sizeof(struct sockaddr_in6)) {
+    memcpy(ingress.source_ip, &((struct sockaddr_in6 *)&peer)->sin6_addr, 16);
+    source_valid = true;
+  }
+  for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header;
+       header = CMSG_NXTHDR(&message, header)) {
+    if (slot == 0 && header->cmsg_level == IPPROTO_IP &&
+        header->cmsg_type == IP_PKTINFO &&
+        header->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+      struct in_pktinfo info;
+      memcpy(&info, CMSG_DATA(header), sizeof(info));
+      memcpy(ingress.group_ip, &info.ipi_addr, 4);
+      ingress.interface_index = (uint32_t)info.ipi_ifindex;
+      destination_valid = true;
+    } else if (slot == 1 && header->cmsg_level == IPPROTO_IPV6 &&
+               header->cmsg_type == IPV6_PKTINFO &&
+               header->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
+      struct in6_pktinfo info;
+      memcpy(&info, CMSG_DATA(header), sizeof(info));
+      memcpy(ingress.group_ip, &info.ipi6_addr, 16);
+      ingress.interface_index = info.ipi6_ifindex;
+      destination_valid = true;
+    }
+  }
+  t->stats.flexicast_multicast_datagrams_received++;
+  if (!source_valid || !destination_valid ||
+      !transport_flexicast_native_packet_valid(t, packet, (size_t)received,
+                                               &ingress) ||
+      !transport_flexicast_receive_packet(t, packet, (size_t)received, source,
+                                          payload) ||
+      !*source || !payload->base)
+    t->stats.flexicast_multicast_datagrams_rejected++;
+  return received;
+#else
+  (void)packet;
+  (void)capacity;
+  errno = ENOTSUP;
+  return -1;
+#endif
+}
+
+/* Replicated ciphertext travels on the ordinary UDP socket. Only the current
+ * control connection's live path tuples may inject it; otherwise a replay
+ * addressed to that socket could bypass the native ingress checks. */
+bool transport_flexicast_receive_unicast(transport_t *t, uint8_t *packet,
+                                         size_t size,
+                                         const struct sockaddr *peer,
+                                         transport_conn_t **source,
+                                         ptls_iovec_t *payload) {
+  if (!t || !packet || size < 9 || !source || !payload || !t->flexicast_enabled)
+    return false;
+  const uint8_t *at = packet + 1;
+  transport_flexicast_flow_t *flow = find_flow(t, quicly_decode64(&at));
+  if (!flow || flow->source || !flow->crypto)
+    return false;
+  *source = NULL;
+  *payload = ptls_iovec_init(NULL, 0);
+  bool allowed = false;
+  if (peer && flow->join_sent && !flow->multicast_unavailable &&
+      flow->control_conn && flow->control_conn->quic) {
+    for (size_t i = 0; i < TRANSPORT_MAX_QUIC_PATHS; i++) {
+      quicly_path_stats_t path;
+      quicly_path_health_t health;
+      if (quicly_get_path_stats(flow->control_conn->quic, i, &path) != 0 ||
+          quicly_get_path_health(flow->control_conn->quic, i, &health) != 0 ||
+          health.abandoned || !health.validated ||
+          peer->sa_family != path.remote.sa.sa_family)
+        continue;
+      if (peer->sa_family == AF_INET) {
+        const struct sockaddr_in *remote = (const struct sockaddr_in *)peer;
+        allowed = remote->sin_port == path.remote.sin.sin_port &&
+                  remote->sin_addr.s_addr == path.remote.sin.sin_addr.s_addr;
+      } else if (peer->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *remote = (const struct sockaddr_in6 *)peer;
+        allowed =
+            remote->sin6_port == path.remote.sin6.sin6_port &&
+            !memcmp(&remote->sin6_addr, &path.remote.sin6.sin6_addr, 16) &&
+            remote->sin6_scope_id == path.remote.sin6.sin6_scope_id;
+      }
+      if (allowed)
+        break;
+    }
+  }
+  if (!allowed) {
+    t->stats.flexicast_multicast_datagrams_rejected++;
+    return true;
+  }
+  return transport_flexicast_receive_packet(t, packet, size, source, payload);
 }
 
 bool transport_flexicast_receive_packet(transport_t *t, uint8_t *packet,
@@ -1879,12 +2109,8 @@ void transport_flexicast_tick(transport_t *t) {
       bool readiness_expired = member->joined && !member->listening &&
                                member->ready_deadline_ms > 0 &&
                                now >= member->ready_deadline_ms;
-      bool feedback_expired = member->listening &&
-                              member_delivery_debt(flow, member) >=
-                                  TRANSPORT_FLEXICAST_ACK_PACKET_THRESHOLD &&
-                              member->last_ack_time_ms > 0 &&
-                              (uint64_t)(now - member->last_ack_time_ms) >=
-                                  feedback_demotion_timeout_ms(flow);
+      bool feedback_expired = member_delivery_debt(flow, member) > 0 &&
+                              now >= tf_member_feedback_deadline(flow, member);
       if (!member->conn || (!readiness_expired && !feedback_expired))
         continue;
       (void)send_state(member->conn, flow->flow_id, flow->key_epoch,

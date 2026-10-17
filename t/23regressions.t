@@ -15,8 +15,8 @@ subtest 'Quicly Flexicast unit suite' => sub {
 };
 subtest 'Flexicast regression matrix' => sub {
     for my $cc ('', 'adaptive') {
-        for my $mode ('pacing 1', 'pacing 5', 'pacing 12', 'aliases 5', 'rekey 2', 'partial-rekey 5', 'egress-rekey 2', 'control-queue 2',
-                      'controls 2', 'limits 2', 'fixed 2', 'rateless 2', 'fixed-cache 2', 'rateless-cache 2', 'video-rateless 1', 'native 2', 'native-wildcard 2') {
+        for my $mode ('pacing 1', 'pacing 5', 'pacing 12', 'blocked-fanout 5', 'aliases 5', 'rekey 2', 'partial-rekey 5', 'egress-rekey 2', 'control-queue 2',
+                      'controls 2', 'rateless-ready-baseline 2', 'rateless-recovery-fairness 1', 'rateless-recovery-dedup 1', 'limits 2', 'fixed 2', 'rateless 2', 'fixed-cache 2', 'rateless-cache 2', 'video-rateless 1', 'native 2', 'native-wildcard 2', 'native-ingress 1') {
             my ($stderr, $stdout) = run_prog("./t/00util/test_flexicast_regressions $mode $cc");
             like($stdout, qr/===FLEXICAST REGRESSIONS OK===/, "$mode $cc") or diag($stderr);
         }

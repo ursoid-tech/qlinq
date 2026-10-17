@@ -133,6 +133,10 @@ typedef struct {
   size_t max_fec_record_bytes;
   size_t max_udp_payload_bytes;
   size_t max_packets_per_service;
+  size_t max_aggregate_nack_requests_per_second;
+  size_t max_recovery_cache_bytes;
+  size_t max_stream_egress_bytes;
+  size_t max_total_stream_egress_bytes;
 } qlinq_limits_t;
 
 typedef struct {
@@ -188,6 +192,9 @@ typedef struct {
    * Quicly applies a two-packet minimum and also uses this window as the
    * temporary flight cap during path recovery. Fixed at endpoint creation. */
   uint32_t initial_cwnd_packets;
+  uint32_t receive_object_timeout_ms;
+  uint32_t handshake_timeout_rtt_multiplier;
+  uint32_t initial_rtt_ms;
 } qlinq_endpoint_config_t;
 
 typedef struct {
@@ -208,6 +215,9 @@ typedef struct {
   const char *name;
 } qlinq_stream_config_t;
 
+/* FEC DATA records retain transport.h payload compatibility. Their received
+ * group_id and sequence identify the coding object; other modes retain the
+ * original object IDs. */
 typedef struct {
   uint64_t group_id;
   uint64_t sequence;
@@ -390,6 +400,20 @@ typedef struct {
   uint64_t malformed_datagrams;
   uint64_t datagrams_received;
   uint64_t stream_frames_received;
+  uint64_t repair_requests_coalesced;
+  uint64_t repair_requests_deferred;
+  size_t recovery_cache_payload_bytes;
+  size_t recovery_cache_peak_payload_bytes;
+  size_t recovery_cache_entries;
+  size_t recovery_cache_peak_entries;
+  size_t stream_egress_bytes;
+  size_t stream_egress_peak_bytes;
+  size_t stream_egress_frames;
+  size_t stream_egress_peak_frames;
+  size_t stream_egress_vector_capacity;
+  size_t stream_egress_peak_vectors;
+  uint64_t stream_egress_blocked;
+  uint64_t stream_control_failures;
 } qlinq_endpoint_stats_t;
 
 typedef struct {

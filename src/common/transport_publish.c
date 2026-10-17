@@ -81,6 +81,8 @@ static bool publication_valid(transport_t *t, const moq_object_t *obj) {
       (obj->size > 0 && !obj->data))
     return false;
 
+  if (transport_publish_track_terminal(t, &obj->track_id))
+    return false;
   size_t recipients = transport_connection_count(t);
   for (size_t i = 0; i < recipients; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
@@ -453,13 +455,14 @@ static transport_publish_result_t publish_datagram_to_flexicast(
       continue;
     path_state_t active_states[TRANSPORT_MAX_PATHS];
     size_t active_paths = 0;
-    for (size_t physical = 0; physical < t->num_fds; physical++) {
-      size_t mapped = transport_path_find_by_link(member->quic, t->local_addrs,
-                                                  t->num_fds, physical);
+    for (size_t physical = 0; physical < t->socket_count; physical++) {
+      quicly_path_stats_t stats;
+      size_t mapped = transport_path_get_eligible_by_local(
+          member->quic, &t->sockets[physical].local_addr, &stats);
       if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
           !quicly_is_path_available(member->quic, mapped))
         continue;
-      active_states[active_paths++] = member->path_states[physical];
+      active_states[active_paths++] = member->paths[physical].state;
     }
     if (active_paths == 0)
       continue;
@@ -1345,8 +1348,6 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
     final_object_id = UINT64_MAX;
 
   size_t active_count = transport_connection_count(t);
-  bool found = false;
-  bool succeeded = true;
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
     if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
@@ -1410,11 +1411,11 @@ bool transport_abort_track(transport_t *t, moq_track_id_t track_id) {
     (void)transport_stream_write_track_abort_frame(conn->stream, alias);
   }
 
-  if (t->fec_buf_len != 0 &&
-      transport_track_id_equal(&t->fec_track_id, &track_id)) {
-    t->fec_buf_len = 0;
-    t->fec_pkt_count = 0;
-    t->fec_first_pkt_time = 0;
+  if (t->pending_group.size != 0 &&
+      transport_track_id_equal(&t->pending_group.track_id, &track_id)) {
+    t->pending_group.size = 0;
+    t->pending_group.record_count = 0;
+    t->pending_group.started_at_ms = 0;
   }
   (void)transport_sent_cache_release_track(&t->sent_cache, &track_id);
   (void)transport_flexicast_cancel_track_repairs(t, &track_id);
