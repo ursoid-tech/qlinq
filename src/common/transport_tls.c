@@ -1,5 +1,6 @@
 #include "transport_tls.h"
 #include "transport_internal.h"
+#include "quicly/defaults.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -87,6 +88,109 @@ bool transport_tls_configure_crypto_backend(transport_t *t) {
             "aes_preference=AES-256-GCM\n",
             selected, requested);
   return true;
+}
+
+ptls_cipher_algorithm_t *transport_tls_cid_cipher(const transport_t *t) {
+#if QLINQ_WITH_FUSION
+  /* Use the configured choice, which already passed the runtime CPU guard.
+   * Later environment changes must not alter an existing endpoint's policy. */
+  if (t->tls_ctx.cipher_suites == fusion_cipher_suites)
+    return &ptls_fusion_quiclb;
+#endif
+  (void)t;
+  return &ptls_openssl_quiclb;
+}
+
+enum { CID_CACHE_ENTRIES = 8, CID_CACHE_MAX_SIZE = 16 };
+
+typedef struct {
+  quicly_cid_encryptor_t super;
+  quicly_cid_encryptor_t *delegate;
+  size_t cid_size, count, next;
+  struct {
+    uint8_t encrypted[CID_CACHE_MAX_SIZE];
+    quicly_cid_plaintext_t plaintext;
+  } entries[CID_CACHE_ENTRIES];
+} cached_cid_encryptor_t;
+
+static void cached_encrypt_cid(quicly_cid_encryptor_t *self,
+                               quicly_cid_t *encrypted, void *reset_token,
+                               const quicly_cid_plaintext_t *plaintext) {
+  cached_cid_encryptor_t *cache = (cached_cid_encryptor_t *)self;
+  cache->delegate->encrypt_cid(cache->delegate, encrypted, reset_token,
+                               plaintext);
+}
+
+static size_t cached_decrypt_cid(quicly_cid_encryptor_t *self,
+                                 quicly_cid_plaintext_t *plaintext,
+                                 const void *encrypted, size_t len) {
+  cached_cid_encryptor_t *cache = (cached_cid_encryptor_t *)self;
+  /* Match the native long-header check before reading any ciphertext. Short
+   * headers pass zero and use this endpoint's immutable cipher block size. */
+  if (len != 0 && len != cache->cid_size)
+    return SIZE_MAX;
+  for (size_t i = 0; i < cache->count; i++) {
+    if (memcmp(cache->entries[i].encrypted, encrypted, cache->cid_size) == 0) {
+      *plaintext = cache->entries[i].plaintext;
+      return cache->cid_size;
+    }
+  }
+  /* The native decoder permits the input to overlap the output. Preserve the
+   * ciphertext before delegation overwrites any such shared storage. */
+  uint8_t cache_key[CID_CACHE_MAX_SIZE];
+  memcpy(cache_key, encrypted, cache->cid_size);
+  size_t result =
+      cache->delegate->decrypt_cid(cache->delegate, plaintext, encrypted, len);
+  if (result == cache->cid_size) {
+    memcpy(cache->entries[cache->next].encrypted, cache_key, cache->cid_size);
+    cache->entries[cache->next].plaintext = *plaintext;
+    cache->next = (cache->next + 1) % CID_CACHE_ENTRIES;
+    if (cache->count < CID_CACHE_ENTRIES)
+      cache->count++;
+  }
+  return result;
+}
+
+static int cached_generate_reset_token(quicly_cid_encryptor_t *self,
+                                       void *token, const void *cid) {
+  cached_cid_encryptor_t *cache = (cached_cid_encryptor_t *)self;
+  return cache->delegate->generate_stateless_reset_token(cache->delegate, token,
+                                                         cid);
+}
+
+quicly_cid_encryptor_t *transport_tls_new_cid_encryptor(const transport_t *t,
+                                                        ptls_iovec_t key) {
+  ptls_cipher_algorithm_t *cipher = transport_tls_cid_cipher(t);
+  quicly_cid_encryptor_t *delegate = quicly_new_default_cid_encryptor(
+      cipher, &ptls_openssl_aes128ecb, &ptls_openssl_sha256, key);
+  if (!delegate)
+    return NULL;
+  cached_cid_encryptor_t *cache = malloc(sizeof(*cache));
+  if (!cache)
+    return delegate;
+  cache->super = (quicly_cid_encryptor_t){
+      cached_encrypt_cid, cached_decrypt_cid, cached_generate_reset_token};
+  cache->delegate = delegate;
+  cache->cid_size = cipher->block_size;
+  cache->count = cache->next = 0;
+  /* The cache belongs to this endpoint/key, just like the native contexts.
+   * It caches only the deterministic CID transform: hits still undergo normal
+   * destination checks and packet authentication in quicly_receive. */
+  return &cache->super;
+}
+
+void transport_tls_free_cid_encryptor(quicly_cid_encryptor_t *encryptor) {
+  if (!encryptor)
+    return;
+  if (encryptor->decrypt_cid == cached_decrypt_cid) {
+    cached_cid_encryptor_t *cache = (cached_cid_encryptor_t *)encryptor;
+    quicly_free_default_cid_encryptor(cache->delegate);
+    ptls_clear_memory(cache, sizeof(*cache));
+    free(cache);
+  } else {
+    /* Wrapper allocation failed; the original native ownership is intact. */
+    quicly_free_default_cid_encryptor(encryptor);
+  }
 }
 
 static const uint16_t insecure_verify_algorithms[] = {

@@ -220,6 +220,7 @@ t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 TRANSPORT_TESTS = t/00util/test_transport_bind \
+	t/00util/test_transport_poll \
 	t/00util/test_crypto_backend \
 	t/00util/test_interleaved_receive \
 	t/00util/test_publication_limits \
@@ -240,7 +241,7 @@ TRANSPORT_TESTS = t/00util/test_transport_bind \
 	t/00util/test_tls \
 	t/00util/test_rateless_benchmark
 
-$(filter-out t/00util/test_multipath_failover,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
+$(filter-out t/00util/test_multipath_failover t/00util/test_multipath_feedback,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 API_TESTS = t/00util/test_qlinq_policy \
@@ -264,6 +265,9 @@ t/00util/test_udp_gso_prefix: t/00util/test_udp_gso_prefix.o
 
 t/00util/test_udp_receive: t/00util/test_udp_receive.o src/common/transport_udp.o
 	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_udp_gro: t/00util/test_udp_gro.o
+	$(CC) -o $@ $< $(LDFLAGS)
 
 t/00util/test_ifmon: t/00util/test_ifmon.o
 	$(CC) -o $@ $< $(LDFLAGS)
@@ -324,7 +328,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json \
 	t/00util/test_crypto_backend \
 	t/00util/test_qlinq_policy \
-	t/00util/test_egress_errors t/00util/test_transport_bind \
+	t/00util/test_egress_errors t/00util/test_transport_bind t/00util/test_transport_poll \
 	t/00util/test_interleaved_receive t/00util/test_publication_limits \
 	t/00util/test_directional_subscriptions \
 	t/00util/test_qlinq_event_overflow t/00util/test_qlinq_compat \
@@ -333,13 +337,25 @@ CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json \
 	t/00util/test_stream_budget t/00util/test_transport \
 	t/00util/test_reliable_bidirectional t/00util/test_tund \
 	t/00util/test_data_uds t/00util/test_transport_wire \
-	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_udp_receive t/00util/test_ifmon \
+	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_udp_receive t/00util/test_udp_gro t/00util/test_ifmon \
 	t/00util/test_multipath t/00util/test_multipath_failover \
 	t/00util/test_multipath_feedback \
 	t/00util/test_multipath_publication \
 	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
 
 t/00util/test_multipath_failover: t/00util/test_multipath_failover.o $(filter-out src/common/transport_udp.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# The feedback fixture delegates native operations except during its explicit
+# scheduler checks. Keep the production library and native dependency intact.
+t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
+		-Dquicly_get_path_stats=test_quicly_get_path_stats \
+		-Dquicly_get_path_health=test_quicly_get_path_health \
+		-Dquicly_is_path_available=test_quicly_is_path_available \
+		-Dquicly_send_on_path=test_quicly_send_on_path -c $< -o $@
+
+t/00util/test_multipath_feedback: t/00util/test_multipath_feedback.o t/00util/transport_quicly_feedback.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 check: all $(CHECK_BINARIES) gencerts

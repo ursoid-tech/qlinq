@@ -81,6 +81,8 @@ t/00util/test_stream_budget
 /t/00util/test_multipath_feedback
 /t/00util/test_multipath_publication
 /t/00util/test_udp_receive
+/t/00util/test_udp_gro
+/t/00util/test_transport_poll
 /t/00util/test_flexicast_regressions
 /t/00util/test_flexicast_scale
 /t/00util/test_flexicast_transport

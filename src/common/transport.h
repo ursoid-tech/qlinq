@@ -513,4 +513,14 @@ struct pollfd;
 size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
                               size_t max_fds);
 
+/* Internal post-poll service entry: maintenance and output still run, while
+ * UDP and interface-monitor reads use this tick's borrowed poll results.
+ * Buffered GRO datagrams remain serviceable without socket readiness. NULL
+ * retains transport_tick's full scan. Interface messages arriving after the
+ * snapshot stay readable for the next poll; consuming any update invalidates
+ * UDP readiness and forces a full scan. The caller must not retain or reuse
+ * readiness on a later tick. */
+void transport_tick_ready(transport_t *t, const struct pollfd *fds,
+                          size_t count);
+
 #endif /* TRANSPORT_H */

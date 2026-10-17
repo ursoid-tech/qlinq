@@ -42,7 +42,7 @@ static bool queue_remaining(transport_egress_t *egress,
                             const struct sockaddr *destination,
                             socklen_t destination_len,
                             const struct iovec *datagrams, size_t first,
-                            size_t count) {
+                            size_t count, uint8_t max_gso_segments) {
   size_t bytes = 0;
   for (size_t i = first; i < count; i++) {
     if (datagrams[i].iov_len > SIZE_MAX - bytes)
@@ -73,6 +73,7 @@ static bool queue_remaining(transport_egress_t *egress,
     size_t tail = (egress->head + egress->count) % egress->capacity;
     transport_egress_packet_t *packet = &egress->packets[tail];
     packet->destination_len = destination_len;
+    packet->max_gso_segments = max_gso_segments;
     memcpy(&packet->destination, destination, destination_len);
     packet->data = copy;
     packet->size = datagrams[i].iov_len;
@@ -92,9 +93,11 @@ static bool queue_remaining(transport_egress_t *egress,
 bool transport_egress_submit(transport_egress_t *egress, int fd,
                              const struct sockaddr *destination,
                              socklen_t destination_len,
-                             const struct iovec *datagrams, size_t count) {
+                             const struct iovec *datagrams, size_t count,
+                             size_t max_gso_segments) {
   if (!egress || fd < 0 || !destination || (!datagrams && count > 0) ||
-      destination_len > sizeof(struct sockaddr_storage))
+      destination_len > sizeof(struct sockaddr_storage) ||
+      max_gso_segments > TRANSPORT_EGRESS_BATCH)
     return false;
   if (count == 0)
     return true;
@@ -102,7 +105,7 @@ bool transport_egress_submit(transport_egress_t *egress, int fd,
   size_t first = 0;
   if (egress->count == 0) {
     ssize_t sent = transport_udp_send_batch(fd, destination, destination_len,
-                                            datagrams, count);
+                                            datagrams, count, max_gso_segments);
     if (sent < 0) {
       egress->send_errors++;
       return false;
@@ -116,8 +119,9 @@ bool transport_egress_submit(transport_egress_t *egress, int fd,
         egress->would_block++;
     }
   }
-  return first == count || queue_remaining(egress, destination, destination_len,
-                                           datagrams, first, count);
+  return first == count ||
+         queue_remaining(egress, destination, destination_len, datagrams, first,
+                         count, (uint8_t)max_gso_segments);
 }
 
 bool transport_egress_flush(transport_egress_t *egress, int fd) {
@@ -133,7 +137,8 @@ bool transport_egress_flush(transport_egress_t *egress, int fd) {
     while (compatible < batch) {
       size_t slot = (egress->head + compatible) % egress->capacity;
       transport_egress_packet_t *packet = &egress->packets[slot];
-      if (packet->destination_len != first->destination_len ||
+      if (packet->max_gso_segments != first->max_gso_segments ||
+          packet->destination_len != first->destination_len ||
           memcmp(&packet->destination, &first->destination,
                  first->destination_len) != 0)
         break;
@@ -144,7 +149,7 @@ bool transport_egress_flush(transport_egress_t *egress, int fd) {
 
     ssize_t sent = transport_udp_send_batch(
         fd, (const struct sockaddr *)&first->destination,
-        first->destination_len, datagrams, compatible);
+        first->destination_len, datagrams, compatible, first->max_gso_segments);
     if (sent < 0) {
       egress->send_errors++;
       /* A hard error applies to the first unsent datagram. Retaining it

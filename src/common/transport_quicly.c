@@ -41,7 +41,8 @@
 #include "quicly/sendstate.h"
 #include "quicly/streambuf.h"
 
-#define QLINQ_STREAM_MULTIPATH_SEND_BATCH 6U
+#define QLINQ_STREAM_MULTIPATH_SEND_BATCH 32U
+#define QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS 6U
 #define QLINQ_PATHFLOW_UPDATE_MS 25U
 #define QLINQ_GROUP_FLUSH_MS 3U
 
@@ -420,21 +421,34 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
   size_t quic_paths[TRANSPORT_MAX_QUIC_PATHS];
   path_t paths[TRANSPORT_MAX_QUIC_PATHS];
   size_t count = 0;
-  size_t symbol_size = transport_get_datagram_symbol_size(t);
-  if (symbol_size == 0)
-    symbol_size = 1200;
+  bool has_datagrams = quicly_has_datagram_frames(quic);
+  bool feedback_only = !quicly_has_pending_stream_data(quic) && !has_datagrams;
+  size_t symbol_size = 0;
+  if (!feedback_only) {
+    symbol_size = transport_get_datagram_symbol_size(t);
+    if (symbol_size == 0)
+      symbol_size = 1200;
+  }
 
   uint64_t remaining = conn->scheduler_paths;
   while (remaining != 0) {
     size_t path = (size_t)__builtin_ctzll(remaining);
     remaining &= remaining - 1U;
     size_t physical = conn->scheduler_sockets[path];
-    quicly_path_stats_t stats;
     quicly_path_health_t health;
-    if (quicly_get_path_stats(quic, path, &stats) != 0 ||
-        !quicly_is_path_available(quic, path) ||
+    if (!quicly_is_path_available(quic, path) ||
         (quicly_get_path_health(quic, path, &health) == 0 &&
          health.state == QUICLY_PATH_SUSPECT))
+      continue;
+    /* Feedback uses round-robin selection, so congestion-derived scores do
+     * not influence its ordering. Keep the same owned, available, healthy
+     * candidates without copying path statistics or calculating estimates. */
+    if (feedback_only) {
+      quic_paths[count++] = path;
+      continue;
+    }
+    quicly_path_stats_t stats;
+    if (quicly_get_path_stats(quic, path, &stats) != 0)
       continue;
     const transport_conn_path_t *physical_path = &conn->paths[physical];
     fp_t relative_owd =
@@ -470,9 +484,7 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
      * a small packet batch, so account for that whole batch when comparing
      * completion times; otherwise each decision charges one packet then sends
      * several and flattens heterogeneous-link scheduling. */
-    size_t batch = quicly_has_datagram_frames(quic)
-                       ? 1U
-                       : QLINQ_STREAM_MULTIPATH_SEND_BATCH;
+    size_t batch = has_datagrams ? 1U : QLINQ_STREAM_MULTIPATH_SEND_BATCH;
     if (batch > 1U) {
       size_t additional = batch - 1U;
       sample.q = additional > FP_SAFE_WHOLE - sample.q ? FP_SAFE_WHOLE
@@ -488,8 +500,6 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
    * plan can reserve a fictitious parity packet even for tiny loss rates.
    * Use expected transmission cost for both the first choice and fallbacks;
    * Quicly still enforces congestion, pacing, and stream eligibility. */
-  bool feedback_only = !quicly_has_pending_stream_data(quic) &&
-                       !quicly_has_datagram_frames(quic);
   size_t feedback_start = conn->feedback_path % count;
   uint64_t attempted_paths = 0;
   for (size_t attempt = 0; attempt < count; attempt++) {
@@ -739,6 +749,7 @@ static bool parse_address(const char *host, uint16_t port,
 }
 
 static void destroy_socket(transport_socket_t *socket) {
+  transport_udp_gro_destroy(socket->gro);
   if (socket->fd >= 0)
     CLOSE_SOCKET(socket->fd);
   transport_egress_destroy(&socket->egress);
@@ -768,6 +779,9 @@ static const char *open_local_socket(transport_t *t,
                              t->limits.max_egress_packets_per_socket,
                              t->limits.max_egress_bytes_per_socket))
     goto Fail;
+  /* Optional per-socket storage is allocated before enabling UDP_GRO. An
+   * unsupported socket or allocation failure retains the stateless path. */
+  socket->gro = transport_udp_gro_create(socket->fd);
   return NULL;
 
 Fail:
@@ -1125,9 +1139,11 @@ transport_t *transport_create(const transport_config_t *config) {
   /* Setup CID encryptor to support active connection migration */
   char cid_key[16];
   ptls_openssl_random_bytes(cid_key, sizeof(cid_key));
-  t->quic_ctx.cid_encryptor = quicly_new_default_cid_encryptor(
-      &ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
-      ptls_iovec_init(cid_key, sizeof(cid_key)));
+  t->quic_ctx.cid_encryptor = transport_tls_new_cid_encryptor(
+      t, ptls_iovec_init(cid_key, sizeof(cid_key)));
+  ptls_clear_memory(cid_key, sizeof(cid_key));
+  if (!t->quic_ctx.cid_encryptor)
+    goto Fail;
 
   t->quic_ctx.tls = &t->tls_ctx;
   quicly_amend_ptls_context(t->quic_ctx.tls);
@@ -1351,7 +1367,7 @@ void transport_destroy(transport_t *t) {
   transport_arena_destroy(&t->arena);
 
   if (t->quic_ctx.cid_encryptor != NULL) {
-    quicly_free_default_cid_encryptor(t->quic_ctx.cid_encryptor);
+    transport_tls_free_cid_encryptor(t->quic_ctx.cid_encryptor);
   }
 
   if (t->pending_group.data) {
@@ -1432,16 +1448,19 @@ static void remove_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
   }
 }
 
-static void service_interfaces(transport_t *t) {
+static bool service_interfaces(transport_t *t) {
   if (t->ifmon_pipe[0] < 0)
-    return;
+    return false;
+  bool consumed = false;
   ifmon_pipe_msg_t msg;
   while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
+    consumed = true;
     if (msg.is_added)
       add_interface(t, &msg);
     else
       remove_interface(t, &msg);
   }
+  return consumed;
 }
 
 static void transport_receive_datagram(transport_t *t, size_t fd_idx,
@@ -1537,7 +1556,19 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
   }
 }
 
-static void receive_packets(transport_t *t) {
+static bool socket_receive_ready(int fd, const struct pollfd *fds,
+                                 size_t count) {
+  if (!fds)
+    return true;
+  for (size_t i = 0; i < count; i++)
+    if (fds[i].fd == fd &&
+        (fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0)
+      return true;
+  return false;
+}
+
+static void receive_packets(transport_t *t, const struct pollfd *fds,
+                            size_t count) {
   size_t receive_budget = t->limits.max_packets_per_tick;
   size_t receive_start =
       t->socket_count ? t->receive_cursor % t->socket_count : 0;
@@ -1549,6 +1580,10 @@ static void receive_packets(transport_t *t) {
   for (size_t visited = 0; visited < t->socket_count && receive_budget > 0;
        visited++) {
     size_t fd_idx = (receive_start + visited) % t->socket_count;
+    transport_socket_t *socket = &t->sockets[fd_idx];
+    if (!transport_udp_gro_pending(socket->gro) &&
+        !socket_receive_ready(socket->fd, fds, count))
+      continue;
     size_t serviced = 0;
     while (receive_budget > 0 && serviced < quantum) {
       size_t batch = quantum - serviced;
@@ -1556,20 +1591,37 @@ static void receive_packets(transport_t *t) {
         batch = receive_budget;
       if (batch > TRANSPORT_UDP_RECEIVE_BATCH)
         batch = TRANSPORT_UDP_RECEIVE_BATCH;
-      transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
-      ssize_t received =
-          transport_udp_receive_batch(t->sockets[fd_idx].fd, datagrams, batch);
+      ssize_t received;
+      bool more;
+      if (socket->gro) {
+        transport_udp_view_t views[TRANSPORT_UDP_RECEIVE_BATCH];
+        received = transport_udp_gro_receive(socket->gro, socket->fd, views,
+                                             batch, &more);
+        for (ssize_t i = 0; i < received; i++)
+          if (!views[i].dropped)
+            transport_receive_datagram(t, fd_idx, views[i].data, views[i].size,
+                                       &views[i].source);
+      } else {
+        transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
+        received = transport_udp_receive_batch(socket->fd, datagrams, batch);
+        for (ssize_t i = 0; i < received; i++) {
+          /* Preserve recvfrom/recvmmsg's original copied-prefix dispatch. The
+           * decoder validates each complete QUIC packet in that prefix. */
+          transport_receive_datagram(t, fd_idx, datagrams[i].data,
+                                     datagrams[i].size, &datagrams[i].source);
+        }
+        more = received == (ssize_t)batch;
+      }
       if (received <= 0)
         break; /* Empty or persistently failing sockets cannot spin the owner.
                 */
-      for (ssize_t i = 0; i < received; i++) {
-        /* Preserve recvfrom/recvmmsg's original copied-prefix dispatch. The
-         * decoder validates each complete QUIC packet in that prefix. */
-        transport_receive_datagram(t, fd_idx, datagrams[i].data,
-                                   datagrams[i].size, &datagrams[i].source);
-        receive_budget--;
-        serviced++;
-      }
+      receive_budget -= (size_t)received;
+      serviced += (size_t)received;
+      /* GRO may fill its raw batch yet return fewer logical views than asked
+       * for. Its explicit continuation flag preserves the packet quantum and
+       * avoids stranding input after a short logical batch. */
+      if (!more)
+        break;
     }
   }
 }
@@ -1658,13 +1710,18 @@ static void service_connections(transport_t *t, uint64_t now) {
       struct iovec dgrams[64];
       uint8_t dgrams_buf[64 * 1500];
       size_t num_dgrams = 64;
-      /* qlinq_path_scheduler_send makes a packet-granular Pathflow choice.
+      /* qlinq_path_scheduler_send chooses one path for each native batch.
        * Quicly may consume the whole output batch on that path, so bound
        * stream-only multipath batches to keep a single decision from steering
        * 64 packets. Datagram publication retains its 64-packet queue batch. */
-      if ((conn->scheduler_paths & (conn->scheduler_paths - 1U)) != 0 &&
-          !quicly_has_datagram_frames(conn->quic))
+      bool stream_only_multipath =
+          (conn->scheduler_paths & (conn->scheduler_paths - 1U)) != 0 &&
+          !quicly_has_datagram_frames(conn->quic);
+      if (stream_only_multipath)
         num_dgrams = QLINQ_STREAM_MULTIPATH_SEND_BATCH;
+      /* Save this classification: quicly_send may drain queued DATAGRAMs.
+       * Stream-only output uses smaller UDP aggregates independently of the
+       * native batch size; retained egress must carry the same limit. */
       int send_res = quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams,
                                  dgrams_buf, sizeof(dgrams_buf));
       if (send_res == 0) {
@@ -1690,7 +1747,9 @@ static void service_connections(transport_t *t, uint64_t now) {
 
         if (!transport_egress_submit(
                 &t->sockets[out_fd_index].egress, t->sockets[out_fd_index].fd,
-                &dest.sa, quicly_get_socklen(&dest.sa), dgrams, num_dgrams))
+                &dest.sa, quicly_get_socklen(&dest.sa), dgrams, num_dgrams,
+                stream_only_multipath ? QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS
+                                      : 0))
           transport_log(t, TRANSPORT_LOG_WARNING, "udp", conn->id, out_fd_index,
                         "egress queue exhausted");
       } else if (send_res == QUICLY_ERROR_FREE_CONNECTION) {
@@ -1751,7 +1810,8 @@ static void service_connections(transport_t *t, uint64_t now) {
   }
 }
 
-void transport_tick(transport_t *t) {
+void transport_tick_ready(transport_t *t, const struct pollfd *fds,
+                          size_t count) {
   if (!transport_owner_ok(t))
     return;
   if (t->tick_active) {
@@ -1786,12 +1846,21 @@ void transport_tick(transport_t *t) {
     }
   }
 
-  service_interfaces(t);
-  receive_packets(t);
+  /* Messages arriving after the snapshot remain readable for the next poll.
+   * Consumed updates can compact slots and recycle descriptors; even a no-op
+   * update invalidates UDP readiness. Direct ticks retain the full scan. */
+  if (socket_receive_ready(t->ifmon_pipe[0], fds, count) &&
+      service_interfaces(t))
+    fds = NULL;
+  receive_packets(t, fds, count);
   uint64_t now = ptls_get_time.cb(&ptls_get_time);
   update_path_measurements(t, now);
   service_connections(t, now);
   t->tick_active = false;
+}
+
+void transport_tick(transport_t *t) {
+  transport_tick_ready(t, NULL, 0);
 }
 
 static bool subscribe_connection(transport_conn_t *conn,
@@ -2392,6 +2461,12 @@ int64_t transport_get_time_ms(void) {
 int64_t transport_get_first_timeout(transport_t *t) {
   if (!transport_owner_ok(t))
     return INT64_MAX;
+
+  /* A GRO read can empty the kernel socket while leaving logical datagrams
+   * in userspace. Poll readiness alone cannot schedule the remaining work. */
+  for (size_t i = 0; i < t->socket_count; i++)
+    if (transport_udp_gro_pending(t->sockets[i].gro))
+      return 0;
 
   int64_t first_timeout = t->aggregate_nack_retry_at_ms > 0
                               ? t->aggregate_nack_retry_at_ms

@@ -3,6 +3,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 typedef struct {
@@ -11,6 +12,112 @@ typedef struct {
   bool server, authenticated, subscribed;
   size_t received;
 } endpoint_t;
+
+/* The test-specific transport object redirects only these native operations.
+ * Ordinary integration traffic below always delegates to the pinned library. */
+static struct {
+  bool enabled;
+  uint64_t available, suspect, health_unavailable, sendable;
+  size_t stats_queries, attempted[TRANSPORT_MAX_QUIC_PATHS], attempts;
+} scheduler_check;
+
+int test_quicly_get_path_stats(quicly_conn_t *conn, size_t path,
+                               quicly_path_stats_t *stats) {
+  if (scheduler_check.enabled)
+    scheduler_check.stats_queries++;
+  return quicly_get_path_stats(conn, path, stats);
+}
+
+int test_quicly_get_path_health(quicly_conn_t *conn, size_t path,
+                                quicly_path_health_t *health) {
+  if (!scheduler_check.enabled)
+    return quicly_get_path_health(conn, path, health);
+  if (scheduler_check.health_unavailable & (UINT64_C(1) << path))
+    return -1;
+  *health = (quicly_path_health_t){.state = scheduler_check.suspect &
+                                                    (UINT64_C(1) << path)
+                                                ? QUICLY_PATH_SUSPECT
+                                                : QUICLY_PATH_USABLE};
+  return 0;
+}
+
+int test_quicly_is_path_available(quicly_conn_t *conn, size_t path) {
+  return scheduler_check.enabled
+             ? (scheduler_check.available & (UINT64_C(1) << path)) != 0
+             : quicly_is_path_available(conn, path);
+}
+
+quicly_error_t test_quicly_send_on_path(quicly_conn_t *conn,
+                                        quicly_send_context_t *context,
+                                        size_t path, size_t *packets_sent) {
+  if (!scheduler_check.enabled)
+    return quicly_send_on_path(conn, context, path, packets_sent);
+  assert(scheduler_check.attempts < TRANSPORT_MAX_QUIC_PATHS);
+  scheduler_check.attempted[scheduler_check.attempts++] = path;
+  *packets_sent = (scheduler_check.sendable & (UINT64_C(1) << path)) != 0;
+  return 0;
+}
+
+static void check_feedback_selection(endpoint_t *server,
+                                     const size_t paths[2]) {
+  transport_conn_t *conn = server->conn;
+  quicly_path_scheduler_t *scheduler =
+      server->transport->quic_ctx.path_scheduler;
+  assert(!quicly_has_pending_stream_data(conn->quic));
+  assert(!quicly_has_datagram_frames(conn->quic));
+  uint64_t owned = (UINT64_C(1) << paths[0]) | (UINT64_C(1) << paths[1]);
+  assert(conn->scheduler_paths == owned);
+  assert(conn->scheduler_sockets[paths[0]] == 0);
+  assert(conn->scheduler_sockets[paths[1]] == 0);
+  size_t saved_cursor = conn->feedback_path;
+  conn->feedback_path = 0;
+  scheduler_check.enabled = true;
+  /* Even an available native path outside the owned mask must be ignored. */
+  scheduler_check.available = scheduler_check.sendable = UINT64_MAX;
+  for (size_t i = 0; i < 4; i++) {
+    scheduler_check.attempts = 0;
+    assert(scheduler->do_send(scheduler, conn->quic, NULL) == 0);
+    assert(scheduler_check.attempts == 1);
+    assert(scheduler_check.attempted[0] == paths[i % 2]);
+    assert(scheduler_check.stats_queries == 0);
+  }
+
+  /* A pacing/cwnd-blocked first choice must fall through to the other path. */
+  conn->feedback_path = 0;
+  scheduler_check.sendable = UINT64_C(1) << paths[1];
+  scheduler_check.attempts = 0;
+  assert(scheduler->do_send(scheduler, conn->quic, NULL) == 0);
+  assert(scheduler_check.attempts == 2);
+  assert(scheduler_check.attempted[0] == paths[0]);
+  assert(scheduler_check.attempted[1] == paths[1]);
+
+  /* Availability and suspect state exclude paths before round-robin ranking. */
+  for (size_t suspect = 0; suspect < 2; suspect++) {
+    scheduler_check.available = suspect ? owned : UINT64_C(1) << paths[1];
+    scheduler_check.suspect = suspect ? UINT64_C(1) << paths[0] : 0;
+    scheduler_check.attempts = 0;
+    assert(scheduler->do_send(scheduler, conn->quic, NULL) == 0);
+    assert(scheduler_check.attempts == 1);
+    assert(scheduler_check.attempted[0] == paths[1]);
+  }
+  scheduler_check.suspect = owned;
+  scheduler_check.attempts = 0;
+  assert(scheduler->do_send(scheduler, conn->quic, NULL) == 0);
+  assert(scheduler_check.attempts == 0);
+
+  /* Preserve the existing fallback when health information is unavailable. */
+  scheduler_check.suspect = 0;
+  scheduler_check.health_unavailable = owned;
+  scheduler_check.sendable = owned;
+  scheduler_check.attempts = 0;
+  conn->feedback_path = 0;
+  assert(scheduler->do_send(scheduler, conn->quic, NULL) == 0);
+  assert(scheduler_check.attempts == 1);
+  assert(scheduler_check.attempted[0] == paths[0]);
+  assert(scheduler_check.stats_queries == 0);
+  memset(&scheduler_check, 0, sizeof(scheduler_check));
+  conn->feedback_path = saved_cursor;
+}
 
 static void event(void *data, const transport_event_t *e) {
   endpoint_t *endpoint = data;
@@ -134,6 +241,7 @@ int main(void) {
     tick(&server, &client);
     usleep(1000);
   }
+  check_feedback_selection(&server, paths);
 
   /* The listener owns one socket but both remote paths have path-bound
    * feedback. A physical-socket-only scheduler drains path zero and leaves

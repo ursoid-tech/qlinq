@@ -10,6 +10,7 @@
 #include "transport_paths.h"
 #include "transport_repair.h"
 #include "transport_subscriptions.h"
+#include "transport_udp.h"
 
 #include "picotls.h"
 #include "picotls/openssl.h"
@@ -59,6 +60,7 @@ typedef struct {
   char interface_name[64];
   uint64_t bytes_received;
   transport_egress_t egress;
+  transport_udp_gro_t *gro;
   size_t remote_index;
   bool open_pending;
   uint64_t open_retry_at_ms;

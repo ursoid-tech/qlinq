@@ -151,28 +151,57 @@ static int test_recovery_cache_lookup(void) {
   return 0;
 }
 
-static int test_udp_batch_boundaries(void) {
+static int test_udp_batch_boundaries(int family) {
   static const struct {
     size_t count;
     size_t lengths[3];
     size_t uniform_length;
     size_t override_index, override_length;
-  } cases[] = {{3, {40, 40, 40}, 0, 0, 0}, {3, {80, 80, 40}, 0, 0, 0},
-               {2, {40, 80}, 0, 0, 0},     {3, {80, 40, 80}, 0, 0, 0},
-               {2, {40, 0}, 0, 0, 0},      {2, {0, 40}, 0, 0, 0},
-               {3, {80, 0, 40}, 0, 0, 0},  {64, {0}, 1280, 64, 0},
-               {64, {0}, 1500, 64, 0},     {64, {0}, 1280, 63, 13},
-               {64, {0}, 1280, 31, 0}};
-  int sender = socket(AF_INET, SOCK_DGRAM, 0);
-  int receiver = socket(AF_INET, SOCK_DGRAM, 0);
-  CHECK(sender >= 0 && receiver >= 0, "UDP batch sockets");
-  struct sockaddr_in address = {.sin_family = AF_INET,
-                                .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
-  socklen_t address_len = sizeof(address);
-  CHECK(bind(receiver, (struct sockaddr *)&address, address_len) == 0 &&
-            getsockname(receiver, (struct sockaddr *)&address, &address_len) ==
-                0,
-        "UDP batch receiver address");
+    size_t max_gso_segments;
+  } cases[] = {{3, {40, 40, 40}, 0, 0, 0, 0}, {3, {80, 80, 40}, 0, 0, 0, 0},
+               {2, {40, 80}, 0, 0, 0, 0},     {3, {80, 40, 80}, 0, 0, 0, 0},
+               {2, {40, 0}, 0, 0, 0, 0},      {2, {0, 40}, 0, 0, 0, 0},
+               {3, {80, 0, 40}, 0, 0, 0, 0},  {64, {0}, 1280, 64, 0, 0},
+               {64, {0}, 1500, 64, 0, 0},     {64, {0}, 1280, 63, 13, 0},
+               {64, {0}, 1280, 31, 0, 0},     {16, {0}, 1280, 16, 0, 6},
+               {32, {0}, 1280, 32, 0, 6},     {64, {0}, 1280, 64, 0, 6}};
+  int version = family == AF_INET ? 4 : 6;
+  /* Match the UDP receive/GRO fixtures: both address families are required.
+   * A missing IPv6 stack or loopback address is a visible setup failure. */
+  int sender = socket(family, SOCK_DGRAM, 0);
+  if (sender < 0) {
+    fprintf(stderr, "UDP batch IPv%d sender socket: %s\n", version,
+            strerror(errno));
+    return 1;
+  }
+  int receiver = socket(family, SOCK_DGRAM, 0);
+  if (receiver < 0) {
+    fprintf(stderr, "UDP batch IPv%d receiver socket: %s\n", version,
+            strerror(errno));
+    close(sender);
+    return 1;
+  }
+  struct sockaddr_storage address = {0};
+  socklen_t address_len;
+  if (family == AF_INET) {
+    struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
+    v4->sin_family = AF_INET;
+    v4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address_len = sizeof(*v4);
+  } else {
+    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address;
+    v6->sin6_family = AF_INET6;
+    v6->sin6_addr = in6addr_loopback;
+    address_len = sizeof(*v6);
+  }
+  if (bind(receiver, (struct sockaddr *)&address, address_len) != 0 ||
+      getsockname(receiver, (struct sockaddr *)&address, &address_len) != 0) {
+    fprintf(stderr, "UDP batch IPv%d receiver address: %s\n", version,
+            strerror(errno));
+    close(receiver);
+    close(sender);
+    return 1;
+  }
   struct timeval timeout = {.tv_sec = 1};
   CHECK(setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                    sizeof(timeout)) == 0,
@@ -195,15 +224,17 @@ static int test_udp_batch_boundaries(void) {
     if (cases[c].uniform_length && cases[c].override_index < cases[c].count)
       datagrams[cases[c].override_index].iov_len = cases[c].override_length;
     CHECK(transport_udp_send_batch(sender, (struct sockaddr *)&address,
-                                   address_len, datagrams,
-                                   cases[c].count) == (ssize_t)cases[c].count,
+                                   address_len, datagrams, cases[c].count,
+                                   cases[c].max_gso_segments) ==
+              (ssize_t)cases[c].count,
           "UDP batch reports complete datagrams");
     for (size_t i = 0; i < cases[c].count; i++) {
       ssize_t size = recv(receiver, received, sizeof(received), MSG_TRUNC);
       if (size != (ssize_t)datagrams[i].iov_len)
         fprintf(stderr,
-                "UDP batch case %zu datagram %zu: received %zd, expected %zu\n",
-                c, i, size, datagrams[i].iov_len);
+                "UDP batch IPv%d case %zu datagram %zu: received %zd, "
+                "expected %zu\n",
+                version, c, i, size, datagrams[i].iov_len);
       CHECK(size == (ssize_t)datagrams[i].iov_len &&
                 memcmp(received, datagrams[i].iov_base, datagrams[i].iov_len) ==
                     0,
@@ -215,6 +246,8 @@ static int test_udp_batch_boundaries(void) {
   }
   close(sender);
   close(receiver);
+  printf("UDP batch IPv%d: %zu boundary cases passed\n", version,
+         sizeof(cases) / sizeof(cases[0]));
   return 0;
 }
 
@@ -649,7 +682,8 @@ int main(void) {
         "sparse recovery state lifetime");
   CHECK(test_assembler_growth_budget() == 0,
         "assembler transient allocation budget");
-  CHECK(test_udp_batch_boundaries() == 0, "UDP batch boundaries");
+  CHECK(test_udp_batch_boundaries(AF_INET) == 0, "IPv4 UDP batch boundaries");
+  CHECK(test_udp_batch_boundaries(AF_INET6) == 0, "IPv6 UDP batch boundaries");
   CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
   CHECK(test_recovery_cache_lookup() == 0, "sparse wrapped cache lookup");
   transport_limits_t configured = {0};

@@ -22,7 +22,15 @@ static ssize_t interrupted_recvmsg(int fd, struct msghdr *message, int flags) {
 #define recvmsg interrupted_recvmsg
 #define transport_udp_receive_batch portable_receive_batch
 #define transport_udp_send_batch portable_send_batch
+#define transport_udp_gro_create portable_gro_create
+#define transport_udp_gro_destroy portable_gro_destroy
+#define transport_udp_gro_pending portable_gro_pending
+#define transport_udp_gro_receive portable_gro_receive
 #include "../../src/common/transport_udp.c"
+#undef transport_udp_gro_create
+#undef transport_udp_gro_destroy
+#undef transport_udp_gro_pending
+#undef transport_udp_gro_receive
 #undef transport_udp_receive_batch
 #undef transport_udp_send_batch
 #undef recvmsg
@@ -89,6 +97,7 @@ static void run(int family, receive_fn receive) {
 }
 
 int main(void) {
+  assert(!portable_gro_create(7) && errno == ENOTSUP);
   run(AF_INET, transport_udp_receive_batch);
   run(AF_INET6, transport_udp_receive_batch);
   run(AF_INET, portable_receive_batch);

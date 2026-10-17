@@ -1,5 +1,6 @@
 /* backend selection and QUIC packet-protection interoperability */
 #include "transport_internal.h"
+#include "transport_tls.h"
 #include "picotls/openssl.h"
 #include "quicly/defaults.h"
 #if QLINQ_WITH_FUSION
@@ -20,17 +21,45 @@
     }                                                                          \
   } while (0)
 
-/* Force an unsupported CPU through the real TLS policy without changing
- * production detection or introducing a runtime override. */
+/* Compile the real TLS helpers under private names for allocation-failure and
+ * cache-hit observation. No production runtime controls are introduced. */
+static bool fail_cache_allocation, fail_native_constructor;
+
+static void *test_tls_malloc(size_t size) {
+  return fail_cache_allocation ? NULL : malloc(size);
+}
+
+static quicly_cid_encryptor_t *
+test_default_cid_constructor(ptls_cipher_algorithm_t *cid_cipher,
+                             ptls_cipher_algorithm_t *reset_cipher,
+                             ptls_hash_algorithm_t *hash, ptls_iovec_t key) {
+  return fail_native_constructor ? NULL
+                                 : quicly_new_default_cid_encryptor(
+                                       cid_cipher, reset_cipher, hash, key);
+}
+
+/* Force an unsupported CPU through the real TLS policy. */
 #if QLINQ_WITH_FUSION
 #define __builtin_cpu_supports(feature) 0
+#endif
+#define malloc test_tls_malloc
+#define quicly_new_default_cid_encryptor test_default_cid_constructor
 #define transport_tls_configure_crypto_backend configure_unsupported_cpu
+#define transport_tls_cid_cipher unsupported_cpu_cid_cipher
+#define transport_tls_new_cid_encryptor test_new_cid_encryptor
+#define transport_tls_free_cid_encryptor test_free_cid_encryptor
 #define transport_tls_load_certificate_and_key unused_load_certificate
 #define transport_tls_init_insecure_verifier unused_init_verifier
 #include "../../src/common/transport_tls.c"
 #undef transport_tls_init_insecure_verifier
 #undef transport_tls_load_certificate_and_key
 #undef transport_tls_configure_crypto_backend
+#undef transport_tls_cid_cipher
+#undef transport_tls_new_cid_encryptor
+#undef transport_tls_free_cid_encryptor
+#undef quicly_new_default_cid_encryptor
+#undef malloc
+#if QLINQ_WITH_FUSION
 #undef __builtin_cpu_supports
 #endif
 
@@ -58,6 +87,289 @@ static transport_t *create_endpoint(void) {
                                .log_callback = capture_log};
   crypto_log[0] = '\0';
   return transport_create(&config);
+}
+
+static int check_cid_protection(transport_t *transport) {
+  ptls_cipher_algorithm_t *candidate = transport_tls_cid_cipher(transport);
+  ptls_cipher_algorithm_t *reference = &ptls_openssl_quiclb;
+  CHECK(candidate->key_size == reference->key_size &&
+        candidate->block_size == reference->block_size &&
+        candidate->iv_size == reference->iv_size);
+  uint8_t key[PTLS_QUICLB_KEY_SIZE], plain[PTLS_QUICLB_MAX_BLOCK_SIZE],
+      encrypted[2][PTLS_QUICLB_MAX_BLOCK_SIZE],
+      recovered[PTLS_QUICLB_MAX_BLOCK_SIZE];
+  for (size_t seed = 0; seed < 3; seed++) {
+    for (size_t i = 0; i < sizeof(key); i++)
+      key[i] = (uint8_t)(i * 17 + seed * 83);
+    for (size_t i = 0; i < sizeof(plain); i++)
+      plain[i] = (uint8_t)(i * 29 + seed * 71);
+    ptls_cipher_context_t *enc[2] = {ptls_cipher_new(candidate, 1, key),
+                                     ptls_cipher_new(reference, 1, key)};
+    ptls_cipher_context_t *dec[2] = {ptls_cipher_new(candidate, 0, key),
+                                     ptls_cipher_new(reference, 0, key)};
+    CHECK(enc[0] && enc[1] && dec[0] && dec[1]);
+    for (size_t length = PTLS_QUICLB_MIN_BLOCK_SIZE;
+         length <= PTLS_QUICLB_MAX_BLOCK_SIZE; length++) {
+      for (size_t i = 0; i < 2; i++)
+        ptls_cipher_encrypt(enc[i], encrypted[i], plain, length);
+      CHECK(memcmp(encrypted[0], encrypted[1], length) == 0);
+      for (size_t i = 0; i < 2; i++) {
+        /* Cross-backend decode, including the in-place operation. */
+        memcpy(recovered, encrypted[1 - i], length);
+        ptls_cipher_encrypt(dec[i], recovered, recovered, length);
+        CHECK(memcmp(recovered, plain, length) == 0);
+      }
+    }
+    for (size_t i = 0; i < 2; i++) {
+      ptls_cipher_free(enc[i]);
+      ptls_cipher_free(dec[i]);
+    }
+
+    quicly_cid_encryptor_t *cid[2] = {
+        transport_tls_new_cid_encryptor(transport,
+                                        ptls_iovec_init(key, sizeof(key))),
+        quicly_new_default_cid_encryptor(reference, &ptls_openssl_aes128ecb,
+                                         &ptls_openssl_sha256,
+                                         ptls_iovec_init(key, sizeof(key)))};
+    CHECK(cid[0] && cid[1]);
+    for (size_t path = 0; path <= 255; path += 17) {
+      quicly_cid_plaintext_t original = {.master_id = 0x12340000u + path,
+                                         .path_id = path,
+                                         .sequence = 255 - path,
+                                         .thread_id = 0xa531,
+                                         .node_id = 0};
+      quicly_cid_t encoded[2];
+      uint8_t tokens[2][QUICLY_STATELESS_RESET_TOKEN_LEN],
+          token[QUICLY_STATELESS_RESET_TOKEN_LEN];
+      for (size_t i = 0; i < 2; i++)
+        cid[i]->encrypt_cid(cid[i], &encoded[i], tokens[i], &original);
+      CHECK(encoded[0].len == 8 && encoded[1].len == 8);
+      CHECK(memcmp(encoded[0].cid, encoded[1].cid, 8) == 0);
+      CHECK(memcmp(tokens[0], tokens[1], sizeof(token)) == 0);
+      for (size_t i = 0; i < 2; i++) {
+        for (size_t length = 0; length <= 8; length += 8) {
+          quicly_cid_plaintext_t decoded;
+          CHECK(cid[i]->decrypt_cid(cid[i], &decoded, encoded[1 - i].cid,
+                                    length) == 8);
+          CHECK(decoded.master_id == original.master_id &&
+                decoded.path_id == original.path_id &&
+                decoded.sequence == original.sequence &&
+                decoded.thread_id == original.thread_id &&
+                decoded.node_id == original.node_id);
+        }
+        CHECK(cid[i]->generate_stateless_reset_token(cid[i], token,
+                                                     encoded[1 - i].cid));
+        CHECK(memcmp(token, tokens[1 - i], sizeof(token)) == 0);
+        quicly_cid_plaintext_t ignored;
+        CHECK(cid[i]->decrypt_cid(cid[i], &ignored, encoded[1 - i].cid, 7) ==
+              SIZE_MAX);
+      }
+    }
+    transport_tls_free_cid_encryptor(cid[0]);
+    quicly_free_default_cid_encryptor(cid[1]);
+  }
+  return 0;
+}
+
+static bool same_cid_plaintext(const quicly_cid_plaintext_t *a,
+                               const quicly_cid_plaintext_t *b) {
+  return a->master_id == b->master_id && a->path_id == b->path_id &&
+         a->sequence == b->sequence && a->thread_id == b->thread_id &&
+         a->node_id == b->node_id;
+}
+
+static quicly_cid_encryptor_t *counted_cid_delegate;
+static size_t (*original_cid_decrypt)(quicly_cid_encryptor_t *,
+                                      quicly_cid_plaintext_t *, const void *,
+                                      size_t);
+static size_t cid_decrypt_calls;
+static bool cid_delegate_failed, cid_delegate_wrong_self;
+
+static size_t count_cid_decrypt(quicly_cid_encryptor_t *self,
+                                quicly_cid_plaintext_t *plaintext,
+                                const void *encrypted, size_t len) {
+  cid_decrypt_calls++;
+  if (self != counted_cid_delegate) {
+    cid_delegate_wrong_self = true;
+    return SIZE_MAX;
+  }
+  if (cid_delegate_failed)
+    return SIZE_MAX;
+  return original_cid_decrypt(self, plaintext, encrypted, len);
+}
+
+static int check_cid_cache(void) {
+  transport_t policy = {0}; /* OpenSSL policy, independent of environment. */
+  uint8_t key[16] = {0}, other_key[16] = {1};
+  quicly_cid_encryptor_t *cid =
+      test_new_cid_encryptor(&policy, ptls_iovec_init(key, sizeof(key)));
+  quicly_cid_encryptor_t *reference = quicly_new_default_cid_encryptor(
+      &ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
+      ptls_iovec_init(key, sizeof(key)));
+  CHECK(cid && reference && cid->decrypt_cid == cached_decrypt_cid);
+  cached_cid_encryptor_t *cache = (cached_cid_encryptor_t *)cid;
+  counted_cid_delegate = cache->delegate;
+  original_cid_decrypt = counted_cid_delegate->decrypt_cid;
+  counted_cid_delegate->decrypt_cid = count_cid_decrypt;
+  cid_decrypt_calls = 0;
+  cid_delegate_failed = cid_delegate_wrong_self = false;
+  quicly_cid_plaintext_t original[10];
+  quicly_cid_t encoded[10];
+  uint8_t tokens[10][QUICLY_STATELESS_RESET_TOKEN_LEN];
+  for (size_t i = 0; i < 10; i++) {
+    original[i] = (quicly_cid_plaintext_t){.master_id = 0x739a0000u + i,
+                                           .path_id = i,
+                                           .sequence = 255 - i,
+                                           .thread_id = 0xa531};
+    quicly_cid_t expected;
+    uint8_t token[QUICLY_STATELESS_RESET_TOKEN_LEN];
+    cid->encrypt_cid(cid, &encoded[i], tokens[i], &original[i]);
+    reference->encrypt_cid(reference, &expected, token, &original[i]);
+    CHECK(encoded[i].len == 8 && expected.len == 8);
+    CHECK(memcmp(encoded[i].cid, expected.cid, 8) == 0);
+    CHECK(memcmp(tokens[i], token, sizeof(token)) == 0);
+  }
+  CHECK(cid_decrypt_calls == 0); /* Encryption does not populate the cache. */
+  quicly_cid_plaintext_t cold_rejected = original[9];
+  CHECK(cid->decrypt_cid(cid, &cold_rejected, NULL, 7) == SIZE_MAX);
+  CHECK(same_cid_plaintext(&cold_rejected, &original[9]) &&
+        cid_decrypt_calls == 0);
+  for (size_t i = 0; i < 8; i++) {
+    quicly_cid_plaintext_t decoded;
+    CHECK(cid->decrypt_cid(cid, &decoded, encoded[i].cid, i % 2 ? 8 : 0) == 8);
+    CHECK(same_cid_plaintext(&decoded, &original[i]));
+    CHECK(cid_decrypt_calls == i + 1);
+  }
+  for (size_t i = 0; i < 8; i++) {
+    quicly_cid_plaintext_t decoded;
+    CHECK(cid->decrypt_cid(cid, &decoded, encoded[i].cid, i % 2 ? 0 : 8) == 8);
+    CHECK(same_cid_plaintext(&decoded, &original[i]));
+  }
+  CHECK(cid_decrypt_calls == 8 && cache->count == 8);
+  quicly_cid_plaintext_t decoded = original[9];
+  const size_t invalid_lengths[] = {1, 7, 9, 16, SIZE_MAX};
+  for (size_t i = 0; i < sizeof(invalid_lengths) / sizeof(invalid_lengths[0]);
+       i++) {
+    CHECK(cid->decrypt_cid(cid, &decoded, encoded[0].cid, invalid_lengths[i]) ==
+          SIZE_MAX);
+    CHECK(same_cid_plaintext(&decoded, &original[9]));
+    /* Invalid lengths must be rejected before even reading the input. */
+    CHECK(cid->decrypt_cid(cid, &decoded, NULL, invalid_lengths[i]) ==
+          SIZE_MAX);
+  }
+  CHECK(cid_decrypt_calls == 8);
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded[8].cid, 0) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original[8]) && cid_decrypt_calls == 9);
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded[1].cid, 8) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original[1]) && cid_decrypt_calls == 9);
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded[0].cid, 8) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original[0]) && cid_decrypt_calls == 10);
+  CHECK(cache->count == 8); /* Nine distinct CIDs evict, never grow storage. */
+
+  uint8_t changed[8];
+  memcpy(changed, encoded[0].cid, sizeof(changed));
+  changed[7] ^= 1; /* A common seven-byte prefix is not a cache match. */
+  quicly_cid_plaintext_t expected;
+  CHECK(reference->decrypt_cid(reference, &expected, changed, 8) == 8);
+  CHECK(cid->decrypt_cid(cid, &decoded, changed, 8) == 8);
+  CHECK(same_cid_plaintext(&decoded, &expected) && cid_decrypt_calls == 11);
+  decoded = original[0]; /* Modifying the output cannot mutate the cache. */
+  CHECK(cid->decrypt_cid(cid, &decoded, changed, 0) == 8);
+  CHECK(same_cid_plaintext(&decoded, &expected) && cid_decrypt_calls == 11);
+
+  cid_delegate_failed = true;
+  decoded = original[0];
+  for (size_t i = 0; i < 2; i++) {
+    CHECK(cid->decrypt_cid(cid, &decoded, encoded[9].cid, 8) == SIZE_MAX);
+    CHECK(same_cid_plaintext(&decoded, &original[0]));
+  }
+  CHECK(cid_decrypt_calls == 13); /* Failed decryptions are never cached. */
+  cid_delegate_failed = false;
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded[9].cid, 0) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original[9]) && cid_decrypt_calls == 14);
+  CHECK(!cid_delegate_wrong_self);
+  for (size_t i = 0; i < 10; i++) {
+    uint8_t token[QUICLY_STATELESS_RESET_TOKEN_LEN];
+    CHECK(cid->generate_stateless_reset_token(cid, token, encoded[i].cid));
+    CHECK(memcmp(token, tokens[i], sizeof(token)) == 0);
+    quicly_cid_t without_token;
+    cid->encrypt_cid(cid, &without_token, NULL, &original[i]);
+    CHECK(without_token.len == 8 &&
+          memcmp(without_token.cid, encoded[i].cid, 8) == 0);
+  }
+
+  /* Concurrent endpoints and a newly created lifetime cannot reuse plaintext
+   * derived using another key, even for identical ciphertext. */
+  for (size_t lifetime = 0; lifetime < 2; lifetime++) {
+    quicly_cid_encryptor_t *other = test_new_cid_encryptor(
+        &policy, ptls_iovec_init(other_key, sizeof(other_key)));
+    quicly_cid_encryptor_t *other_reference = quicly_new_default_cid_encryptor(
+        &ptls_openssl_quiclb, &ptls_openssl_aes128ecb, &ptls_openssl_sha256,
+        ptls_iovec_init(other_key, sizeof(other_key)));
+    CHECK(other && other_reference);
+    CHECK(other_reference->decrypt_cid(other_reference, &expected,
+                                       encoded[9].cid, 8) == 8);
+    CHECK(!same_cid_plaintext(&expected, &original[9]));
+    CHECK(other->decrypt_cid(other, &decoded, encoded[9].cid, 0) == 8);
+    CHECK(same_cid_plaintext(&decoded, &expected));
+    CHECK(cid->decrypt_cid(cid, &decoded, encoded[9].cid, 8) == 8);
+    CHECK(same_cid_plaintext(&decoded, &original[9]) &&
+          cid_decrypt_calls == 14);
+    test_free_cid_encryptor(other);
+    quicly_free_default_cid_encryptor(other_reference);
+    other_key[0]++;
+  }
+  union {
+    quicly_cid_plaintext_t plaintext;
+    uint8_t ciphertext[16];
+  } overlapping;
+  memcpy(overlapping.ciphertext, encoded[1].cid, 8);
+  CHECK(cid->decrypt_cid(cid, &overlapping.plaintext, overlapping.ciphertext,
+                         8) == 8);
+  CHECK(same_cid_plaintext(&overlapping.plaintext, &original[1]));
+  CHECK(cid_decrypt_calls == 15);
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded[1].cid, 0) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original[1]) && cid_decrypt_calls == 15);
+  counted_cid_delegate->decrypt_cid = original_cid_decrypt;
+  test_free_cid_encryptor(cid);
+  quicly_free_default_cid_encryptor(reference);
+
+  fail_cache_allocation = true;
+  cid = test_new_cid_encryptor(&policy, ptls_iovec_init(key, sizeof(key)));
+  fail_cache_allocation = false;
+  CHECK(cid && cid->decrypt_cid != cached_decrypt_cid);
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded[9].cid, 0) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original[9]));
+  test_free_cid_encryptor(cid); /* The paired destructor also owns fallback. */
+  fail_native_constructor = true;
+  CHECK(test_new_cid_encryptor(&policy, ptls_iovec_init(key, sizeof(key))) ==
+        NULL);
+  fail_native_constructor = false;
+  test_free_cid_encryptor(NULL);
+  return 0;
+}
+
+static int check_cid_credential_reload(transport_t *t) {
+  quicly_cid_encryptor_t *cid = t->quic_ctx.cid_encryptor;
+  quicly_cid_plaintext_t original = {.master_id = 0x983ba52c,
+                                     .path_id = 3,
+                                     .sequence = 27,
+                                     .thread_id = 0xffff},
+                         decoded;
+  quicly_cid_t encoded;
+  uint8_t token[QUICLY_STATELESS_RESET_TOKEN_LEN],
+      after[QUICLY_STATELESS_RESET_TOKEN_LEN];
+  cid->encrypt_cid(cid, &encoded, token, &original);
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded.cid, 0) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original));
+  CHECK(transport_reload_credentials(t, "t/assets/server.crt",
+                                     "t/assets/server.key"));
+  CHECK(t->quic_ctx.cid_encryptor == cid);
+  CHECK(cid->decrypt_cid(cid, &decoded, encoded.cid, 8) == 8);
+  CHECK(same_cid_plaintext(&decoded, &original));
+  CHECK(cid->generate_stateless_reset_token(cid, after, encoded.cid));
+  CHECK(memcmp(token, after, sizeof(token)) == 0);
+  return 0;
 }
 
 static int check_packet_protection(ptls_cipher_suite_t *candidate,
@@ -271,6 +583,11 @@ static int check_mixed_peers_and_key_updates(void) {
   CHECK(server_cipher->aead ==
             server.transport->tls_ctx.cipher_suites[0]->aead &&
         client_cipher->aead == &ptls_openssl_aes256gcm);
+  CHECK(transport_tls_cid_cipher(client.transport) == &ptls_openssl_quiclb);
+#if QLINQ_WITH_FUSION
+  CHECK((transport_tls_cid_cipher(server.transport) == &ptls_fusion_quiclb) ==
+        (server_cipher->aead == &ptls_fusion_aes256gcm));
+#endif
   moq_track_id_t track = {.type = MOQ_TRACK_DATA,
                           .flags = MOQ_TRACK_FLAG_RELIABLE,
                           .name = "mixed-backend-key-update"};
@@ -320,15 +637,20 @@ static int check_mixed_peers_and_key_updates(void) {
 }
 
 int main(void) {
+  CHECK(check_cid_cache() == 0);
   CHECK(unsetenv("QLINQ_CRYPTO_BACKEND") == 0);
   transport_t *t = create_endpoint();
   CHECK(t && t->tls_ctx.cipher_suites == ptls_openssl_cipher_suites);
+  CHECK(transport_tls_cid_cipher(t) == &ptls_openssl_quiclb);
   CHECK(strstr(crypto_log, "backend=openssl requested=openssl fallback=none"));
+  CHECK(check_cid_protection(t) == 0);
+  CHECK(check_cid_credential_reload(t) == 0);
   transport_destroy(t);
 
   CHECK(setenv("QLINQ_CRYPTO_BACKEND", "openssl", 1) == 0);
   t = create_endpoint();
   CHECK(t && t->tls_ctx.cipher_suites == ptls_openssl_cipher_suites);
+  CHECK(transport_tls_cid_cipher(t) == &ptls_openssl_quiclb);
   transport_destroy(t);
 
   CHECK(setenv("QLINQ_CRYPTO_BACKEND", "invalid", 1) == 0);
@@ -344,8 +666,10 @@ int main(void) {
       __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("vaes") &&
       __builtin_cpu_supports("vpclmulqdq") && ptls_fusion_is_supported_by_cpu();
   CHECK((t->tls_ctx.cipher_suites != ptls_openssl_cipher_suites) == capable);
+  CHECK((transport_tls_cid_cipher(t) == &ptls_fusion_quiclb) == capable);
 #else
   CHECK(t->tls_ctx.cipher_suites == ptls_openssl_cipher_suites);
+  CHECK(transport_tls_cid_cipher(t) == &ptls_openssl_quiclb);
   CHECK(strstr(crypto_log, "fallback=not-built"));
 #endif
   if (t->tls_ctx.cipher_suites == ptls_openssl_cipher_suites) {
@@ -354,6 +678,7 @@ int main(void) {
   } else {
     CHECK(strstr(crypto_log, "backend=fusion requested=fusion fallback=none"));
   }
+  CHECK(check_cid_protection(t) == 0);
   /* verify suite attributes match reference */
   for (size_t i = 0;; i++) {
     ptls_cipher_suite_t *suite = t->tls_ctx.cipher_suites[i];
@@ -383,6 +708,8 @@ int main(void) {
 #if QLINQ_WITH_FUSION
   CHECK(configure_unsupported_cpu(t));
   CHECK(t->tls_ctx.cipher_suites == ptls_openssl_cipher_suites);
+  CHECK(transport_tls_cid_cipher(t) == &ptls_openssl_quiclb);
+  CHECK(unsupported_cpu_cid_cipher(t) == &ptls_openssl_quiclb);
   CHECK(strstr(crypto_log,
                "backend=openssl requested=fusion fallback=cpu-unsupported"));
 #endif

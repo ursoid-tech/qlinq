@@ -42,7 +42,9 @@ static quicly_path_scheduler_t forced_scheduler = {.do_send = force_path};
 
 ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
                                  socklen_t destination_len,
-                                 const struct iovec *datagrams, size_t count) {
+                                 const struct iovec *datagrams, size_t count,
+                                 size_t max_gso_segments) {
+  assert(max_gso_segments == 0 || max_gso_segments == 6);
   if (startup_client && startup_client->client_conn) {
     quicly_conn_t *quic = startup_client->client_conn->quic;
     quicly_stats_t stats;
@@ -149,8 +151,8 @@ static void release_startup_flight(void) {
                              .iov_len = startup_held[i].size};
     assert(real_udp_send_batch(startup_client->sockets[0].fd,
                                (struct sockaddr *)&startup_held[i].destination,
-                               startup_held[i].destination_len, &datagram,
-                               1) == 1);
+                               startup_held[i].destination_len, &datagram, 1,
+                               0) == 1);
     startup_delivered++;
   }
 }
