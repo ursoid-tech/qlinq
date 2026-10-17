@@ -137,3 +137,5 @@ qlinq-tun-engine
 /t/00util/test_xfer_protocol
 t/00util/test_quicly_flexicast
 t/00util/fuzz_flexicast_state
+
+t/00util/flexicast_network_probe

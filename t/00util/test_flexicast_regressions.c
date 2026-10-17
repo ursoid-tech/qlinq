@@ -101,6 +101,13 @@ static void create_fixture(fixture_t *fixture, size_t count, bool adaptive,
    * the same defaults applications receive. */
   if (adaptive)
     config.flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_ADAPTIVE;
+  if (strcmp(mode, "pacer-high") == 0 || strcmp(mode, "pacer-maximum") == 0) {
+    config.flexicast_cc_startup_rate = strcmp(mode, "pacer-high") == 0
+                                           ? UINT64_C(625000000)
+                                           : UINT64_C(1073741824);
+    config.flexicast_cc_minimum_rate = config.flexicast_cc_startup_rate;
+    config.flexicast_cc_maximum_rate = config.flexicast_cc_startup_rate;
+  }
   bool native = strstr(mode, "native") != NULL;
   if (native) {
     config.bind_hosts[0] = "127.0.0.2";
@@ -135,13 +142,13 @@ static void create_fixture(fixture_t *fixture, size_t count, bool adaptive,
       pump(fixture, 2);
     CHECK(fixture->clients[j].connected);
     /* Give one member a different local alias for the same shared track. */
-    if (strcmp(mode, "aliases") == 0 && j == count - 1) {
+    if (strstr(mode, "aliases") != NULL && j == count - 1) {
       moq_track_id_t other = {.type = MOQ_TRACK_VIDEO, .name = "alias-offset"};
       CHECK(transport_subscribe(fixture->clients[j].transport, other));
     }
     CHECK(transport_subscribe(fixture->clients[j].transport, fixture->track));
   }
-  size_t cohort = strcmp(mode, "aliases") == 0 ? count - 1 : count;
+  size_t cohort = strstr(mode, "aliases") != NULL ? count - 1 : count;
   for (size_t attempt = 0; attempt < 1500; attempt++) {
     pump(fixture, 2);
     fixture->flow = transport_flexicast_find_source(fixture->source.transport,
@@ -464,8 +471,14 @@ static void test_rekey(fixture_t *fixture, const char *mode) {
   }
   transport_subscriptions_remove(&departed->send_subscriptions,
                                  fixture->track.type, fixture->track.name);
+  flow->cc_supply_empty_since_ms = 1;
+  flow->cc_supply_ready_at_ms = 2;
+  flow->cc_supply_idle_ready_at_ms = 3;
   transport_flexicast_remove_member(source, departed, &fixture->track);
   CHECK(flow->rekey_pending);
+  CHECK(flow->cc_supply_empty_since_ms == 0 &&
+        flow->cc_supply_ready_at_ms == 0);
+  CHECK(flow->cc_supply_idle_ready_at_ms == 0);
   uint64_t packet_number =
       quicly_flexicast_get_next_packet_number(flow->crypto);
   if (!partial && !backlog)
@@ -857,6 +870,9 @@ static void test_feedback_deadline(void) {
   CHECK(tf_member_feedback_deadline(&flow, &member) == INT64_MAX);
 }
 
+#include "test_flexicast_ecn.inc"
+#include "test_flexicast_pacer.inc"
+
 int main(int argc, char **argv) {
   test_feedback_deadline();
   const char *mode = argc > 1 ? argv[1] : "pacing";
@@ -864,7 +880,17 @@ int main(int argc, char **argv) {
   CHECK(count > 0 && count <= MAX_CLIENTS);
   fixture_t fixture;
   create_fixture(&fixture, count, argc > 3, mode);
-  if (strcmp(mode, "blocked-fanout") == 0)
+  if (strcmp(mode, "pacer-high") == 0 || strcmp(mode, "pacer-maximum") == 0)
+    test_high_rate_pacer(&fixture);
+  else if (strcmp(mode, "pacer-aliases") == 0)
+    test_aggregate_pacer(&fixture);
+  else if (strcmp(mode, "pacer-rtt") == 0)
+    test_submitted_rtt(&fixture);
+  else if (strcmp(mode, "pacer-native-fallback") == 0)
+    test_native_fallback_pacing(&fixture);
+  else if (strcmp(mode, "ecn") == 0 || strcmp(mode, "native-ecn") == 0)
+    test_ecn(&fixture, strstr(mode, "native") != NULL);
+  else if (strcmp(mode, "blocked-fanout") == 0)
     test_blocked_fanout(&fixture);
   else if (strcmp(mode, "native-ingress") == 0)
     test_native_ingress(&fixture);

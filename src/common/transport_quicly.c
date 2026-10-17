@@ -732,6 +732,8 @@ static bool set_fd_nonblocking(int fd) {
 
 static int open_unicast_socket(int family) {
   int fd = socket(family, SOCK_DGRAM, 0);
+  if (fd >= 0)
+    (void)transport_udp_enable_recv_ecn(fd, family);
   if (fd >= 0 && family == AF_INET6) {
     /* A wildcard IPv6 path must not claim a separately configured IPv4 path's
      * port. Each physical socket and its address matching stay family-specific.
@@ -1593,14 +1595,15 @@ static bool service_interfaces(transport_t *t) {
 
 static void transport_receive_datagram(transport_t *t, size_t fd_idx,
                                        uint8_t *buf, size_t len,
-                                       struct sockaddr_storage *source) {
+                                       struct sockaddr_storage *source,
+                                       uint8_t ecn) {
   t->sockets[fd_idx].bytes_received += len;
 
   transport_conn_t *flexicast_source = NULL;
   ptls_iovec_t flexicast_payload = ptls_iovec_init(NULL, 0);
-  if (transport_flexicast_receive_unicast(
+  if (transport_flexicast_receive_unicast_ecn(
           t, buf, len, (struct sockaddr *)source, &flexicast_source,
-          &flexicast_payload)) {
+          &flexicast_payload, ecn)) {
     if (flexicast_source && flexicast_payload.base &&
         !(flexicast_source->authenticated && t->simulated_loss_rate > 0 &&
           (rand() % 100) < t->simulated_loss_rate))
@@ -1771,7 +1774,7 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
         for (ssize_t i = 0; i < received; i++)
           if (!views[i].dropped)
             transport_receive_datagram(t, fd_idx, views[i].data, views[i].size,
-                                       &views[i].source);
+                                       &views[i].source, views[i].ecn);
       } else {
         transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
         received = transport_udp_receive_batch(socket->fd, datagrams, batch);
@@ -1779,7 +1782,8 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
           /* Preserve recvfrom/recvmmsg's original copied-prefix dispatch. The
            * decoder validates each complete QUIC packet in that prefix. */
           transport_receive_datagram(t, fd_idx, datagrams[i].data,
-                                     datagrams[i].size, &datagrams[i].source);
+                                     datagrams[i].size, &datagrams[i].source,
+                                     datagrams[i].ecn);
         }
         more = received == (ssize_t)batch;
       }

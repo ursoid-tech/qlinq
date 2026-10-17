@@ -262,10 +262,26 @@ Group ciphertext never enters the generic UDP egress queue.
 
 Each successful kernel submission consumes its exact protected UDP payload
 size from the token bucket. The bucket remains bounded independently of cohort
-size. Native submission uses the configured source address and interface via
+size. High-rate buckets hold at least one millisecond of rate credit, up to the
+configured egress byte budget, so the millisecond refill clock does not impose
+the previous ten-datagram-per-millisecond ceiling. A smaller byte budget can
+limit the achievable rate. Elapsed credit is earned at the previous rate,
+before a feedback update changes it. An aggregate bucket also charges every
+physical copy; fractional per-flow shares remain finite below one byte/second.
+Native submission uses the configured source address and interface via
 Linux packet-info ancillary data, including with wildcard binds; replication
 selects an available connection path and its matching local socket. A permanent
 native submission failure switches the remaining packet to replicated delivery.
+
+RTT samples use the actual kernel submission time, excluding local pacing and
+socket waits. Native multicast needs one timestamp; differing replica times
+use bounded sparse storage. If that storage is exhausted, the affected RTT
+sample is omitted rather than attributing local queue time to the network.
+Delivery-rate sampling aggregates all ACK frames in a completed millisecond
+bucket and ignores duplicate ACKs, so batching cannot discard delivered bytes
+or reset the sampling clock. ECN ancillary data is read on native and replicated
+ingress, while per-packet send marking leaves ordinary QUIC socket traffic
+unchanged.
 Platforms without explicit source selection fall back to replication. Temporary
 socket pressure retains the packet for retry. Generic QUIC egress drops a hard
 failure at its head and continues, with at most 64 packets processed per flush.
@@ -323,9 +339,9 @@ prove network delivery. `flexicast_protected_packets_queued` and
 `flexicast_protected_bytes_queued` report ciphertext still owned by the dispatcher;
 plaintext queue gauges remain separate. At most one active logical packet per
 flow retains an extra protected buffer of at most `max_udp_payload_size` bytes.
-The public API exposes these counters with the `group_` prefix. Quicly RTT samples
-currently include any local delay between protection and a replica submission;
-physical byte accounting does not use those timing estimates.
+The public API exposes these counters with the `group_` prefix. Quicly RTT
+samples use successful physical submission times; physical byte accounting
+does not depend on those timing estimates.
 Completion watermark, rolling checkpoint, ACK, cache-release, and cache-
 backpressure counts are also reported so finite-flow experiments can
 distinguish recovery-window behavior from ordinary gap repair.

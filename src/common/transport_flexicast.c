@@ -209,6 +209,9 @@ size_t tf_clear_flow_queue(transport_flexicast_flow_t *flow) {
   size_t cleared = tf_queue_clear(&flow->data_queue);
   cleared += clear_flow_repair_queue(flow);
   flow->cc_interval_physical_bytes = 0;
+  flow->cc_supply_empty_since_ms = 0;
+  flow->cc_supply_ready_at_ms = 0;
+  flow->cc_supply_idle_ready_at_ms = 0;
   return cleared;
 }
 
@@ -568,6 +571,8 @@ static int open_receive_socket(uint8_t ip_version, uint16_t port) {
   int fd = socket(family, SOCK_DGRAM, 0);
   if (fd < 0)
     return -1;
+  /* ECN is optional; missing socket support must not disable delivery. */
+  (void)transport_udp_enable_recv_ecn(fd, family);
   int reuse = 1;
   int receive_buffer = 2 * 1024 * 1024;
   int v6_only = 1;
@@ -844,6 +849,7 @@ transport_flexicast_member_add(transport_flexicast_flow_t *flow,
     return NULL;
   member = &flow->members[flow->member_count++];
   member->conn = conn;
+  flow->cc_membership_epoch++;
   return member;
 }
 
@@ -866,6 +872,7 @@ static void set_member_listening(transport_t *t,
                                  bool listening, int64_t now) {
   if (member->listening == listening)
     return;
+  flow->cc_membership_epoch++;
   bool inconsistent = false;
   if (listening) {
     flow->listening_count++;
@@ -987,6 +994,7 @@ bool transport_flexicast_member_remove(transport_t *t,
     return false;
   }
   size_t last = flow->member_count - 1U;
+  flow->cc_membership_epoch++;
   bool inconsistent = false;
   if (member->listening) {
     if (flow->listening_count == 0)
@@ -1096,6 +1104,10 @@ static bool rekey_source_flow(transport_t *t,
       flow->key_epoch == UINT32_MAX)
     return false;
 
+  flow->cc_supply_empty_since_ms = 0;
+  flow->cc_supply_ready_at_ms = 0;
+  flow->cc_supply_idle_ready_at_ms = 0;
+
   uint8_t next_secret[TRANSPORT_FLEXICAST_SECRET_SIZE];
   ptls_openssl_random_bytes(next_secret, sizeof(next_secret));
   uint64_t first_packet_number =
@@ -1158,6 +1170,9 @@ static void schedule_source_rekey(transport_t *t,
                                   int64_t now) {
   if (!t || !flow || !flow->active || !flow->source)
     return;
+  flow->cc_supply_empty_since_ms = 0;
+  flow->cc_supply_ready_at_ms = 0;
+  flow->cc_supply_idle_ready_at_ms = 0;
   /* Payloads are queued as plaintext and can safely be protected under the
    * next epoch. Repair intent is cohort-specific, so cancel only repair work;
    * surviving members can re-request it after the batched rekey. */
@@ -1859,7 +1874,8 @@ ssize_t transport_flexicast_receive_native(transport_t *t, size_t slot,
   union {
     struct cmsghdr align;
     uint8_t bytes[CMSG_SPACE(sizeof(struct in_pktinfo)) +
-                  CMSG_SPACE(sizeof(struct in6_pktinfo))];
+                  CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+                  CMSG_SPACE(sizeof(int)) * 2];
   } control = {0};
   struct msghdr message = {.msg_name = &peer,
                            .msg_namelen = sizeof(peer),
@@ -1908,8 +1924,9 @@ ssize_t transport_flexicast_receive_native(transport_t *t, size_t slot,
   if (!source_valid || !destination_valid ||
       !transport_flexicast_native_packet_valid(t, packet, (size_t)received,
                                                &ingress) ||
-      !transport_flexicast_receive_packet(t, packet, (size_t)received, source,
-                                          payload) ||
+      !transport_flexicast_receive_packet_ecn(
+          t, packet, (size_t)received, source, payload,
+          transport_udp_message_ecn(&message)) ||
       !*source || !payload->base)
     t->stats.flexicast_multicast_datagrams_rejected++;
   return received;
@@ -1929,6 +1946,13 @@ bool transport_flexicast_receive_unicast(transport_t *t, uint8_t *packet,
                                          const struct sockaddr *peer,
                                          transport_conn_t **source,
                                          ptls_iovec_t *payload) {
+  return transport_flexicast_receive_unicast_ecn(t, packet, size, peer, source,
+                                                 payload, 0);
+}
+
+bool transport_flexicast_receive_unicast_ecn(
+    transport_t *t, uint8_t *packet, size_t size, const struct sockaddr *peer,
+    transport_conn_t **source, ptls_iovec_t *payload, uint8_t ecn) {
   if (!t || !packet || size < 9 || !source || !payload || !t->flexicast_enabled)
     return false;
   const uint8_t *at = packet + 1;
@@ -1967,13 +1991,23 @@ bool transport_flexicast_receive_unicast(transport_t *t, uint8_t *packet,
     t->stats.flexicast_multicast_datagrams_rejected++;
     return true;
   }
-  return transport_flexicast_receive_packet(t, packet, size, source, payload);
+  return transport_flexicast_receive_packet_ecn(t, packet, size, source,
+                                                payload, ecn);
 }
 
 bool transport_flexicast_receive_packet(transport_t *t, uint8_t *packet,
                                         size_t packet_size,
                                         transport_conn_t **source_conn,
                                         ptls_iovec_t *payload) {
+  return transport_flexicast_receive_packet_ecn(t, packet, packet_size,
+                                                source_conn, payload, 0);
+}
+
+bool transport_flexicast_receive_packet_ecn(transport_t *t, uint8_t *packet,
+                                            size_t packet_size,
+                                            transport_conn_t **source_conn,
+                                            ptls_iovec_t *payload,
+                                            uint8_t ecn) {
   if (!t || !packet || !source_conn || !payload || packet_size < 9 ||
       !t->flexicast_enabled)
     return false;
@@ -1986,9 +2020,9 @@ bool transport_flexicast_receive_packet(transport_t *t, uint8_t *packet,
   *payload = ptls_iovec_init(NULL, 0);
   uint64_t packet_number = 0;
   int64_t now = transport_get_time_ms();
-  if (quicly_flexicast_receive_datagram_at(flow->crypto, packet, packet_size,
-                                           payload, &packet_number,
-                                           now) == QUICLY_FLEXICAST_OK) {
+  if (quicly_flexicast_receive_datagram_ecn_at(
+          flow->crypto, packet, packet_size, payload, &packet_number, now,
+          ecn) == QUICLY_FLEXICAST_OK) {
     t->stats.flexicast_packets_received++;
     if (quicly_flexicast_ack_is_due(flow->crypto, now) &&
         !(t->simulated_flexicast_feedback_loss_rate > 0 &&

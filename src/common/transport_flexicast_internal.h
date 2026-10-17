@@ -20,6 +20,14 @@ size_t tf_cancel_flow_repairs(transport_t *t, transport_flexicast_flow_t *flow,
                               uint64_t object_id);
 size_t tf_clear_flow_queue(transport_flexicast_flow_t *flow);
 void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow);
+/* Shared by dispatch and deterministic pacing regressions. */
+void tf_refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
+                         int64_t now);
+/* Supply provenance, separate from pacing decisions; also used by deterministic
+ * tests. */
+void tf_sample_supply_at(transport_t *, transport_flexicast_flow_t *,
+                         transport_flexicast_queued_payload_t *, size_t cost,
+                         int64_t now);
 void tf_emit_ready_shadow_observations(transport_t *t,
                                        transport_flexicast_flow_t *flow,
                                        int64_t now);

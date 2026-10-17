@@ -10,6 +10,153 @@
 #define TRANSPORT_UDP_MAX_BATCH 64U
 #define TRANSPORT_UDP_GSO_BUFFER_SIZE 65507U /* IPv4 UDP payload ceiling. */
 
+bool transport_udp_enable_recv_ecn(int fd, int family) {
+  int enabled = 1;
+#if defined(IP_RECVTOS)
+  if (family == AF_INET)
+    return setsockopt(fd, IPPROTO_IP, IP_RECVTOS, &enabled, sizeof(enabled)) ==
+           0;
+#endif
+#if defined(IPV6_RECVTCLASS)
+  if (family == AF_INET6)
+    return setsockopt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, &enabled,
+                      sizeof(enabled)) == 0;
+#endif
+  (void)fd;
+  (void)family;
+  (void)enabled;
+  return false;
+}
+
+uint8_t transport_udp_message_ecn(const struct msghdr *message) {
+  if (!message || (message->msg_flags & MSG_CTRUNC))
+    return 0;
+  for (struct cmsghdr *header = CMSG_FIRSTHDR(message); header;
+       header = CMSG_NXTHDR((struct msghdr *)message, header)) {
+    if (header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_TOS &&
+        header->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
+      /* Linux receives IPv4 TOS as a byte; IPv6 traffic class is an int. */
+      return *(const uint8_t *)CMSG_DATA(header) & 3U;
+    }
+#ifdef IPV6_TCLASS
+    if (header->cmsg_level == IPPROTO_IPV6 &&
+        header->cmsg_type == IPV6_TCLASS &&
+        header->cmsg_len >= CMSG_LEN(sizeof(int))) {
+      int traffic_class;
+      memcpy(&traffic_class, CMSG_DATA(header), sizeof(traffic_class));
+      return (uint8_t)traffic_class & 3U;
+    }
+#endif
+  }
+  return 0;
+}
+
+ssize_t transport_udp_receive_ecn(int fd, void *buffer, size_t capacity,
+                                  struct sockaddr_storage *peer,
+                                  socklen_t *peer_length, uint8_t *ecn) {
+  union {
+    struct cmsghdr align;
+    uint8_t bytes[CMSG_SPACE(sizeof(int)) * 2];
+  } control = {0};
+  struct iovec vector = {.iov_base = buffer, .iov_len = capacity};
+  struct msghdr message = {.msg_name = peer,
+                           .msg_namelen = *peer_length,
+                           .msg_iov = &vector,
+                           .msg_iovlen = 1,
+                           .msg_control = control.bytes,
+                           .msg_controllen = sizeof(control.bytes)};
+  *ecn = 0;
+  ssize_t received = recvmsg(fd, &message, 0);
+  if (received < 0)
+    return received;
+  if (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
+    errno = EMSGSIZE;
+    return -1;
+  }
+  *peer_length = message.msg_namelen;
+  *ecn = transport_udp_message_ecn(&message);
+  return received;
+}
+
+ssize_t transport_udp_send_ecn(int fd, const struct sockaddr *destination,
+                               const struct sockaddr *source,
+                               unsigned interface_index,
+                               const struct iovec *datagram, uint8_t ecn) {
+#ifdef __linux__
+  if (!destination || !datagram || ecn > 3 ||
+      (source && source->sa_family != destination->sa_family)) {
+    errno = EINVAL;
+    return -1;
+  }
+  union {
+    struct cmsghdr align;
+    uint8_t bytes[CMSG_SPACE(sizeof(struct in6_pktinfo)) +
+                  CMSG_SPACE(sizeof(struct in_pktinfo)) +
+                  CMSG_SPACE(sizeof(int))];
+  } control = {0};
+  struct msghdr message = {.msg_name = (void *)destination,
+                           .msg_iov = (struct iovec *)datagram,
+                           .msg_iovlen = 1,
+                           .msg_control = control.bytes};
+  size_t source_space = 0;
+  if (destination->sa_family == AF_INET) {
+    message.msg_namelen = sizeof(struct sockaddr_in);
+    if (source) {
+      source_space = CMSG_SPACE(sizeof(struct in_pktinfo));
+      struct cmsghdr *header = (struct cmsghdr *)control.bytes;
+      header->cmsg_level = IPPROTO_IP;
+      header->cmsg_type = IP_PKTINFO;
+      header->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+      struct in_pktinfo info = {
+          .ipi_ifindex = (int)interface_index,
+          .ipi_spec_dst = ((const struct sockaddr_in *)source)->sin_addr};
+      memcpy(CMSG_DATA(header), &info, sizeof(info));
+    }
+  } else if (destination->sa_family == AF_INET6) {
+    message.msg_namelen = sizeof(struct sockaddr_in6);
+    if (source) {
+      source_space = CMSG_SPACE(sizeof(struct in6_pktinfo));
+      struct cmsghdr *header = (struct cmsghdr *)control.bytes;
+      header->cmsg_level = IPPROTO_IPV6;
+      header->cmsg_type = IPV6_PKTINFO;
+      header->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+      struct in6_pktinfo info = {
+          .ipi6_ifindex = interface_index,
+          .ipi6_addr = ((const struct sockaddr_in6 *)source)->sin6_addr};
+      memcpy(CMSG_DATA(header), &info, sizeof(info));
+    }
+  } else {
+    errno = EAFNOSUPPORT;
+    return -1;
+  }
+  struct cmsghdr *mark = (struct cmsghdr *)(control.bytes + source_space);
+  mark->cmsg_level =
+      destination->sa_family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+  mark->cmsg_type = destination->sa_family == AF_INET ? IP_TOS : IPV6_TCLASS;
+  mark->cmsg_len = CMSG_LEN(sizeof(int));
+  int traffic_class = ecn;
+  memcpy(CMSG_DATA(mark), &traffic_class, sizeof(traffic_class));
+  message.msg_controllen = source_space + CMSG_SPACE(sizeof(int));
+  ssize_t sent;
+  do {
+    sent = sendmsg(fd, &message, 0);
+  } while (sent < 0 && errno == EINTR);
+  if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+    return 0;
+  return sent == (ssize_t)datagram->iov_len ? 1 : -1;
+#else
+  (void)ecn;
+  if (source)
+    return transport_udp_send_from(fd, destination, source, interface_index,
+                                   datagram);
+  return transport_udp_send_batch(fd, destination,
+                                  destination->sa_family == AF_INET
+                                      ? sizeof(struct sockaddr_in)
+                                      : sizeof(struct sockaddr_in6),
+                                  datagram, 1, 0);
+#endif
+}
+
 ssize_t transport_udp_send_from(int fd, const struct sockaddr *destination,
                                 const struct sockaddr *source,
                                 unsigned interface_index,
@@ -257,6 +404,10 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
 #if defined(__linux__) && !defined(QLINQ_UDP_RECEIVE_PORTABLE)
   struct mmsghdr messages[TRANSPORT_UDP_RECEIVE_BATCH] = {0};
   struct iovec iovs[TRANSPORT_UDP_RECEIVE_BATCH];
+  union {
+    struct cmsghdr align;
+    uint8_t bytes[CMSG_SPACE(sizeof(int)) * 2];
+  } control[TRANSPORT_UDP_RECEIVE_BATCH];
   for (size_t i = 0; i < count; i++) {
     iovs[i] = (struct iovec){.iov_base = datagrams[i].data,
                              .iov_len = sizeof(datagrams[i].data)};
@@ -264,6 +415,8 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
     messages[i].msg_hdr.msg_namelen = sizeof(datagrams[i].source);
     messages[i].msg_hdr.msg_iov = &iovs[i];
     messages[i].msg_hdr.msg_iovlen = 1;
+    messages[i].msg_hdr.msg_control = control[i].bytes;
+    messages[i].msg_hdr.msg_controllen = sizeof(control[i].bytes);
   }
   int received;
   do {
@@ -273,6 +426,7 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
     return errno == EAGAIN || errno == EWOULDBLOCK ? 0 : -1;
   for (int i = 0; i < received; i++) {
     datagrams[i].size = messages[i].msg_len;
+    datagrams[i].ecn = transport_udp_message_ecn(&messages[i].msg_hdr);
     datagrams[i].truncated = (messages[i].msg_hdr.msg_flags & MSG_TRUNC) != 0;
   }
   return received;
@@ -282,10 +436,16 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
     transport_udp_datagram_t *datagram = &datagrams[received];
     struct iovec iov = {.iov_base = datagram->data,
                         .iov_len = sizeof(datagram->data)};
+    union {
+      struct cmsghdr align;
+      uint8_t bytes[CMSG_SPACE(sizeof(int)) * 2];
+    } control;
     struct msghdr message = {.msg_name = &datagram->source,
                              .msg_namelen = sizeof(datagram->source),
                              .msg_iov = &iov,
-                             .msg_iovlen = 1};
+                             .msg_iovlen = 1,
+                             .msg_control = control.bytes,
+                             .msg_controllen = sizeof(control.bytes)};
     ssize_t size;
     do {
       size = recvmsg(fd, &message, MSG_DONTWAIT);
@@ -296,6 +456,7 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
       return -1;
     }
     datagram->size = (size_t)size;
+    datagram->ecn = transport_udp_message_ecn(&message);
     datagram->truncated = (message.msg_flags & MSG_TRUNC) != 0;
     received++;
   }
@@ -310,6 +471,7 @@ typedef struct {
   struct sockaddr_storage source;
   size_t size;
   size_t segment_size;
+  uint8_t ecn;
   bool dropped;
   uint8_t data[TRANSPORT_UDP_GRO_SIZE];
 } transport_udp_gro_message_t;
@@ -398,7 +560,7 @@ static ssize_t gro_refill(transport_udp_gro_t *state, int fd) {
   struct iovec iovs[TRANSPORT_UDP_GRO_BATCH];
   union {
     struct cmsghdr alignment;
-    uint8_t bytes[CMSG_SPACE(sizeof(int))];
+    uint8_t bytes[CMSG_SPACE(sizeof(int)) * 3];
   } control[TRANSPORT_UDP_GRO_BATCH];
   for (size_t i = 0; i < TRANSPORT_UDP_GRO_BATCH; i++) {
     transport_udp_gro_message_t *raw = &state->messages[i];
@@ -426,6 +588,7 @@ static ssize_t gro_refill(transport_udp_gro_t *state, int fd) {
   for (size_t i = 0; i < state->count; i++) {
     transport_udp_gro_message_t *raw = &state->messages[i];
     raw->size = messages[i].msg_len;
+    raw->ecn = transport_udp_message_ecn(&messages[i].msg_hdr);
     raw->dropped =
         raw->size > sizeof(raw->data) ||
         messages[i].msg_hdr.msg_controllen > sizeof(control[i].bytes) ||
@@ -463,6 +626,7 @@ ssize_t transport_udp_gro_receive(transport_udp_gro_t *state, int fd,
     transport_udp_gro_message_t *raw = &state->messages[state->index];
     transport_udp_view_t *view = &views[received++];
     *view = (transport_udp_view_t){.source = raw->source,
+                                   .ecn = raw->ecn,
                                    .data = raw->data + state->offset,
                                    .dropped = raw->dropped};
     if (raw->dropped) {

@@ -231,6 +231,9 @@ qlinq-app: $(APP_OBJS) libqlinq.a
 qlinq-cast: $(CAST_OBJS) libqlinq.a
 	$(CC) -o $@ $(CAST_OBJS) libqlinq.a $(LDFLAGS)
 
+qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
@@ -331,11 +334,14 @@ API_TESTS = t/00util/test_qlinq_policy \
 $(API_TESTS): %: %.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+t/00util/flexicast_network_probe: t/00util/flexicast_network_probe.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 t/00util/test_flexicast_regressions: t/00util/test_flexicast_regressions.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_quicly_flexicast: deps/quicly/t/flexicast-cc-regression.c deps/quicly/t/flexicast-crypto.c deps/quicly/t/flexicast-packet.c deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -Ideps/quicly/deps/picotest -o $@ $^ $(LDFLAGS)
+t/00util/test_quicly_flexicast: deps/quicly/t/flexicast-cc-regression.c deps/quicly/t/flexicast-crypto.c deps/quicly/t/flexicast-packet.c deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c $(wildcard deps/quicly/t/flexicast-*.inc) deps/quicly/t/flexicast-provenance.inc deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
+	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -Ideps/quicly/deps/picotest -o $@ $(filter-out %.inc,$^) $(LDFLAGS)
 
 t/00util/test_flexicast_scale: t/00util/test_flexicast_scale.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_flexicast_scale.o $(COMMON_OBJS) $(LDFLAGS)
@@ -496,6 +502,7 @@ check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_fle
 	prove -I. -v t/*.t
 
 clean: 
+	rm -f t/00util/flexicast_network_probe
 	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_flexicast_regressions t/00util/test_qlinq_delivery t/00util/test_egress_errors t/00util/test_quicly_flexicast t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/fuzz_transport_wire t/00util/fuzz_flexicast_frames t/00util/fuzz_flexicast_state t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete

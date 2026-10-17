@@ -4,6 +4,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 
@@ -23,6 +25,7 @@ ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
 
 typedef struct {
   struct sockaddr_storage source;
+  uint8_t ecn;
   size_t size;
   bool truncated;
   uint8_t data[TRANSPORT_UDP_RECEIVE_SIZE];
@@ -45,6 +48,7 @@ bool transport_udp_gro_pending(const transport_udp_gro_t *state);
 
 typedef struct {
   struct sockaddr_storage source;
+  uint8_t ecn;
   uint8_t *data;
   size_t size;
   bool truncated;
@@ -69,5 +73,17 @@ ssize_t transport_udp_send_from(int fd, const struct sockaddr *destination,
                                 const struct sockaddr *source,
                                 unsigned interface_index,
                                 const struct iovec *datagram);
+
+/* Per-datagram ECN marking avoids changing the ordinary QUIC traffic sharing
+ * the socket. source is optional. Unsupported platforms send Not-ECT. */
+ssize_t transport_udp_send_ecn(int fd, const struct sockaddr *destination,
+                               const struct sockaddr *source,
+                               unsigned interface_index,
+                               const struct iovec *datagram, uint8_t ecn);
+bool transport_udp_enable_recv_ecn(int fd, int family);
+uint8_t transport_udp_message_ecn(const struct msghdr *message);
+ssize_t transport_udp_receive_ecn(int fd, void *buffer, size_t capacity,
+                                  struct sockaddr_storage *peer,
+                                  socklen_t *peer_length, uint8_t *ecn);
 
 #endif

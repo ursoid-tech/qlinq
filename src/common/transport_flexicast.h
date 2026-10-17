@@ -82,6 +82,10 @@ typedef struct transport_flexicast_queued_payload_t {
   bool replicated;
   bool counted;
   uint64_t airtime_bytes;
+  /* Supply limitations observed before this packet reaches the socket. */
+  uint32_t cc_sample_flags;
+  uint32_t cc_packet_fanout;
+  uint64_t cc_packet_membership_epoch;
 } transport_flexicast_queued_payload_t;
 
 typedef struct transport_flexicast_queue_t {
@@ -212,12 +216,24 @@ typedef struct transport_flexicast_flow_t {
   uint64_t cc_external_load_epoch;
   int64_t cc_external_load_interval_started_ms;
   uint32_t cc_external_load_fraction_ppm;
+  /* Rounded up for diagnostics; token accounting uses the exact ratio below. */
   uint64_t pacing_rate_bytes_per_second;
+  /* Exact rate is numerator / divisor, including aggregate shares below 1 B/s.
+   */
+  uint64_t pacing_rate_numerator;
+  uint32_t pacing_rate_divisor;
+  bool last_submission_replicated;
   uint64_t pacing_tokens;
   uint64_t pacing_burst_bytes;
   uint64_t pacing_remainder;
   int64_t pacing_last_refill_ms;
   int64_t dispatch_retry_at_ms;
+  /* Observation clocks only: these never change dispatch eligibility. */
+  int64_t cc_supply_empty_since_ms;
+  int64_t cc_supply_ready_at_ms;
+  int64_t cc_supply_idle_ready_at_ms;
+  uint64_t cc_supply_credit_epoch;
+  uint64_t cc_membership_epoch;
   uint64_t next_payload_delivery_id;
   int64_t last_payload_sent_ms;
   quicly_flexicast_cc_type_t *cc_type;
@@ -251,6 +267,13 @@ typedef struct transport_flexicast_registry_t {
   transport_flexicast_membership_t *memberships;
   size_t capacity;
   size_t member_capacity;
+  uint64_t pacing_tokens;
+  uint64_t pacing_rate;
+  uint64_t pacing_burst;
+  uint64_t pacing_remainder;
+  int64_t pacing_last_refill_ms;
+  uint64_t pacing_credit_epoch;
+  uint64_t cc_observed_aggregate_limit;
 } transport_flexicast_registry_t;
 
 bool transport_flexicast_registry_init(transport_flexicast_registry_t *registry,
@@ -327,6 +350,10 @@ ssize_t transport_flexicast_receive_native(transport_t *, size_t, uint8_t *,
 bool transport_flexicast_receive_unicast(transport_t *, uint8_t *, size_t,
                                          const struct sockaddr *,
                                          transport_conn_t **, ptls_iovec_t *);
+bool transport_flexicast_receive_unicast_ecn(transport_t *, uint8_t *, size_t,
+                                             const struct sockaddr *,
+                                             transport_conn_t **,
+                                             ptls_iovec_t *, uint8_t);
 
 /* Recognizes and decrypts a Flexicast packet in-place. A true result means the
  * UDP datagram belonged to a known flow and must not be passed to quicly. */
@@ -334,6 +361,9 @@ bool transport_flexicast_receive_packet(transport_t *t, uint8_t *packet,
                                         size_t packet_size,
                                         transport_conn_t **source_conn,
                                         ptls_iovec_t *payload);
+bool transport_flexicast_receive_packet_ecn(transport_t *, uint8_t *, size_t,
+                                            transport_conn_t **, ptls_iovec_t *,
+                                            uint8_t);
 
 bool transport_flexicast_send_ack(transport_flexicast_flow_t *flow,
                                   uint64_t packet_number);

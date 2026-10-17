@@ -150,30 +150,42 @@ The source holds Flexicast payloads in bounded plaintext queues until a
 per-flow token bucket permits transmission. Ordinary data is limited to 256
 packets and repair data to 128 packets; the two queues share the configured
 per-socket egress byte budget. A pluggable Quicly controller
-produces the logical flow rate, burst, inflight target, limiting receiver, and
+produces the physical flow rate, burst, inflight target, limiting receiver, and
 next feedback timeout. qlinq executes that output and accounts for physical
 cost: replicated-unicast transmission charges one packet per recipient, while
 native multicast charges one packet total. The `multicast` controller follows
 the limiting receiver with conservative additive growth and multiplicative
-reduction. The `adaptive` controller adds flat-loss baseline learning,
-queue-delay and ECN classification, active-sender-aware growth, median-rate
-catch-up, and recovery probes for radio-oriented meshes. The controller name is
+reduction. The `adaptive` controller learns flat radio loss separately from
+queue congestion. A sender clock bounds both growth and congestion reductions;
+persistent congestion can cause further reductions on later clock ticks.
+Any receiver's congestion evidence blocks growth, while median-rate hints only
+shape growth. Per-receiver delivery estimates account for the physical copies
+used by replication. The controller name is
 an implementation profile, not a wire negotiation value. qlinq also reports
 transport-generic queued external work, age, and physical-airtime share. That
-signal freezes adaptive growth while work is outstanding; it does not reduce
-the total path rate, because doing so would also starve the repair service that
-must clear the signal.
+signal freezes adaptive growth while work is outstanding. Repeating a hint
+does not change the rate. Congestion evidence still reduces the rate during
+repairs; repair backlog never raises it. Missing feedback reduces the rate
+after three timeout intervals, and ordinary pacing at the configured floor
+permits recovery traffic. Aggregate limits are applied after controller updates
+and enforced by a shared physical-byte token bucket across source flows,
+including when their individual minimum rates would exceed the aggregate cap.
 
 The initial receiver ACK in each key epoch is immediate so short flows produce
 feedback. Subsequent packets are acknowledged as ranges after the negotiated
 delay or packet-frequency threshold, reducing control-path fan-in without
-sacrificing startup liveness. Queue exhaustion is reported as publication
+sacrificing startup liveness. The pending range set is bounded even when the
+control connection is backpressured; old ranges can be retired so fresh
+feedback remains encodable. On Linux, group packets use per-packet ECT(0)
+marking, and authenticated new packets contribute cumulative ECN counters to
+PATH_ACK feedback. Replays do not increment those counters; key rotation
+starts new counters. Queue exhaustion is reported as publication
 backpressure, and token and controller deadlines participate in
 `transport_get_first_timeout`. Queuing plaintext ensures a payload delayed
 across an epoch change is protected only with the current flow key. Permanent
 native-send errors immediately use the identical protected packet on the
-replicated-unicast path; only transient would-block errors enter the UDP egress
-queue.
+replicated-unicast path. Transient would-block errors retain ciphertext beside
+its plaintext in the Flexicast queue until submission or rekey.
 
 Flexicast capability, endpoint announcement, member state, and key exchange use
 the transport parameter and `FC_ANNOUNCE`, `FC_STATE`, and `FC_KEY` frames from
