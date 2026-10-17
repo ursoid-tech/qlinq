@@ -125,14 +125,12 @@ int main(void) {
     while (qlinq_next_event(context, &event)) {
       if (event.type == QLINQ_EVENT_RECORD && event.stream == subscription &&
           strcmp(event.stream_name, "api/records") == 0) {
-        if (event.record.sequence == first.sequence &&
-            event.record.group_id == first.group_id && event.record.keyframe &&
+        if (event.record.group_id == 0 && !event.record.keyframe &&
             event.record.priority == first.priority &&
             event.record.size == first.size &&
             memcmp(event.record.data, first.data, first.size) == 0)
           got_first = true;
-        if (event.record.sequence == second.sequence &&
-            event.record.group_id == second.group_id &&
+        if (event.record.group_id == 0 &&
             event.record.priority == second.priority &&
             event.record.size == second.size &&
             memcmp(event.record.data, second.data, second.size) == 0)
@@ -149,7 +147,8 @@ int main(void) {
       qlinq_event_release(&event);
     }
   }
-  CHECK(got_first && got_second, "receive owned records with metadata");
+  CHECK(got_first && got_second,
+        "receive owned records with coding-object metadata");
   CHECK(receiver_finished, "receiver observes recovered stream completion");
   CHECK(publisher_drained, "publisher observes confirmed cohort drain");
   CHECK(qlinq_stream_get_stats(publisher, &stream_stats) &&
@@ -220,8 +219,8 @@ int main(void) {
     qlinq_event_t event;
     while (qlinq_next_event(context, &event)) {
       if (event.type == QLINQ_EVENT_RECORD &&
-          event.stream == fixed_subscription &&
-          event.record.sequence == fixed_record.sequence)
+          event.stream == fixed_subscription && event.record.group_id == 0 &&
+          event.record.sequence == 0)
         fixed_record_received = true;
       if (event.type == QLINQ_EVENT_STREAM_FINISHED &&
           event.stream == fixed_subscription)

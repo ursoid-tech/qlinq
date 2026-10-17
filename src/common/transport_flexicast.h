@@ -31,6 +31,8 @@ typedef struct transport_flexicast_member_t {
   bool joined;
   bool listening;
   bool offer_pending;
+  bool reoffer_pending;
+  bool rejoining;
   bool offer_bind_sent;
   uint32_t offer_epoch;
   quicly_flexicast_announce_frame_t offer_announce;
@@ -49,6 +51,7 @@ typedef struct transport_flexicast_member_t {
   uint16_t transitions_in_window;
   uint64_t acknowledged_delivery_epoch;
   int64_t last_ack_time_ms;
+  int64_t first_unacknowledged_ms; /* zero when no active delivery debt */
   /* Progress for the one logical payload currently being replicated. */
   uint64_t payload_delivery_id;
   int64_t ready_deadline_ms;
@@ -305,6 +308,25 @@ bool transport_flexicast_receive_path_ack(transport_t *t,
 bool transport_flexicast_receive_quic_frame(
     transport_t *t, transport_conn_t *conn,
     const quicly_flexicast_frame_t *frame);
+
+/* kernel-provided native ingress metadata */
+typedef struct {
+  uint8_t ip_version;
+  uint8_t source_ip[16], group_ip[16];
+  uint16_t destination_port;
+  uint32_t interface_index;
+  bool truncated;
+} transport_flexicast_ingress_t;
+bool transport_flexicast_native_packet_valid(
+    transport_t *, const uint8_t *, size_t,
+    const transport_flexicast_ingress_t *);
+/* read complete native datagram, checking tuple before decryption */
+ssize_t transport_flexicast_receive_native(transport_t *, size_t, uint8_t *,
+                                           size_t, transport_conn_t **,
+                                           ptls_iovec_t *);
+bool transport_flexicast_receive_unicast(transport_t *, uint8_t *, size_t,
+                                         const struct sockaddr *,
+                                         transport_conn_t **, ptls_iovec_t *);
 
 /* Recognizes and decrypts a Flexicast packet in-place. A true result means the
  * UDP datagram belonged to a known flow and must not be passed to quicly. */

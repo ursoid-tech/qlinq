@@ -1,11 +1,14 @@
 #include "picotls/openssl.h"
 #include "portable_sockets.h"
 #include "quicly/defaults.h"
+#include "transport_flexicast_internal.h"
 #include "transport_internal.h"
+#include "transport_publish.h"
 #include "transport_protocol.h"
 #include "transport_publish.h"
 #include "transport_subscriptions.h"
 #include "transport_tracks.h"
+#include "transport_udp.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -231,6 +234,168 @@ static void test_delivery(fixture_t *fixture, bool native) {
   }
 }
 
+static void test_blocked_fanout(fixture_t *fixture) {
+  transport_t *source = fixture->source.transport;
+  transport_flexicast_flow_t *flow = fixture->flow;
+  CHECK(!flow->native_multicast && fixture->count >= 2);
+  uint8_t bytes[32] = {42};
+  moq_object_t object = object_for(fixture, bytes, sizeof(bytes));
+  size_t packet_size = quicly_flexicast_datagram_size(
+      flow->crypto, QLINQ_WIRE_FEC_HEADER_SIZE + sizeof(bytes));
+  uint64_t sent = source->stats.flexicast_physical_packets_sent;
+  int64_t oldest = transport_get_time_ms() - 10000;
+  for (size_t replica = 0; replica < fixture->count; ++replica) {
+    /* Admit precisely one successful replica. Freeze refills so clock speed
+     * cannot let an unsent member escape the blocked-fanout assertions. */
+    flow->pacing_tokens = packet_size;
+    flow->pacing_last_refill_ms = INT64_MAX;
+    if (replica == 0)
+      CHECK(transport_publish_ex(source, &object) ==
+            TRANSPORT_PUBLISH_DELIVERED);
+    else
+      tf_drain_paced_payloads(source, flow);
+    CHECK(source->stats.flexicast_physical_packets_sent == sent + replica + 1);
+    CHECK(flow->data_queue.count == (replica + 1 < fixture->count ? 1U : 0U));
+    CHECK(flow->feedback_outstanding_count == replica + 1);
+    for (size_t i = 0; i < fixture->count; ++i) {
+      transport_flexicast_member_t *member = &flow->members[i];
+      if (i <= replica) {
+        CHECK(tf_member_feedback_deadline(flow, member) != INT64_MAX);
+        if (i == replica)
+          CHECK(member->first_unacknowledged_ms > oldest + 3000);
+      } else {
+        CHECK(member->first_unacknowledged_ms == 0);
+        CHECK(tf_member_feedback_deadline(flow, member) == INT64_MAX);
+      }
+    }
+    if (replica == 0)
+      flow->members[0].first_unacknowledged_ms = oldest;
+    else
+      CHECK(flow->members[0].first_unacknowledged_ms == oldest);
+  }
+  /* Existing debt was preserved while every later replica started its own
+   * deadline. Restore the aged fixture clock before processing real ACKs. */
+  flow->members[0].first_unacknowledged_ms = transport_get_time_ms();
+  flow->pacing_last_refill_ms = transport_get_time_ms();
+  check_delivery(fixture, 1, fixture->count);
+  pump(fixture, 50);
+  CHECK(flow->listening_count == fixture->count);
+  CHECK(flow->feedback_outstanding_count == 0);
+  CHECK(source->stats.flexicast_feedback_fallbacks == 0);
+}
+
+static void test_native_ingress(fixture_t *fixture) {
+  transport_t *source = fixture->source.transport;
+  transport_t *receiver = fixture->clients[0].transport;
+  transport_flexicast_flow_t *flow = NULL;
+  for (size_t i = 0; i < receiver->flexicast.capacity; i++)
+    if (receiver->flexicast.flows[i].active &&
+        receiver->flexicast.flows[i].flow_id == fixture->flow->flow_id)
+      flow = &receiver->flexicast.flows[i];
+  CHECK(flow && flow->crypto && flow->interface_index);
+  uint8_t ciphertext[2048], original[2048], received[2048];
+  uint8_t body[32] = {42};
+  size_t size;
+  uint64_t number;
+  CHECK(quicly_flexicast_send_datagram_at(
+            fixture->flow->crypto, ptls_iovec_init(body, sizeof(body)),
+            ciphertext, sizeof(ciphertext), &size, &number,
+            transport_get_time_ms()) == QUICLY_FLEXICAST_OK);
+  memcpy(original, ciphertext, size);
+  transport_flexicast_ingress_t ingress = {.ip_version = flow->ip_version,
+                                           .destination_port = flow->udp_port,
+                                           .interface_index =
+                                               flow->interface_index};
+  memcpy(ingress.source_ip, flow->source_ip, 16);
+  memcpy(ingress.group_ip, flow->group_ip, 16);
+  CHECK(transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                &ingress));
+  transport_flexicast_ingress_t bad = ingress;
+  bad.source_ip[3] ^= 1;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &bad));
+  bad = ingress;
+  bad.group_ip[3] ^= 1;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &bad));
+  bad = ingress;
+  bad.destination_port++;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &bad));
+  bad = ingress;
+  bad.interface_index++;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &bad));
+  bad = ingress;
+  bad.interface_index = 0;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &bad));
+  bad = ingress;
+  bad.ip_version = 6;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &bad));
+  bad = ingress;
+  bad.truncated = true;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &bad));
+  flow->multicast_unavailable = true;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &ingress));
+  flow->multicast_unavailable = false;
+  flow->membership_acquired = false;
+  CHECK(!transport_flexicast_native_packet_valid(receiver, ciphertext, size,
+                                                 &ingress));
+  flow->membership_acquired = true;
+  /* Exercise the real recvmsg boundary: a valid ciphertext replayed to the
+   * wildcard receive socket's unicast address must not consume its packet
+   * number. Neither may a truncated multicast packet. */
+  struct sockaddr_in local = {.sin_family = AF_INET,
+                              .sin_port = htons(flow->udp_port)};
+  CHECK(inet_pton(AF_INET, "127.0.0.1", &local.sin_addr) == 1);
+  struct sockaddr_in sender = {.sin_family = AF_INET};
+  memcpy(&sender.sin_addr, flow->source_ip, 4);
+  size_t source_fd = SIZE_MAX;
+  for (size_t i = 0; i < source->socket_count; i++)
+    if (((struct sockaddr_in *)&source->sockets[i].local_addr)
+            ->sin_addr.s_addr == sender.sin_addr.s_addr)
+      source_fd = i;
+  CHECK(source_fd != SIZE_MAX);
+  struct iovec vector = {.iov_base = ciphertext, .iov_len = size};
+  CHECK(transport_udp_send_from(
+            source->sockets[source_fd].fd, (struct sockaddr *)&local,
+            (struct sockaddr *)&sender, source->flexicast_interface_index,
+            &vector) == 1);
+  transport_conn_t *conn = NULL;
+  ptls_iovec_t payload = {0};
+  CHECK(transport_flexicast_receive_native(receiver, 0, received,
+                                           sizeof(received), &conn,
+                                           &payload) == (ssize_t)size);
+  CHECK(!conn && !payload.base && !memcmp(received, original, size));
+  local.sin_port++;
+  CHECK(transport_flexicast_receive_unicast(
+      receiver, ciphertext, size, (struct sockaddr *)&local, &conn, &payload));
+  CHECK(!conn && !payload.base && !memcmp(ciphertext, original, size));
+  CHECK(
+      transport_udp_send_from(source->sockets[source_fd].fd,
+                              (struct sockaddr *)&source->flexicast_group_addr,
+                              (struct sockaddr *)&sender,
+                              source->flexicast_interface_index, &vector) == 1);
+  CHECK(transport_flexicast_receive_native(receiver, 0, received, 16, &conn,
+                                           &payload) == 16);
+  CHECK(!conn && !payload.base);
+  CHECK(
+      transport_udp_send_from(source->sockets[source_fd].fd,
+                              (struct sockaddr *)&source->flexicast_group_addr,
+                              (struct sockaddr *)&sender,
+                              source->flexicast_interface_index, &vector) == 1);
+  CHECK(transport_flexicast_receive_native(receiver, 0, received,
+                                           sizeof(received), &conn,
+                                           &payload) == (ssize_t)size);
+  CHECK(conn == flow->control_conn && payload.len == sizeof(body) &&
+        !memcmp(payload.base, body, sizeof(body)));
+  CHECK(receiver->stats.flexicast_packets_received == 1);
+}
+
 static quicly_flexicast_frame_t state_frame(fixture_t *fixture, uint64_t epoch,
                                             uint64_t action) {
   quicly_flexicast_frame_t frame = {.type = QUICLY_FRAME_TYPE_FC_STATE};
@@ -268,10 +433,10 @@ static void test_rekey(fixture_t *fixture, const char *mode) {
     CHECK(accepted != 0);
   }
   if (backlog) {
-    transport_egress_t *egress = &source->egress[0];
+    transport_egress_t *egress = &source->sockets[0].egress;
     CHECK(egress->count == 0);
     transport_egress_packet_t *packet = &egress->packets[egress->head];
-    packet->destination = source->local_addrs[0];
+    packet->destination = source->sockets[0].local_addr;
     packet->destination_len = sizeof(struct sockaddr_in);
     packet->data = malloc(1);
     CHECK(packet->data);
@@ -307,7 +472,7 @@ static void test_rekey(fixture_t *fixture, const char *mode) {
     CHECK(transport_publish_ex(source, &object) == TRANSPORT_PUBLISH_DELIVERED);
   CHECK(quicly_flexicast_get_next_packet_number(flow->crypto) == packet_number);
   CHECK(flow->data_queue.count == 1);
-  CHECK(source->egress[0].count == (backlog ? 1U : 0U));
+  CHECK(source->sockets[0].egress.count == (backlog ? 1U : 0U));
   CHECK(flow->key_epoch == old_epoch);
   /* A second membership event cannot postpone the already scheduled epoch. */
   int64_t deadline = flow->rekey_ready_at_ms;
@@ -349,6 +514,36 @@ static void test_rekey(fixture_t *fixture, const char *mode) {
                                           &decoded, &packet_number) !=
         QUICLY_FLEXICAST_OK);
   quicly_flexicast_flow_free(observer);
+}
+
+static void test_ready_baseline(fixture_t *fixture) {
+  transport_t *source = fixture->source.transport;
+  transport_flexicast_flow_t *flow = fixture->flow;
+  transport_flexicast_member_t *member = &flow->members[0];
+  transport_conn_t *conn = member->conn;
+  uint8_t alias;
+  CHECK(transport_subscriptions_find_alias(&conn->send_subscriptions,
+                                           &fixture->track, &alias) == 0);
+  transport_checkpoint_ack_state_t *ack = transport_checkpoint_ack(conn, alias);
+  *ack = (transport_checkpoint_ack_state_t){.participating = true,
+                                            .sent_initialized = true,
+                                            .sent_group_id = 1,
+                                            .sent_object_id = 17,
+                                            .oldest_unacked_sent_at_ms = 1,
+                                            .acked_initialized = true,
+                                            .acked_group_id = 1,
+                                            .acked_object_id = 3,
+                                            .finish_target = true};
+  transport_checkpoint_ack_state_t before = *ack;
+  member->recovery_baseline_pending = true;
+  quicly_flexicast_frame_t frame =
+      state_frame(fixture, flow->key_epoch, QUICLY_FLEXICAST_STATE_READY);
+  CHECK(transport_flexicast_receive_quic_frame(source, conn, &frame));
+  CHECK(!memcmp(ack, &before, sizeof(before)));
+  CHECK(!member->recovery_baseline_pending);
+  frame = state_frame(fixture, flow->key_epoch, QUICLY_FLEXICAST_STATE_LEAVE);
+  CHECK(transport_flexicast_receive_quic_frame(source, conn, &frame));
+  CHECK(!memcmp(ack, &before, sizeof(before)));
 }
 
 static void test_controls(fixture_t *fixture) {
@@ -440,11 +635,9 @@ static void test_cache_pressure(fixture_t *fixture) {
                                      false));
   }
   CHECK(!transport_sent_cache_has_space(&source->sent_cache));
-  source->fec_in_flush = true;
   object.object_id = TRANSPORT_SENT_CACHE_SIZE;
-  CHECK(transport_publish_ex(source, &object) ==
-        TRANSPORT_PUBLISH_BACKPRESSURE);
-  source->fec_in_flush = false;
+  CHECK(transport_publish_ex(source, &object) == TRANSPORT_PUBLISH_BUFFERED);
+  CHECK(!transport_publish_flush_grouped(source));
   CHECK(source->stats.recovery_cache_backpressure == 1);
   CHECK(source->stats.flexicast_packets_sent == 0);
   for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++)
@@ -484,13 +677,204 @@ static void test_video_rateless(fixture_t *fixture) {
   CHECK(fixture->clients[0].last_checksum == checksum);
 }
 
+/* Feed one systematic symbol directly, so loss and feedback timing do not
+ * depend on the network RNG or congestion controller. */
+static frame_assembler_t *seed_partial(fixture_t *fixture, uint8_t alias,
+                                       uint64_t group_id, uint64_t object_id) {
+  uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + 32] = {0};
+  qlinq_wire_fec_header_t header = {.alias = alias,
+                                    .group_id = group_id,
+                                    .object_id = object_id,
+                                    .symbol_index = 0,
+                                    .total_symbols = 5,
+                                    .data_symbols = 4,
+                                    .symbol_size = 32,
+                                    .original_size = 128,
+                                    .priority = 1};
+  CHECK(qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) ==
+        QLINQ_WIRE_OK);
+  transport_conn_t *conn = fixture->clients[0].transport->client_conn;
+  transport_protocol_receive_datagram(
+      conn, ptls_iovec_init(packet, sizeof(packet)), false);
+  frame_assembler_t *assembler =
+      transport_find_assembler(conn, alias, group_id, object_id);
+  CHECK(assembler && assembler->received_count == 1);
+  assembler->first_symbol_time_ms = transport_get_time_ms() - 10000;
+  return assembler;
+}
+
+static void test_recovery_fairness(fixture_t *fixture) {
+  transport_t *receiver = fixture->clients[0].transport;
+  transport_conn_t *conn = receiver->client_conn;
+  uint8_t alias;
+  CHECK(transport_subscriptions_find_alias(&conn->receive_subscriptions,
+                                           &fixture->track, &alias) == 0);
+  conn->assembler_limit = 32;
+  frame_assembler_t *partial = seed_partial(fixture, alias, 0, 0);
+  /* Leave enough unrepairable partial objects to keep the partial queue busy
+   * after its first request. Whole-object debt must still receive admission. */
+  for (size_t i = 0; i < 16; i++)
+    (void)seed_partial(fixture, alias, 0, 100 + i);
+  transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
+  memset(gap, 0, sizeof(*gap));
+  int64_t now = transport_get_time_ms();
+  gap->pending_base = 1;
+  gap->pending_mask = UINT16_MAX;
+  gap->detected_at_ms = now - 10000;
+  for (size_t i = 0; i < 2; i++)
+    gap->recovery_windows[i] =
+        (transport_recovery_window_t){.active = true,
+                                      .first_object_id = 1 + i * 32,
+                                      .final_object_id = 32 + i * 32,
+                                      .missing_mask = UINT32_MAX,
+                                      .last_request_ms = now - 10000};
+
+  /* Cache only the partial object and the first entirely missing object.
+   * Their peers remain missing throughout this test. */
+  uint8_t bytes[128] = {0};
+  moq_object_t object = object_for(fixture, bytes, sizeof(bytes));
+  for (size_t id = 0; id < 2; id++) {
+    object.object_id = id;
+    CHECK(transport_sent_cache_store(&fixture->source.transport->sent_cache,
+                                     &object, 5, 4, 32, false));
+  }
+  receiver->limits.max_repair_requests_per_second = 1;
+  receiver->limits.max_aggregate_nack_requests_per_second = 1;
+  uint64_t requests = receiver->stats.repair_requests_sent;
+  uint64_t whole = receiver->stats.repair_whole_object_requests_sent;
+  for (size_t round = 0; round < 4; round++) {
+    /* Replenish exactly one token without sleeping or advancing assembler
+     * expiry. Alternation must survive exhausting both admission limits. */
+    now = transport_get_time_ms();
+    conn->nack_request_limiter = (transport_repair_limiter_t){
+        .tokens_milli = 1000, .last_refill_ms = now};
+    receiver->aggregate_nack_limiter = conn->nack_request_limiter;
+    transport_tick(receiver);
+    CHECK(receiver->stats.repair_requests_sent == requests + round + 1);
+    CHECK(receiver->stats.repair_whole_object_requests_sent ==
+          whole + (round + 2) / 2);
+  }
+  CHECK(partial->object_id == 0 && partial->nack_attempt == 1);
+  CHECK(gap->pending_mask != 0);
+  CHECK(gap->recovery_windows[0].missing_mask != 0);
+  for (size_t attempt = 0; attempt < 1500 && fixture->clients[0].received < 2;
+       attempt++)
+    pump(fixture, 1);
+  if (fixture->clients[0].received != 2)
+    fprintf(
+        stderr,
+        "fairness received=%zu lost=%llu sent=%llu whole=%llu "
+        "source_requests=%llu symbols=%llu partial_count=%u\n",
+        fixture->clients[0].received,
+        (unsigned long long)receiver->stats.fec_objects_lost,
+        (unsigned long long)receiver->stats.repair_requests_sent,
+        (unsigned long long)receiver->stats.repair_whole_object_requests_sent,
+        (unsigned long long)
+            fixture->source.transport->stats.repair_requests_received,
+        (unsigned long long)
+            fixture->source.transport->stats.repair_symbols_sent,
+        partial->received_count);
+  CHECK(fixture->clients[0].received == 2);
+  CHECK(fixture->clients[0].last_size == sizeof(bytes));
+  CHECK(fixture->clients[0].last_checksum == 0);
+  CHECK(receiver->stats.fec_objects_lost == 0);
+}
+
+static void test_recovery_dedup(fixture_t *fixture) {
+  transport_t *receiver = fixture->clients[0].transport;
+  transport_conn_t *conn = receiver->client_conn;
+  uint8_t alias;
+  CHECK(transport_subscriptions_find_alias(&conn->receive_subscriptions,
+                                           &fixture->track, &alias) == 0);
+  receiver->limits.max_repair_requests_per_second = 128;
+  receiver->limits.max_aggregate_nack_requests_per_second = 128;
+  for (size_t shared = 0; shared < 2; shared++) {
+    frame_assembler_t *partial = seed_partial(fixture, alias, shared, 0);
+    partial->shared_delivery = shared != 0;
+    transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
+    memset(gap, 0, sizeof(*gap));
+    gap->group_id = shared;
+    gap->pending_mask = UINT16_MAX;
+    gap->shared_delivery = shared != 0;
+    gap->detected_at_ms = transport_get_time_ms() - 10000;
+    gap->recovery_windows[0] =
+        (transport_recovery_window_t){.active = true,
+                                      .group_id = shared,
+                                      .final_object_id = 15,
+                                      .missing_mask = UINT16_MAX,
+                                      .last_request_ms = gap->detected_at_ms};
+    memset(&conn->nack_request_limiter, 0, sizeof(conn->nack_request_limiter));
+    memset(&receiver->aggregate_nack_limiter, 0,
+           sizeof(receiver->aggregate_nack_limiter));
+    uint64_t sent = receiver->stats.repair_requests_sent;
+    uint64_t whole = receiver->stats.repair_whole_object_requests_sent;
+    uint64_t coalesced = receiver->stats.repair_requests_coalesced;
+    transport_tick(receiver);
+    /* Fifteen entirely missing objects and one partial, each requested once.
+     * In particular, the gap pass must not duplicate the window's requests or
+     * request the whole object already owned by the partial assembler. */
+    if (receiver->stats.repair_requests_sent != sent + 16)
+      fprintf(stderr,
+              "dedup shared=%zu sent=%llu whole=%llu coalesced=%llu "
+              "partial_attempt=%u\n",
+              shared,
+              (unsigned long long)(receiver->stats.repair_requests_sent - sent),
+              (unsigned long long)(receiver->stats
+                                       .repair_whole_object_requests_sent -
+                                   whole),
+              (unsigned long long)(receiver->stats.repair_requests_coalesced -
+                                   coalesced),
+              partial->nack_attempt);
+    CHECK(receiver->stats.repair_requests_sent == sent + 16);
+    CHECK(receiver->stats.repair_whole_object_requests_sent == whole + 15);
+    CHECK(receiver->stats.repair_requests_coalesced == coalesced);
+    CHECK(partial->nack_attempt == 1);
+    transport_release_assembler(receiver, partial);
+  }
+}
+
+static void test_feedback_deadline(void) {
+  transport_flexicast_flow_t flow = {0};
+  transport_flexicast_member_t member = {0};
+  flow.cc_config.feedback_timeout_msec = 1000;
+  flow.cc_config.minimum_rate_bytes_per_second = 250;
+  flow.cc_config.maximum_datagram_size = 1280;
+  flow.ack_delay_msec = 25;
+  flow.delivery_epoch = 1;
+  member.listening = true;
+  member.acknowledged_delivery_epoch = 1;
+  CHECK(tf_member_feedback_deadline(&flow, &member) == INT64_MAX);
+  member.acknowledged_delivery_epoch = 0;
+  /* No actual submitted packet means no timer, even with queued debt. */
+  CHECK(tf_member_feedback_deadline(&flow, &member) == INT64_MAX);
+  member.first_unacknowledged_ms = 1000;
+  CHECK(tf_member_feedback_deadline(&flow, &member) == 4000);
+  flow.cc_config.minimum_rate_bytes_per_second = 1;
+  CHECK(tf_member_feedback_deadline(&flow, &member) == 4000);
+  flow.ack_delay_msec = 2000;
+  CHECK(tf_member_feedback_deadline(&flow, &member) == 7000);
+  member.acknowledged_delivery_epoch = 1;
+  CHECK(tf_member_feedback_deadline(&flow, &member) == INT64_MAX);
+}
+
 int main(int argc, char **argv) {
+  test_feedback_deadline();
   const char *mode = argc > 1 ? argv[1] : "pacing";
   size_t count = argc > 2 ? strtoul(argv[2], NULL, 10) : 2;
   CHECK(count > 0 && count <= MAX_CLIENTS);
   fixture_t fixture;
   create_fixture(&fixture, count, argc > 3, mode);
-  if (strstr(mode, "rekey") || strcmp(mode, "control-queue") == 0)
+  if (strcmp(mode, "blocked-fanout") == 0)
+    test_blocked_fanout(&fixture);
+  else if (strcmp(mode, "native-ingress") == 0)
+    test_native_ingress(&fixture);
+  else if (strcmp(mode, "rateless-recovery-fairness") == 0)
+    test_recovery_fairness(&fixture);
+  else if (strcmp(mode, "rateless-recovery-dedup") == 0)
+    test_recovery_dedup(&fixture);
+  else if (strcmp(mode, "rateless-ready-baseline") == 0)
+    test_ready_baseline(&fixture);
+  else if (strstr(mode, "rekey") || strcmp(mode, "control-queue") == 0)
     test_rekey(&fixture, mode);
   else if (strcmp(mode, "controls") == 0)
     test_controls(&fixture);

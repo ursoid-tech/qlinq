@@ -485,11 +485,11 @@ static bool build_shadow_observation_snapshot(
       incomplete = true;
       continue;
     }
-    requester->path_count = t->num_fds;
+    requester->path_count = t->socket_count;
     for (size_t path = 0; path < requester->path_count; path++) {
-      const path_state_t *state = &conn->path_states[path];
+      const path_state_t *state = &conn->paths[path].state;
       transport_repair_planner_path_t *entry = &requester->paths[path];
-      entry->resource_id = t->local_ifindices[path];
+      entry->resource_id = t->sockets[path].interface_index;
       entry->measurement_known = state->initialized && state->b_ewma > 0;
       entry->estimate.b = state->b_ewma > 0 ? state->b_ewma : FP_FROM_INT(100);
       entry->estimate.l = state->l_ewma;
@@ -841,7 +841,8 @@ unicast_repair_can_accept(transport_t *t, transport_flexicast_flow_t *flow,
         needed++;
     }
     if (needed > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY ||
-        conn->queued_datagrams[0] > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - needed)
+        quicly_get_num_datagram_frames_path(conn->quic, 0) >
+            QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - needed)
       return false;
     matched++;
   }

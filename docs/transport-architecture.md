@@ -281,22 +281,29 @@ boolean wrapper returns false for partial delivery and all failures. DELIVERED
 means accepted by transport queues; it is not a network-delivery confirmation.
 Finite-stream checkpoint and completion ACKs provide that stronger guarantee.
 
-Finite rateless publishers call `transport_finish_track` after their final
-application record. Publication assigns internal FEC object IDs, emits a
-rolling checkpoint every 32 objects, and sends a reliable completion
-watermark. Receivers keep at most 128 missing-window bitmaps. Missing-object
-requests are pipelined within the per-tick, token, and control-queue budgets.
+Finite fixed-FEC and rateless publishers call `transport_finish_track` after
+their final application record. Publication assigns internal FEC object IDs,
+freezes the current receiver cohort, flushes the last partial group, emits a
+rolling checkpoint every 32 objects, and sends a reliable completion watermark.
+Receivers retain at most 128 missing-window bitmaps. Missing-object requests are
+pipelined within per-tick, token, and control-queue budgets, with admission
+rotating across peers, aliases, and whole/partial-object recovery. Multicast
+feedback uses randomized backoff and shared-repair suppression.
+
 Cumulative ACKs release source repair-cache entries. Publication reports
 backpressure when protected source entries exhaust the cache's entry or byte
-budget. The source cache also has a configurable
-`max_recovery_cache_bytes` payload budget, defaulting to 16 MiB, and admits new
-objects only when both byte and entry limits can be met without evicting
-protected objects. Configuration must hold a maximum FEC object and one
-32-object recovery window at the grouped publication size. Completed cumulative
+budget. The source cache has a configurable `max_recovery_cache_bytes` payload
+budget, defaulting to 16 MiB, and admits objects only when both limits can be met
+without evicting protected objects. Configuration must hold a maximum FEC object
+and one 32-object recovery window at the grouped publication size. Completed
 checkpoints and repeated final watermarks retire obsolete receiver gaps and
 partial objects through the acknowledged object ID, preserving other groups,
-tracks, and later objects.
-This recovery lifecycle belongs in qlinq because it describes application-track/FEC object lifetime, while Quicly owns delivery and protection of the reliable control bytes.
+tracks, and later objects. Receiver completion and publisher cohort settlement
+produce separate lifecycle events; aborts release pending recovery state.
+
+This recovery lifecycle belongs in qlinq because it describes application-track
+and FEC object lifetime. Quicly owns delivery and protection of reliable control
+bytes.
 
 `transport_get_stats` reports protocol errors, handshake and reconnect counts,
 publication outcomes, FEC outcomes, thread-contract violations, UDP

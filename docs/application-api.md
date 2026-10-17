@@ -126,10 +126,9 @@ for (;;) {
 A subscription may be created before the connection completes. It is retained
 and activated after peer authentication. Event record bytes are copied into
 the context's bounded queue and remain valid until `qlinq_event_release()`.
-For FEC-backed data streams, the façade preserves each record's group,
-sequence, keyframe, and priority metadata inside the grouped transport payload;
-receivers using the same API recover the original record boundaries and
-metadata.
+For FEC DATA streams, records use the grouped transport payload format.
+The API restores record boundaries; group and sequence IDs identify the coding
+object, as described under progress and ownership below.
 
 `qlinq_endpoint_get_stats` copies a snapshot into a caller-owned
 `qlinq_endpoint_stats_t` without resetting counters. Read it on the context's

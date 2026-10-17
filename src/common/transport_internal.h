@@ -165,10 +165,6 @@ struct transport_t {
   int ifmon_pipe[2];
   transport_fec_cache_t fec_cache;
   transport_repair_limiter_t aggregate_repair_limiter;
-  transport_repair_limiter_t aggregate_nack_limiter;
-  int64_t aggregate_nack_retry_at_ms;
-  size_t recovery_conn_cursor;
-  uint32_t fec_assembler_timeout_ms;
   transport_repair_mode_t repair_mode;
   uint64_t repair_feedback_nonce;
   FILE *repair_shadow_log;
@@ -223,6 +219,10 @@ struct transport_conn_t {
   quicly_stream_t *stream;
   frame_assembler_t assemblers[TRANSPORT_HARD_MAX_ASSEMBLERS];
   size_t assembler_index;
+  /* rotate admission when only one request fits allowance */
+  size_t recovery_assembler_cursor;
+  uint8_t recovery_alias_cursor;
+  bool recovery_partial_next;
   size_t assembler_limit;
   size_t assembler_count;
   uint64_t assembler_rx_rate;

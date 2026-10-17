@@ -19,7 +19,6 @@ typedef struct {
   uint32_t requested_mask;
   uint16_t nack_attempt;
   uint8_t cursor;
-  uint16_t nack_attempt;
   int64_t last_request_ms;
 } transport_recovery_window_t;
 
@@ -29,6 +28,8 @@ typedef struct {
   uint64_t pending_base;
   uint32_t pending_mask;
   uint32_t requested_mask;
+  uint8_t recovery_window_cursor;
+  uint8_t recovery_gap_cursor;
   uint64_t group_id;
   int64_t detected_at_ms;
   uint16_t nack_attempt;
@@ -37,7 +38,6 @@ typedef struct {
   bool delivered_initialized;
   bool shared_delivery;
   bool checkpoint_initialized;
-  bool shared_delivery;
   uint64_t last_checkpoint_object_id;
   bool finish_pending;
   bool finish_emitted;
@@ -59,8 +59,6 @@ typedef struct {
   bool acked_initialized;
   uint64_t acked_group_id;
   uint64_t acked_object_id;
-  bool finish_target;
-  bool finish_accounted;
 } transport_checkpoint_ack_state_t;
 
 typedef struct {

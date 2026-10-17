@@ -130,7 +130,7 @@ int main(void) {
     qlinq_event_t event;
     while (qlinq_next_event(context, &event)) {
       if (event.type == QLINQ_EVENT_RECORD && event.stream == subscription &&
-          event.record.sequence == record.sequence &&
+          event.record.group_id == 0 && event.record.sequence == 0 &&
           event.record.size == record.size &&
           memcmp(event.record.data, payload, record.size) == 0)
         received = true;

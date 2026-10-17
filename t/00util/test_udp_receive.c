@@ -21,6 +21,7 @@ static ssize_t interrupted_recvmsg(int fd, struct msghdr *message, int flags) {
 #define QLINQ_UDP_RECEIVE_PORTABLE 1
 #define recvmsg interrupted_recvmsg
 #define transport_udp_receive_batch portable_receive_batch
+#define transport_udp_send_from portable_send_from
 #define transport_udp_send_batch portable_send_batch
 #define transport_udp_send_batch_ecn portable_send_batch_ecn
 #define transport_udp_enable_recv_ecn portable_enable_recv_ecn
@@ -35,6 +36,7 @@ static ssize_t interrupted_recvmsg(int fd, struct msghdr *message, int flags) {
 #undef transport_udp_gro_pending
 #undef transport_udp_gro_receive
 #undef transport_udp_receive_batch
+#undef transport_udp_send_from
 #undef transport_udp_send_batch
 #undef transport_udp_send_batch_ecn
 #undef transport_udp_enable_recv_ecn

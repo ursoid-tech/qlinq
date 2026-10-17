@@ -10,7 +10,11 @@
  * inside dispatch, which borrows queue and member entries until it returns.
  * No group ciphertext may enter the generic UDP egress queue. */
 
-void tf_advance_delivery_epoch(transport_flexicast_flow_t *flow);
+void tf_record_delivery_submission(transport_flexicast_flow_t *,
+                                   transport_flexicast_member_t *,
+                                   bool first_submission);
+int64_t tf_member_feedback_deadline(const transport_flexicast_flow_t *,
+                                    const transport_flexicast_member_t *);
 size_t tf_cancel_flow_repairs(transport_t *t, transport_flexicast_flow_t *flow,
                               bool entire_track, uint64_t group_id,
                               uint64_t object_id);

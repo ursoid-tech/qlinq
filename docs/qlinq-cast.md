@@ -112,3 +112,7 @@ final summary is always written to standard error.
 - Exit `130`: interrupted locally; a sender attempts to notify receivers first.
 
 Run `qlinq-cast --help` for the complete option list.
+
+Cast prefixes each record payload with its own eight-byte, big-endian sequence
+number. Receivers remove this prefix before writing the output. This keeps file
+ordering independent of the transport coding-object IDs and grouped records.

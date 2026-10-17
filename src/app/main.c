@@ -235,8 +235,8 @@ static bool write_received_payload(app_ctx_t *app,
   if (app->receive_limit != 0 && app->received_objects >= app->receive_limit &&
       app->receive_done_at == 0)
     app->receive_done_at = transport_get_time_ms();
-  if (app->output)
-    fflush(app->output);
+  if (app->output && fflush(app->output) != 0)
+    return false;
   return true;
 }
 
@@ -349,8 +349,7 @@ static void on_transport_event(void *user_data,
         strcmp(event->track_id.name, app->track.name) != 0)
       break;
     if (!write_received_object(app, event)) {
-      fprintf(stderr,
-              "qlinq-app: malformed recovered object or output error\n");
+      fprintf(stderr, "qlinq-app: malformed object or output error\n");
       app->failed = true;
     }
     break;
