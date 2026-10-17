@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Run the isolated transit qualification fixture."""
+import subprocess
+import sys
+from transit_demo import main
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (subprocess.CalledProcessError, RuntimeError) as exc:
+        print(f'Transit experiment failed: {exc}', file=sys.stderr)
+        if isinstance(exc, subprocess.CalledProcessError):
+            print(exc.stderr, file=sys.stderr)
+        sys.exit(2)

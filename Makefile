@@ -246,6 +246,25 @@ package-tun: qlinq-tun
 examples/data_multipath_benchmark: examples/data_multipath_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
+examples/transit_benchmark: examples/transit_benchmark.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+examples/transit_udp_calibration: examples/transit_udp_calibration.o
+	$(CC) -o $@ $^ -lm
+
+check-transit-reports: examples/transit_benchmark
+	python3 examples/test_multipath_transit_demo.py
+
+check-transit-smoke: check-transit-reports gencerts
+	@if [ "$${QLINQ_SKIP_PRIVILEGED:-0}" = 1 ]; then \
+		echo "SKIP routed transit smoke test (QLINQ_SKIP_PRIVILEGED=1)"; \
+	else \
+		mkdir -p tmp; \
+		./examples/multipath_transit_demo --scenario healthy --rate-mbps 1000 \
+			--mbps 10 --seconds 7 --warmup 2 --drain 2 \
+			--output-dir "$$(mktemp -d "$$PWD/tmp/transit-smoke.XXXXXX")"; \
+	fi
+
 t/00util/test_fec: t/00util/test_fec.o $(FEC_OBJS)
 	$(CC) -o $@ t/00util/test_fec.o $(FEC_OBJS) $(LDFLAGS)
 
@@ -322,8 +341,12 @@ check-multipath-demo:
 		./examples/multipath_demo.sh; \
 	fi
 
-check-multipath-bw-demo:
+check-multipath-bw-reports:
 	python3 examples/test_multipath_bw_demo.py
+
+check-reports: check-transit-reports check-multipath-bw-reports
+
+check-multipath-bw-demo: check-multipath-bw-reports
 	@if [ "$${QLINQ_SKIP_PRIVILEGED:-0}" = 1 ]; then \
 		echo "SKIP privileged bandwidth demo (QLINQ_SKIP_PRIVILEGED=1)"; \
 	else \
@@ -391,7 +414,7 @@ t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile
 t/00util/test_multipath_feedback: t/00util/test_multipath_feedback.o t/00util/transport_quicly_feedback.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-check: all $(CHECK_BINARIES) gencerts
+check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
@@ -440,7 +463,7 @@ indent:
 	clang-format -style=file -i $(FORMAT_SOURCES)
 
 .PHONY: all clean check benchmark fuzz-wire check-submodules FORCE \
-	check-multipath-demo check-multipath-bw-demo check-sanitize soak release-check indent gencerts
+	check-multipath-demo check-multipath-bw-demo check-multipath-bw-reports check-reports check-transit-reports check-transit-smoke check-sanitize soak release-check indent gencerts
 
 .PHONY: install-tun check-tun-tool check-tun-real package-tun
 

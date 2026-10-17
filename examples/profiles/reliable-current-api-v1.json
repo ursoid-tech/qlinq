@@ -1,0 +1,30 @@
+{
+  "id": "reliable-current-api-v1",
+  "status": "candidate-not-qualified",
+  "common": {
+    "mode": "reliable",
+    "paths": 3,
+    "rate-mbps": 1000,
+    "rtt-ms": 40,
+    "source-policy": "retry",
+    "record-bytes": 8000,
+    "deadline-ms": 200,
+    "warmup": 5,
+    "drain": 5,
+    "stream-egress-bytes": 25165824,
+    "total-stream-egress-bytes": 33554432,
+    "receive-memory-bytes": 33554432,
+    "recovery-cache-bytes": 33554432,
+    "egress-packets": 4096,
+    "egress-bytes": 33554432,
+    "packets-per-service": 4096,
+    "event-queue-events": 8192,
+    "event-queue-bytes": 134217728,
+    "reaction-seconds": 1
+  },
+  "cases": {
+    "healthy": {"scenario": "healthy", "seconds": 90, "mbps": 2300},
+    "loss": {"scenario": "loss", "seconds": 400, "mbps": 1200, "recovery-mbps": 2300, "fault-at": 300, "restore-at": 330, "loss-percent": 5},
+    "outage": {"scenario": "outage", "seconds": 400, "mbps": 1200, "recovery-mbps": 2300, "fault-at": 300, "restore-at": 330}
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "id": "reliable-reduced-rate-v1",
+  "status": "diagnostic-not-qualified",
+  "purpose": "Exercise reliable loss/outage gates below the current local fixture ceiling. This profile is not a substitute for reliable-current-api-v1.",
+  "common": {
+    "mode": "reliable",
+    "paths": 3,
+    "rate-mbps": 1000,
+    "rtt-ms": 40,
+    "source-policy": "retry",
+    "record-bytes": 8000,
+    "deadline-ms": 200,
+    "warmup": 5,
+    "drain": 5,
+    "stream-egress-bytes": 25165824,
+    "total-stream-egress-bytes": 33554432,
+    "receive-memory-bytes": 33554432,
+    "recovery-cache-bytes": 33554432,
+    "egress-packets": 4096,
+    "egress-bytes": 33554432,
+    "packets-per-service": 4096,
+    "event-queue-events": 8192,
+    "event-queue-bytes": 134217728,
+    "reaction-seconds": 1
+  },
+  "cases": {
+    "loss": {
+      "scenario": "loss",
+      "seconds": 400,
+      "mbps": 700,
+      "recovery-mbps": 900,
+      "recovery-restored-path-min-mbps": 100,
+      "fault-at": 300,
+      "restore-at": 330,
+      "loss-percent": 5
+    },
+    "outage": {
+      "scenario": "outage",
+      "seconds": 400,
+      "mbps": 700,
+      "recovery-mbps": 900,
+      "recovery-restored-path-min-mbps": 100,
+      "fault-at": 300,
+      "restore-at": 330
+    }
+  }
+}

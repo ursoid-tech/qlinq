@@ -25,6 +25,11 @@ kernels. Use `make CODEC_TARGET=portable` for binaries intended for other CPUs.
 Changes to compiler, flags, codec targeting or `WITH_FUSION` rebuild objects
 through a configuration stamp; `libqlinq.a` is recreated when its members change.
 
+The optional Fusion AES-GCM implementation is built when supported by the
+compiler (`WITH_FUSION=0` disables it). Select it at runtime with
+`QLINQ_CRYPTO_BACKEND=fusion`; unsupported CPUs or builds fall back to OpenSSL.
+OpenSSL remains the runtime default. `make check-reports` runs both benchmark
+report validators without creating network namespaces.
 This produces the following tools and an embeddable transport library:
 
 - `qlinqd`: The background peer-to-peer network daemon.
