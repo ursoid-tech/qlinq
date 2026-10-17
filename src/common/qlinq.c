@@ -54,7 +54,6 @@ struct qlinq_endpoint {
   uint8_t *shared_secret;
   size_t shared_secret_size;
   uint64_t records_received;
-  int64_t last_service_ms;
   bool service_pending;
   bool listener;
   bool active;
@@ -216,11 +215,13 @@ static bool queue_event(qlinq_context_t *context, const qlinq_event_t *source,
     return false;
   }
 
-  qlinq_event_node_t *node = calloc(1, allocation_size);
+  /* Payload and message storage are fully overwritten below. */
+  qlinq_event_node_t *node = malloc(allocation_size);
   if (!node) {
     set_status(context, QLINQ_STATUS_NO_MEMORY);
     return false;
   }
+  node->next = NULL;
   node->allocation_size = allocation_size;
   node->event = *source;
   node->event._private = node;
@@ -1037,7 +1038,8 @@ qlinq_send_result_t qlinq_stream_send(qlinq_stream_t *stream,
   return mapped;
 }
 
-static void refresh_writable_events(qlinq_context_t *context) {
+static bool update_writable_events(qlinq_context_t *context, bool enqueue) {
+  bool pending = false;
   for (qlinq_endpoint_t *endpoint = context->endpoints; endpoint;
        endpoint = endpoint->next) {
     if (!endpoint->active || !endpoint->transport)
@@ -1053,6 +1055,9 @@ static void refresh_writable_events(qlinq_context_t *context) {
         stream->writable_announced = false;
       if (!writable || stream->writable_announced)
         continue;
+      pending = true;
+      if (!enqueue)
+        continue;
       qlinq_event_t event = {.type = QLINQ_EVENT_STREAM_WRITABLE,
                              .endpoint = endpoint,
                              .status = QLINQ_STATUS_OK};
@@ -1060,30 +1065,27 @@ static void refresh_writable_events(qlinq_context_t *context) {
       stream->writable_announced = queue_event(context, &event, NULL, 0, NULL);
     }
   }
+  return pending;
 }
 
-static void service_endpoint(qlinq_endpoint_t *endpoint) {
-  /* Record the start, so any clock advance during this sweep is observed on
-   * the next call. API work submitted from callbacks can set pending again. */
-  endpoint->last_service_ms = transport_get_time_ms();
+static void refresh_writable_events(qlinq_context_t *context) {
+  (void)update_writable_events(context, true);
+}
+
+static void service_endpoint(qlinq_endpoint_t *endpoint,
+                             const struct pollfd *fds, size_t count) {
+  /* Clear before servicing so any API work submitted during the tick can
+   * request another service tick. */
   endpoint->service_pending = false;
-  transport_tick(endpoint->transport);
+  transport_tick_ready(endpoint->transport, fds, count);
 }
 
-static size_t service_pending_endpoints(qlinq_context_t *context) {
+static size_t count_active_endpoints(qlinq_context_t *context) {
   size_t endpoint_count = 0;
   for (qlinq_endpoint_t *endpoint = context->endpoints; endpoint;
        endpoint = endpoint->next) {
-    if (endpoint->active && endpoint->transport) {
-      /* A return from poll often leads straight back here in the same timer
-       * millisecond. Skip only that redundant sweep, with no intervening API
-       * work. Socket readiness and transport deadlines are still polled below;
-       * once time advances, the normal maintenance sweep runs again. */
-      if (endpoint->service_pending ||
-          endpoint->last_service_ms != transport_get_time_ms())
-        service_endpoint(endpoint);
+    if (endpoint->active && endpoint->transport)
       endpoint_count++;
-    }
   }
   return endpoint_count;
 }
@@ -1130,6 +1132,15 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
     entry->count = transport_get_poll_fds(endpoint->transport, fds + count,
                                           capacity - count);
     count += entry->count;
+    /* API mutations require a tick even without readable transport fds. Poll
+     * once without waiting so the same tick can consume any queued replies.
+     * This endpoint will be serviced regardless of its deadline. Other
+     * endpoints still need their timers checked, even when wait_ms is zero. */
+    if (endpoint->service_pending) {
+      wait_ms = 0;
+      entry->deadline = -1;
+      continue;
+    }
     int64_t deadline = transport_get_first_timeout(endpoint->transport);
     entry->deadline = deadline;
     if (deadline >= 0) {
@@ -1160,13 +1171,13 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
    * timers, and timeout wakes that drive periodic maintenance. */
   for (size_t i = 0; i < poll_count; i++) {
     qlinq_endpoint_poll_t *entry = &polls[i];
-    bool ready =
-        result == 0 || (entry->deadline >= 0 && entry->deadline <= now);
+    bool ready = entry->endpoint->service_pending || result == 0 ||
+                 (entry->deadline >= 0 && entry->deadline <= now);
     for (size_t fd = entry->first; !ready && fd < entry->first + entry->count;
          fd++)
       ready = fds[fd].revents != 0;
     if (ready && entry->endpoint->active && entry->endpoint->transport)
-      service_endpoint(entry->endpoint);
+      service_endpoint(entry->endpoint, fds + entry->first, entry->count);
   }
   return QLINQ_STATUS_OK;
 }
@@ -1188,17 +1199,20 @@ qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
     return context->last_status < 0 ? context->last_status : QLINQ_STATUS_OK;
   set_status(context, QLINQ_STATUS_OK);
 
-  size_t endpoint_count = service_pending_endpoints(context);
-  refresh_writable_events(context);
-  if (context->event_head)
-    return context->last_status < 0 ? context->last_status : QLINQ_STATUS_OK;
+  size_t endpoint_count = count_active_endpoints(context);
   if (endpoint_count == 0) {
     set_status(context, QLINQ_STATUS_STATE);
     return QLINQ_STATUS_STATE;
   }
 
+  /* Observe readiness before polling, but enqueue only after input is
+   * serviced. A writable notification must not occupy the last event slot
+   * before an incoming record, or repeatedly prevent ACK progress when an
+   * application retries a record larger than the currently available room. */
+  bool writable_pending = update_writable_events(context, false);
   qlinq_status_t status =
-      poll_endpoints(context, endpoint_count, timeout_ms, fd, events, revents);
+      poll_endpoints(context, endpoint_count, writable_pending ? 0 : timeout_ms,
+                     fd, events, revents);
   if (status != QLINQ_STATUS_OK)
     return status;
   refresh_writable_events(context);
