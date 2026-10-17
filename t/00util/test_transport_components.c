@@ -350,6 +350,68 @@ static int test_udp_batch_boundaries(int family) {
   return 0;
 }
 
+static int test_udp_ecn(void) {
+#ifdef __linux__
+  const int families[] = {AF_INET, AF_INET6};
+  for (size_t f = 0; f < sizeof(families) / sizeof(families[0]); f++) {
+    int family = families[f];
+    int sender = socket(family, SOCK_DGRAM, 0);
+    int receiver = socket(family, SOCK_DGRAM, 0);
+    CHECK(sender >= 0 && receiver >= 0, "ECN sockets");
+    struct sockaddr_storage address = {0};
+    socklen_t length;
+    if (family == AF_INET) {
+      struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
+      v4->sin_family = AF_INET;
+      v4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      length = sizeof(*v4);
+    } else {
+      struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address;
+      v6->sin6_family = AF_INET6;
+      v6->sin6_addr = in6addr_loopback;
+      length = sizeof(*v6);
+    }
+    CHECK(bind(receiver, (struct sockaddr *)&address, length) == 0 &&
+              getsockname(receiver, (struct sockaddr *)&address, &length) == 0,
+          "ECN receiver address");
+    CHECK(transport_udp_enable_recv_ecn(receiver, family), "enable ECN input");
+    struct timeval timeout = {.tv_sec = 1};
+    CHECK(setsockopt(receiver, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                     sizeof(timeout)) == 0,
+          "ECN receive deadline");
+    uint8_t bytes[] = {1, 2, 3}, received[8];
+    struct iovec vector = {.iov_base = bytes, .iov_len = sizeof(bytes)};
+    for (uint8_t mark = 0; mark < 4; mark++) {
+      CHECK(transport_udp_send_ecn(sender, (struct sockaddr *)&address, NULL, 0,
+                                   &vector, mark) == 1,
+            "per-packet ECN output");
+      struct sockaddr_storage peer;
+      socklen_t peer_length = sizeof(peer);
+      uint8_t ecn = 0;
+      CHECK(transport_udp_receive_ecn(receiver, received, sizeof(received),
+                                      &peer, &peer_length,
+                                      &ecn) == (ssize_t)sizeof(bytes) &&
+                ecn == mark && !memcmp(received, bytes, sizeof(bytes)),
+            "IPv4/IPv6 ECN survives the socket boundary");
+    }
+    CHECK(transport_udp_send_batch(sender, (struct sockaddr *)&address, length,
+                                   &vector, 1, 0) == 1,
+          "ordinary traffic on shared socket");
+    struct sockaddr_storage peer;
+    socklen_t peer_length = sizeof(peer);
+    uint8_t ecn = 3;
+    CHECK(transport_udp_receive_ecn(receiver, received, sizeof(received), &peer,
+                                    &peer_length,
+                                    &ecn) == (ssize_t)sizeof(bytes) &&
+              ecn == 0,
+          "Flexicast marking does not persist on ordinary traffic");
+    close(sender);
+    close(receiver);
+  }
+#endif
+  return 0;
+}
+
 static int test_assembler_growth_budget(void) {
   transport_t *transport = calloc(1, sizeof(*transport));
   frame_assembler_t assembler = {0}, other = {0};
@@ -811,6 +873,7 @@ int main(void) {
         "assembler transient allocation budget");
   CHECK(test_udp_batch_boundaries(AF_INET) == 0, "IPv4 UDP batch boundaries");
   CHECK(test_udp_batch_boundaries(AF_INET6) == 0, "IPv6 UDP batch boundaries");
+  CHECK(test_udp_ecn() == 0, "UDP ECN metadata");
   CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
   CHECK(test_recovery_cache_lookup() == 0, "sparse wrapped cache lookup");
   CHECK(test_recovery_cache_nonmonotonic_ids() == 0,

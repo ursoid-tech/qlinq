@@ -21,6 +21,10 @@ static ssize_t interrupted_recvmsg(int fd, struct msghdr *message, int flags) {
 #define QLINQ_UDP_RECEIVE_PORTABLE 1
 #define recvmsg interrupted_recvmsg
 #define transport_udp_receive_batch portable_receive_batch
+#define transport_udp_enable_recv_ecn portable_enable_recv_ecn
+#define transport_udp_message_ecn portable_message_ecn
+#define transport_udp_receive_ecn portable_receive_ecn
+#define transport_udp_send_ecn portable_send_ecn
 #define transport_udp_send_from portable_send_from
 #define transport_udp_send_batch portable_send_batch
 #define transport_udp_send_batch_ecn portable_send_batch_ecn
@@ -36,6 +40,10 @@ static ssize_t interrupted_recvmsg(int fd, struct msghdr *message, int flags) {
 #undef transport_udp_gro_pending
 #undef transport_udp_gro_receive
 #undef transport_udp_receive_batch
+#undef transport_udp_enable_recv_ecn
+#undef transport_udp_message_ecn
+#undef transport_udp_receive_ecn
+#undef transport_udp_send_ecn
 #undef transport_udp_send_from
 #undef transport_udp_send_batch
 #undef transport_udp_send_batch_ecn
@@ -49,6 +57,7 @@ static void run(int family, receive_fn receive) {
   int sender = socket(family, SOCK_DGRAM, 0);
   int sink = socket(family, SOCK_DGRAM, 0);
   assert(sender >= 0 && sink >= 0);
+  bool ecn = transport_udp_enable_recv_ecn(sink, family);
   struct sockaddr_storage address = {0};
   socklen_t length;
   if (family == AF_INET) {
@@ -68,8 +77,14 @@ static void run(int family, receive_fn receive) {
   assert(receive(sink, packets, 32) == 0);
   for (unsigned i = 0; i < 65; i++) {
     unsigned value = i;
-    assert(sendto(sender, &value, sizeof(value), 0, (struct sockaddr *)&address,
-                  length) == sizeof(value));
+    if (ecn) {
+      struct iovec vector = {&value, sizeof(value)};
+      assert(transport_udp_send_ecn(sender, (struct sockaddr *)&address, NULL,
+                                    0, &vector, (uint8_t)(i & 3U)) == 1);
+    } else {
+      assert(sendto(sender, &value, sizeof(value), 0,
+                    (struct sockaddr *)&address, length) == sizeof(value));
+    }
   }
   unsigned total = 0;
   interruptions = 1;
@@ -81,6 +96,7 @@ static void run(int family, receive_fn receive) {
       assert(packets[i].size == sizeof(value) && !packets[i].truncated);
       assert(packets[i].source.ss_family == family);
       memcpy(&value, packets[i].data, sizeof(value));
+      assert(packets[i].ecn == (ecn ? (uint8_t)(total & 3U) : 0));
       assert(value == total++);
     }
   }

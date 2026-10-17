@@ -1394,12 +1394,11 @@ int main(void) {
       repair_queue_preflight(64, 1000) || repair_queue_preflight(63, 24) ||
       repair_queue_preflight(64, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
       repair_queue_preflight(63, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
-      checkpoint_alias_fairness() ||
-      checkpoint_repair_batch(1024, 1024) || checkpoint_repair_batch(2, 1024) ||
-      checkpoint_repair_batch(1024, 3) || entry_limit_and_control_failure() ||
-      byte_limits_and_recovery() || endpoint_vector_limit() ||
-      vector_capacity_compaction() || configurable_limits() ||
-      configured_frame_capacity(128U * 1024U, 2048) ||
+      checkpoint_alias_fairness() || checkpoint_repair_batch(1024, 1024) ||
+      checkpoint_repair_batch(2, 1024) || checkpoint_repair_batch(1024, 3) ||
+      entry_limit_and_control_failure() || byte_limits_and_recovery() ||
+      endpoint_vector_limit() || vector_capacity_compaction() ||
+      configurable_limits() || configured_frame_capacity(128U * 1024U, 2048) ||
       configured_frame_capacity(256U * 1024U, 4096) ||
       retained_nack_retries(false) || retained_nack_retries(true) ||
       retained_nack_ack_gap(false) || retained_nack_ack_gap(true) ||

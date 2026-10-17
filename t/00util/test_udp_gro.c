@@ -286,6 +286,7 @@ static void deterministic(void) {
 static void check_real_source(const transport_udp_view_t *view, int family,
                               const struct sockaddr_storage *sender) {
   assert(view->source.ss_family == family);
+  assert(view->ecn == 3);
   if (family == AF_INET) {
     const struct sockaddr_in *actual =
         (const struct sockaddr_in *)&view->source;
@@ -306,6 +307,11 @@ static void real_socket(int family) {
   int sender = socket(family, SOCK_DGRAM, 0);
   int sink = socket(family, SOCK_DGRAM, 0);
   assert(sender >= 0 && sink >= 0);
+  assert(transport_udp_enable_recv_ecn(sink, family));
+  int mark = 3;
+  assert(setsockopt(sender, family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6,
+                    family == AF_INET ? IP_TOS : IPV6_TCLASS, &mark,
+                    sizeof(mark)) == 0);
   struct sockaddr_storage destination = {0};
   socklen_t length;
   if (family == AF_INET) {

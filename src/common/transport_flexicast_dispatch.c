@@ -201,9 +201,9 @@ static void update_external_load_hint(const transport_t *t,
   hints->external_load_fraction_ppm = flow->cc_external_load_fraction_ppm;
 }
 
-static void update_controller_hints(transport_t *t,
-                                    transport_flexicast_flow_t *flow,
-                                    int64_t now) {
+static size_t update_controller_hints(transport_t *t,
+                                      transport_flexicast_flow_t *flow,
+                                      int64_t now) {
   quicly_flexicast_cc_hints_t hints = {0};
   uint64_t rates[TRANSPORT_FLEXICAST_MAX_FLOWS];
   size_t count = 0;
@@ -241,23 +241,80 @@ static void update_controller_hints(transport_t *t,
     rates[j] = value;
   }
   hints.active_senders = (uint32_t)count;
+  hints.delivery_rate_divisor =
+      flow->native_multicast && !flow->last_submission_replicated
+          ? 1
+          : (uint32_t)flow->listening_count;
   hints.median_sender_rate_bytes_per_second = rates[count / 2];
   if (t->flexicast_cc_aggregate_rate_limit != 0)
     hints.aggregate_rate_limit_bytes_per_second =
         t->flexicast_cc_aggregate_rate_limit / count;
   update_external_load_hint(t, flow, &hints, now);
   quicly_flexicast_cc_set_flow_hints(flow->crypto, &hints, now);
+  return count;
 }
 
-static void refresh_pacer(transport_t *t, transport_flexicast_flow_t *flow,
-                          int64_t now) {
-  update_controller_hints(t, flow, now);
+/* Credit the elapsed interval at its previous rate. Wide intermediate math
+ * handles user rates and long idle intervals without overflow; fractional
+ * aggregate shares retain their remainder instead of rounding to unlimited. */
+static void refill_tokens(uint64_t *tokens, uint64_t *remainder,
+                          int64_t *last_refill, uint64_t numerator,
+                          uint32_t divisor, uint64_t burst, int64_t now) {
+  if (*last_refill == 0 || now <= *last_refill || burst == 0)
+    return;
+  uint64_t elapsed = (uint64_t)(now - *last_refill);
+  *last_refill = now;
+  uint64_t denominator = (uint64_t)(divisor != 0 ? divisor : 1) * 1000U;
+  uint64_t room = *tokens < burst ? burst - *tokens : 0;
+  __extension__ typedef unsigned __int128 wide_t;
+  wide_t credit = (wide_t)numerator * elapsed + *remainder;
+  wide_t added = credit / denominator;
+  if (added >= room) {
+    *tokens = burst;
+    *remainder = 0;
+  } else {
+    *tokens += (uint64_t)added;
+    *remainder = (uint64_t)(credit % denominator);
+  }
+}
+
+static uint64_t pacing_burst(const transport_t *t, uint64_t rate,
+                             uint64_t suggested) {
+  uint64_t minimum = t->limits.max_udp_payload_size * 4U;
+  uint64_t burst = suggested < minimum ? minimum : suggested;
+  uint64_t traditional_maximum = t->limits.max_udp_payload_size * 10U;
+  if (burst > traditional_maximum)
+    burst = traditional_maximum;
+  /* A millisecond clock needs a full millisecond of credit at high rates. */
+  uint64_t millisecond = rate / 1000U + (rate % 1000U != 0);
+  if (burst < millisecond)
+    burst = millisecond;
+  /* The configured byte budget remains the absolute burst bound. Budgets
+   * below rate / 1000 intentionally bound the rate achievable with this clock.
+   */
+  uint64_t maximum = t->limits.max_egress_bytes_per_socket;
+  if (maximum < t->limits.max_udp_payload_size)
+    maximum = t->limits.max_udp_payload_size;
+  return burst > maximum ? maximum : burst;
+}
+
+void tf_refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
+                         int64_t now) {
+  /* Settle old credit before hints can change controller output or fair share.
+   */
+  refill_tokens(&flow->pacing_tokens, &flow->pacing_remainder,
+                &flow->pacing_last_refill_ms, flow->pacing_rate_numerator,
+                flow->pacing_rate_divisor, flow->pacing_burst_bytes, now);
+  transport_flexicast_registry_t *registry = &t->flexicast;
+  refill_tokens(&registry->pacing_tokens, &registry->pacing_remainder,
+                &registry->pacing_last_refill_ms, registry->pacing_rate, 1,
+                registry->pacing_burst, now);
+  size_t active = update_controller_hints(t, flow, now);
   quicly_flexicast_cc_output_t cc_output;
   quicly_flexicast_cc_get_flow_output(flow->crypto, &cc_output);
   if (flow->listening_count == 0)
     return;
   uint64_t rate = cc_output.rate_bytes_per_second;
-  uint64_t burst = cc_output.burst_bytes;
   if (rate == 0) {
     uint64_t slowest = UINT64_MAX;
     for (size_t i = 0; i < flow->member_count; i++) {
@@ -271,39 +328,156 @@ static void refresh_pacer(transport_t *t, transport_flexicast_flow_t *flow,
     }
     if (slowest == UINT64_MAX)
       slowest = 64U * 1024U;
-    /* Compatibility fallback for flows created without a controller. */
-    rate = slowest * 4U / 5U;
+    rate = slowest / 5U * 4U;
   }
-  if (burst == 0)
-    burst = rate / 20U;
-  uint64_t minimum_burst = t->limits.max_udp_payload_size * 4U;
-  if (burst < minimum_burst)
-    burst = minimum_burst;
-  uint64_t maximum_burst = t->limits.max_udp_payload_size * 10U;
-  if (burst > maximum_burst)
-    burst = maximum_burst;
-
+  uint64_t numerator = rate;
+  uint32_t divisor = 1;
+  uint64_t aggregate = t->flexicast_cc_aggregate_rate_limit;
+  if (aggregate != 0 && rate > aggregate / active) {
+    numerator = aggregate;
+    divisor = (uint32_t)active;
+    rate = numerator / divisor + (numerator % divisor != 0);
+  }
+  uint64_t burst = pacing_burst(t, rate, cc_output.burst_bytes);
+  if (flow->pacing_rate_numerator != numerator ||
+      flow->pacing_rate_divisor != divisor ||
+      flow->pacing_burst_bytes != burst) {
+    flow->cc_supply_empty_since_ms = 0;
+    flow->cc_supply_ready_at_ms = 0;
+    flow->cc_supply_idle_ready_at_ms = 0;
+  }
+  if (registry->cc_observed_aggregate_limit != aggregate) {
+    registry->cc_observed_aggregate_limit = aggregate;
+    registry->pacing_credit_epoch++;
+  }
   if (flow->pacing_last_refill_ms == 0) {
     flow->pacing_tokens = burst;
     flow->pacing_last_refill_ms = now;
-  } else if (now > flow->pacing_last_refill_ms) {
-    uint64_t elapsed = (uint64_t)(now - flow->pacing_last_refill_ms);
-    if (elapsed > 60000U)
-      elapsed = 60000U;
-    uint64_t numerator = elapsed * rate + flow->pacing_remainder;
-    uint64_t added = numerator / 1000U;
-    flow->pacing_remainder = numerator % 1000U;
-    flow->pacing_tokens =
-        added >= burst -
-                     (flow->pacing_tokens < burst ? flow->pacing_tokens : burst)
-            ? burst
-            : flow->pacing_tokens + added;
-    flow->pacing_last_refill_ms = now;
   }
+  /* A fractional remainder has units of the old denominator. Discard at most
+   * one byte when the active cohort count changes instead of minting credit. */
+  if (flow->pacing_rate_divisor != divisor)
+    flow->pacing_remainder = 0;
+  flow->pacing_rate_numerator = numerator;
+  flow->pacing_rate_divisor = divisor;
   flow->pacing_rate_bytes_per_second = rate;
   flow->pacing_burst_bytes = burst;
   if (flow->pacing_tokens > burst)
     flow->pacing_tokens = burst;
+  if (aggregate != 0) {
+    uint64_t aggregate_burst = pacing_burst(t, aggregate, 0);
+    if (registry->pacing_last_refill_ms == 0) {
+      registry->pacing_tokens = aggregate_burst;
+      registry->pacing_last_refill_ms = now;
+    }
+    registry->pacing_rate = aggregate;
+    registry->pacing_burst = aggregate_burst;
+    if (registry->pacing_tokens > aggregate_burst)
+      registry->pacing_tokens = aggregate_burst;
+  }
+}
+
+static uint64_t pacing_available(const transport_t *t,
+                                 const transport_flexicast_flow_t *flow) {
+  uint64_t available = flow->pacing_tokens;
+  if (t->flexicast_cc_aggregate_rate_limit != 0 &&
+      available > t->flexicast.pacing_tokens)
+    available = t->flexicast.pacing_tokens;
+  return available;
+}
+
+/* Inspect credit without consuming it or changing either pacer clock. */
+static uint64_t sample_credit_at(const transport_t *t,
+                                 const transport_flexicast_flow_t *flow,
+                                 int64_t now) {
+  /* Tokens are mutable balances, not a history. A newer refill can include
+   * credit or consumption that did not exist at the queried past instant. */
+  if (now < flow->pacing_last_refill_ms ||
+      (t->flexicast_cc_aggregate_rate_limit != 0 &&
+       now < t->flexicast.pacing_last_refill_ms))
+    return 0;
+  uint64_t tokens = flow->pacing_tokens, remainder = flow->pacing_remainder;
+  int64_t refill = flow->pacing_last_refill_ms;
+  refill_tokens(&tokens, &remainder, &refill, flow->pacing_rate_numerator,
+                flow->pacing_rate_divisor, flow->pacing_burst_bytes, now);
+  if (t->flexicast_cc_aggregate_rate_limit != 0) {
+    uint64_t shared = t->flexicast.pacing_tokens;
+    remainder = t->flexicast.pacing_remainder;
+    refill = t->flexicast.pacing_last_refill_ms;
+    refill_tokens(&shared, &remainder, &refill, t->flexicast.pacing_rate, 1,
+                  t->flexicast.pacing_burst, now);
+    if (tokens > shared)
+      tokens = shared;
+  }
+  return tokens;
+}
+
+static uint64_t unused_supply_credit(const transport_t *t,
+                                     const transport_flexicast_flow_t *flow,
+                                     int64_t now) {
+  if (flow->cc_supply_empty_since_ms <= 0 ||
+      now <= flow->cc_supply_empty_since_ms ||
+      now - flow->cc_supply_empty_since_ms <= 1)
+    return 0;
+  /* Readiness queries may refill at publication time. Preserve the earlier
+   * proven opportunity for a full-sized packet when its budget is unchanged. */
+  if (flow->cc_supply_idle_ready_at_ms > 0 &&
+      flow->cc_supply_idle_ready_at_ms < now &&
+      (t->flexicast_cc_aggregate_rate_limit == 0 ||
+       flow->cc_supply_credit_epoch == t->flexicast.pacing_credit_epoch))
+    return t->limits.max_udp_payload_size;
+  return sample_credit_at(t, flow, now - 1);
+}
+
+/* A dry queue is application-limited only when it missed an actual send
+ * opportunity. A queue that drains while waiting for credit is ordinary
+ * pacing. Ignore the final millisecond because that is the pacer's resolution.
+ * Likewise, late service is recorded only after a known eligibility deadline,
+ * allowing two milliseconds for clock quantization and event-loop wakeup. */
+void tf_sample_supply_at(transport_t *t, transport_flexicast_flow_t *flow,
+                         transport_flexicast_queued_payload_t *queued,
+                         size_t cost, int64_t now) {
+  if (cost != 0 && unused_supply_credit(t, flow, now) >= cost)
+    queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_APP_LIMITED;
+  if (flow->cc_supply_ready_at_ms > 0 && now > flow->cc_supply_ready_at_ms &&
+      now - flow->cc_supply_ready_at_ms > 2 &&
+      sample_credit_at(t, flow, now) >= cost &&
+      (t->flexicast_cc_aggregate_rate_limit == 0 ||
+       flow->cc_supply_credit_epoch == t->flexicast.pacing_credit_epoch))
+    queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
+  flow->cc_supply_empty_since_ms = 0;
+  flow->cc_supply_ready_at_ms = 0;
+  flow->cc_supply_idle_ready_at_ms = 0;
+}
+
+static int64_t pacing_ready_at(const transport_t *t,
+                               const transport_flexicast_flow_t *flow,
+                               size_t cost, int64_t now) {
+  uint64_t delay = 0;
+  if (cost > pacing_available(t, flow)) {
+    if (flow->pacing_rate_numerator == 0)
+      return INT64_MAX;
+    uint64_t deficit =
+        cost > flow->pacing_tokens ? cost - flow->pacing_tokens : 0;
+    uint64_t needed = deficit * 1000U * flow->pacing_rate_divisor;
+    delay = needed / flow->pacing_rate_numerator +
+            (needed % flow->pacing_rate_numerator != 0);
+    if (t->flexicast_cc_aggregate_rate_limit != 0 &&
+        cost > t->flexicast.pacing_tokens) {
+      needed = (cost - t->flexicast.pacing_tokens) * 1000U;
+      uint64_t shared_delay =
+          needed / t->flexicast_cc_aggregate_rate_limit +
+          (needed % t->flexicast_cc_aggregate_rate_limit != 0);
+      if (delay < shared_delay)
+        delay = shared_delay;
+    }
+    if (delay == 0)
+      delay = 1;
+  }
+  int64_t ready =
+      delay > (uint64_t)(INT64_MAX - now) ? INT64_MAX : now + (int64_t)delay;
+  return ready < flow->dispatch_retry_at_ms ? flow->dispatch_retry_at_ms
+                                            : ready;
 }
 
 static size_t pacing_cost(const transport_flexicast_flow_t *flow,
@@ -339,15 +513,10 @@ submit_protected_packet(transport_t *t, size_t socket_index,
     return 0;
   struct iovec vec = {.iov_base = queued->packet,
                       .iov_len = queued->packet_size};
-  socklen_t destination_len = destination->sa_family == AF_INET
-                                  ? sizeof(struct sockaddr_in)
-                                  : sizeof(struct sockaddr_in6);
-  ssize_t sent =
-      source
-          ? transport_udp_send_from(t->sockets[socket_index].fd, destination,
-                                    source, t->flexicast_interface_index, &vec)
-          : transport_udp_send_batch(t->sockets[socket_index].fd, destination,
-                                     destination_len, &vec, 1, 0);
+  ssize_t sent = transport_udp_send_ecn(
+      t->sockets[socket_index].fd, destination, source,
+      t->flexicast_interface_index, &vec,
+      2); /* ECT(0), reported back by the Flexicast PATH_ACK_ECN. */
   if (sent > 0) {
     egress->packets_sent++;
     egress->bytes_sent += queued->packet_size;
@@ -365,6 +534,26 @@ static void
 account_protected_packet(transport_t *t, transport_flexicast_flow_t *flow,
                          transport_flexicast_queued_payload_t *queued,
                          transport_flexicast_member_t *recipient) {
+  int64_t now = transport_get_time_ms();
+  bool replicated = recipient != NULL;
+  quicly_flexicast_send_context_t context = {
+      .pacing_rate_bytes_per_second = flow->pacing_rate_bytes_per_second,
+      .physical_fanout = replicated ? queued->cc_packet_fanout : 1,
+      .flags = QUICLY_FLEXICAST_SAMPLE_VALID | queued->cc_sample_flags};
+  if (replicated &&
+      queued->cc_packet_membership_epoch != flow->cc_membership_epoch)
+    context.flags |= QUICLY_FLEXICAST_SAMPLE_MIXED;
+  if (context.flags & QUICLY_FLEXICAST_SAMPLE_MIXED)
+    context.flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
+  (void)quicly_flexicast_mark_submitted_with_context(
+      flow->crypto, recipient ? recipient->conn->id : 0, queued->packet_number,
+      now, &context);
+  if (flow->last_submission_replicated != replicated) {
+    flow->last_submission_replicated = replicated;
+    /* A failed native submission can switch this packet to N physical copies
+     * without changing its announced multicast address or key epoch. */
+    (void)update_controller_hints(t, flow, now);
+  }
   tf_record_delivery_submission(flow, recipient, !queued->counted);
   if (!queued->counted) {
     t->stats.flexicast_packets_sent++;
@@ -374,8 +563,12 @@ account_protected_packet(transport_t *t, transport_flexicast_flow_t *flow,
   t->stats.flexicast_physical_packets_sent++;
   if (!recipient)
     t->stats.flexicast_native_packets_sent++;
-  flow->last_payload_sent_ms = transport_get_time_ms();
+  flow->last_payload_sent_ms = now;
   flow->pacing_tokens -= queued->packet_size;
+  if (t->flexicast_cc_aggregate_rate_limit != 0) {
+    t->flexicast.pacing_tokens -= queued->packet_size;
+    t->flexicast.pacing_credit_epoch++;
+  }
   queued->airtime_bytes += queued->packet_size;
 }
 
@@ -406,7 +599,7 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     size_t size = pacing_cost(flow, queued->size);
     if (size == 0 || size > t->limits.max_udp_payload_size)
       return FLEXICAST_DISPATCH_FAILED;
-    if (size > flow->pacing_tokens)
+    if (size > pacing_available(t, flow))
       return FLEXICAST_DISPATCH_BLOCKED;
     queued->packet = malloc(size);
     if (!queued->packet)
@@ -433,6 +626,8 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       }
       queued->delivery_id = flow->next_payload_delivery_id;
     }
+    queued->cc_packet_fanout = 0;
+    queued->cc_packet_membership_epoch = flow->cc_membership_epoch;
     for (size_t i = 0; i < flow->member_count; i++) {
       transport_flexicast_member_t *member = &flow->members[i];
       if (member->payload_delivery_id == queued->delivery_id ||
@@ -441,6 +636,8 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
         int complete;
         (void)quicly_flexicast_abandon_datagram(
             flow->crypto, member->conn->id, queued->packet_number, &complete);
+      } else if (member->listening) {
+        queued->cc_packet_fanout++;
       }
     }
   }
@@ -461,6 +658,7 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       return FLEXICAST_DISPATCH_OK;
     }
     if (result == 0) {
+      queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
       flow->dispatch_retry_at_ms = now + 10;
       return FLEXICAST_DISPATCH_BLOCKED;
     }
@@ -470,13 +668,16 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
   while (queued->next_member < flow->member_count) {
     transport_flexicast_member_t *member = &flow->members[queued->next_member];
     if (!member->listening ||
+        !transport_publish_recipient_eligible(t, member->conn, &flow->track_id))
+      queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_MIXED;
+    if (!member->listening ||
         member->payload_delivery_id == queued->delivery_id ||
         !transport_publish_recipient_eligible(t, member->conn,
                                               &flow->track_id)) {
       queued->next_member++;
       continue;
     }
-    if (queued->packet_size > flow->pacing_tokens)
+    if (queued->packet_size > pacing_available(t, flow))
       return FLEXICAST_DISPATCH_BLOCKED;
     struct sockaddr_storage destination;
     struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
@@ -487,12 +688,14 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     int result = submit_protected_packet(
         t, fd_index, (struct sockaddr *)&destination, NULL, queued);
     if (result == 0) {
+      queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
       flow->dispatch_retry_at_ms = now + 10;
       return FLEXICAST_DISPATCH_BLOCKED;
     }
     if (result > 0) {
       account_protected_packet(t, flow, queued, member);
     } else {
+      queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_MIXED;
       int complete;
       (void)quicly_flexicast_abandon_datagram(flow->crypto, member->conn->id,
                                               queued->packet_number, &complete);
@@ -592,7 +795,7 @@ typedef struct {
 } flexicast_queue_selection_t;
 
 static flexicast_queue_selection_t
-select_queued_payload(transport_flexicast_flow_t *flow) {
+select_queued_payload(const transport_t *t, transport_flexicast_flow_t *flow) {
   transport_flexicast_queued_payload_t *repair =
       queue_front(&flow->repair_queue);
   size_t repair_cost = repair ? pacing_cost(flow, repair->size) : SIZE_MAX;
@@ -611,8 +814,8 @@ select_queued_payload(transport_flexicast_flow_t *flow) {
     return (flexicast_queue_selection_t){0};
 
   size_t cost = pacing_cost(flow, payload->size);
-  if (use_repair && payload->delivery_id == 0 && cost > flow->pacing_tokens &&
-      flow->data_queue.count != 0) {
+  if (use_repair && payload->delivery_id == 0 &&
+      cost > pacing_available(t, flow) && flow->data_queue.count != 0) {
     transport_flexicast_queued_payload_t *data = queue_front(&flow->data_queue);
     size_t data_cost = pacing_cost(flow, data->size);
     if (data_cost < cost) {
@@ -662,9 +865,16 @@ record_sent_repair(transport_flexicast_flow_t *flow,
 void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {
   if (flow->data_queue.count == 0 && flow->repair_queue.count == 0)
     return;
-  if (flow->rekey_pending)
+  if (flow->rekey_pending) {
+    flow->cc_supply_empty_since_ms = 0;
+    flow->cc_supply_ready_at_ms = 0;
+    flow->cc_supply_idle_ready_at_ms = 0;
     return;
+  }
   if (transport_flexicast_listening_members(flow) == 0) {
+    flow->cc_supply_empty_since_ms = 0;
+    flow->cc_supply_ready_at_ms = 0;
+    flow->cc_supply_idle_ready_at_ms = 0;
     bool awaiting_rekey_ready = false;
     for (size_t i = 0; i < flow->member_count; i++)
       awaiting_rekey_ready |= flow->members[i].conn && flow->members[i].joined;
@@ -672,15 +882,23 @@ void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {
       t->stats.flexicast_pacing_dropped += tf_clear_flow_queue(flow);
     return;
   }
-  refresh_pacer(t, flow, transport_get_time_ms());
+  int64_t supply_now = transport_get_time_ms();
+  uint64_t unused_credit = unused_supply_credit(t, flow, supply_now);
+  tf_refresh_pacer_at(t, flow, supply_now);
+  flexicast_queue_selection_t first = select_queued_payload(t, flow);
+  if (first.payload) {
+    tf_sample_supply_at(t, flow, first.payload, first.cost, supply_now);
+    if (first.cost != 0 && unused_credit >= first.cost)
+      first.payload->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_APP_LIMITED;
+  }
   while (flow->data_queue.count != 0 || flow->repair_queue.count != 0) {
-    flexicast_queue_selection_t selection = select_queued_payload(flow);
+    flexicast_queue_selection_t selection = select_queued_payload(t, flow);
     transport_flexicast_queued_payload_t *queued = selection.payload;
     if (!queued || !queued->data)
       break;
     size_t cost = selection.cost;
     bool is_repair = selection.repair;
-    if (cost > flow->pacing_tokens)
+    if (cost > pacing_available(t, flow))
       break;
     uint64_t before = queued->airtime_bytes;
     flexicast_dispatch_result_t result = dispatch_payload(t, flow, queued);
@@ -707,6 +925,18 @@ void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {
     if (result != FLEXICAST_DISPATCH_OK)
       break;
   }
+  int64_t observed_at = transport_get_time_ms();
+  flexicast_queue_selection_t next = select_queued_payload(t, flow);
+  if (next.payload) {
+    flow->cc_supply_ready_at_ms =
+        pacing_ready_at(t, flow, next.cost, observed_at);
+    flow->cc_supply_idle_ready_at_ms = 0;
+  } else {
+    flow->cc_supply_empty_since_ms = observed_at;
+    flow->cc_supply_idle_ready_at_ms =
+        pacing_ready_at(t, flow, t->limits.max_udp_payload_size, observed_at);
+  }
+  flow->cc_supply_credit_epoch = t->flexicast.pacing_credit_epoch;
 }
 
 bool transport_flexicast_track_ready(transport_t *t,
@@ -719,13 +949,13 @@ bool transport_flexicast_track_ready(transport_t *t,
         !transport_track_id_equal(&flow->track_id, track) ||
         transport_flexicast_listening_members(flow) == 0)
       continue;
-    refresh_pacer(t, flow, transport_get_time_ms());
+    tf_refresh_pacer_at(t, flow, transport_get_time_ms());
     if (flow->data_queue.count >=
             TRANSPORT_FLEXICAST_QUEUE_CAPACITY * 3U / 4U ||
         flow->data_queue.bytes + flow->repair_queue.bytes >=
             t->limits.max_egress_bytes_per_socket * 3U / 4U ||
         (flow->data_queue.count != 0 &&
-         flow->pacing_tokens < t->limits.max_udp_payload_size))
+         pacing_available(t, flow) < t->limits.max_udp_payload_size))
       return false;
   }
   return true;
@@ -790,28 +1020,12 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
     if ((flow->data_queue.count == 0 && flow->repair_queue.count == 0) ||
         transport_flexicast_listening_members(flow) == 0)
       continue;
-    refresh_pacer(t, flow, now);
-    flexicast_queue_selection_t selection = select_queued_payload(flow);
+    tf_refresh_pacer_at(t, flow, now);
+    flexicast_queue_selection_t selection = select_queued_payload(t, flow);
     if (!selection.payload)
       continue;
     size_t cost = selection.cost;
-    if (cost <= flow->pacing_tokens) {
-      int64_t deadline =
-          flow->dispatch_retry_at_ms > now ? flow->dispatch_retry_at_ms : now;
-      if (deadline < first_timeout)
-        first_timeout = deadline;
-      continue;
-    }
-    if (flow->pacing_rate_bytes_per_second == 0)
-      continue;
-    uint64_t deficit = cost - flow->pacing_tokens;
-    uint64_t delay =
-        (deficit * 1000U + flow->pacing_rate_bytes_per_second - 1U) /
-        flow->pacing_rate_bytes_per_second;
-    if (delay == 0)
-      delay = 1;
-    int64_t timeout =
-        delay > (uint64_t)(INT64_MAX - now) ? INT64_MAX : now + (int64_t)delay;
+    int64_t timeout = pacing_ready_at(t, flow, cost, now);
     if (timeout < first_timeout)
       first_timeout = timeout;
   }
