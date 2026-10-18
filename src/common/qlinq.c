@@ -94,6 +94,7 @@ struct qlinq_context {
   qlinq_endpoint_poll_t *endpoint_polls;
   size_t poll_endpoint_capacity;
   bool rx_cadence_enabled;
+  uint64_t rx_cadence_window_ns;
   uint64_t rx_cadence_decisions, rx_cadence_eligible;
   uint64_t rx_cadence_waits, rx_cadence_timeouts, rx_cadence_wakes;
   uint64_t rx_cadence_errors, rx_cadence_requested_ns;
@@ -797,7 +798,17 @@ qlinq_context_t *qlinq_context_create(const qlinq_context_config_t *config) {
   context->last_status = QLINQ_STATUS_OK;
 #ifdef __linux__
   const char *cadence = getenv("QLINQ_EXPERIMENT_RX_CADENCE_USEC");
-  context->rx_cadence_enabled = cadence && strcmp(cadence, "1000") == 0;
+  if (cadence) {
+    if (strcmp(cadence, "1000") == 0)
+      context->rx_cadence_window_ns = 1000000U;
+    else if (strcmp(cadence, "2000") == 0)
+      context->rx_cadence_window_ns = 2000000U;
+    else if (strcmp(cadence, "3000") == 0)
+      context->rx_cadence_window_ns = 3000000U;
+    else if (strcmp(cadence, "4000") == 0)
+      context->rx_cadence_window_ns = 4000000U;
+    context->rx_cadence_enabled = context->rx_cadence_window_ns != 0;
+  }
 #endif
   return context;
 }
@@ -841,10 +852,11 @@ void qlinq_context_destroy(qlinq_context_t *context) {
   free(context->endpoint_polls);
   if (context->rx_cadence_enabled)
     fprintf(stderr,
-            "rx-cadence-summary window_usec=1000 decisions=%" PRIu64
+            "rx-cadence-summary window_usec=%" PRIu64 " decisions=%" PRIu64
             " eligible=%" PRIu64 " waits=%" PRIu64 " timeouts=%" PRIu64
             " wakes=%" PRIu64 " errors=%" PRIu64 " requested_ns=%" PRIu64
             " poll_calls=%" PRIu64 " ppoll_calls=%" PRIu64 "\n",
+            context->rx_cadence_window_ns / 1000U,
             context->rx_cadence_decisions, context->rx_cadence_eligible,
             context->rx_cadence_waits, context->rx_cadence_timeouts,
             context->rx_cadence_wakes, context->rx_cadence_errors,
@@ -1184,7 +1196,8 @@ static bool rx_endpoint_receive_only(const qlinq_endpoint_t *endpoint) {
 /* Native deadlines are wall milliseconds. Map their remaining duration to
  * the earlier monotonic sample, subtracting clock-read/setup time. The caller
  * budget and service-start cadence never slide. Failure expires the wait. */
-static uint64_t rx_cadence_remaining(uint64_t previous_start,
+static uint64_t rx_cadence_remaining(uint64_t window_ns,
+                                     uint64_t previous_start,
                                      uint64_t caller_start, int timeout_ms,
                                      int64_t deadline, uint64_t *ordinary_ns) {
   *ordinary_ns = 0;
@@ -1207,11 +1220,11 @@ static uint64_t rx_cadence_remaining(uint64_t previous_start,
       target = before + delta;
   }
   *ordinary_ns = target > now ? target - now : 0;
-  if (!previous_start || previous_start > before ||
-      previous_start > UINT64_MAX - 1000000U)
+  if (!window_ns || !previous_start || previous_start > before ||
+      previous_start > UINT64_MAX - window_ns)
     return 0;
-  if (previous_start + 1000000U < target)
-    target = previous_start + 1000000U;
+  if (previous_start + window_ns < target)
+    target = previous_start + window_ns;
   return target > now ? target - now : 0;
 }
 #endif
@@ -1305,11 +1318,11 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
         saved[i] = fds[i].events;
       if (transport_rx_cadence_mask(polls[0].endpoint->transport, fds, count)) {
         context->rx_cadence_eligible++;
-        /* Recheck after eligibility work, before either kind of wait. */
-        polls[0].deadline =
-            transport_get_first_timeout(polls[0].endpoint->transport);
+        /* eligibility only inspects transport state and masks poll events;
+         * reuse this pass's absolute deadline */
         uint64_t ordinary_ns;
         uint64_t delay_ns = rx_cadence_remaining(
+            context->rx_cadence_window_ns,
             polls[0].endpoint->rx_service_started_ns, caller_started_ns,
             timeout_ms, polls[0].deadline, &ordinary_ns);
         bool masked = delay_ns != 0;
@@ -1337,10 +1350,24 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
           context->rx_cadence_errors++;
           errno = wait_errno;
         } else if (masked) {
-          if (result == 0)
+          if (result == 0) {
             context->rx_cadence_timeouts++;
-          else
+            if (context->rx_cadence_window_ns > 1000000U) {
+              uint64_t started = polls[0].endpoint->rx_service_started_ns;
+              uint64_t now_ns = rx_monotonic_now();
+              int64_t native_at = polls[0].deadline;
+              bool native_due =
+                  native_at >= 0 && native_at <= transport_get_time_ms();
+              /* return on shorter caller timeout without sliding cadence;
+               * native timers still trigger a full readiness check */
+              if (now_ns && started && now_ns >= started &&
+                  now_ns - started < context->rx_cadence_window_ns &&
+                  !native_due)
+                return QLINQ_STATUS_OK;
+            }
+          } else {
             context->rx_cadence_wakes++;
+          }
           /* UDP was masked. Obtain fresh input readiness and retain any
            * interface/error wake; transport invalidates it after fd changes. */
           context->rx_poll_calls++;

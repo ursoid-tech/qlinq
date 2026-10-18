@@ -138,9 +138,11 @@ static void eligibility_guards(qlinq_endpoint_t *endpoint) {
   assert(!transport_rx_cadence_mask(t, fds, count));
 }
 
-static void run(bool use_callback, bool enabled) {
-  assert(setenv("QLINQ_EXPERIMENT_RX_CADENCE_USEC", enabled ? "1000" : "0",
-                1) == 0);
+static void run(unsigned window_usec, bool use_callback) {
+  bool enabled = window_usec != 0;
+  char cadence[16];
+  snprintf(cadence, sizeof(cadence), "%u", window_usec);
+  assert(setenv("QLINQ_EXPERIMENT_RX_CADENCE_USEC", cadence, 1) == 0);
   callback_mode = use_callback;
   received = injected_bursts = 0;
   closing_tx = NULL;
@@ -154,7 +156,7 @@ static void run(bool use_callback, bool enabled) {
   qlinq_endpoint_config_t config = {
       .bind_addresses = {"127.0.0.1"},
       .bind_address_count = 1,
-      .port = (uint16_t)(19871 + 2U * enabled + use_callback),
+      .port = (uint16_t)(19850 + (window_usec / 1000U) * 2U + use_callback),
       .idle_timeout_ms = 5000,
       .security = {.shared_secret = "cadence",
                    .shared_secret_size = 7,
@@ -267,9 +269,9 @@ static void run(bool use_callback, bool enabled) {
   if (use_callback && enabled)
     assert(close_in_masked_wait);
   fprintf(stderr,
-          "cadence-real enabled=%d callback=%d records=%u waits=%" PRIu64
+          "cadence-real window_usec=%u callback=%d records=%u waits=%" PRIu64
           " resent=%" PRIu64 " active_close=%d\n",
-          enabled, use_callback, received, rx->rx_cadence_waits,
+          window_usec, use_callback, received, rx->rx_cadence_waits,
           stats.num_bytes.stream_data_resent, close_in_masked_wait);
   closing_tx = NULL;
   impaired_fd = -1;
@@ -278,12 +280,15 @@ static void run(bool use_callback, bool enabled) {
 }
 
 int main(void) {
-  run(false, false);
-  run(true, false);
+  const unsigned windows[] = {0,
 #ifdef __linux__
-  run(false, true);
-  run(true, true);
+                              1000, 2000, 3000, 4000
 #endif
+  };
+  for (size_t i = 0; i < sizeof(windows) / sizeof(*windows); i++) {
+    run(windows[i], false);
+    run(windows[i], true);
+  }
   unsetenv("QLINQ_EXPERIMENT_RX_CADENCE_USEC");
   puts("===RX CADENCE REAL OK===");
   return 0;

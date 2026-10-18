@@ -33,7 +33,7 @@ static bool fake_writable(transport_t *, const moq_track_id_t *);
 #undef ppoll
 
 static uint64_t mono, wall, clock_step, mask_cost, requested, tick_cost;
-static int64_t deadline, rechecked_deadline;
+static int64_t deadline;
 static unsigned polls, waits, masked_waits, ticks, masks, queries;
 static int poll_timeout, wait_result, wait_error, poll_error;
 static short udp_ready, monitor_ready, wait_udp, wait_monitor;
@@ -62,7 +62,8 @@ static size_t fake_fds(transport_t *t, struct pollfd *fds, size_t cap) {
 }
 static int64_t fake_deadline(transport_t *t) {
   (void)t;
-  return ++queries == 1 ? deadline : rechecked_deadline;
+  queries++;
+  return deadline;
 }
 static bool fake_writable(transport_t *t, const moq_track_id_t *track) {
   (void)t;
@@ -74,6 +75,7 @@ static bool fake_mask(transport_t *t, struct pollfd *fds, size_t count) {
   assert(count == 2);
   masks++;
   mono += mask_cost;
+  wall += mask_cost;
   if (!can_mask)
     return false;
   assert(fds[0].events == POLLIN && fds[1].events == POLLIN);
@@ -151,7 +153,7 @@ static void reset(void) {
   mono = 100000000U;
   wall = 10000000000U;
   clock_step = mask_cost = requested = tick_cost = 0;
-  deadline = rechecked_deadline = INT64_MAX;
+  deadline = INT64_MAX;
   polls = waits = masked_waits = ticks = masks = queries = 0;
   poll_timeout = -99;
   wait_result = wait_error = poll_error = 0;
@@ -161,6 +163,7 @@ static void reset(void) {
   writable = false;
   context.owner_thread = pthread_self();
   context.rx_cadence_enabled = true;
+  context.rx_cadence_window_ns = 1000000U;
   context.endpoints = &endpoint;
   context.max_queued_events = 10;
   context.max_queued_event_bytes = 65536;
@@ -181,7 +184,7 @@ static void timing_and_idle(void) {
   reset();
   service_ok(1);
   assert(masked_waits == 1 && requested == 750000 && polls == 1 &&
-         poll_timeout == 0 && ticks == 1);
+         poll_timeout == 0 && ticks == 1 && queries == 1);
   reset();
   mask_cost = 600000;
   service_ok(1);
@@ -223,58 +226,120 @@ static void timing_and_idle(void) {
   assert(polls == 1 && !waits &&
          ticks == 1); /* Preserve main's idle maintenance tick. */
   reset();
-  rechecked_deadline = fake_ms();
+  deadline = fake_ms() + 1;
+  mask_cost = 1200000U;
   service_ok(1);
   assert(waits == 1 && !masked_waits && requested == 0 && ticks == 1);
   reset();
   wall += 800000;
-  deadline = rechecked_deadline = fake_ms() + 1;
+  deadline = fake_ms() + 1;
   service_ok(1);
   assert(masked_waits == 1 && requested == 200000);
   reset();
-  deadline = rechecked_deadline = fake_ms();
+  deadline = fake_ms();
   service_ok(1);
   assert(!waits && poll_timeout == 0 && ticks == 1);
 
   uint64_t ordinary;
   reset();
   clock_step = 10000;
-  assert(rx_cadence_remaining(mono - 100000, mono, 1, INT64_MAX, &ordinary) ==
-         880000);
+  assert(rx_cadence_remaining(1000000U, mono - 100000, mono, 1, INT64_MAX,
+                              &ordinary) == 880000);
   assert(ordinary == 980000);
   reset();
-  assert(rx_cadence_remaining(mono, mono - 900000, 1, INT64_MAX, &ordinary) ==
-         100000);
+  assert(rx_cadence_remaining(1000000U, mono, mono - 900000, 1, INT64_MAX,
+                              &ordinary) == 100000);
   reset();
-  assert(rx_cadence_remaining(UINT64_MAX - 10, mono, 1, INT64_MAX, &ordinary) ==
-         0);
+  assert(rx_cadence_remaining(1000000U, UINT64_MAX - 10, mono, 1, INT64_MAX,
+                              &ordinary) == 0);
   reset();
-  assert(rx_cadence_remaining(mono + 1, mono, 1, INT64_MAX, &ordinary) == 0);
+  assert(rx_cadence_remaining(1000000U, mono + 1, mono, 1, INT64_MAX,
+                              &ordinary) == 0);
   reset();
-  assert(rx_cadence_remaining(mono, mono + 1, 1, INT64_MAX, &ordinary) == 0 &&
+  assert(rx_cadence_remaining(1000000U, mono, mono + 1, 1, INT64_MAX,
+                              &ordinary) == 0 &&
          !ordinary);
   reset();
-  assert(rx_cadence_remaining(mono, UINT64_MAX - 10, 1, INT64_MAX, &ordinary) ==
+  assert(rx_cadence_remaining(1000000U, mono, UINT64_MAX - 10, 1, INT64_MAX,
+                              &ordinary) == 0 &&
+         !ordinary);
+  reset();
+  assert(rx_cadence_remaining(1000000U, mono - 250000, mono, 1, -1,
+                              &ordinary) == 750000);
+  reset();
+  assert(rx_cadence_remaining(1000000U, mono - 250000, mono, 1, 0, &ordinary) ==
              0 &&
          !ordinary);
   reset();
-  assert(rx_cadence_remaining(mono - 250000, mono, 1, -1, &ordinary) == 750000);
-  reset();
-  assert(rx_cadence_remaining(mono - 250000, mono, 1, 0, &ordinary) == 0 &&
-         !ordinary);
-  reset();
-  assert(rx_cadence_remaining(mono - 250000, mono, 1, INT64_MAX - 1,
+  assert(rx_cadence_remaining(1000000U, mono - 250000, mono, 1, INT64_MAX - 1,
                               &ordinary) == 750000);
   reset();
   deadline = fake_ms() + 1;
   wall += 2000000;
-  assert(rx_cadence_remaining(mono - 250000, mono, 1, deadline, &ordinary) ==
-         0);
+  assert(rx_cadence_remaining(1000000U, mono - 250000, mono, 1, deadline,
+                              &ordinary) == 0);
   reset();
   deadline = fake_ms() + 1;
   wall -= 2000000;
-  assert(rx_cadence_remaining(mono - 250000, mono, 1, deadline, &ordinary) ==
-         750000);
+  assert(rx_cadence_remaining(1000000U, mono - 250000, mono, 1, deadline,
+                              &ordinary) == 750000);
+}
+
+static void longer_cadence(void) {
+  reset();
+  context.rx_cadence_window_ns = 2000000U;
+  uint64_t original = endpoint.rx_service_started_ns;
+  service_ok(1);
+  assert(requested == 1000000U && waits == 1 && !polls && !ticks &&
+         endpoint.rx_service_started_ns == original);
+  service_ok(1);
+  assert(requested == 750000U && waits == 2 && polls == 1 && ticks == 1);
+
+  reset();
+  context.rx_cadence_window_ns = 3000000U;
+  original = endpoint.rx_service_started_ns;
+  for (unsigned i = 0; i < 2; i++) {
+    service_ok(1);
+    assert(!polls && !ticks && endpoint.rx_service_started_ns == original);
+  }
+  service_ok(1);
+  assert(requested == 750000U && polls == 1 && ticks == 1);
+
+  reset();
+  context.rx_cadence_window_ns = 4000000U;
+  original = endpoint.rx_service_started_ns;
+  for (unsigned i = 0; i < 3; i++) {
+    service_ok(1);
+    assert(!polls && !ticks && endpoint.rx_service_started_ns == original);
+  }
+  service_ok(1);
+  assert(requested == 750000U && polls == 1 && ticks == 1);
+
+  /* earlier native timers must service input too, rather than repeatedly
+   * moving cadence anchor */
+  reset();
+  context.rx_cadence_window_ns = 4000000U;
+  deadline = fake_ms() + 1;
+  service_ok(1);
+  assert(requested == 1000000U && polls == 1 && ticks == 1);
+
+  reset();
+  context.rx_cadence_window_ns = 4000000U;
+  wait_result = 1;
+  wait_monitor = POLLIN;
+  udp_ready = 0;
+  service_ok(1);
+  assert(ticks == 1 && polls == 1 && seen_monitor == POLLIN);
+
+  reset();
+  uint64_t ordinary;
+  assert(rx_cadence_remaining(2000000U, mono - 250000U, mono, 5, INT64_MAX,
+                              &ordinary) == 1750000U);
+  assert(ordinary == 5000000U);
+  reset();
+  assert(rx_cadence_remaining(0, mono - 250000U, mono, 5, INT64_MAX,
+                              &ordinary) == 0 &&
+         ordinary == 5000000U);
 }
 
 static void bypasses(void) {
@@ -293,7 +358,7 @@ static void bypasses(void) {
   service_ok(-1);
   assert(!waits && poll_timeout == INT_MAX);
   reset();
-  deadline = rechecked_deadline = -1;
+  deadline = -1;
   service_ok(-1);
   assert(!waits && poll_timeout == -1);
   reset();
@@ -367,20 +432,23 @@ static void wake_and_errors(void) {
 
 int main(void) {
   timing_and_idle();
+  longer_cadence();
   bypasses();
   wake_and_errors();
   clean();
-  const char *values[] = {"",      "0",     "100",  "1000 ",
-                          "+1000", "01000", "2000", "1000"};
+  const char *values[] = {"",     "0",    "100",  "1000 ", "+1000", "01000",
+                          "1500", "1000", "2000", "3000",  "4000"};
   for (size_t i = 0; i < sizeof(values) / sizeof(*values); i++) {
     assert(setenv("QLINQ_EXPERIMENT_RX_CADENCE_USEC", values[i], 1) == 0);
     qlinq_context_t *c = qlinq_context_create(NULL);
-    assert(c && c->rx_cadence_enabled == (i == 7));
+    assert(c && c->rx_cadence_enabled == (i >= 7));
+    assert(c && c->rx_cadence_window_ns ==
+                    (i >= 7 ? (uint64_t)(i - 6) * 1000000U : 0));
     qlinq_context_destroy(c);
   }
   unsetenv("QLINQ_EXPERIMENT_RX_CADENCE_USEC");
   qlinq_context_t *c = qlinq_context_create(NULL);
-  assert(c && !c->rx_cadence_enabled);
+  assert(c && !c->rx_cadence_enabled && !c->rx_cadence_window_ns);
   qlinq_context_destroy(c);
   puts("===RX CADENCE SCHEDULE OK===");
   return 0;
