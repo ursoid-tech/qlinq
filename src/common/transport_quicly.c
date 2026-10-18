@@ -1153,6 +1153,10 @@ transport_t *transport_create(const transport_config_t *config) {
   t->verifier_initialized = false;
 
   t->quic_ctx = quicly_spec_context;
+  /* Use Quicly's native adaptive requester and its supported receive delay. */
+  t->quic_ctx.transport_params.min_ack_delay_usec =
+      QUICLY_LOCAL_MAX_ACK_DELAY * 1000u;
+  t->quic_ctx.ack_frequency = 128;
   if (config->congestion_control == TRANSPORT_CC_RENO)
     t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_reno_init;
   else if (config->congestion_control == TRANSPORT_CC_PICO)
@@ -1608,13 +1612,18 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
   size_t quantum = t->socket_count ? (receive_budget + t->socket_count - 1U) /
                                          t->socket_count
                                    : 0;
-  for (size_t visited = 0; visited < t->socket_count && receive_budget > 0;
-       visited++) {
+  for (size_t visited = 0; visited < t->socket_count; visited++) {
     size_t fd_idx = (receive_start + visited) % t->socket_count;
     transport_socket_t *socket = &t->sockets[fd_idx];
     if (!transport_udp_gro_pending(socket->gro) &&
         !socket_receive_ready(socket->fd, fds, count))
       continue;
+    if (receive_budget == 0) {
+      /* The earlier sockets consumed this tick's budget. Remember every
+       * remaining ready socket even when the last serviced socket drained. */
+      socket->receive_backlog = true;
+      continue;
+    }
     size_t serviced = 0;
     while (receive_budget > 0 && serviced < quantum) {
       size_t batch = quantum - serviced;
@@ -1643,11 +1652,21 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
         }
         more = received == (ssize_t)batch;
       }
-      if (received <= 0)
+      if (received <= 0) {
+        /* Only an actual empty read proves this socket drained. A timer-only
+         * tick or a receive error must not erase an earlier exhausted budget.
+         */
+        if (received == 0)
+          socket->receive_backlog = false;
         break; /* Empty or persistently failing sockets cannot spin the owner.
                 */
+      }
       receive_budget -= (size_t)received;
       serviced += (size_t)received;
+      if (!more)
+        socket->receive_backlog = false;
+      else if (receive_budget == 0 || serviced >= quantum)
+        socket->receive_backlog = true;
       /* GRO may fill its raw batch yet return fewer logical views than asked
        * for. Its explicit continuation flag preserves the packet quantum and
        * avoids stranding input after a short logical batch. */
@@ -2577,6 +2596,59 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
     fds[count++] = (struct pollfd){.fd = t->ifmon_pipe[0], .events = POLLIN};
   }
   return count;
+}
+
+bool transport_rx_cadence_mask(transport_t *t, struct pollfd *fds,
+                               size_t count) {
+  if (!transport_owner_ok(t) || !fds || t->tick_active || t->shutting_down ||
+      t->reconnect_in_progress || t->pending_group.size ||
+      t->socket_count == 0 || transport_connection_count(t) != 1)
+    return false;
+  transport_conn_t *conn = transport_connection_at(t, 0);
+  if (!conn || !conn->quic || !conn->authenticated || !conn->protocol_ready ||
+      !conn->quic_ready || !quicly_connection_is_ready(conn->quic) ||
+      quicly_has_pending_stream_data(conn->quic) ||
+      quicly_has_datagram_frames(conn->quic) ||
+      quicly_get_state(conn->quic) != QUICLY_STATE_CONNECTED ||
+      transport_subscriptions_count(&conn->send_subscriptions) != 0 ||
+      transport_subscriptions_count(&conn->receive_subscriptions) == 0)
+    return false;
+
+  if (!conn->rx_cadence_handshake_confirmed) {
+    quicly_stats_t stats;
+    if (quicly_get_stats(conn->quic, &stats) != 0 ||
+        stats.handshake_confirmed_msec == UINT64_MAX)
+      return false;
+    conn->rx_cadence_handshake_confirmed = true;
+  }
+
+  /* Validate before mutating any mask. This also rejects stale/recycled fd
+   * snapshots and leaves egress and interface wakeups on the ordinary path. */
+  size_t slot = 0;
+  for (size_t i = 0; i < t->socket_count; i++) {
+    transport_socket_t *socket = &t->sockets[i];
+    if (socket->egress.count || socket->open_pending ||
+        socket->receive_backlog || transport_udp_gro_pending(socket->gro))
+      return false;
+    if (socket->fd < 0)
+      continue;
+    if (slot >= count || fds[slot].fd != socket->fd ||
+        fds[slot].events != POLLIN || fds[slot].revents != 0)
+      return false;
+    slot++;
+  }
+  size_t udp_count = slot;
+  if (t->ifmon_pipe[0] >= 0) {
+    if (slot >= count || fds[slot].fd != t->ifmon_pipe[0] ||
+        fds[slot].events != POLLIN || fds[slot].revents != 0)
+      return false;
+    slot++;
+  }
+  if (!udp_count || slot != count)
+    return false;
+  for (size_t i = 0; i < udp_count; i++)
+    fds[i].events &= (short)~POLLIN;
+  return true;
 }
 
 bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,

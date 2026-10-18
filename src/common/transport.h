@@ -520,6 +520,13 @@ struct pollfd;
 size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
                               size_t max_fds);
 
+/* Private receive-coalescing experiment. Validate an entire fresh poll slice
+ * for one confirmed receive-only peer, then mask only UDP POLLIN. On false
+ * the slice is unchanged. The caller must restore masks and obtain fresh
+ * readiness before service; interface and exceptional readiness stay live. */
+bool transport_rx_cadence_mask(transport_t *t, struct pollfd *fds,
+                               size_t count);
+
 /* Internal post-poll service entry: maintenance and output still run, while
  * UDP and interface-monitor reads use this tick's borrowed poll results.
  * Buffered GRO datagrams remain serviceable without socket readiness. NULL

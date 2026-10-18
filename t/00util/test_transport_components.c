@@ -151,6 +151,104 @@ static int test_recovery_cache_lookup(void) {
   return 0;
 }
 
+static int test_recovery_cache_nonmonotonic_ids(void) {
+  transport_sent_cache_t cache = {.capacity = 4, .max_payload_bytes = 16};
+  cache.entries = calloc(cache.capacity, sizeof(*cache.entries));
+  CHECK(cache.entries, "nonmonotonic cache allocation");
+  const moq_track_id_t tracks[2] = {{.type = MOQ_TRACK_DATA,
+                                     .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                     .name = "nonmonotonic"},
+                                    {.type = MOQ_TRACK_DATA,
+                                     .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                                     .name = "nonmonotonic"}};
+  uint8_t payload[] = {1, 2, 3};
+  moq_object_t object = {.track_id = tracks[0],
+                         .group_id = 9,
+                         .object_id = UINT64_MAX,
+                         .data = payload,
+                         .size = sizeof(payload)};
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, false),
+        "retain largest possible object ID without overflow");
+  object.group_id = 2;
+  object.object_id = 7;
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, false),
+        "retain lower object ID after larger ID");
+  sent_object_cache_t *original =
+      transport_sent_cache_find(&cache, &tracks[0], 2, 7);
+  CHECK(original, "find lower object ID");
+  original->next_repair_symbol = 12;
+  object.track_id = tracks[1];
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, false),
+        "same numeric ID on another track remains distinct");
+  object.track_id = tracks[0];
+  object.group_id = 3;
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, false),
+        "same numeric ID in another group remains distinct");
+  object.group_id = 2;
+  CHECK(transport_sent_cache_store(&cache, &object, 3, 1, 3, true) &&
+            cache.count == 4 && original->next_repair_symbol == 12 &&
+            original->recovery_protected,
+        "retry of lower ID preserves repair progress and protection");
+  payload[0] = 9;
+  CHECK(!transport_sent_cache_store(&cache, &object, 3, 1, 3, true) &&
+            original->data[0] == 1,
+        "conflicting lower-ID retry still validates retained contents");
+  payload[0] = 1;
+  CHECK(transport_sent_cache_release_through(&cache, &tracks[0], 9,
+                                             UINT64_MAX) == 1 &&
+            transport_sent_cache_find(&cache, &tracks[0], 2, 7) == original,
+        "release of greatest ID preserves lower IDs and other groups");
+  object.group_id = 4;
+  object.object_id = 8;
+  CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, false) &&
+            transport_sent_cache_find(&cache, &tracks[0], 4, 8),
+        "reuse release hole with a nonmonotonic ID");
+  CHECK(transport_sent_cache_release_track(&cache, &tracks[0]) == 3 &&
+            cache.count == 1 &&
+            transport_sent_cache_find(&cache, &tracks[1], 2, 7),
+        "release skips holes and preserves a different track");
+  CHECK(transport_sent_cache_release_track(&cache, &tracks[1]) == 1 &&
+            cache.count == 0,
+        "release last live entry clears cache");
+  object.group_id = 0;
+  for (uint64_t id = 0; id < 8; id++) {
+    object.object_id = id;
+    CHECK(transport_sent_cache_store(&cache, &object, 2, 1, 3, true),
+          "small increasing IDs work after clear and through eviction");
+  }
+  for (uint64_t id = 0; id <= 8; id++)
+    CHECK((transport_sent_cache_find(&cache, &tracks[0], 0, id) != NULL) ==
+              (id >= 4 && id < 8),
+          "lookup remains exact after clear, wrap and replacement");
+  object.object_id = 8;
+  CHECK(!transport_sent_cache_can_store(&cache, &object, false) &&
+            !transport_sent_cache_store(&cache, &object, 2, 1, 3, false) &&
+            cache.count == 4 && cache.payload_bytes == 12,
+        "newer protected object is rejected without changing a full cache");
+  object.object_id = 7;
+  CHECK(transport_sent_cache_can_store(&cache, &object, false) &&
+            transport_sent_cache_store(&cache, &object, 2, 1, 3, false),
+        "retained retry remains admissible in full protected cache");
+  CHECK(transport_sent_cache_release_through(&cache, &tracks[0], 0, 5) == 2,
+        "leave only a retained suffix");
+  cache.max_payload_bytes = 6;
+  object.object_id = 8;
+  CHECK(!transport_sent_cache_can_store(&cache, &object, false) &&
+            !transport_sent_cache_store(&cache, &object, 2, 1, 3, false) &&
+            cache.count == 2 && cache.payload_bytes == 6,
+        "newer protected object observes byte cap while slots remain");
+  object.object_id = 7;
+  CHECK(transport_sent_cache_can_store(&cache, &object, false),
+        "existing identical retry remains valid at byte cap");
+  payload[0] = 9;
+  CHECK(!transport_sent_cache_can_store(&cache, &object, false),
+        "byte-pressure retry still rejects conflicting contents");
+  transport_sent_cache_destroy(&cache);
+  CHECK(cache.count == 0 && cache.object_id_upper_bound == 0,
+        "destroy clears cache lookup bound");
+  return 0;
+}
+
 static int test_udp_batch_boundaries(int family) {
   static const struct {
     size_t count;
@@ -686,6 +784,8 @@ int main(void) {
   CHECK(test_udp_batch_boundaries(AF_INET6) == 0, "IPv6 UDP batch boundaries");
   CHECK(test_recovery_cache_protection() == 0, "recovery cache protection");
   CHECK(test_recovery_cache_lookup() == 0, "sparse wrapped cache lookup");
+  CHECK(test_recovery_cache_nonmonotonic_ids() == 0,
+        "nonmonotonic recovery cache identities");
   transport_limits_t configured = {0};
   transport_limits_t resolved_limits;
   char limit_error[128];

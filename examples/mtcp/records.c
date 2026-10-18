@@ -135,6 +135,43 @@ static void log_event(void *unused, const qlinq_log_event_t *e) {
   if (e->level >= QLINQ_LOG_WARNING)
     fprintf(stderr, "qlinq: %s\n", e->message);
 }
+/* Match CPU-study policy explicitly without changing record generation,
+ * delivery, or the library defaults. These settings are read before offering.
+ */
+static void configure_policy(qlinq_endpoint_config_t *cfg) {
+  const char *cc = getenv("QLINQ_BENCH_CC");
+  const char *pacing = getenv("QLINQ_BENCH_PACING");
+  if (!cc || !*cc)
+    cc = "default";
+  if (!pacing || !*pacing)
+    pacing = "default";
+  if (!strcmp(cc, "default"))
+    cfg->congestion_control = QLINQ_CC_DEFAULT;
+  else if (!strcmp(cc, "reno"))
+    cfg->congestion_control = QLINQ_CC_RENO;
+  else if (!strcmp(cc, "pico"))
+    cfg->congestion_control = QLINQ_CC_PICO;
+  else if (!strcmp(cc, "cubic"))
+    cfg->congestion_control = QLINQ_CC_CUBIC;
+  else {
+    fprintf(stderr, "invalid QLINQ_BENCH_CC: %s\n", cc);
+    exit(2);
+  }
+  if (!strcmp(pacing, "default"))
+    cfg->pacing = QLINQ_PACING_DEFAULT;
+  else if (!strcmp(pacing, "off"))
+    cfg->pacing = QLINQ_PACING_DISABLED;
+  else if (!strcmp(pacing, "on"))
+    cfg->pacing = QLINQ_PACING_ENABLED;
+  else {
+    fprintf(stderr, "invalid QLINQ_BENCH_PACING: %s\n", pacing);
+    exit(2);
+  }
+  fprintf(stderr,
+          "qlinq requested controller=%s pacing=%s initial_cwnd_packets=100\n",
+          cc, pacing);
+}
+
 static void run_qlinq(int paths, const char *cert, const char *key) {
   qlinq_context_config_t cc = {.log_callback = log_event};
   qlinq_context_t *ctx = qlinq_context_create(&cc);
@@ -150,6 +187,7 @@ static void run_qlinq(int paths, const char *cert, const char *key) {
                    .private_key_file = key,
                    .trust_store_file = cert,
                    .verify_peer = true}};
+  configure_policy(&cfg);
   cfg.bind_addresses[0] = sender ? "10.231.1.1" : "10.232.1.2";
   cfg.bind_addresses[1] = "10.231.2.1";
   cfg.remote_addresses[0] = "10.232.1.2";

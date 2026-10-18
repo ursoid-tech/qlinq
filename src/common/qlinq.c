@@ -6,11 +6,14 @@
 #include "transport_wire.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <openssl/crypto.h>
 #include <pthread.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #define QLINQ_DEFAULT_EVENT_COUNT 1024U
 #define QLINQ_DEFAULT_EVENT_BYTES (64U * 1024U * 1024U)
@@ -58,6 +61,7 @@ struct qlinq_endpoint {
   uint64_t record_payload_bytes_copied;
   uint64_t record_callbacks_accepted;
   uint64_t record_callbacks_rejected;
+  uint64_t rx_service_started_ns;
   bool service_pending;
   bool listener;
   bool active;
@@ -89,7 +93,30 @@ struct qlinq_context {
   struct pollfd *poll_fds;
   qlinq_endpoint_poll_t *endpoint_polls;
   size_t poll_endpoint_capacity;
+  bool rx_cadence_enabled;
+  uint64_t rx_cadence_decisions, rx_cadence_eligible;
+  uint64_t rx_cadence_waits, rx_cadence_timeouts, rx_cadence_wakes;
+  uint64_t rx_cadence_errors, rx_cadence_requested_ns;
+  uint64_t rx_poll_calls, rx_ppoll_calls;
 };
+
+#ifdef __linux__
+static uint64_t rx_clock_ns(clockid_t clock) {
+  struct timespec ts;
+  if (clock_gettime(clock, &ts) != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 ||
+      (uint64_t)ts.tv_sec > (UINT64_MAX - (uint64_t)ts.tv_nsec) / 1000000000U)
+    return 0;
+  return (uint64_t)ts.tv_sec * 1000000000U + (uint64_t)ts.tv_nsec;
+}
+#endif
+
+static uint64_t rx_monotonic_now(void) {
+#ifdef __linux__
+  return rx_clock_ns(CLOCK_MONOTONIC);
+#else
+  return 0;
+#endif
+}
 
 _Static_assert((int)QLINQ_CC_DEFAULT == TRANSPORT_CC_DEFAULT,
                "public and transport policy values must match");
@@ -768,6 +795,10 @@ qlinq_context_t *qlinq_context_create(const qlinq_context_config_t *config) {
   }
   context->owner_thread = pthread_self();
   context->last_status = QLINQ_STATUS_OK;
+#ifdef __linux__
+  const char *cadence = getenv("QLINQ_EXPERIMENT_RX_CADENCE_USEC");
+  context->rx_cadence_enabled = cadence && strcmp(cadence, "1000") == 0;
+#endif
   return context;
 }
 
@@ -808,6 +839,17 @@ void qlinq_context_destroy(qlinq_context_t *context) {
   portable_socket_cleanup();
   free(context->poll_fds);
   free(context->endpoint_polls);
+  if (context->rx_cadence_enabled)
+    fprintf(stderr,
+            "rx-cadence-summary window_usec=1000 decisions=%" PRIu64
+            " eligible=%" PRIu64 " waits=%" PRIu64 " timeouts=%" PRIu64
+            " wakes=%" PRIu64 " errors=%" PRIu64 " requested_ns=%" PRIu64
+            " poll_calls=%" PRIu64 " ppoll_calls=%" PRIu64 "\n",
+            context->rx_cadence_decisions, context->rx_cadence_eligible,
+            context->rx_cadence_waits, context->rx_cadence_timeouts,
+            context->rx_cadence_wakes, context->rx_cadence_errors,
+            context->rx_cadence_requested_ns, context->rx_poll_calls,
+            context->rx_ppoll_calls);
   free(context);
 }
 
@@ -1120,8 +1162,59 @@ static void service_endpoint(qlinq_endpoint_t *endpoint,
   /* Clear before servicing so any API work submitted during the tick can
    * request another service tick. */
   endpoint->service_pending = false;
+  if (endpoint->context->rx_cadence_enabled)
+    endpoint->rx_service_started_ns = rx_monotonic_now();
   transport_tick_ready(endpoint->transport, fds, count);
 }
+
+#ifdef __linux__
+static bool rx_endpoint_receive_only(const qlinq_endpoint_t *endpoint) {
+  bool subscribed = false;
+  for (const qlinq_stream_t *stream = endpoint->streams; stream;
+       stream = stream->next) {
+    if (stream->state != QLINQ_STREAM_OPEN)
+      continue;
+    if (stream->direction != QLINQ_STREAM_SUBSCRIBE)
+      return false;
+    subscribed = true;
+  }
+  return subscribed;
+}
+
+/* Native deadlines are wall milliseconds. Map their remaining duration to
+ * the earlier monotonic sample, subtracting clock-read/setup time. The caller
+ * budget and service-start cadence never slide. Failure expires the wait. */
+static uint64_t rx_cadence_remaining(uint64_t previous_start,
+                                     uint64_t caller_start, int timeout_ms,
+                                     int64_t deadline, uint64_t *ordinary_ns) {
+  *ordinary_ns = 0;
+  if (!caller_start || timeout_ms <= 0 ||
+      caller_start > UINT64_MAX - (uint64_t)timeout_ms * 1000000U)
+    return 0;
+  uint64_t before = rx_clock_ns(CLOCK_MONOTONIC);
+  uint64_t wall = rx_clock_ns(CLOCK_REALTIME);
+  uint64_t now = rx_clock_ns(CLOCK_MONOTONIC);
+  if (!before || !wall || now < before || before < caller_start)
+    return 0;
+  uint64_t target = caller_start + (uint64_t)timeout_ms * 1000000U;
+  if (deadline >= 0 && deadline != INT64_MAX &&
+      (uint64_t)deadline <= UINT64_MAX / 1000000U) {
+    uint64_t native_wall = (uint64_t)deadline * 1000000U;
+    if (native_wall <= wall)
+      return 0;
+    uint64_t delta = native_wall - wall;
+    if (delta <= UINT64_MAX - before && before + delta < target)
+      target = before + delta;
+  }
+  *ordinary_ns = target > now ? target - now : 0;
+  if (!previous_start || previous_start > before ||
+      previous_start > UINT64_MAX - 1000000U)
+    return 0;
+  if (previous_start + 1000000U < target)
+    target = previous_start + 1000000U;
+  return target > now ? target - now : 0;
+}
+#endif
 
 static size_t count_active_endpoints(qlinq_context_t *context) {
   size_t endpoint_count = 0;
@@ -1135,7 +1228,8 @@ static size_t count_active_endpoints(qlinq_context_t *context) {
 
 static qlinq_status_t poll_endpoints(qlinq_context_t *context,
                                      size_t endpoint_count, int timeout_ms,
-                                     int fd, short events, short *revents) {
+                                     int fd, short events, short *revents,
+                                     uint64_t caller_started_ns) {
   if (endpoint_count > SIZE_MAX / sizeof(qlinq_endpoint_poll_t) ||
       endpoint_count > SIZE_MAX / TRANSPORT_MAX_POLL_FDS ||
       endpoint_count * TRANSPORT_MAX_POLL_FDS >
@@ -1197,7 +1291,77 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
   size_t app_index = count;
   if (fd >= 0)
     fds[count++] = (struct pollfd){.fd = fd, .events = events};
-  int result = poll(fds, count, wait_ms);
+  int result;
+  bool used_rx_wait = false;
+#ifdef __linux__
+  if (context->rx_cadence_enabled) {
+    context->rx_cadence_decisions++;
+    if (timeout_ms > 0 && wait_ms > 0 && fd < 0 && poll_count == 1 &&
+        !context->event_head && !polls[0].endpoint->service_pending &&
+        rx_endpoint_receive_only(polls[0].endpoint) &&
+        count <= TRANSPORT_MAX_POLL_FDS) {
+      short saved[TRANSPORT_MAX_POLL_FDS];
+      for (size_t i = 0; i < count; i++)
+        saved[i] = fds[i].events;
+      if (transport_rx_cadence_mask(polls[0].endpoint->transport, fds, count)) {
+        context->rx_cadence_eligible++;
+        /* Recheck after eligibility work, before either kind of wait. */
+        polls[0].deadline =
+            transport_get_first_timeout(polls[0].endpoint->transport);
+        uint64_t ordinary_ns;
+        uint64_t delay_ns = rx_cadence_remaining(
+            polls[0].endpoint->rx_service_started_ns, caller_started_ns,
+            timeout_ms, polls[0].deadline, &ordinary_ns);
+        bool masked = delay_ns != 0;
+        if (!masked) {
+          for (size_t i = 0; i < count; i++)
+            fds[i].events = saved[i];
+          delay_ns = ordinary_ns;
+        }
+        struct timespec delay = {.tv_sec = (time_t)(delay_ns / 1000000000U),
+                                 .tv_nsec = (long)(delay_ns % 1000000000U)};
+        context->rx_ppoll_calls++;
+        if (masked) {
+          context->rx_cadence_waits++;
+          context->rx_cadence_requested_ns += delay_ns;
+        }
+        result = ppoll(fds, count, &delay, NULL);
+        int wait_errno = errno;
+        used_rx_wait = true;
+        short wake[TRANSPORT_MAX_POLL_FDS];
+        for (size_t i = 0; i < count; i++) {
+          wake[i] = fds[i].revents;
+          fds[i].events = saved[i];
+        }
+        if (result < 0) {
+          context->rx_cadence_errors++;
+          errno = wait_errno;
+        } else if (masked) {
+          if (result == 0)
+            context->rx_cadence_timeouts++;
+          else
+            context->rx_cadence_wakes++;
+          /* UDP was masked. Obtain fresh input readiness and retain any
+           * interface/error wake; transport invalidates it after fd changes. */
+          context->rx_poll_calls++;
+          result = poll(fds, count, 0);
+          if (result < 0)
+            context->rx_cadence_errors++;
+          else
+            for (size_t i = 0; i < count; i++)
+              fds[i].revents |= wake[i];
+        }
+      }
+    }
+  }
+#else
+  (void)caller_started_ns;
+#endif
+  if (!used_rx_wait) {
+    if (context->rx_cadence_enabled)
+      context->rx_poll_calls++;
+    result = poll(fds, count, wait_ms);
+  }
   if (result >= 0 && fd >= 0 && revents)
     *revents = fds[app_index].revents;
   if (result < 0 && SOCKET_ERROR_CODE != SOCKET_EINTR) {
@@ -1214,7 +1378,8 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
    * timers, and timeout wakes that drive periodic maintenance. */
   for (size_t i = 0; i < poll_count; i++) {
     qlinq_endpoint_poll_t *entry = &polls[i];
-    bool ready = entry->endpoint->service_pending || result == 0 ||
+    bool ready = entry->endpoint->service_pending ||
+                 (!used_rx_wait && result == 0) ||
                  (entry->deadline >= 0 && entry->deadline <= now);
     for (size_t fd = entry->first; !ready && fd < entry->first + entry->count;
          fd++)
@@ -1236,6 +1401,9 @@ qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
   if (!context_access(context))
     return QLINQ_STATUS_STATE;
 
+  uint64_t caller_started_ns =
+      context->rx_cadence_enabled ? rx_monotonic_now() : 0;
+
   if (timeout_ms < -1)
     return QLINQ_STATUS_INVALID;
   if (context->event_head)
@@ -1256,7 +1424,7 @@ qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
   bool writable_pending = update_writable_events(context, false);
   qlinq_status_t status =
       poll_endpoints(context, endpoint_count, writable_pending ? 0 : timeout_ms,
-                     fd, events, revents);
+                     fd, events, revents, caller_started_ns);
   if (status != QLINQ_STATUS_OK)
     return status;
   refresh_writable_events(context);

@@ -40,6 +40,7 @@ bool transport_sent_cache_init(transport_sent_cache_t *cache,
     return false;
   cache->capacity = capacity;
   cache->max_payload_bytes = byte_limit;
+  cache->object_id_upper_bound = 0;
   return true;
 }
 
@@ -50,6 +51,8 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
   if (!cache || !track)
     return NULL;
   if (!cache->entries)
+    return NULL;
+  if (object_id > cache->object_id_upper_bound)
     return NULL;
   size_t capacity = cache_capacity(cache), remaining = cache->count;
   size_t index = cache->next_entry;
@@ -100,6 +103,12 @@ bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
    * reserved for a full cache, byte pressure, retries, or eviction. */
   if (cache->count < cache_capacity(cache) && object->size <= available)
     return true;
+  /* A newer ID cannot be an existing retained retry. If protected entries
+   * cannot be evicted, neither a full slot budget nor byte pressure needs a
+   * scan merely to reject this new object. Lower/equal IDs still validate the
+   * exact identity and payload below. */
+  if (!allow_evict && object->object_id > cache->object_id_upper_bound)
+    return false;
   for (size_t i = 0; i < cache_capacity(cache); i++) {
     const sent_object_cache_t *entry = &cache->entries[i];
     if (!entry->data) {
@@ -123,6 +132,8 @@ static void release_entry(transport_sent_cache_t *cache,
   if (entry->data) {
     cache->payload_bytes -= entry->size;
     cache->count--;
+    if (cache->count == 0)
+      cache->object_id_upper_bound = 0;
     free(entry->data);
   }
   memset(entry, 0, sizeof(*entry));
@@ -209,6 +220,8 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->next_systematic_repair_symbol = 0;
   entry->recovery_protected = !allow_evict;
   entry->data = copy;
+  if (object->object_id > cache->object_id_upper_bound)
+    cache->object_id_upper_bound = object->object_id;
   cache->payload_bytes += object->size;
   cache->count++;
   if (cache->payload_bytes > cache->peak_payload_bytes)
@@ -227,15 +240,21 @@ size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
   size_t released = 0;
   if (!cache->entries)
     return 0;
-  for (size_t i = 0; i < cache_capacity(cache); i++) {
-    sent_object_cache_t *entry = &cache->entries[i];
-    if (entry->data && entry->group_id == group_id &&
-        entry->object_id <= object_id &&
+  size_t capacity = cache_capacity(cache), remaining = cache->count;
+  size_t index = cache->next_entry;
+  for (size_t scanned = 0; remaining != 0 && scanned < capacity; scanned++) {
+    index = index != 0 ? index - 1U : capacity - 1U;
+    sent_object_cache_t *entry = &cache->entries[index];
+    if (!entry->data)
+      continue;
+    remaining--;
+    if (entry->group_id == group_id && entry->object_id <= object_id &&
         transport_track_id_equal(&entry->track_id, track)) {
       release_entry(cache, entry);
       released++;
     }
   }
+  assert(remaining == 0);
   return released;
 }
 
@@ -246,13 +265,20 @@ size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
   size_t released = 0;
   if (!cache->entries)
     return 0;
-  for (size_t i = 0; i < cache_capacity(cache); i++) {
-    sent_object_cache_t *entry = &cache->entries[i];
-    if (entry->data && transport_track_id_equal(&entry->track_id, track)) {
+  size_t capacity = cache_capacity(cache), remaining = cache->count;
+  size_t index = cache->next_entry;
+  for (size_t scanned = 0; remaining != 0 && scanned < capacity; scanned++) {
+    index = index != 0 ? index - 1U : capacity - 1U;
+    sent_object_cache_t *entry = &cache->entries[index];
+    if (!entry->data)
+      continue;
+    remaining--;
+    if (transport_track_id_equal(&entry->track_id, track)) {
       release_entry(cache, entry);
       released++;
     }
   }
+  assert(remaining == 0);
   return released;
 }
 

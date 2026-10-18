@@ -61,6 +61,9 @@ typedef struct {
   uint64_t bytes_received;
   transport_egress_t egress;
   transport_udp_gro_t *gro;
+  /* A receive quantum ended without proving this socket drained. Retain
+   * through timer-only ticks; socket compaction moves the flag with its fd. */
+  bool receive_backlog;
   size_t remote_index;
   bool open_pending;
   uint64_t open_retry_at_ms;
@@ -151,6 +154,7 @@ struct transport_conn_t {
   transport_subscription_table_t send_subscriptions;
   transport_subscription_table_t receive_subscriptions;
   bool quic_ready;
+  bool rx_cadence_handshake_confirmed;
   bool hello_sent;
   bool hello_received;
   bool protocol_ready;

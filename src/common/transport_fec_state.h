@@ -42,6 +42,9 @@ typedef struct {
   size_t max_payload_bytes;
   size_t payload_bytes, peak_payload_bytes;
   size_t count, peak_count;
+  /* Conservative across releases, exact again when the cache becomes empty.
+   * New monotonic object IDs can skip a lookup without assuming track order. */
+  uint64_t object_id_upper_bound;
 } transport_sent_cache_t;
 
 bool transport_sent_cache_init(transport_sent_cache_t *cache,

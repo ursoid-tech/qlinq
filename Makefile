@@ -382,6 +382,8 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json \
+	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
+	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
 	t/00util/test_qlinq_policy \
 	t/00util/test_egress_errors t/00util/test_transport_bind t/00util/test_transport_poll \
@@ -412,6 +414,24 @@ t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile
 		-Dquicly_send_on_path=test_quicly_send_on_path -c $< -o $@
 
 t/00util/test_multipath_feedback: t/00util/test_multipath_feedback.o t/00util/transport_quicly_feedback.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+# These fixtures include the public service implementation to observe its
+# private wait state without adding production test hooks.
+t/00util/test_rx_cadence.o t/00util/test_rx_cadence_real.o: src/common/qlinq.c
+t/00util/test_rx_cadence_backlog.o: t/00util/test_transport_poll.c
+
+t/00util/test_rx_cadence: t/00util/test_rx_cadence.o $(filter-out src/common/qlinq.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_rx_cadence_backlog: t/00util/test_rx_cadence_backlog.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/transport_egress_cadence.o: src/common/transport_egress.c Makefile
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
+		-Dtransport_udp_send_batch=test_cadence_udp_send_batch -c $< -o $@
+
+t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_egress_cadence.o $(filter-out src/common/qlinq.o src/common/transport_egress.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 check: all $(CHECK_BINARIES) gencerts check-reports

@@ -242,6 +242,7 @@ ptls_iovec_t transport_stream_ingress_get(quicly_stream_t *stream) {
 int transport_stream_ingress_receive(quicly_stream_t *stream, size_t off,
                                      const void *src, size_t len) {
   transport_stream_ctx_t *ctx = stream->data;
+  ptls_buffer_t *buffer = &ctx->streambuf.ingress;
   if (len == 0)
     return 0;
   if (off > SIZE_MAX - ctx->ingress_prefix ||
@@ -253,8 +254,19 @@ int transport_stream_ingress_receive(quicly_stream_t *stream, size_t off,
                  "stream receive offset overflow");
     return -1;
   }
-  return quicly_recvbuf_receive(stream, &ctx->streambuf.ingress,
-                                off + ctx->ingress_prefix, src, len);
+  size_t remaining = buffer->off - ctx->ingress_prefix;
+  /* Keep the consumed prefix while the allocation has room. Moving an
+   * out-of-order tail on every consumption threshold wastes bandwidth even
+   * when subsequent input only fills holes in the existing extent. Compact
+   * before growing, and copy no more bytes than have been consumed. */
+  if (off + ctx->ingress_prefix + len > buffer->capacity &&
+      ctx->ingress_prefix != 0 && ctx->ingress_prefix >= remaining) {
+    memmove(buffer->base, buffer->base + ctx->ingress_prefix, remaining);
+    buffer->off = remaining;
+    ctx->ingress_prefix = 0;
+  }
+  return quicly_recvbuf_receive(stream, buffer, off + ctx->ingress_prefix, src,
+                                len);
 }
 
 void transport_stream_ingress_shift(quicly_stream_t *stream, size_t delta) {
@@ -263,13 +275,10 @@ void transport_stream_ingress_shift(quicly_stream_t *stream, size_t delta) {
   assert(delta <= buffer->off - ctx->ingress_prefix);
   ctx->ingress_prefix += delta;
   size_t remaining = buffer->off - ctx->ingress_prefix;
-  /* Copy no more bytes than were consumed since the last compaction. The
-   * retained prefix stays smaller than the live span, bounding used storage
-   * below twice the receive window even when out-of-order data fills it. */
-  if (ctx->ingress_prefix >= remaining) {
-    if (remaining != 0)
-      memmove(buffer->base, buffer->base + ctx->ingress_prefix, remaining);
-    buffer->off = remaining;
+  /* An empty buffer can reuse its allocation immediately. Otherwise defer
+   * compaction until receiving more bytes would need additional capacity. */
+  if (remaining == 0) {
+    buffer->off = 0;
     ctx->ingress_prefix = 0;
   }
   quicly_stream_sync_recvbuf(stream, delta);

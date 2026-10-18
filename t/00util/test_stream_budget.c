@@ -637,9 +637,9 @@ static bool ingress_matches(quicly_stream_t *stream, const uint8_t *data,
 static int ingress_compaction(void) {
   int failed = 0;
   transport_t *t = fixture();
-  uint8_t *data = malloc(98304);
+  uint8_t *data = malloc(131073);
   CHECK(t && t->client_conn && data);
-  for (size_t i = 0; i < 98304; i++)
+  for (size_t i = 0; i < 131073; i++)
     data[i] = (uint8_t)(i * 37 + (i >> 8));
   quicly_stream_t *stream = NULL;
   CHECK(quicly_get_or_open_stream(t->client_conn->quic, 3, &stream) == 0 &&
@@ -660,23 +660,35 @@ static int ingress_compaction(void) {
   CHECK(ctx->ingress_prefix == 12288 &&
         ingress_matches(stream, data, 12288, 53248));
   /* Growing an allocation with a retained prefix must preserve both offsets
-   * and bytes. The next shift crosses the amortized compaction threshold. */
+   * and bytes. Consumption leaves the sparse tail in place until new input
+   * would require more capacity. */
   size_t capacity = buffer->capacity;
   CHECK(receive_ingress_range(stream, 65536, data + 65536, 32768, false));
   CHECK(buffer->capacity > capacity &&
         ingress_matches(stream, data, 12288, 86016));
   transport_stream_ingress_shift(stream, 40960);
-  CHECK(ctx->ingress_prefix == 0 && buffer->off == 45056 &&
+  CHECK(ctx->ingress_prefix == 53248 && buffer->off == 98304 &&
         ingress_matches(stream, data, 53248, 45056));
+  capacity = buffer->capacity;
+  CHECK(capacity == 131072);
+  transport_stream_ingress_shift(stream, 4096);
+  CHECK(ctx->ingress_prefix == 57344 &&
+        ingress_matches(stream, data, 57344, 40960));
+  /* Appending past the allocation reclaims the prefix without allocating.
+   * The shifted receive offsets and payload must still agree. */
+  CHECK(receive_ingress_range(stream, 98304, data + 98304, 32769, false));
+  CHECK(ctx->ingress_prefix == 0 && buffer->off == 73729 &&
+        buffer->capacity == capacity &&
+        ingress_matches(stream, data, 57344, 73729));
   /* FIN uses the physical buffer extent in Quicly; the virtual view must
    * exclude consumed bytes even when receive ranges become empty. */
   transport_stream_ingress_shift(stream, 4096);
   CHECK(ctx->ingress_prefix == 4096);
-  CHECK(receive_ingress_range(stream, 98304, NULL, 0, true));
-  CHECK(ingress_matches(stream, data, 57344, 40960));
-  transport_stream_ingress_shift(stream, 40960);
+  CHECK(receive_ingress_range(stream, 131073, NULL, 0, true));
+  CHECK(ingress_matches(stream, data, 61440, 69633));
+  transport_stream_ingress_shift(stream, 69633);
   CHECK(ctx->ingress_prefix == 0 && buffer->off == 0 &&
-        ingress_matches(stream, data, 98304, 0));
+        ingress_matches(stream, data, 131073, 0));
   CHECK(transport_stream_ingress_receive(stream, SIZE_MAX, data, 1) == -1 &&
         quicly_get_state(stream->conn) >= QUICLY_STATE_CLOSING);
   CHECK(t->stats.resource_limit_errors == 1 &&
