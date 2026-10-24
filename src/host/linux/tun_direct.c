@@ -366,12 +366,14 @@ static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
     state = "degraded";
   printf("QLINQ_STATUS {\"state\":\"%s\",\"sent\":%llu,\"received\":%llu,"
          "\"tx_bytes\":%llu,\"rx_bytes\":%llu,\"dropped\":%llu,"
-         "\"fec_recovered\":%llu,\"fec_lost\":%llu,\"reconnects\":%llu,"
+         "\"fec_recovered\":%llu,\"fec_decoded\":%llu,\"fec_lost\":%llu,"
+         "\"reconnects\":%llu,"
          "\"queued_bytes\":%zu,\"paths\":[",
          state, (unsigned long long)sent, (unsigned long long)received,
          (unsigned long long)tx_bytes, (unsigned long long)rx_bytes,
          (unsigned long long)dropped,
          (unsigned long long)stats.fec_objects_recovered,
+         (unsigned long long)stats.fec_objects_decoded,
          (unsigned long long)stats.fec_objects_lost,
          (unsigned long long)stats.reconnect_attempts, stats.queued_bytes);
   bool first = true;
@@ -379,8 +381,11 @@ static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
     qlinq_path_stats_t path;
     if (!qlinq_endpoint_get_path_stats(endpoint, i, &path))
       continue;
+    char interface_name[64];
+    tun_resolve_interface_name(path.local_address, path.interface_name,
+                               interface_name);
     printf("%s{\"interface\":", first ? "" : ",");
-    json_string(path.interface_name);
+    json_string(interface_name);
     printf(",\"address\":");
     json_string(path.local_address);
     printf(",\"active\":%s,\"tx_bytes\":%llu,\"rx_bytes\":%llu,\"rtt_ms\":%u,"

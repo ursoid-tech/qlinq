@@ -111,3 +111,5 @@ qlinq-tun-engine
 
 /t/00util/test_udp_receive
 /t/00util/test_qlinq_policy
+
+/t/00util/test_tun_names

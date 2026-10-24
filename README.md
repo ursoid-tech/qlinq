@@ -38,8 +38,9 @@ This produces the following tools and an embeddable transport library:
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
 - `qlinq-tun`: Single native executable for Linux tunnel management and the
   direct `qlinq.h` packet worker: local identities, pairing, saved profiles,
-  up/down, status and diagnostics. No Python runtime or companion engine is
-  required. Existing `--peer ...` and `--listen ...` invocations remain supported.
+  up/down, status, diagnostics and Prometheus text metrics. No Python runtime or
+  companion engine is required. Existing `--peer ...` and `--listen ...`
+  invocations remain supported.
 - `libqlinq.a`: The in-process `transport.h` API used by `qlinq-app`, plus the
   [native application API](docs/application-api.md) in `qlinq.h` for named
   streams, owned events and endpoint management.

@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,76 @@
 #include <sys/kern_control.h>
 #include <sys/sys_domain.h>
 #endif
+
+void tun_resolve_interface_name(const char *address, const char *interface,
+                                char name[64]) {
+  strcpy(name, "fallback");
+  if (!address)
+    return;
+  struct in_addr v4;
+  struct in6_addr v6;
+  int family;
+  if (inet_pton(AF_INET, address, &v4) == 1) {
+    family = AF_INET;
+  } else if (inet_pton(AF_INET6, address, &v6) == 1) {
+    if (IN6_IS_ADDR_V4MAPPED(&v6)) {
+      memcpy(&v4, &v6.s6_addr[12], sizeof(v4));
+      family = AF_INET;
+    } else {
+      family = AF_INET6;
+    }
+  } else {
+    return;
+  }
+  if ((family == AF_INET && (ntohl(v4.s_addr) >> 24) == 127) ||
+      (family == AF_INET6 && IN6_IS_ADDR_LOOPBACK(&v6))) {
+    strcpy(name, "lo");
+    return;
+  }
+  if ((family == AF_INET && v4.s_addr == htonl(INADDR_ANY)) ||
+      (family == AF_INET6 && IN6_IS_ADDR_UNSPECIFIED(&v6)))
+    return;
+  /* transport knows which device owns a scoped path; address alone
+   * cannot distinguish identical link-local addresses across devices */
+  if (interface && interface[0] && strnlen(interface, 64) < 64 &&
+      strcmp(interface, address)) {
+    strcpy(name, interface);
+    return;
+  }
+  /* lookup includes loopback, virtual and down interfaces to label an existing
+   * path */
+  struct ifaddrs *interfaces;
+  if (getifaddrs(&interfaces) != 0)
+    return;
+  const char *found = NULL;
+  for (const struct ifaddrs *iface = interfaces; iface;
+       iface = iface->ifa_next) {
+    if (!iface->ifa_addr || !iface->ifa_name || !iface->ifa_name[0] ||
+        iface->ifa_addr->sa_family != family)
+      continue;
+    const void *candidate =
+        family == AF_INET
+            ? (const void *)&((const struct sockaddr_in *)iface->ifa_addr)
+                  ->sin_addr
+            : (const void *)&((const struct sockaddr_in6 *)iface->ifa_addr)
+                  ->sin6_addr;
+    const void *target =
+        family == AF_INET ? (const void *)&v4 : (const void *)&v6;
+    size_t size = family == AF_INET ? sizeof(v4) : sizeof(v6);
+    if (memcmp(candidate, target, size))
+      continue;
+    /* the same address on multiple devices cannot identify a unique path */
+    if (strlen(iface->ifa_name) >= 64 ||
+        (found && strcmp(found, iface->ifa_name))) {
+      found = NULL;
+      break;
+    }
+    found = iface->ifa_name;
+  }
+  if (found)
+    strcpy(name, found);
+  freeifaddrs(interfaces);
+}
 
 #ifdef __APPLE__
 static int tun_create_by_id(char if_name[IFNAMSIZ], unsigned int id) {

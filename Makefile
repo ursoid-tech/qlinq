@@ -220,7 +220,7 @@ qlinq-app: $(APP_OBJS) libqlinq.a
 qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-qlinq-tun: src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
+qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 PREFIX ?= /usr/local
@@ -231,8 +231,15 @@ install-tun: qlinq-tun
 	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
 	install -m 644 packaging/qlinq.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/qlinq.conf
 
-check-tun-tool: qlinq-tun
+check-tun-tool: qlinq-tun t/00util/test_tun_names
+	./t/00util/test_tun_names
 	python3 t/test_tun_tool.py
+	python3 t/test_tun_metrics.py
+
+t/00util/test_tun_names.o: src/host/linux/tun_device.c
+
+t/00util/test_tun_names: t/00util/test_tun_names.o
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_tun_json: t/00util/test_tun_json.o src/host/linux/tun_json.o src/common/cli_parse.o
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -381,7 +388,7 @@ benchmark: t/00util/test_benchmark
 benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
-CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json \
+CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \

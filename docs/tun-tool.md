@@ -165,6 +165,98 @@ two backups. The control socket is private to the profile owner. A stale status
 snapshot is reported explicitly. On Linux, a worker exits if its supervisor dies;
 the next startup can reclaim the stale control socket under an exclusive lock.
 
+## Prometheus metrics
+
+Export a profile's current statistics in the Prometheus text format:
+
+```sh
+sudo qlinq-tun metrics office
+```
+
+For Node Exporter's textfile collector, create a directory readable by its
+service account, enable `--collector.textfile.directory` on Node Exporter, and
+write an absolute `.prom` path in that directory:
+
+```sh
+sudo install -d -m 755 /var/lib/node_exporter/textfile_collector
+sudo qlinq-tun metrics office \
+  --output /var/lib/node_exporter/textfile_collector/qlinq-office.prom
+```
+
+Add `--interval 5` to refresh the file every five seconds in the foreground.
+The interval accepts whole seconds from 1 through 3600 and requires `--output`.
+Run this command under your service manager, or invoke the one-shot command
+from a timer. Use a distinct output file for each tunnel and run only one writer
+per file. The existing `qlinq-tun@` service manages the tunnel itself; metrics
+collection runs separately so it can report stopped tunnels. The exporter needs
+the profile owner's access to the private control socket (normally root).
+Node Exporter only needs read access to the exported file and its directory.
+
+Each update atomically replaces the file with mode 644, so readers cannot see
+partial updates. Temporary files do not match `*.prom`. The output contains only
+allowlisted health/statistics fields, tunnel names and uplink interface/address
+labels. It includes no pairing secrets or identity contents. A failed read,
+invalid status or failed write exits nonzero and retains the previous file.
+SIGINT/SIGTERM stops periodic collection successfully and also retains the file.
+No HTTP server or additional runtime dependency is added to qlinq; Prometheus
+scrapes Node Exporter's HTTP endpoint.
+
+Every sample has a `tunnel` label. Per-path samples also have `interface` and
+`address` labels, rather than unstable path slot numbers. Interface labels use
+`lo` for IPv4 loopback (`127.0.0.0/8`), IPv6 loopback (`::1`), and mapped IPv4
+loopback addresses. Other paths retain the device name known to the transport,
+so identical IPv6 link-local addresses on different uplinks remain distinct.
+When the device is unknown, addresses resolve against the local interface list;
+unassigned, invalid or ambiguous addresses, or lookup failures, use the literal
+label `fallback`. JSON status uses the same names. This lookup does not change
+which interfaces the transport discovers or uses.
+
+The initial metrics are:
+
+| Metric | Meaning |
+| --- | --- |
+| `qlinq_tun_running` | A supervisor answered the local control socket |
+| `qlinq_tun_connected` | A fresh snapshot reports an authenticated connection with an active path |
+| `qlinq_tun_snapshot_fresh` | A worker snapshot exists and is at most three seconds old |
+| `qlinq_tun_snapshot_age_seconds` | Cached snapshot age; absent when stopped |
+| `qlinq_tun_metrics_export_time_seconds` | Unix time of the last successful export |
+| `qlinq_tun_state{state="..."}` | Last reported state, with sample value 1 |
+| `qlinq_tun_tx_packets_total`, `qlinq_tun_tx_bytes_total` | Inner packets/bytes accepted for transport sending |
+| `qlinq_tun_rx_packets_total`, `qlinq_tun_rx_bytes_total` | Valid inner packets/bytes received before TUN writes |
+| `qlinq_tun_dropped_packets_total` | Combined transmit/receive TUN worker drops |
+| `qlinq_tun_fec_completed_objects_total` | Completed datagram objects, including those requiring no FEC decoding |
+| `qlinq_tun_fec_decoded_objects_total` | Completed objects that required FEC decoding |
+| `qlinq_tun_fec_lost_objects_total` | Datagram objects counted lost by the assembler |
+| `qlinq_tun_reconnect_attempts_total` | Worker reconnect attempts |
+| `qlinq_tun_transport_queued_bytes` | Current datagram egress queue occupancy |
+| `qlinq_tun_path_active` | Path was active/validated in the last snapshot |
+| `qlinq_tun_path_tx_bytes_total`, `qlinq_tun_path_rx_bytes_total` | Physical socket wire byte counters |
+| `qlinq_tun_path_packets_lost` | Current QUIC path connection loss count, exposed as a gauge |
+| `qlinq_tun_path_rtt_seconds` | RTT for active paths with a nonzero measurement |
+
+Worker counters reset when the worker restarts. Wire byte counters reset when
+physical sockets are replaced. QUIC path loss counts reset on reconnect, which
+is why they are gauges. Use `rate()` on byte/packet counters for throughput;
+accepted sends are not remote delivery confirmations. Path labels disappear
+when their paths are removed. The last counters/path values remain available
+while a worker snapshot is stale, alongside `snapshot_fresh=0` and
+`connected=0`. Stopped tunnels emit health/state/export-time samples and omit
+traffic/path values rather than inventing zero counters.
+
+Monitor freshness of both the worker and the exporter. For example:
+
+```promql
+qlinq_tun_connected == 0
+time() - qlinq_tun_metrics_export_time_seconds > 30
+rate(qlinq_tun_tx_bytes_total[5m]) * 8
+```
+
+Choose the exporter age threshold to exceed its refresh interval and your scrape
+interval. If the exporter is killed, its retained file can otherwise appear
+healthy indefinitely. Node Exporter's `node_textfile_mtime_seconds` also exposes
+file age; monitoring `qlinq_tun_snapshot_fresh` alone does not detect a stopped
+exporter. Remove the `.prom` file when permanently removing a tunnel/exporter.
+
 ## Verification and pilot boundaries
 
 ```sh

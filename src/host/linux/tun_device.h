@@ -4,6 +4,12 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+/* display name for a local numeric address: "lo" for loopback, the transport's
+ * known interface name, or device name for a unique local match; uses
+ * "fallback" if unavailable or ambiguous; buffer must hold >= 64 bytes */
+void tun_resolve_interface_name(const char *address, const char *interface,
+                                char name[64]);
+
 int tun_alloc(char *dev);
 int tun_set_mtu(const char *if_name, int mtu);
 int configure_ip_and_up(const char *if_name, const char *ip_cidr);

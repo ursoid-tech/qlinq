@@ -1,4 +1,6 @@
 #include "tun_control.h"
+#include "cli_parse.h"
+#include "tun_metrics.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -29,6 +31,9 @@ static void help(void) {
        "  run NAME [--mock]         Run in foreground (for systemd)\n"
        "  down NAME                 Stop the tunnel\n"
        "  status NAME [--json]      Show live health\n"
+       "  metrics NAME [--output /PATH/FILE.prom] [--interval SECONDS]\n"
+       "                            Export Prometheus text (interval requires "
+       "output)\n"
        "  diag NAME [--json] [--mock] Check configuration and prerequisites\n"
        "  diagnose NAME             Print a redacted JSON diagnostic report\n"
        "Default config directory: /etc/qlinq/tunnels\n"
@@ -50,8 +55,8 @@ static bool parse(int argc, char **argv, tc_args *a) {
   if (i == argc)
     return false;
   a->action = argv[i++];
-  const char *actions[] = {"init", "pair",   "up",   "run",
-                           "down", "status", "diag", "diagnose"};
+  const char *actions[] = {"init",   "pair", "up",       "run",    "down",
+                           "status", "diag", "diagnose", "metrics"};
   bool known = false;
   for (unsigned j = 0; j < sizeof(actions) / sizeof(actions[0]); j++)
     if (!strcmp(a->action, actions[j]))
@@ -77,6 +82,25 @@ static bool parse(int argc, char **argv, tc_args *a) {
       a->json = true;
       continue;
     }
+    if (!strcmp(a->action, "metrics")) {
+      if (++i == argc)
+        return false;
+      if (!strcmp(option, "--output") && !a->metrics_output) {
+        const char *path = argv[i];
+        size_t length = strlen(path);
+        if (path[0] != '/' || length < 6 || length >= PATH_MAX - 7 ||
+            strcmp(path + length - 5, ".prom"))
+          return false;
+        a->metrics_output = path;
+      } else if (!strcmp(option, "--interval") && !a->metrics_interval) {
+        uint64_t seconds;
+        if (!cli_parse_u64(argv[i], 3600, &seconds) || seconds == 0)
+          return false;
+        a->metrics_interval = (unsigned)seconds;
+      } else
+        return false;
+      continue;
+    }
     if (!init || ++i == argc)
       return false;
     const char *v = argv[i];
@@ -99,6 +123,8 @@ static bool parse(int argc, char **argv, tc_args *a) {
     else
       return false;
   }
+  if (a->metrics_interval && !a->metrics_output)
+    return false;
   return !init || ((!!a->listen != !!a->invite) && a->uplink_count);
 }
 
@@ -146,8 +172,13 @@ static int control(const char *dir, const char *request,
     tc_error("control connection failed: %s", strerror(error));
     return -1;
   }
-  if (!send_all(fd, request, strlen(request)) || !send_all(fd, "\n", 1)) {
+  char message[128];
+  int length = snprintf(message, sizeof(message), "%s\n", request);
+  if (length <= 0 || (size_t)length >= sizeof(message) ||
+      !send_all(fd, message, (size_t)length)) {
+    int error = errno;
     close(fd);
+    tc_error("control request failed: %s", strerror(error));
     return -1;
   }
   size_t used = 0;
@@ -174,6 +205,47 @@ static int control(const char *dir, const char *request,
     return -1;
   }
   return 1;
+}
+
+/* separate foreground exporter reports stopped tunnels without touching
+ * transport state */
+static int export_metrics(const tc_args *a, const char *dir, char *reply) {
+  signal(SIGTERM, stop_handler);
+  signal(SIGINT, stop_handler);
+  do {
+    int status = control(dir, "status", reply);
+    if (stop_requested)
+      return 0;
+    if (status < 0)
+      return 1;
+    if (!status)
+      strcpy(reply, "{\"state\":\"stopped\"}");
+    size_t size = 0;
+    char *text = tm_format(a->name, reply, &size);
+    if (!text) {
+      tc_error("cannot format metrics from tunnel status");
+      return 1;
+    }
+    bool ok = a->metrics_output
+                  ? tm_write_file(a->metrics_output, text, size)
+                  : fwrite(text, 1, size, stdout) == size && !fflush(stdout);
+    free(text);
+    if (!ok) {
+      tc_error("metrics export failed: %s", strerror(errno));
+      return 1;
+    }
+    if (!a->metrics_interval)
+      break;
+    uint64_t until = tc_now_ms() + (uint64_t)a->metrics_interval * 1000;
+    while (!stop_requested) {
+      uint64_t now = tc_now_ms();
+      if (now >= until)
+        break;
+      uint64_t remaining = until - now;
+      poll(NULL, 0, (int)(remaining > 200 ? 200 : remaining));
+    }
+  } while (!stop_requested);
+  return 0;
 }
 
 static int open_log(const char *dir, const char *name, int flags) {
@@ -413,7 +485,7 @@ static int serve(const tc_args *a, const char *dir, const tc_config *c) {
       int fd = accept(server, NULL, NULL);
       if (fd < 0)
         continue;
-      struct timeval timeout = {.tv_sec = 0, .tv_usec = 200000};
+      struct timeval timeout = {.tv_sec = 2};
       setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
       setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
       char request[128];
@@ -586,6 +658,7 @@ static void print_status(const char *name, const char *reply) {
 }
 
 int tun_control_main(int argc, char **argv) {
+  signal(SIGPIPE, SIG_IGN);
   umask(077);
   for (int i = 1; i < argc; i++)
     if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
@@ -610,7 +683,9 @@ int tun_control_main(int argc, char **argv) {
   if (!reply)
     return 1;
   int result = 0;
-  if (!strcmp(a.action, "run"))
+  if (!strcmp(a.action, "metrics"))
+    result = export_metrics(&a, dir, reply);
+  else if (!strcmp(a.action, "run"))
     result = serve(&a, dir, &config);
   else if (!strcmp(a.action, "up"))
     result = start(&a, dir, &config, reply);
@@ -630,7 +705,7 @@ int tun_control_main(int argc, char **argv) {
       } else
         result = tc_pair(&a, dir, &config);
     } else if (!strcmp(a.action, "down")) {
-      for (unsigned i = 0; status == 1 && i < 150; i++) {
+      for (unsigned i = 0; status && i < 150; i++) {
         usleep(50000);
         status = control(dir, "status", reply);
       }

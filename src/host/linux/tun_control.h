@@ -14,9 +14,9 @@ typedef struct {
 
 typedef struct {
   const char *root, *action, *name, *identity, *invite, *listen;
-  const char *interface, *local_ip, *peer_ip, *run_as;
+  const char *interface, *local_ip, *peer_ip, *run_as, *metrics_output;
   const char *uplinks[4], *routes[16];
-  unsigned uplink_count, route_count;
+  unsigned uplink_count, route_count, metrics_interval;
   bool mock, json;
 } tc_args;
 
