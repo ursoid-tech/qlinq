@@ -668,6 +668,8 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
            (announce->ip_version == 4 ? AF_INET : AF_INET6)))
     return false;
   size_t slot = ip_version_slot(announce->ip_version);
+  if (slot >= 2)
+    return false;
   bool created = false;
   if (t->flexicast_fds[slot] < 0) {
     int fd = open_receive_socket(announce->ip_version, announce->udp_port);
