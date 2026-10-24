@@ -40,8 +40,11 @@ typedef struct {
   bool *received_mask;
   bool *missing_mask;
   uint16_t *missing_indices;
+  bool decoded;
+  bool shared_delivery;
   uint8_t priority;
   bool nack_sent;
+  uint16_t nack_attempt;
   int64_t first_symbol_time_ms;
   int64_t last_activity_time_ms;
   int64_t last_nack_time_ms;

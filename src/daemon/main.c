@@ -57,6 +57,16 @@ static void show_help(FILE *out, const char *program) {
       "                              fec is an alias for fixed-fec\n"
       "  --reliable                  alias for --mode reliable\n"
       "  --rateless                  alias for --mode rateless\n"
+      "  --flexicast                 enable shared datagram delivery\n"
+      "  --flexicast-group ADDRESS --flexicast-port PORT\n"
+      "  --flexicast-interface ADDRESS\n"
+      "  --flexicast-cc multicast|adaptive\n"
+      "  --flexicast-cc-startup-rate BPS --flexicast-cc-min-rate BPS\n"
+      "  --flexicast-cc-max-rate BPS --flexicast-cc-aggregate-rate BPS\n"
+      "  --flexicast-cc-feedback-timeout MS\n"
+      "  --repair-mode auto|indexed|rateless\n"
+      "  --max-connections N --max-repair-requests N --max-aggregate-repairs "
+      "N\n"
       "  --verbose\n\n"
       "SIGHUP reloads --cert and --key atomically.\n",
       program);
@@ -111,6 +121,7 @@ typedef struct {
   uint32_t stats_ms;
   bool verbose;
   bool help;
+  transport_config_t transport;
 } options_t;
 
 typedef struct daemon_ctx_s {
@@ -222,6 +233,18 @@ static void on_transport_event(void *user_data,
     break;
   case TRANSPORT_EVENT_OBJECT_LOST:
     printf("daemon: object lost event\n");
+    break;
+  case TRANSPORT_EVENT_TRACK_FINISHED:
+    if (ctx->options->verbose)
+      printf("daemon: track '%s' finished\n", event->track_id.name);
+    break;
+  case TRANSPORT_EVENT_TRACK_DRAINED:
+    if (ctx->options->verbose)
+      printf("daemon: track '%s' drained\n", event->track_id.name);
+    break;
+  case TRANSPORT_EVENT_TRACK_ABORTED:
+    if (ctx->options->verbose)
+      printf("daemon: track '%s' aborted\n", event->track_id.name);
     break;
   case TRANSPORT_EVENT_KEYFRAME_REQUEST:
     break;
@@ -419,6 +442,10 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       options->allow_insecure_peer = true;
       continue;
     }
+    if (strcmp(arg, "--flexicast") == 0) {
+      options->transport.enable_flexicast = true;
+      continue;
+    }
     if (strcmp(arg, "--verbose") == 0) {
       options->verbose = true;
       continue;
@@ -473,11 +500,91 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         goto invalid;
       options->track_flags = flags;
       have_mode = true;
+    } else if (strcmp(arg, "--flexicast-group") == 0) {
+      options->transport.flexicast_group = value;
+      options->transport.enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-interface") == 0) {
+      options->transport.flexicast_interface = value;
+    } else if (strcmp(arg, "--flexicast-port") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || !parsed)
+        goto invalid;
+      options->transport.flexicast_group_port = (uint16_t)parsed;
+    } else if (strcmp(arg, "--repair-mode") == 0) {
+      if (strcmp(value, "auto") == 0)
+        options->transport.repair_mode = TRANSPORT_REPAIR_MODE_AUTO;
+      else if (strcmp(value, "indexed") == 0)
+        options->transport.repair_mode = TRANSPORT_REPAIR_MODE_INDEXED;
+      else if (strcmp(value, "rateless") == 0)
+        options->transport.repair_mode = TRANSPORT_REPAIR_MODE_RATELESS;
+      else
+        goto invalid;
+    } else if (strcmp(arg, "--flexicast-cc") == 0) {
+      if (strcmp(value, "multicast") == 0)
+        options->transport.flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_MULTICAST;
+      else if (strcmp(value, "adaptive") == 0)
+        options->transport.flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_ADAPTIVE;
+      else
+        goto invalid;
+      options->transport.enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-cc-startup-rate") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT64_MAX, &parsed))
+        goto invalid;
+      options->transport.flexicast_cc_startup_rate = parsed;
+      options->transport.enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-cc-min-rate") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT64_MAX, &parsed))
+        goto invalid;
+      options->transport.flexicast_cc_minimum_rate = parsed;
+      options->transport.enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-cc-max-rate") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT64_MAX, &parsed))
+        goto invalid;
+      options->transport.flexicast_cc_maximum_rate = parsed;
+      options->transport.enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-cc-aggregate-rate") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT64_MAX, &parsed))
+        goto invalid;
+      options->transport.flexicast_cc_aggregate_rate_limit = parsed;
+      options->transport.enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-cc-feedback-timeout") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed))
+        goto invalid;
+      options->transport.flexicast_cc_feedback_timeout_ms = parsed;
+      options->transport.enable_flexicast = true;
+    } else if (strcmp(arg, "--max-connections") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, TRANSPORT_HARD_MAX_CONNECTIONS, &parsed) ||
+          !parsed)
+        goto invalid;
+      options->transport.limits.max_connections = parsed;
+    } else if (strcmp(arg, "--max-repair-requests") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || !parsed)
+        goto invalid;
+      options->transport.limits.max_repair_requests_per_second = parsed;
+    } else if (strcmp(arg, "--max-aggregate-repairs") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || !parsed)
+        goto invalid;
+      options->transport.limits.max_aggregate_repair_requests_per_second =
+          parsed;
     } else {
       goto invalid;
     }
   }
 
+  if ((options->transport.flexicast_group &&
+       (!options->transport.flexicast_group_port ||
+        !options->transport.flexicast_interface)) ||
+      (!options->transport.flexicast_group &&
+       options->transport.flexicast_group_port))
+    goto invalid;
   if (!options->auth_token)
     options->auth_token = getenv("QLINQ_AUTH_TOKEN");
   if (!options->auth_token || options->auth_token[0] == '\0') {
@@ -530,6 +637,25 @@ static bool add_transport(daemon_ctx_t *ctx, const peer_options_t *peer) {
                                .reconnect_enabled = peer != NULL,
                                .callback = on_transport_event,
                                .user_data = tctx};
+  config.enable_flexicast = options->transport.enable_flexicast;
+  config.flexicast_interface = options->transport.flexicast_interface;
+  config.flexicast_cc_mode = options->transport.flexicast_cc_mode;
+  config.flexicast_cc_startup_rate =
+      options->transport.flexicast_cc_startup_rate;
+  config.flexicast_cc_minimum_rate =
+      options->transport.flexicast_cc_minimum_rate;
+  config.flexicast_cc_maximum_rate =
+      options->transport.flexicast_cc_maximum_rate;
+  config.flexicast_cc_aggregate_rate_limit =
+      options->transport.flexicast_cc_aggregate_rate_limit;
+  config.flexicast_cc_feedback_timeout_ms =
+      options->transport.flexicast_cc_feedback_timeout_ms;
+  config.repair_mode = options->transport.repair_mode;
+  config.limits = options->transport.limits;
+  if (!peer) {
+    config.flexicast_group = options->transport.flexicast_group;
+    config.flexicast_group_port = options->transport.flexicast_group_port;
+  }
   config.bind_hosts[0] = peer ? (strchr(peer->host, ':') ? "::" : "0.0.0.0")
                               : options->listen_host;
   if (peer) {

@@ -38,7 +38,8 @@ NANORQ_NATIVE_CFLAGS ?= $(if $(filter native,$(CODEC_TARGET)),-march=native)
 # other undefined-behavior checks across qlinq and its linked dependencies.
 SANITIZER_FLAGS = -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=pointer-overflow
 # Quicly is included with -isystem to keep third-party warnings out of qlinq's
-# build. Use -MD so ABI-affecting Quicly and picotls headers remain tracked.
+# build. Use -MD (rather than -MMD) so ABI-affecting Quicly and picotls headers
+# are still tracked as dependencies.
 DEPFLAGS = -MD -MP
 
 # Compile Fusion only when this compiler accepts its ISA and runtime guards.
@@ -60,6 +61,10 @@ INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/inclu
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/bplus_ranges.c \
+              deps/quicly/lib/flexicast.c \
+              deps/quicly/lib/flexicast_cc.c \
+              deps/quicly/lib/flexicast_cc_multicast.c \
+              deps/quicly/lib/flexicast_cc_adaptive.c \
               deps/quicly/lib/defaults.c \
               deps/quicly/lib/frame.c \
               deps/quicly/lib/local_cid.c \
@@ -105,17 +110,21 @@ NANORQ_CODEC_OBJS = $(NANORQ_OBJS) deps/nanors/deps/obl/oblas_common.o \
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
-TRANSPORT_OBJS = src/common/qlinq.o \
-              src/common/cli_parse.o \
+TRANSPORT_OBJS = src/common/cli_parse.o \
               src/common/transport_config.o \
+              src/common/qlinq.o \
               src/common/transport_egress.o \
               src/common/transport_fec_state.o \
+              src/common/transport_flexicast.o \
+              src/common/transport_flexicast_dispatch.o \
+              src/common/transport_flexicast_repair.o \
               src/common/transport_memory.o \
               src/common/transport_paths.o \
               src/common/transport_protocol.o \
               src/common/transport_publish.o \
               src/common/transport_recovery.o \
               src/common/transport_repair.o \
+              src/common/transport_repair_planner.o \
               src/common/transport_scheduler.o \
               src/common/transport_stream.o \
               src/common/transport_subscriptions.o \
@@ -139,7 +148,8 @@ COMMON_OBJS = src/common/data_uds.o \
 DAEMON_OBJS = src/daemon/main.o \
               $(COMMON_OBJS)
 
-APP_OBJS = src/app/main.o src/app/xfer.o src/app/xfer_file.o
+APP_OBJS = src/app/main.o src/app/transfer.o src/app/xfer.o src/app/xfer_file.o
+CAST_OBJS = src/cast/main.o
 
 FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
@@ -187,7 +197,7 @@ deps/nanors/%.o deps/nanorq/%.o: private CODEC_CFLAGS = $(FEC_CFLAGS) $(FEC_NATI
 deps/%.o: deps/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(CODEC_CFLAGS) -w -c $< -o $@
 
-all: qlinqd qlinq-app qlinq-tund qlinq-tun
+all: qlinqd qlinq-app qlinq-cast qlinq-tund qlinq-tun
 
 # Track only backend inclusion here; other compiler flag changes still require
 # a clean build. Switching WITH_FUSION must rebuild its dispatch and tests.
@@ -217,6 +227,9 @@ qlinqd: $(DAEMON_OBJS)
 
 qlinq-app: $(APP_OBJS) libqlinq.a
 	$(CC) -o $@ $(APP_OBJS) libqlinq.a $(LDFLAGS)
+
+qlinq-cast: $(CAST_OBJS) libqlinq.a
+	$(CC) -o $@ $(CAST_OBJS) libqlinq.a $(LDFLAGS)
 
 qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -285,7 +298,8 @@ t/00util/test_fec: t/00util/test_fec.o $(FEC_OBJS)
 t/00util/test_egress_errors: t/00util/test_egress_errors.o src/common/transport_egress.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-TRANSPORT_TESTS = t/00util/test_transport_bind \
+TRANSPORT_TESTS = t/00util/test_flexicast_transport \
+	 t/00util/test_transport_bind \
 	t/00util/test_transport_poll \
 	t/00util/test_crypto_backend \
 	t/00util/test_interleaved_receive \
@@ -327,6 +341,18 @@ API_TESTS = t/00util/test_qlinq_policy \
 $(API_TESTS): %: %.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+t/00util/flexicast_network_probe: t/00util/flexicast_network_probe.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_flexicast_regressions: t/00util/test_flexicast_regressions.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_quicly_flexicast: deps/quicly/t/flexicast-cc-regression.c deps/quicly/t/flexicast-crypto.c deps/quicly/t/flexicast-packet.c deps/quicly/t/flexicast.c deps/quicly/t/flexicast-main.c $(wildcard deps/quicly/t/flexicast-*.inc) deps/quicly/t/flexicast-provenance.inc deps/quicly/deps/picotest/picotest.c $(QUICLY_OBJS)
+	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -Ideps/quicly/deps/picotest -o $@ $(filter-out %.inc,$^) $(LDFLAGS)
+
+t/00util/test_flexicast_scale: t/00util/test_flexicast_scale.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_flexicast_scale.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/test_data_uds: t/00util/test_data_uds.o src/common/data_uds.o
 	$(CC) -o $@ t/00util/test_data_uds.o src/common/data_uds.o $(LDFLAGS)
 
@@ -344,13 +370,32 @@ t/00util/test_udp_gro: t/00util/test_udp_gro.o
 
 t/00util/test_ifmon: t/00util/test_ifmon.o
 	$(CC) -o $@ $< $(LDFLAGS)
+t/00util/test_qlinq_api: t/00util/test_qlinq_api.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_qlinq_api.o $(COMMON_OBJS) $(LDFLAGS)
 
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
 		-o $@ t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 
+t/00util/fuzz_flexicast_frames: t/00util/fuzz_flexicast_frames.c $(QUICLY_OBJS)
+	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
+		-o $@ t/00util/fuzz_flexicast_frames.c deps/quicly/lib/flexicast.c \
+		$(filter-out deps/quicly/lib/flexicast.o,$(QUICLY_OBJS)) $(LDFLAGS)
+
+t/00util/fuzz_flexicast_state: t/00util/fuzz_flexicast_state.c $(COMMON_OBJS)
+	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined -fno-sanitize=pointer-overflow \
+		-o $@ t/00util/fuzz_flexicast_state.c deps/quicly/lib/flexicast.c \
+		src/common/transport_fec_state.c \
+		$(filter-out deps/quicly/lib/flexicast.o src/common/transport_fec_state.o,$(COMMON_OBJS)) $(LDFLAGS)
+
+fuzz-flexicast-state: t/00util/fuzz_flexicast_state
+	ASAN_OPTIONS=detect_leaks=1 ./t/00util/fuzz_flexicast_state -runs=10000 -max_len=1024 -len_control=0
+
 fuzz-wire: t/00util/fuzz_transport_wire
 	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_transport_wire -runs=10000
+
+fuzz-flexicast: t/00util/fuzz_flexicast_frames
+	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_flexicast_frames -runs=10000
 
 check-submodules:
 	./scripts/check_submodules.sh
@@ -390,6 +435,8 @@ release-check: check-submodules
 	$(MAKE) clean
 	$(MAKE) check
 	$(MAKE) fuzz-wire
+	$(MAKE) fuzz-flexicast
+	$(MAKE) fuzz-flexicast-state
 	$(MAKE) check-sanitize
 	$(MAKE) clean
 	$(MAKE) all examples/data_multipath_benchmark gencerts
@@ -414,6 +461,9 @@ CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_xfer_file t/00util/tes
 	t/00util/test_qlinq_reconnect t/00util/test_qlinq_delivery \
 	t/00util/test_qlinq_event_ownership t/00util/test_generic_ports \
 	t/00util/test_stream_budget t/00util/test_transport \
+	t/00util/test_flexicast_transport t/00util/test_flexicast_scale \
+	t/00util/test_flexicast_regressions t/00util/test_quicly_flexicast \
+	t/00util/test_qlinq_api \
 	t/00util/test_reliable_bidirectional t/00util/test_tund \
 	t/00util/test_data_uds t/00util/test_transport_wire \
 	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_udp_receive t/00util/test_udp_gro t/00util/test_ifmon \
@@ -462,17 +512,25 @@ t/00util/transport_egress_cadence.o: src/common/transport_egress.c Makefile
 t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_egress_cadence.o $(filter-out src/common/qlinq.o src/common/transport_egress.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-check: all $(CHECK_BINARIES) gencerts check-reports
+check: all $(CHECK_BINARIES) t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_flexicast_regressions t/00util/test_quicly_flexicast t/00util/test_qlinq_api gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
 	rm -f $(QUICLY_INTEGRATION_TEST)
+	rm -f t/00util/flexicast_network_probe
+	rm -f qlinqd qlinq-app qlinq-cast qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_flexicast_transport t/00util/test_flexicast_scale t/00util/test_flexicast_regressions t/00util/test_qlinq_delivery t/00util/test_egress_errors t/00util/test_quicly_flexicast t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_qlinq_api t/00util/test_qlinq_reconnect t/00util/fuzz_transport_wire t/00util/fuzz_flexicast_frames t/00util/fuzz_flexicast_state t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
 		$(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
+
+
+# Optional Linux integration suite. It uses root/CAP_NET_ADMIN or an
+# unprivileged user namespace to verify native IPv4/IPv6 SSM across a bridge.
+check-flexicast-netns: t/00util/test_flexicast_transport gencerts
+	./t/netns_flexicast_ssm.sh
 
 # Check certificate lifetime on every invocation, including existing fixtures.
 # Grouped targets keep each certificate/key pair together under parallel make.
@@ -511,7 +569,7 @@ FORMAT_SOURCES := $(shell find src examples t/00util -type f \
 indent:
 	clang-format -style=file -i $(FORMAT_SOURCES)
 
-.PHONY: all clean check benchmark fuzz-wire check-submodules FORCE \
+.PHONY: all clean check check-flexicast-netns benchmark fuzz-wire fuzz-flexicast fuzz-flexicast-state check-submodules FORCE \
 	check-multipath-demo check-multipath-bw-demo check-multipath-bw-reports check-reports check-transit-reports check-transit-smoke check-sanitize soak release-check indent gencerts
 
 .PHONY: install-tun check-tun-tool check-tun-real package-tun

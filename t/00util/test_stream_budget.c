@@ -1097,7 +1097,7 @@ static int checkpoint_retires_redundant_recovery(void) {
   gap->pending_mask = 7;
   gap->last_seen = gap->largest_delivered = 11;
   gap->seen_initialized = gap->delivered_initialized = true;
-  gap->delivered_mask[0] = 3;
+  gap->delivered_mask[0] = (UINT64_C(1) << 10) | (UINT64_C(1) << 11);
   /* Covered, future, other-track and other-group partial objects coexist. */
   for (unsigned i = 0; i < 4; i++) {
     frame_assembler_t *a = &conn->assemblers[i];
@@ -1195,7 +1195,7 @@ static int checkpoint_repair_batch(size_t peer_limit, size_t aggregate_limit) {
                                       .first_object_id = 32 * n,
                                       .final_object_id = 32 * n + 31,
                                       .missing_mask = UINT32_MAX,
-                                      .cursor = 13};
+                                      .cursor = 29};
   }
   size_t expected = peer_limit < aggregate_limit ? peer_limit : aggregate_limit;
   if (expected > 32)
@@ -1203,19 +1203,80 @@ static int checkpoint_repair_batch(size_t peer_limit, size_t aggregate_limit) {
   transport_tick(t);
   CHECK(t->stats.repair_requests_sent == expected);
   CHECK(t->stats.repair_whole_object_requests_sent == expected);
-  CHECK(gap->recovery_windows[0].cursor == (13 + expected) % 32);
-  CHECK(gap->recovery_windows[0].last_request_ms > 0);
-  CHECK(gap->recovery_windows[1].last_request_ms == 0);
-  for (size_t n = 0; n < 32; n++) {
+  for (size_t window = 0; window < 2; window++) {
+    size_t admitted = (expected + 1 - window) / 2;
+    CHECK(gap->recovery_windows[window].cursor == (29 + admitted) % 32);
+    /* The retry interval starts after the entire request round, so a tick or
+     * token cap cannot delay the next previously unrequested object. */
+    CHECK(gap->recovery_windows[window].last_request_ms == 0);
+    for (size_t n = 0; n < 32; n++) {
+      uint8_t payload[32];
+      size_t written;
+      CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 7,
+                                   QLINQ_WIRE_NACK_RATELESS |
+                                       QLINQ_WIRE_NACK_WHOLE_OBJECT,
+                                   3, 32 * window + (29 + n) % 32, NULL, 0,
+                                   &written) == QLINQ_WIRE_OK);
+      CHECK(transport_stream_has_retained_frame(conn->stream, QLINQ_WIRE_NACK,
+                                                payload,
+                                                written) == (n < admitted));
+    }
+  }
+
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
+/* Alias and window rotations must be independent: otherwise two aliases
+ * can repeatedly select opposite windows and strand the other two forever. */
+static int checkpoint_alias_fairness(void) {
+  int failed = 0;
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn && t->client_conn->stream);
+  transport_conn_t *conn = t->client_conn;
+  conn->authenticated = conn->protocol_ready = true;
+  conn->negotiated_limits = t->limits;
+  conn->peer_capabilities |= QLINQ_WIRE_CAP_RATELESS_REPAIR;
+  t->limits.max_repair_requests_per_second = 1;
+  t->limits.max_aggregate_nack_requests_per_second = 1;
+  for (uint8_t alias = 7; alias < 9; alias++) {
+    CHECK(transport_subscriptions_add(
+        &conn->receive_subscriptions, MOQ_TRACK_DATA,
+        MOQ_TRACK_FLAG_FEC_RATELESS, alias == 7 ? "first" : "second", alias));
+    transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
+    for (size_t window = 0; window < 2; window++)
+      gap->recovery_windows[window] =
+          (transport_recovery_window_t){.active = true,
+                                        .group_id = 3,
+                                        .first_object_id = 32 * window,
+                                        .final_object_id = 32 * window,
+                                        .missing_mask = 1};
+  }
+  for (size_t round = 0; round < 4; round++) {
+    /* Model expired retry delays while replenishing only one token. Debt is
+     * retained, so repeated selection remains possible and observable. */
+    for (uint8_t alias = 7; alias < 9; alias++)
+      for (size_t window = 0; window < 2; window++)
+        transport_object_gap(conn, alias)
+            ->recovery_windows[window]
+            .last_request_ms = 0;
+    int64_t now = transport_get_time_ms();
+    conn->nack_request_limiter = (transport_repair_limiter_t){
+        .tokens_milli = 1000, .last_refill_ms = now};
+    t->aggregate_nack_limiter = conn->nack_request_limiter;
+    transport_tick(t);
+    CHECK(t->stats.repair_requests_sent == round + 1);
+    CHECK(t->stats.repair_requests_coalesced == 0);
     uint8_t payload[32];
     size_t written;
     CHECK(qlinq_wire_encode_nack(
-              payload, sizeof(payload), 7,
+              payload, sizeof(payload), (uint8_t)(7 + round % 2),
               QLINQ_WIRE_NACK_RATELESS | QLINQ_WIRE_NACK_WHOLE_OBJECT, 3,
-              (13 + n) % 32, NULL, 0, &written) == QLINQ_WIRE_OK);
+              32 * (round / 2), NULL, 0, &written) == QLINQ_WIRE_OK);
     CHECK(transport_stream_has_retained_frame(conn->stream, QLINQ_WIRE_NACK,
-                                              payload,
-                                              written) == (n < expected));
+                                              payload, written));
   }
 cleanup:
   if (!dispose(t))
@@ -1333,11 +1394,11 @@ int main(void) {
       repair_queue_preflight(64, 1000) || repair_queue_preflight(63, 24) ||
       repair_queue_preflight(64, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
       repair_queue_preflight(63, QLINQ_FEC_MAX_TOTAL_SYMBOLS) ||
-      checkpoint_repair_batch(1024, 1024) || checkpoint_repair_batch(2, 1024) ||
-      checkpoint_repair_batch(1024, 3) || entry_limit_and_control_failure() ||
-      byte_limits_and_recovery() || endpoint_vector_limit() ||
-      vector_capacity_compaction() || configurable_limits() ||
-      configured_frame_capacity(128U * 1024U, 2048) ||
+      checkpoint_alias_fairness() || checkpoint_repair_batch(1024, 1024) ||
+      checkpoint_repair_batch(2, 1024) || checkpoint_repair_batch(1024, 3) ||
+      entry_limit_and_control_failure() || byte_limits_and_recovery() ||
+      endpoint_vector_limit() || vector_capacity_compaction() ||
+      configurable_limits() || configured_frame_capacity(128U * 1024U, 2048) ||
       configured_frame_capacity(256U * 1024U, 4096) ||
       retained_nack_retries(false) || retained_nack_retries(true) ||
       retained_nack_ack_gap(false) || retained_nack_ack_gap(true) ||
