@@ -527,9 +527,10 @@ static int run_tunnel(const options_t *options) {
   while (!stopping &&
          (!options->run_ms || monotonic_ms() - started < options->run_ms)) {
     short ready_events = 0;
-    qlinq_status_t status =
-        qlinq_service_fd(context, options->mock ? 10 : 50, tun_fd,
-                         POLLIN | (queue.count ? POLLOUT : 0), &ready_events);
+    qlinq_status_t status = qlinq_service_fd(
+        context, options->mock ? 10 : 50, tun_fd,
+        (pending.size ? 0 : POLLIN) | (queue.count ? POLLOUT : 0),
+        &ready_events);
     if (status < QLINQ_STATUS_OK) {
       fprintf(stderr, "qlinq service failed: %d\n", status);
       result = 1;
@@ -610,7 +611,7 @@ static int run_tunnel(const options_t *options) {
         }
         pending.queued_ms = monotonic_ms();
       }
-      if (!qlinq_stream_is_writable(publisher)) {
+      if (strcmp(state, "connected") != 0) {
         /* drain kernel packets while disconnected instead of replaying a
          * stale burst when connectivity returns */
         pending.size = 0;
@@ -619,6 +620,8 @@ static int run_tunnel(const options_t *options) {
           break;
         continue;
       }
+      if (!qlinq_stream_is_writable(publisher))
+        break; /* Preserve pending until the configured queue age expires. */
       qlinq_record_t record = {.data = pending.bytes,
                                .size = pending.size,
                                .sequence = sent + 1,
@@ -650,7 +653,8 @@ static int run_tunnel(const options_t *options) {
   printf("direct TUN summary: sent=%llu received=%llu partial=%llu "
          "dropped=%llu\n",
          (unsigned long long)sent, (unsigned long long)received,
-         (unsigned long long)partial, (unsigned long long)queue.dropped);
+         (unsigned long long)partial,
+         (unsigned long long)(queue.dropped + tx_dropped));
   if (options->mock && options->run_ms && (!sent || !received))
     result = 1;
   qlinq_endpoint_shutdown(endpoint, "tunnel stopped");

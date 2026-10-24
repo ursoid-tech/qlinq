@@ -16,7 +16,7 @@
 
 typedef struct {
   int calls;
-  uint8_t payload[64];
+  uint8_t payload[512];
   size_t size;
   uint8_t priority;
 } test_state_t;
@@ -104,8 +104,7 @@ static void retry_and_ownership(void) {
   uint8_t registration[] = {MOQ_TRACK_DATA, MOQ_TRACK_FLAG_RELIABLE, 1, 'r'};
   assert(write(fd, registration, sizeof(registration)) == sizeof(registration));
   uint8_t frames[12] = {0};
-  uint32_t size = 1;
-  memcpy(frames, &size, 4);
+  frames[3] = 1; /* Literal big-endian length, independent of host order. */
   frames[5] = 42;
   memcpy(frames + 6, frames, 6);
   assert(write(fd, frames, sizeof(frames)) == sizeof(frames));
@@ -219,11 +218,10 @@ static void routing_and_zero_descriptor(void) {
       }
       if (cases[i].destination >= 0) {
         uint8_t frame[6];
-        uint32_t size;
         assert(read_exact(clients[cases[i].destination], frame,
                           sizeof(frame)) == 0);
-        memcpy(&size, frame, sizeof(size));
-        assert(size == 1 && frame[4] == 2 && frame[5] == 'z');
+        const uint8_t expected[] = {0, 0, 0, 1, 2, 'z'};
+        assert(memcmp(frame, expected, sizeof(expected)) == 0);
       }
     }
     data_uds_destroy(uds);
@@ -295,11 +293,10 @@ int main(void) {
     return 1;
   }
 
-  const uint8_t payload[] = "framed-payload";
-  uint32_t payload_size = sizeof(payload);
-  uint8_t frame[5 + sizeof(payload)];
-  memcpy(frame, &payload_size, 4);
-  frame[4] = 2;
+  uint8_t payload[258];
+  for (size_t i = 0; i < sizeof(payload); i++)
+    payload[i] = (uint8_t)i;
+  uint8_t frame[5 + sizeof(payload)] = {0, 0, 1, 2, 2};
   memcpy(frame + 5, payload, sizeof(payload));
   if (write_bytewise(fd, uds, frame, sizeof(frame)) != 0 || state.calls != 1 ||
       state.size != sizeof(payload) || state.priority != 2 ||
@@ -313,18 +310,17 @@ int main(void) {
   moq_track_id_t track = {.type = MOQ_TRACK_DATA,
                           .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
                           .name = "partial"};
-  const uint8_t reply[] = "queued-reply";
+  const uint8_t reply[258] = "queued-reply";
   if (!data_uds_send(uds, &track, reply, sizeof(reply), 1)) {
     close(fd);
     data_uds_destroy(uds);
     return 1;
   }
-  uint32_t reply_size;
-  uint8_t reply_priority;
+  uint8_t reply_header[5];
+  const uint8_t expected_header[] = {0, 0, 1, 2, 1};
   uint8_t reply_buf[sizeof(reply)];
-  if (read_exact(fd, &reply_size, sizeof(reply_size)) != 0 ||
-      read_exact(fd, &reply_priority, sizeof(reply_priority)) != 0 ||
-      reply_size != sizeof(reply) || reply_priority != 1 ||
+  if (read_exact(fd, reply_header, sizeof(reply_header)) != 0 ||
+      memcmp(reply_header, expected_header, sizeof(expected_header)) != 0 ||
       read_exact(fd, reply_buf, sizeof(reply_buf)) != 0 ||
       memcmp(reply_buf, reply, sizeof(reply)) != 0) {
     fprintf(stderr, "queued output framing failed\n");

@@ -97,7 +97,36 @@ static void missing_prefixes(void) {
 }
 #endif
 
+#ifdef __linux__
+static void netlink_addresses(void) {
+  struct {
+    struct rtattr peer;
+    struct in_addr peer_ip;
+    struct rtattr local;
+    struct in_addr local_ip;
+  } attrs = {.peer = {.rta_type = IFA_ADDRESS, .rta_len = RTA_LENGTH(4)},
+             .local = {.rta_type = IFA_LOCAL, .rta_len = RTA_LENGTH(4)}};
+  inet_pton(AF_INET, "192.0.2.1", &attrs.peer_ip);
+  inet_pton(AF_INET, "192.0.2.2", &attrs.local_ip);
+  ifmon_addr_t addr = {.family = AF_INET};
+  assert(parse_address_attributes(&addr, &attrs.peer, sizeof(attrs)));
+  assert(addr.ip.v4.s_addr == attrs.local_ip.s_addr);
+  assert(parse_address_attributes(&addr, &attrs.peer, RTA_LENGTH(4)));
+  assert(addr.ip.v4.s_addr == attrs.peer_ip.s_addr);
+  attrs.peer.rta_len = RTA_LENGTH(0);
+  assert(!parse_address_attributes(&addr, &attrs.peer, RTA_LENGTH(0)));
+  addr.family = AF_INET6;
+  attrs.peer.rta_len = RTA_LENGTH(4);
+  assert(!parse_address_attributes(&addr, &attrs.peer, RTA_LENGTH(4)));
+}
+#endif
+
 int main(void) {
+  assert(!is_iface_allowed("lo") && !is_iface_allowed("lo:1"));
+  assert(is_iface_allowed("lon0") && is_iface_allowed("local0"));
+#ifdef __linux__
+  netlink_addresses();
+#endif
   snapshot_changes();
 #ifndef _WIN32
   missing_prefixes();

@@ -118,7 +118,7 @@ bool transport_path_measure(transport_path_measurement_t *m,
       !m->initialized || m->quic_path != quic_path || now_ms < m->started_ms ||
       stats->acked < m->baseline.acked ||
       stats->bytes_acked < m->baseline.bytes_acked ||
-      stats->sent < m->baseline.sent ||
+      stats->sent < m->baseline.sent || stats->lost < m->baseline.lost ||
       !transport_endpoint_equal(&stats->local.sa, &m->baseline.local.sa) ||
       !transport_endpoint_equal(&stats->remote.sa, &m->baseline.remote.sa);
   if (reset) {
@@ -143,6 +143,14 @@ bool transport_path_measure(transport_path_measurement_t *m,
   uint64_t elapsed = now_ms - m->started_ms;
   if (elapsed < window_ms)
     return false;
+  uint64_t sent = stats->sent - m->baseline.sent;
+  uint64_t lost = stats->lost - m->baseline.lost;
+  if (sent != 0) {
+    if (lost > sent)
+      lost = sent;
+    m->recent_loss = (fp_t)((fp_wide_t)lost * FP_ONE / sent);
+    m->loss_sampled = true;
+  }
   uint64_t delivered = stats->bytes_acked - m->baseline.bytes_acked;
   fp_wide_t rate = (fp_wide_t)delivered * 1000 / elapsed;
   uint64_t observed = rate > UINT64_MAX ? UINT64_MAX : (uint64_t)rate;
@@ -153,6 +161,10 @@ bool transport_path_measure(transport_path_measurement_t *m,
   m->started_ms = now_ms;
   m->busy = busy;
   return false;
+}
+
+fp_t transport_path_recent_loss(const transport_path_measurement_t *m) {
+  return m && m->loss_sampled ? m->recent_loss : FP_FROM_FLOAT(0.01f);
 }
 
 fp_t transport_path_probe_cap(const transport_path_measurement_t *m,

@@ -314,7 +314,7 @@ t/00util/test_quicly_integration: t/00util/test_quicly_integration.o $(COMMON_OB
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=quicly_send,--wrap=quicly_receive,--wrap=quicly_close,--wrap=quicly_get_path_health
 endif
 
-$(filter-out $(QUICLY_INTEGRATION_TEST) t/00util/test_multipath_failover t/00util/test_multipath_feedback,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
+$(filter-out $(QUICLY_INTEGRATION_TEST) t/00util/test_multipath_failover t/00util/test_multipath_feedback t/00util/test_publication_limits,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 API_TESTS = t/00util/test_qlinq_policy \
@@ -423,6 +423,13 @@ CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_xfer_file t/00util/tes
 	t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls
 
 t/00util/test_multipath_failover: t/00util/test_multipath_failover.o $(filter-out src/common/transport_udp.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/transport_quicly_clock.o: src/common/transport_quicly.c Makefile
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
+		-Dclock_gettime=test_clock_gettime -c $< -o $@
+
+t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_quicly_clock.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # The feedback fixture delegates native operations except during its explicit

@@ -83,7 +83,8 @@ static bool write_exact(int fd, const void *buf, size_t size) {
 }
 
 static bool write_packet(int fd, const uint8_t *packet, uint32_t size) {
-  return write_exact(fd, &size, sizeof(size)) &&
+  uint32_t length_be = htonl(size);
+  return write_exact(fd, &length_be, sizeof(length_be)) &&
          write_exact(fd, &tund_priority, sizeof(tund_priority)) &&
          write_exact(fd, packet, size);
 }
@@ -249,12 +250,17 @@ int main(int argc, char **argv) {
 
     if (fds[1].revents & POLLIN) {
       /* read packet from UDS, write to TUN interface */
-      uint32_t pkt_len = 0;
+      uint32_t length_be;
       uint8_t rx_priority = 1;
       uint8_t packet[2048];
       /* Reject impossible sizes before waiting for the rest of the frame. */
-      if (!read_exact(uds_fd, &pkt_len, sizeof(pkt_len)) ||
-          pkt_len > sizeof(packet) ||
+      if (!read_exact(uds_fd, &length_be, sizeof(length_be))) {
+        close(uds_fd);
+        uds_fd = -1;
+        continue;
+      }
+      uint32_t pkt_len = ntohl(length_be);
+      if (pkt_len > sizeof(packet) ||
           !read_exact(uds_fd, &rx_priority, sizeof(rx_priority)) ||
           !read_exact(uds_fd, packet, pkt_len)) {
         close(uds_fd);

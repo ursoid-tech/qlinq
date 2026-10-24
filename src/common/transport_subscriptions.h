@@ -18,6 +18,7 @@ typedef struct {
   track_subscription_t *entries;
   size_t capacity;
   uint64_t next_generation;
+  uint16_t alias_entry[UINT8_MAX + 1U]; /* entry index plus one */
   transport_subscription_state_t *states[UINT8_MAX + 1U];
 } transport_subscription_table_t;
 

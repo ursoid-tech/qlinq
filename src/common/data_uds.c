@@ -166,7 +166,7 @@ static bool queue_client_frame(uds_client_t *client, const uint8_t *buf,
     client->output_capacity = capacity;
   }
 
-  uint32_t payload_size = (uint32_t)size;
+  uint32_t payload_size = htonl((uint32_t)size);
   memcpy(client->output + client->output_len, &payload_size,
          sizeof(payload_size));
   client->output[client->output_len + sizeof(payload_size)] = priority;
@@ -424,7 +424,9 @@ static int process_client_input(data_uds_t *d, uds_client_t *client) {
       return ret;
 
     if (client->payload_size == 0 && client->payload_len == 0) {
-      memcpy(&client->payload_size, client->frame_header, sizeof(uint32_t));
+      uint32_t length_be;
+      memcpy(&length_be, client->frame_header, sizeof(length_be));
+      client->payload_size = ntohl(length_be);
       client->priority = client->frame_header[sizeof(uint32_t)];
       size_t max_payload = (client->track_id.flags & MOQ_TRACK_FLAG_RELIABLE)
                                ? TRANSPORT_MAX_RELIABLE_OBJECT_SIZE

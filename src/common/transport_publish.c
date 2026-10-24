@@ -141,7 +141,7 @@ static size_t collect_paths(transport_t *t, transport_conn_t *conn,
                             size_t estimate_symbol_size, uint64_t admission_now,
                             publication_path_t *paths) {
   size_t active_paths = 0;
-  uint64_t measure_now = ptls_get_time.cb(&ptls_get_time);
+  uint64_t measure_now = transport_get_time_ms();
   for (size_t physical = 0; physical < t->socket_count; physical++) {
     quicly_path_stats_t stats;
     size_t mapped = transport_path_get_eligible_by_local(
@@ -171,6 +171,8 @@ static size_t collect_paths(transport_t *t, transport_conn_t *conn,
     candidate->sample = transport_path_estimate_on_path(
         conn->quic, mapped, &stats, queued, t->sockets[physical].egress.bytes,
         estimate_symbol_size, relative_owd);
+    candidate->sample.p =
+        transport_path_recent_loss(measured ? &path->measurement : NULL);
     /* Datagram groups leave QLINQ's queue quickly, but remain serialized by
      * QUIC until the path ACKs them.  Include that outstanding work in the
      * Pathflow input, as the stream scheduler does, so a fast path is not
@@ -844,7 +846,7 @@ group_record(transport_t *t, const moq_object_t *obj, size_t fec_limit) {
       return TRANSPORT_PUBLISH_ERROR;
   }
 
-  uint64_t now = ptls_get_time.cb(&ptls_get_time);
+  uint64_t now = transport_get_time_ms();
   if (group->size == 0) {
     size_t count = transport_connection_count(t);
     for (size_t i = 0; i < count; i++) {

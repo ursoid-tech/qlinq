@@ -11,7 +11,7 @@ import time
 import uuid
 
 
-LENGTH = struct.Struct("=I")
+LENGTH = struct.Struct("!I")
 TIMEOUT = 3
 TRACK = b"framing-test"
 
@@ -115,7 +115,9 @@ def main():
                             expect_disconnect(peer)
 
                         with accept_peer(listener) as peer:
-                            size = LENGTH.unpack(read_exact(peer, LENGTH.size))[0]
+                            length_bytes = read_exact(peer, LENGTH.size)
+                            assert length_bytes == b"\x00\x00\x00\x40"
+                            size = LENGTH.unpack(length_bytes)[0]
                             priority = read_exact(peer, 1)[0]
                             assert size == 64 and priority == 2
                             payload = read_exact(peer, size)

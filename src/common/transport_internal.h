@@ -140,6 +140,7 @@ struct transport_t {
   uint32_t fec_assembler_timeout_ms;
   uint8_t simulated_loss_rate;
   arena_t arena;
+  uint8_t send_buffer[64 * 1500];
 
   transport_pending_group_t pending_group;
   transport_fec_track_state_t fec_tracks[TRANSPORT_HARD_MAX_SUBSCRIPTIONS];
@@ -169,6 +170,7 @@ struct transport_conn_t {
   uint64_t stream_frames_received;
   uint64_t datagrams_received;
   uint64_t malformed_datagrams;
+  uint64_t telemetry_reply_at_ns[UINT8_MAX + 1U];
 
   quicly_stream_t *stream;
   frame_assembler_t assemblers[TRANSPORT_HARD_MAX_ASSEMBLERS];
@@ -279,6 +281,7 @@ void transport_assembler_observe_receive(transport_conn_t *conn,
 void transport_release_assembler(transport_t *t, frame_assembler_t *assembler);
 bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
                               uint16_t symbols, uint16_t symbol_size);
+size_t transport_select_datagram_path(transport_conn_t *conn);
 bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
                               ptls_iovec_t datagram);
 

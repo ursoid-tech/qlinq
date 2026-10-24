@@ -67,14 +67,11 @@ int transport_subscriptions_find_by_alias(
   if (!table || !out_track)
     return -1;
   memset(out_track, 0, sizeof(*out_track));
-  for (size_t i = 0; i < table->capacity; i++) {
-    const track_subscription_t *entry = &table->entries[i];
-    if (entry->active && entry->alias == alias) {
-      *out_track = entry->track_id;
-      return 0;
-    }
-  }
-  return -1;
+  uint16_t slot = table->alias_entry[alias];
+  if (slot == 0)
+    return -1;
+  *out_track = table->entries[slot - 1U].track_id;
+  return 0;
 }
 
 int transport_subscriptions_find_alias(
@@ -132,6 +129,8 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
         memset(table->states[alias], 0, sizeof(*table->states[alias]));
         table->states[alias]->generation = ++table->next_generation;
       }
+      table->alias_entry[entry->alias] = 0;
+      table->alias_entry[alias] = (uint16_t)(i + 1U);
       entry->alias = alias;
       return true;
     }
@@ -150,6 +149,7 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
       memcpy(entry->track_id.name, name, name_len + 1U);
       entry->alias = alias;
       entry->active = true;
+      table->alias_entry[alias] = (uint16_t)(i + 1U);
       return true;
     }
   }
@@ -164,6 +164,7 @@ void transport_subscriptions_remove(transport_subscription_table_t *table,
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && track_matches(&entry->track_id, type, name)) {
       entry->active = false;
+      table->alias_entry[entry->alias] = 0;
       free(table->states[entry->alias]);
       table->states[entry->alias] = NULL;
       if (entry->stream)

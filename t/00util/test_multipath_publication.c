@@ -1,5 +1,6 @@
 #include "transport_fixture.h"
 #include "transport_paths.h"
+#include "transport_wire.h"
 
 #include <stdio.h>
 
@@ -49,6 +50,55 @@ static void update_measurements(transport_fixture_t *f) {
   transport_tick(f->server.transport);
 }
 
+static void check_feedback(transport_fixture_t *f,
+                           const moq_track_id_t *track) {
+  transport_conn_t *conn = f->client.conn;
+  transport_t *t = conn->transport;
+  uint8_t alias;
+  assert(transport_subscriptions_find_alias(&conn->receive_subscriptions, track,
+                                            &alias) == 0);
+  size_t path = transport_select_datagram_path(conn);
+  assert(path != SIZE_MAX && path != 63);
+  size_t before = quicly_get_num_datagram_frames_path(conn->quic, path);
+  uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + 3] = {0};
+  qlinq_wire_fec_header_t header = {.alias = alias,
+                                    .path_id = 63,
+                                    .group_id = 999,
+                                    .object_id = 999,
+                                    .total_symbols = 2,
+                                    .data_symbols = 2,
+                                    .symbol_size = 3,
+                                    .original_size = 6};
+  assert(qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) ==
+         QLINQ_WIRE_OK);
+  t->receive_datagram.cb(&t->receive_datagram, conn->quic,
+                         ptls_iovec_init(packet, sizeof(packet)));
+  assert(quicly_get_num_datagram_frames_path(conn->quic, path) == before + 1);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, 63) == 0);
+  conn->telemetry_reply_at_ns[63] = transport_get_time_ns() + 1000000000U;
+  for (size_t i = 0; i < 100; i++)
+    t->receive_datagram.cb(&t->receive_datagram, conn->quic,
+                           ptls_iovec_init(packet, sizeof(packet)));
+  assert(quicly_get_num_datagram_frames_path(conn->quic, path) == before + 1);
+  header.path_id = UINT8_MAX;
+  assert(qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) ==
+         QLINQ_WIRE_OK);
+  t->receive_datagram.cb(&t->receive_datagram, conn->quic,
+                         ptls_iovec_init(packet, sizeof(packet)));
+  assert(quicly_get_num_datagram_frames_path(conn->quic, path) == before + 1);
+  header.path_id = 62;
+  header.original_size = 0;
+  assert(qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) ==
+         QLINQ_WIRE_OK);
+  t->receive_datagram.cb(&t->receive_datagram, conn->quic,
+                         ptls_iovec_init(packet, sizeof(packet)));
+  assert(quicly_get_num_datagram_frames_path(conn->quic, path) == before + 1);
+  /* Clear the incomplete synthetic object without affecting delivery counts. */
+  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
+    if (conn->assemblers[i].total_symbols)
+      transport_release_assembler(t, &conn->assemblers[i]);
+}
+
 int main(void) {
   transport_fixture_t f;
   size_t paths[2];
@@ -57,6 +107,21 @@ int main(void) {
                           .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
                           .name = "native-path-history"};
   fixture_subscribe(&f, &f.client, track);
+  for (size_t i = 0; i < 100; i++)
+    fixture_tick(&f);
+
+  check_feedback(&f, &track);
+
+  /* An occupied primary queue must not hide another native path sharing
+   * the same local socket. Both repair routing and readiness need it. */
+  uint8_t ignored = 0xff;
+  ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
+  for (size_t i =
+           quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]);
+       i < QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY; i++)
+    assert(transport_queue_datagram(f.server.conn, paths[0], frame));
+  assert(transport_select_datagram_path(f.server.conn) == paths[1]);
+  assert(transport_is_track_ready(f.server.transport, &track));
   for (size_t i = 0; i < 100; i++)
     fixture_tick(&f);
 
@@ -111,6 +176,8 @@ int main(void) {
   assert(transport_path_get_eligible_by_local(
              f.server.conn->quic, &f.server.transport->sockets[0].local_addr,
              &stats) == paths[1]);
+  assert(transport_select_datagram_path(f.server.conn) == paths[1]);
+  assert(transport_is_track_ready(f.server.transport, &track));
   uint8_t payload[2000];
   memset(payload, 0x5a, sizeof(payload));
   moq_object_t object = {.track_id = track,

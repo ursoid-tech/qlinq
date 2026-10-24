@@ -435,7 +435,14 @@ static int test_subscription_state_lifetime(void) {
   CHECK(transport_subscriptions_next_alias(&table, 8) == 8 &&
             transport_subscriptions_next_alias(&table, 9) == 10,
         "alias remap releases the old alias and reserves the new one");
+  moq_track_id_t by_alias;
+  CHECK(transport_subscriptions_find_by_alias(&table, 8, &by_alias) != 0 &&
+            transport_subscriptions_find_by_alias(&table, 9, &by_alias) == 0 &&
+            strcmp(by_alias.name, "one") == 0,
+        "alias index migrates with subscription");
   transport_subscriptions_remove(&table, MOQ_TRACK_DATA, "one");
+  CHECK(transport_subscriptions_find_by_alias(&table, 9, &by_alias) != 0,
+        "removed alias cannot resolve stale track");
   CHECK(!transport_subscriptions_get_state(&table, 9) &&
             transport_subscriptions_next_alias(&table, 9) == 9,
         "unsubscribe releases recovery state");
@@ -501,6 +508,27 @@ static int test_path_pacing_inputs(void) {
   CHECK(transport_path_probe_cap(&measurement, &stats, 1120, 1601) ==
             FP_FROM_INT(FP_SAFE_WHOLE),
         "stale ACK observations do not cap a recovered path");
+
+  /* A long clean lifetime must not dilute a new loss burst. */
+  stats.sent = 1000000;
+  stats.acked = 1000000;
+  stats.lost = 0;
+  memset(&measurement, 0, sizeof(measurement));
+  CHECK(transport_path_measure(&measurement, &stats, 0, 0, 2000),
+        "initialize loss baseline after long clean lifetime");
+  stats.sent += 100;
+  stats.lost += 50;
+  transport_path_measure(&measurement, &stats, 0, 0, 2100);
+  CHECK(transport_path_recent_loss(&measurement) == FP_ONE / 2,
+        "recent loss reflects burst independently of lifetime");
+  stats.sent += 100;
+  transport_path_measure(&measurement, &stats, 0, 0, 2200);
+  CHECK(transport_path_recent_loss(&measurement) == 0,
+        "clean window clears recent loss");
+  stats.lost = 0;
+  CHECK(transport_path_measure(&measurement, &stats, 0, 0, 2300) &&
+            !measurement.loss_sampled,
+        "loss counter reset starts fresh measurement");
 
   transport_path_budget_t budget = {0};
   CHECK(transport_path_budget_burst(FP_FROM_INT(100)) == 8 &&

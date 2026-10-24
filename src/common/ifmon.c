@@ -10,6 +10,7 @@
 #include <net/if.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,7 +88,7 @@ static int is_iface_allowed(const char *name) {
     return 0;
 
   /* Linux / Generic */
-  if (strncmp(name, "lo", 2) == 0)
+  if (strcmp(name, "lo") == 0 || strncmp(name, "lo:", 3) == 0)
     return 0;
   if (strncmp(name, "tun", 3) == 0)
     return 0;
@@ -213,6 +214,25 @@ static void fill_missing_prefixes(ifmon_list_t *list) {
 #endif
 
 #if defined(__linux__)
+static bool parse_address_attributes(ifmon_addr_t *addr, struct rtattr *rta,
+                                     int rta_len) {
+  const void *local = NULL, *peer = NULL;
+  size_t size = addr->family == AF_INET ? sizeof(struct in_addr)
+                                        : sizeof(struct in6_addr);
+  for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
+    if (RTA_PAYLOAD(rta) < size)
+      continue;
+    if (rta->rta_type == IFA_LOCAL)
+      local = RTA_DATA(rta);
+    else if (rta->rta_type == IFA_ADDRESS)
+      peer = RTA_DATA(rta);
+  }
+  if (!local && !peer)
+    return false;
+  memcpy(&addr->ip, local ? local : peer, size);
+  return true;
+}
+
 int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
                    size_t scratchpad_size) {
   if (!list || !scratchpad || scratchpad_size < sizeof(struct nlmsghdr))
@@ -256,7 +276,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
         done1 = 1;
         break;
       }
-      if (nlh->nlmsg_type == RTM_NEWLINK) {
+      if (nlh->nlmsg_type == RTM_NEWLINK &&
+          nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(struct ifinfomsg))) {
         struct ifinfomsg *ifi = (struct ifinfomsg *)NLMSG_DATA(nlh);
         if (!(ifi->ifi_flags & IFF_UP))
           continue;
@@ -275,12 +296,15 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
           int rta_len = nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct ifinfomsg));
           for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
             if (rta->rta_type == IFLA_IFNAME) {
-              strncpy(iface->name, (char *)RTA_DATA(rta),
-                      sizeof(iface->name) - 1);
+              size_t length = RTA_PAYLOAD(rta);
+              if (length > sizeof(iface->name) - 1)
+                length = sizeof(iface->name) - 1;
+              memcpy(iface->name, RTA_DATA(rta), length);
             } else if (rta->rta_type == IFLA_ADDRESS) {
               format_mac((uint8_t *)RTA_DATA(rta), RTA_PAYLOAD(rta),
                          iface->hw_addr);
-            } else if (rta->rta_type == IFLA_OPERSTATE) {
+            } else if (rta->rta_type == IFLA_OPERSTATE &&
+                       RTA_PAYLOAD(rta) >= sizeof(uint8_t)) {
               uint8_t operstate = *(uint8_t *)RTA_DATA(rta);
               if (operstate != 6 /* IF_OPER_UP */ &&
                   operstate != 0 /* IF_OPER_UNKNOWN */) {
@@ -332,7 +356,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
         done2 = 1;
         break;
       }
-      if (nlh->nlmsg_type == RTM_NEWADDR) {
+      if (nlh->nlmsg_type == RTM_NEWADDR &&
+          nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(struct ifaddrmsg))) {
         struct ifaddrmsg *ifa = (struct ifaddrmsg *)NLMSG_DATA(nlh);
 
         ifmon_iface_t *iface = NULL;
@@ -354,16 +379,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
             struct rtattr *rta = IFA_RTA(ifa);
             int rta_len =
                 nlh->nlmsg_len - NLMSG_LENGTH(sizeof(struct ifaddrmsg));
-            for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
-              if (rta->rta_type == IFA_ADDRESS) {
-                if (ifa->ifa_family == AF_INET) {
-                  memcpy(&addr->ip.v4, RTA_DATA(rta), sizeof(struct in_addr));
-                } else if (ifa->ifa_family == AF_INET6) {
-                  memcpy(&addr->ip.v6, RTA_DATA(rta), sizeof(struct in6_addr));
-                }
-              }
-            }
-            iface->addr_count++;
+            if (parse_address_attributes(addr, rta, rta_len))
+              iface->addr_count++;
           }
         }
       }

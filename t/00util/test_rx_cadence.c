@@ -51,7 +51,7 @@ static int fake_clock(clockid_t clock, struct timespec *ts) {
   return 0;
 }
 static int64_t fake_ms(void) {
-  return (int64_t)(wall / 1000000U);
+  return (int64_t)(mono / 1000000U);
 }
 static size_t fake_fds(transport_t *t, struct pollfd *fds, size_t cap) {
   (void)t;
@@ -231,7 +231,8 @@ static void timing_and_idle(void) {
   service_ok(1);
   assert(waits == 1 && !masked_waits && requested == 0 && ticks == 1);
   reset();
-  wall += 800000;
+  mono += 800000;
+  endpoint.rx_service_started_ns += 800000;
   deadline = fake_ms() + 1;
   service_ok(1);
   assert(masked_waits == 1 && requested == 200000);
@@ -277,7 +278,7 @@ static void timing_and_idle(void) {
   deadline = fake_ms() + 1;
   wall += 2000000;
   assert(rx_cadence_remaining(1000000U, mono - 250000, mono, 1, deadline,
-                              &ordinary) == 0);
+                              &ordinary) == 750000);
   reset();
   deadline = fake_ms() + 1;
   wall -= 2000000;

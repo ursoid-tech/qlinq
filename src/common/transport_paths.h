@@ -14,7 +14,7 @@
 #define TRANSPORT_PATH_BURST_MAX 64U
 
 /* Counter windows belong to one QUIC path, rather than its physical socket.
- * They provide a recent, per-path ACK-rate lower bound for probing. */
+ * They provide recent loss and a per-path ACK-rate lower bound for probing. */
 typedef struct {
   quicly_path_stats_t baseline;
   uint64_t started_ms;
@@ -22,7 +22,8 @@ typedef struct {
   uint64_t probe_rates[4], probe_times[4];
   size_t probe_cursor;
   uint32_t minimum_rtt;
-  bool initialized, busy;
+  fp_t recent_loss;
+  bool initialized, busy, loss_sampled;
 } transport_path_measurement_t;
 
 bool transport_path_measure(transport_path_measurement_t *measurement,
@@ -31,6 +32,8 @@ bool transport_path_measure(transport_path_measurement_t *measurement,
 /* A recent ACK rate is demand-limited on an underused path. It caps the
  * cwnd/RTT estimate only while a busy path has RTT inflation; an absent,
  * stale, or clean-RTT sample deliberately leaves that estimate alone. */
+fp_t transport_path_recent_loss(
+    const transport_path_measurement_t *measurement);
 fp_t transport_path_probe_cap(const transport_path_measurement_t *measurement,
                               const quicly_path_stats_t *stats,
                               size_t symbol_size, uint64_t now_ms);

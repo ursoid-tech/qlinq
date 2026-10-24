@@ -205,12 +205,15 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
                             const transport_repair_batch_t *repair) {
   size_t queued = 0;
   for (size_t i = 0; i < repair->count; i++) {
+    size_t path = transport_select_datagram_path(conn);
+    if (path == SIZE_MAX)
+      break;
     uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + QLINQ_FEC_MAX_SYMBOL_SIZE];
     size_t packet_len = QLINQ_WIRE_FEC_HEADER_SIZE + repair->symbol_size;
     qlinq_wire_fec_header_t header = {.alias = alias,
                                       .is_keyframe = cached->is_keyframe,
                                       .priority = cached->priority,
-                                      .path_id = 0,
+                                      .path_id = (uint8_t)path,
                                       .group_id = cached->group_id,
                                       .object_id = cached->object_id,
                                       .symbol_index = repair->indices[i],
@@ -224,7 +227,8 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
       break;
     memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE,
            repair->symbols + i * repair->symbol_size, repair->symbol_size);
-    if (!transport_queue_datagram(conn, 0, ptls_iovec_init(packet, packet_len)))
+    if (!transport_queue_datagram(conn, path,
+                                  ptls_iovec_init(packet, packet_len)))
       break;
     queued++;
   }
@@ -293,18 +297,13 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
     t->stats.repair_requests_aggregate_throttled++;
     return true;
   }
-  /* charge request but avoid encoding parity if repair queue is full */
-  if (rateless && indices_valid && missing_count != 0 &&
-      cached->next_repair_symbol >= cached->data_symbols &&
-      cached->next_repair_symbol < QLINQ_FEC_MAX_TOTAL_SYMBOLS &&
-      quicly_get_num_datagram_frames_path(conn->quic, 0) >=
-          QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY) {
-    quicly_path_health_t health;
-    if (quicly_get_path_health(conn->quic, 0, &health) == 0 &&
-        !health.abandoned) {
-      t->stats.repair_queue_failures++;
-      return true;
-    }
+  /* Charge the request, but avoid encoding when no eligible queue has room. */
+  if (indices_valid && missing_count != 0 &&
+      transport_select_datagram_path(conn) == SIZE_MAX) {
+    if (rateless && cached->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS)
+      t->stats.repair_rateless_exhausted++;
+    t->stats.repair_queue_failures++;
+    return true;
   }
 
   transport_repair_batch_t repair;
@@ -833,17 +832,6 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     return;
   }
 
-  /* automatically send a telemetry reply to measure OWD */
-  uint8_t reply[QLINQ_WIRE_TELEMETRY_SIZE];
-  qlinq_wire_telemetry_t telemetry = {.path_id = hdr.path_id,
-                                      .send_time_ns = hdr.send_time_ns,
-                                      .recv_time_ns = transport_get_time_ns()};
-  if (qlinq_wire_encode_telemetry(reply, sizeof(reply), &telemetry) ==
-      QLINQ_WIRE_OK) {
-    ptls_iovec_t reply_vec = ptls_iovec_init(reply, sizeof(reply));
-    (void)transport_queue_datagram(tconn, hdr.path_id, reply_vec);
-  }
-
   uint8_t is_keyframe = hdr.is_keyframe;
   uint64_t group_id = hdr.group_id;
   uint64_t object_id = hdr.object_id;
@@ -866,6 +854,28 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
   if (payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size)
     goto malformed_datagram;
+
+  /* The echoed ID belongs to the sender, never to our local path table.
+   * Bound feedback per wire path, and reserve queue space for application data.
+   */
+  uint64_t now_ns = transport_get_time_ns();
+  if (hdr.path_id < TRANSPORT_MAX_QUIC_PATHS &&
+      now_ns >= tconn->telemetry_reply_at_ns[hdr.path_id]) {
+    tconn->telemetry_reply_at_ns[hdr.path_id] = now_ns + 10000000U;
+    size_t reply_path = transport_select_datagram_path(tconn);
+    if (reply_path != SIZE_MAX &&
+        quicly_get_num_datagram_frames_path(conn, reply_path) <
+            QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY / 2) {
+      uint8_t reply[QLINQ_WIRE_TELEMETRY_SIZE];
+      qlinq_wire_telemetry_t telemetry = {.path_id = hdr.path_id,
+                                          .send_time_ns = hdr.send_time_ns,
+                                          .recv_time_ns = now_ns};
+      if (qlinq_wire_encode_telemetry(reply, sizeof(reply), &telemetry) ==
+          QLINQ_WIRE_OK)
+        (void)transport_queue_datagram(tconn, reply_path,
+                                       ptls_iovec_init(reply, sizeof(reply)));
+    }
+  }
 
   bool rateless = (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
   bool rateless_data = resolved_track.type == MOQ_TRACK_DATA && rateless;
@@ -1027,14 +1037,15 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     }
 
     if (success) {
-      uint8_t *full_data = malloc(original_size);
-      if (!full_data)
-        return; /* out of memory */
+      /* Reused slots may have a wider stride. Compact toward the start;
+       * each destination ends before the next source block begins. */
+      uint8_t *full_data = asm_slot->buffer_storage;
       size_t bytes_left = original_size;
       for (size_t i = 0; i < data_symbols; i++) {
         size_t chunk = (bytes_left < symbol_size) ? bytes_left : symbol_size;
         if (chunk > 0) {
-          memcpy(full_data + (i * symbol_size), asm_slot->buffers[i], chunk);
+          if (full_data + i * symbol_size != asm_slot->buffers[i])
+            memmove(full_data + i * symbol_size, asm_slot->buffers[i], chunk);
           bytes_left -= chunk;
         }
       }
@@ -1058,7 +1069,6 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       if (!got_all_data)
         t->stats.fec_objects_decoded++;
       transport_emit_event(t, &ev);
-      free(full_data);
       transport_release_assembler(t, asm_slot);
     }
   }

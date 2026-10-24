@@ -41,6 +41,13 @@ typedef data_uds_result_t (*data_uds_record_callback_t)(
 typedef bool (*data_uds_is_ready_callback_t)(void *user_data,
                                              const moq_track_id_t *track_id);
 
+/* UDS wire format: register with u8 track_type, u8 flags, u8 name_length,
+ * then name_length name bytes (no terminator). Each subsequent frame in either
+ * direction is u32 payload_length in network byte order (big-endian), u8
+ * priority, then payload_length payload bytes. Length excludes the 5-byte
+ * header.
+ */
+
 /* create and destroy a UDS generic data socket listener */
 data_uds_t *data_uds_create(const char *socket_name,
                             data_uds_callback_t callback,

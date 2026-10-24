@@ -6,9 +6,12 @@
 
 static uint64_t group_timer_now;
 
-static uint64_t group_timer_time(ptls_get_time_t *self) {
-  (void)self;
-  return group_timer_now;
+int test_clock_gettime(clockid_t id, struct timespec *ts) {
+  if (id != CLOCK_MONOTONIC || group_timer_now == 0)
+    return clock_gettime(id, ts);
+  ts->tv_sec = group_timer_now / 1000;
+  ts->tv_nsec = (group_timer_now % 1000) * 1000000;
+  return 0;
 }
 
 static void fill_queue(transport_conn_t *conn, size_t count) {
@@ -334,9 +337,7 @@ static void test_group_timer_backpressure(void) {
                                     .active = true,
                                     .has_objects = true,
                                     .next_object_id = t->sent_cache.capacity};
-  ptls_get_time_t saved_time = ptls_get_time;
-  group_timer_now = ptls_get_time.cb(&ptls_get_time);
-  ptls_get_time.cb = group_timer_time;
+  group_timer_now = transport_get_time_ms();
   assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
   uint64_t started = t->pending_group.started_at_ms;
   group_timer_now += 3;
@@ -408,7 +409,7 @@ static void test_group_timer_backpressure(void) {
          t->pending_group.size == 0 &&
          t->pending_group.flush_retry_at_ms == 0 && !f.server.failed &&
          !f.client.failed);
-  ptls_get_time = saved_time;
+  group_timer_now = 0;
   free(timer_view);
   fixture_destroy(&f);
 }

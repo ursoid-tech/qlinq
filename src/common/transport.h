@@ -505,10 +505,11 @@ size_t transport_get_datagram_symbol_size(const transport_t *t);
 /* check if a track is ready for more data (application-layer backpressure) */
 bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id);
 
-/* get current time in milliseconds */
+/* Current CLOCK_MONOTONIC time in milliseconds (not a Unix timestamp). */
 int64_t transport_get_time_ms(void);
 
-/* query earliest timeout timestamp in milliseconds for pacer and timers */
+/* Earliest timeout in the same monotonic milliseconds as transport_get_time_ms.
+ */
 int64_t transport_get_first_timeout(transport_t *t);
 
 struct pollfd;

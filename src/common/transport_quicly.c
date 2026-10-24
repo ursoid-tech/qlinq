@@ -49,7 +49,7 @@
 
 uint64_t transport_get_time_ns(void) {
   struct timespec ts;
-  clock_gettime(CLOCK_REALTIME, &ts);
+  clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
@@ -58,6 +58,12 @@ uint64_t transport_get_monotonic_ns(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
+
+static void monotonic_now_cb(quicly_now_t *self, double *now) {
+  (void)self;
+  *now = (double)transport_get_monotonic_ns() / 1000000.0;
+}
+static quicly_now_t transport_monotonic_now = {monotonic_now_cb};
 
 /* Exact identities share hash buckets; collisions never replace live objects.
  * Slot references are offset by one so calloc initializes empty indexes. */
@@ -331,6 +337,38 @@ static void accumulate_egress_stats(transport_stats_t *stats,
     stats->egress_peak_bytes = egress->peak_bytes;
 }
 
+/* Resolve local ownership independently of peer wire IDs. Prefer an empty
+ * queue, then the lower RTT; reselect for every repair symbol in a batch. */
+size_t transport_select_datagram_path(transport_conn_t *conn) {
+  size_t best = SIZE_MAX, best_queued = SIZE_MAX;
+  uint32_t best_rtt = UINT32_MAX;
+  transport_t *t = conn->transport;
+  for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+    quicly_path_stats_t stats;
+    quicly_path_health_t health;
+    if (!quicly_is_path_available(conn->quic, path) ||
+        quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
+        (quicly_get_path_health(conn->quic, path, &health) == 0 &&
+         health.state == QUICLY_PATH_SUSPECT))
+      continue;
+    bool owned = false;
+    for (size_t physical = 0; physical < t->socket_count; physical++)
+      owned |= transport_path_matches_local(&stats,
+                                            &t->sockets[physical].local_addr);
+    if (!owned)
+      continue;
+    size_t queued = quicly_get_num_datagram_frames_path(conn->quic, path);
+    if (queued < QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY &&
+        (queued < best_queued ||
+         (queued == best_queued && stats.rtt_smoothed < best_rtt))) {
+      best = path;
+      best_queued = queued;
+      best_rtt = stats.rtt_smoothed;
+    }
+  }
+  return best;
+}
+
 bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
                               ptls_iovec_t datagram) {
   quicly_path_stats_t path_stats;
@@ -489,6 +527,7 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
     path_t sample = transport_path_estimate_on_path(
         quic, path, &stats, quicly_get_num_datagram_frames_path(quic, path),
         t->sockets[physical].egress.bytes, symbol_size, relative_owd);
+    sample.p = transport_path_recent_loss(&physical_path->measurement);
     const path_state_t *state = &physical_path->state;
     if (state->initialized &&
         (physical_path->state_overridden ||
@@ -609,8 +648,6 @@ static void bind_to_device(int fd, uint32_t index) {
 #if defined(__linux__)
   char ifname[IF_NAMESIZE];
   if (if_indextoname(index, ifname)) {
-    if (strncmp(ifname, "veth", 4) == 0)
-      return;
     setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
   }
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||    \
@@ -1128,7 +1165,7 @@ transport_t *transport_create(const transport_config_t *config) {
     transport_log(t, TRANSPORT_LOG_WARNING, "simulation", 0, SIZE_MAX,
                   "simulated packet loss is enabled");
 
-  t->last_pathflow_update = ptls_get_time.cb(&ptls_get_time);
+  t->last_pathflow_update = transport_get_time_ms();
 
   if (pipe(t->ifmon_pipe) == 0) {
     if (set_fd_nonblocking(t->ifmon_pipe[0]) &&
@@ -1156,6 +1193,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->verifier_initialized = false;
 
   t->quic_ctx = quicly_spec_context;
+  t->quic_ctx.now = &transport_monotonic_now;
   /* Use Quicly's native adaptive requester and its supported receive delay. */
   t->quic_ctx.transport_params.min_ack_delay_usec =
       QUICLY_LOCAL_MAX_ACK_DELAY * 1000u;
@@ -1789,6 +1827,7 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
         path_t sample = transport_path_estimate_on_path(
             target->quic, mapped, &stats, queued, t->sockets[i].egress.bytes,
             symbol_size, relative_owd);
+        sample.p = transport_path_recent_loss(&target->paths[i].measurement);
         fp_t cap = transport_path_probe_cap(&target->paths[i].measurement,
                                             &stats, symbol_size, now);
         if (sample.b > cap)
@@ -1830,7 +1869,6 @@ static void service_connections(transport_t *t, uint64_t now) {
 
       quicly_address_t dest, src;
       struct iovec dgrams[64];
-      uint8_t dgrams_buf[64 * 1500];
       size_t num_dgrams = 64;
       /* qlinq_path_scheduler_send chooses one path for each native batch.
        * Quicly may consume the whole output batch on that path, so bound
@@ -1845,8 +1883,8 @@ static void service_connections(transport_t *t, uint64_t now) {
        * Stream-only output uses smaller UDP aggregates independently of the
        * native batch size; retained egress must carry the same limit. */
       quicly_error_t send_res =
-          quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams, dgrams_buf,
-                      sizeof(dgrams_buf));
+          quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams,
+                      t->send_buffer, sizeof(t->send_buffer));
       if (send_res == 0) {
         if (num_dgrams == 0)
           break;
@@ -1969,7 +2007,7 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
       t->pending_group.flush_retry_cache_releases !=
           t->stats.recovery_cache_releases)
     flush_group_on_timer(t);
-  uint64_t now = ptls_get_time.cb(&ptls_get_time);
+  uint64_t now = transport_get_time_ms();
   update_path_measurements(t, now);
   service_connections(t, now);
   t->tick_active = false;
@@ -2090,7 +2128,7 @@ bool transport_unsubscribe(transport_t *t, moq_track_id_t track_id) {
     if (!unsubscribe_connection(t, conn, &track_id))
       succeeded = false;
   }
-  return found && succeeded;
+  return !found || succeeded;
 }
 
 bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
@@ -2555,14 +2593,28 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
     } else {
       if (conn->admission_retry_at_ns > transport_get_monotonic_ns())
         return false;
-      for (size_t p = 0; p < TRANSPORT_MAX_QUIC_PATHS; p++) {
-        size_t queued = quicly_get_num_datagram_frames_path(conn->quic, p);
-        if (queued >= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4)
-          return false;
+      bool ready = false;
+      for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+        quicly_path_stats_t stats;
+        quicly_path_health_t health;
+        if (!quicly_is_path_available(conn->quic, path) ||
+            quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
+            (quicly_get_path_health(conn->quic, path, &health) == 0 &&
+             health.state == QUICLY_PATH_SUSPECT))
+          continue;
+        bool owned = false;
+        for (size_t physical = 0; physical < t->socket_count; physical++)
+          owned |= transport_path_matches_local(
+              &stats, &t->sockets[physical].local_addr);
+        if (owned &&
+            quicly_get_num_datagram_frames_path(conn->quic, path) <
+                QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4 &&
+            stats.cwnd != 0 && stats.bytes_in_flight / 2 < stats.cwnd) {
+          ready = true;
+          break;
+        }
       }
-      quicly_path_stats_t pstats;
-      if (quicly_get_path_stats(conn->quic, 0, &pstats) == 0 &&
-          pstats.bytes_in_flight >= pstats.cwnd * 2)
+      if (!ready)
         return false;
     }
   }
@@ -2571,7 +2623,7 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
 }
 
 int64_t transport_get_time_ms(void) {
-  return (int64_t)ptls_get_time.cb(&ptls_get_time);
+  return (int64_t)(transport_get_monotonic_ns() / 1000000U);
 }
 
 int64_t transport_get_first_timeout(transport_t *t) {
@@ -2600,10 +2652,10 @@ int64_t transport_get_first_timeout(transport_t *t) {
       } else {
         uint64_t delta = conn->admission_retry_at_ns - monotonic_now;
         uint64_t delay_ms = delta / 1000000U + (delta % 1000000U != 0);
-        int64_t wall_now = transport_get_time_ms();
-        int64_t retry_at = delay_ms > (uint64_t)(INT64_MAX - wall_now)
+        int64_t timer_now = transport_get_time_ms();
+        int64_t retry_at = delay_ms > (uint64_t)(INT64_MAX - timer_now)
                                ? INT64_MAX
-                               : wall_now + (int64_t)delay_ms;
+                               : timer_now + (int64_t)delay_ms;
         if (retry_at < first_timeout)
           first_timeout = retry_at;
       }

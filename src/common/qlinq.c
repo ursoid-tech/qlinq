@@ -1193,9 +1193,8 @@ static bool rx_endpoint_receive_only(const qlinq_endpoint_t *endpoint) {
   return subscribed;
 }
 
-/* Native deadlines are wall milliseconds. Map their remaining duration to
- * the earlier monotonic sample, subtracting clock-read/setup time. The caller
- * budget and service-start cadence never slide. Failure expires the wait. */
+/* Native deadlines, caller budgets and cadence share a monotonic clock.
+ * Subtract setup time without sliding the original service-start deadline. */
 static uint64_t rx_cadence_remaining(uint64_t window_ns,
                                      uint64_t previous_start,
                                      uint64_t caller_start, int timeout_ms,
@@ -1205,19 +1204,19 @@ static uint64_t rx_cadence_remaining(uint64_t window_ns,
       caller_start > UINT64_MAX - (uint64_t)timeout_ms * 1000000U)
     return 0;
   uint64_t before = rx_clock_ns(CLOCK_MONOTONIC);
-  uint64_t wall = rx_clock_ns(CLOCK_REALTIME);
+  uint64_t sampled = rx_clock_ns(CLOCK_MONOTONIC);
   uint64_t now = rx_clock_ns(CLOCK_MONOTONIC);
-  if (!before || !wall || now < before || before < caller_start)
+  if (!before || !sampled || now < sampled || sampled < before ||
+      before < caller_start)
     return 0;
   uint64_t target = caller_start + (uint64_t)timeout_ms * 1000000U;
   if (deadline >= 0 && deadline != INT64_MAX &&
       (uint64_t)deadline <= UINT64_MAX / 1000000U) {
-    uint64_t native_wall = (uint64_t)deadline * 1000000U;
-    if (native_wall <= wall)
+    uint64_t native = (uint64_t)deadline * 1000000U;
+    if (native <= now)
       return 0;
-    uint64_t delta = native_wall - wall;
-    if (delta <= UINT64_MAX - before && before + delta < target)
-      target = before + delta;
+    if (native < target)
+      target = native;
   }
   *ordinary_ns = target > now ? target - now : 0;
   if (!window_ns || !previous_start || previous_start > before ||
