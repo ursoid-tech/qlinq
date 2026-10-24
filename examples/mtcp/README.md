@@ -20,9 +20,37 @@ From a fresh recursive clone of qlinq:
 
 ```sh
 git clone --recurse-submodules https://github.com/ursoid-tech/qlinq.git
-cd qlinq/examples/mtcp
+cd qlinq
+cd examples/mtcp
 ./build.sh
 ```
+Qlinq enables Quicly's native adaptive ACK requester (`ack_frequency = 128`)
+and advertises its native 25 ms receive-delay floor. Ordinary delayed ACKs
+remain two ACK-eliciting packets or 25 ms until the native loss/CWND gate
+activates; adaptive tolerance is capped at 10 packets. Handshake, immediate-ACK
+and multipath policy handling use the pinned native implementation. This does
+not configure a fixed ACK32/8 ms policy.
+
+To select CUBIC, pacing and Fusion, with bounded receive batching:
+
+```sh
+sudo env QLINQ_CRYPTO_BACKEND=fusion QLINQ_EXPERIMENT_RX_CADENCE_USEC=1000 \
+    QLINQ_BENCH_CC=cubic QLINQ_BENCH_PACING=on \
+    ./run.sh records 100M 60
+```
+
+`QLINQ_BENCH_CC` accepts `default`, `reno`, `pico`, or `cubic`;
+`QLINQ_BENCH_PACING` accepts `default`, `off`, or `on`. Both default to the
+library policy when unset. These controls are read only at startup; record
+scheduling, payload verification and CPU accounting are unchanged. Requested
+settings are retained in each run's `config.json` and endpoint logs.
+
+Receive batching is Linux-only and opt-in. It delays UDP readability for up to
+1 ms after the previous service start, including unread encrypted control.
+Caller/native deadlines, pending output, known backlog, handshakes and multiple
+peers bypass or shorten the wait. Scheduling can exceed the requested delay.
+Hold other runtime options fixed when comparing a change; compiler flags and
+the record workload remain unchanged.
 
 Build without sudo. The default source root is `../..`; while this directory
 is staged outside qlinq, use `./build.sh /absolute/path/to/qlinq` instead.
@@ -148,3 +176,23 @@ collector, not automatically to every run of these examples or a future HEAD.
 - `lab.sh`: configure/remove the isolated two-path network and credentials.
 - `run.sh`: launch both endpoints, collect diagnostics and print a summary.
 - `verify.sh`: independently check raw samples and two-path evidence.
+
+### UDP payload policy
+
+`QLINQ_BENCH_UDP_PAYLOAD` selects the existing public endpoint limit
+`limits.max_udp_payload_bytes` before connection setup. Leaving it unset keeps
+the library's 1,280-byte default. The lab accepts 1,200–1,472 bytes; its IPv4
+veth links have a 1,500-byte MTU. A value of 1,452 also leaves room for IPv6
+and UDP headers within that MTU. For example:
+
+```sh
+sudo env QLINQ_CRYPTO_BACKEND=fusion QLINQ_BENCH_CC=cubic \
+  QLINQ_BENCH_PACING=on QLINQ_EXPERIMENT_RX_CADENCE_USEC=1000 \
+  QLINQ_BENCH_UDP_PAYLOAD=1452 ./run.sh records 100M 60
+```
+
+The requested payload ceiling is recorded in `config.json` and endpoint stderr.
+This changes connection policy only; record generation, admission, validation,
+latency logging, and CPU accounting are unchanged. MPTCP uses the same driver
+and workload and ignores this QUIC-specific setting. Rebuild the driver after
+updating `records.c`.

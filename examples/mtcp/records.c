@@ -167,9 +167,24 @@ static void configure_policy(qlinq_endpoint_config_t *cfg) {
     fprintf(stderr, "invalid QLINQ_BENCH_PACING: %s\n", pacing);
     exit(2);
   }
+  const char *udp_payload = getenv("QLINQ_BENCH_UDP_PAYLOAD");
+  if (udp_payload && *udp_payload) {
+    char *end;
+    errno = 0;
+    unsigned long bytes = strtoul(udp_payload, &end, 10);
+    /* isolated IPv4 lab has 1500-byte MTU; do not fragment packets */
+    if (errno || end == udp_payload || *end || bytes < 1200 || bytes > 1472) {
+      fprintf(stderr, "invalid QLINQ_BENCH_UDP_PAYLOAD: %s\n", udp_payload);
+      exit(2);
+    }
+    cfg->limits.max_udp_payload_bytes = (size_t)bytes;
+  }
   fprintf(stderr,
-          "qlinq requested controller=%s pacing=%s initial_cwnd_packets=100\n",
-          cc, pacing);
+          "qlinq requested controller=%s pacing=%s initial_cwnd_packets=100 "
+          "udp_payload_bytes=%zu\n",
+          cc, pacing,
+          cfg->limits.max_udp_payload_bytes ? cfg->limits.max_udp_payload_bytes
+                                            : 1280U);
 }
 
 static void run_qlinq(int paths, const char *cert, const char *key) {

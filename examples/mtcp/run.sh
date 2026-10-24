@@ -65,9 +65,10 @@ jq -n --arg mode "$BACKEND" --arg profile "$PROFILE" --argjson seconds "$DURATIO
     --arg cc "${QLINQ_BENCH_CC:-default}" --arg pacing "${QLINQ_BENCH_PACING:-default}" \
     --arg crypto "${QLINQ_CRYPTO_BACKEND:-openssl}" \
     --arg cadence "${QLINQ_EXPERIMENT_RX_CADENCE_USEC:-disabled}" \
+    --arg udp_payload "${QLINQ_BENCH_UDP_PAYLOAD:-1280}" \
     '{mode:$mode,profile:$profile,seconds:$seconds,offered_mbps:$mbps,start_ns:$start,record_bytes:8192,drain_seconds:10,
       qlinq_requested_policy:(if $mode=="mptcp" then null else
-        {controller:$cc,pacing:$pacing,crypto:$crypto,rx_cadence_usec:$cadence} end)}' > "$OUT/config.json"
+        {controller:$cc,pacing:$pacing,crypto:$crypto,rx_cadence_usec:$cadence,udp_payload_bytes:$udp_payload} end)}' > "$OUT/config.json"
 for role in receiver sender; do
     if [[ $role == receiver ]]; then NS=qm-server; else NS=qm-client; fi
     (cd "$OUT/$role" && exec timeout --kill-after=2 "$((DURATION+20))" \
