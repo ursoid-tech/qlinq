@@ -732,6 +732,8 @@ static bool set_fd_nonblocking(int fd) {
 
 static int open_unicast_socket(int family) {
   int fd = socket(family, SOCK_DGRAM, 0);
+  if (fd >= 0)
+    (void)transport_udp_enable_recv_ecn(fd, family);
   if (fd >= 0 && family == AF_INET6) {
     /* A wildcard IPv6 path must not claim a separately configured IPv4 path's
      * port. Each physical socket and its address matching stay family-specific.
@@ -1022,13 +1024,15 @@ transport_t *transport_create(const transport_config_t *config) {
            (config->reconnect_max_delay_ms != 0
                 ? config->reconnect_max_delay_ms
                 : TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS)) ||
+      config->simulated_flexicast_feedback_loss_rate > 100 ||
       (!config->verify_peer && !config->allow_insecure_peer)) {
     if (config && config->callback && config->port != 0 &&
         config->num_bind_hosts > 0 &&
         config->num_bind_hosts <= TRANSPORT_MAX_PATHS &&
         config->num_path_interface_names <= TRANSPORT_MAX_PATHS &&
         config->num_remote_hosts <= TRANSPORT_MAX_PATHS &&
-        config->simulated_loss_rate <= 100)
+        config->simulated_loss_rate <= 100 &&
+        config->simulated_flexicast_feedback_loss_rate <= 100)
       fprintf(stderr,
               "transport: peer verification requires verify_peer or explicit "
               "allow_insecure_peer\n");
@@ -1067,6 +1071,8 @@ transport_t *transport_create(const transport_config_t *config) {
     t->sockets[i].fd = -1;
     t->sockets[i].remote_index = SIZE_MAX;
   }
+  for (size_t i = 0; i < 2; i++)
+    t->flexicast_fds[i] = -1;
   t->owner_thread = pthread_self();
   atomic_init(&t->cross_thread_violations, 0);
   t->limits = limits;
@@ -1080,15 +1086,69 @@ transport_t *transport_create(const transport_config_t *config) {
                                  limits.max_recovery_cache_bytes,
                                  recovery_object_bytes))
     goto Fail;
+
+  t->flexicast_enabled = config->enable_flexicast;
   if (config->repair_mode != TRANSPORT_REPAIR_MODE_AUTO &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_INDEXED &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS)
     goto Fail;
   t->repair_mode = config->repair_mode;
+  if (config->flexicast_cc_mode != TRANSPORT_FLEXICAST_CC_MULTICAST &&
+      config->flexicast_cc_mode != TRANSPORT_FLEXICAST_CC_ADAPTIVE) {
+    goto Fail;
+  }
+  if (config->flexicast_repair_route != TRANSPORT_FLEXICAST_REPAIR_SHARED &&
+      config->flexicast_repair_route != TRANSPORT_FLEXICAST_REPAIR_UNICAST) {
+    goto Fail;
+  }
+  if ((config->flexicast_cc_minimum_rate != 0 &&
+       config->flexicast_cc_maximum_rate != 0 &&
+       config->flexicast_cc_minimum_rate > config->flexicast_cc_maximum_rate) ||
+      (config->flexicast_cc_startup_rate != 0 &&
+       config->flexicast_cc_minimum_rate != 0 &&
+       config->flexicast_cc_startup_rate < config->flexicast_cc_minimum_rate) ||
+      (config->flexicast_cc_startup_rate != 0 &&
+       config->flexicast_cc_maximum_rate != 0 &&
+       config->flexicast_cc_startup_rate > config->flexicast_cc_maximum_rate)) {
+    fprintf(stderr, "transport: invalid Flexicast congestion-control rates\n");
+    goto Fail;
+  }
+  t->flexicast_cc_mode = config->flexicast_cc_mode;
+  t->flexicast_cc_startup_rate = config->flexicast_cc_startup_rate;
+  t->flexicast_cc_minimum_rate = config->flexicast_cc_minimum_rate;
+  t->flexicast_cc_maximum_rate = config->flexicast_cc_maximum_rate;
+  t->flexicast_cc_aggregate_rate_limit =
+      config->flexicast_cc_aggregate_rate_limit;
+  t->flexicast_cc_feedback_timeout_ms =
+      config->flexicast_cc_feedback_timeout_ms;
+  t->flexicast_repair_route = config->flexicast_repair_route;
+  t->repair_feedback_nonce = config->repair_feedback_seed;
+  if (t->repair_feedback_nonce == 0)
+    ptls_openssl_random_bytes(&t->repair_feedback_nonce,
+                              sizeof(t->repair_feedback_nonce));
+  if (t->repair_feedback_nonce == 0)
+    t->repair_feedback_nonce = UINT64_C(0x9e3779b97f4a7c15);
+  t->repair_shadow_deadline_ms =
+      config->repair_shadow_deadline_ms != 0
+          ? config->repair_shadow_deadline_ms
+          : TRANSPORT_REPAIR_PLANNER_DEFAULT_DEADLINE_MS;
+  if (config->repair_shadow_log_file) {
+    t->repair_shadow_log = fopen(config->repair_shadow_log_file, "ab");
+    if (!t->repair_shadow_log) {
+      fprintf(stderr, "transport: unable to open repair shadow log '%s': %s\n",
+              config->repair_shadow_log_file, strerror(errno));
+      goto Fail;
+    }
+    setvbuf(t->repair_shadow_log, NULL, _IOLBF, 0);
+  }
   t->next_conn_id = 1;
 
   t->conns = calloc(t->limits.max_connections, sizeof(*t->conns));
   if (!t->conns)
+    goto Fail;
+  if (t->flexicast_enabled && !transport_flexicast_registry_init(
+                                  &t->flexicast, TRANSPORT_FLEXICAST_MAX_FLOWS,
+                                  t->limits.max_connections))
     goto Fail;
   if (!transport_arena_init(&t->arena, 16U * 1024U * 1024U)) {
     transport_log(t, TRANSPORT_LOG_ERROR, "memory", 0, SIZE_MAX,
@@ -1125,6 +1185,8 @@ transport_t *transport_create(const transport_config_t *config) {
   if (config->simulated_loss_rate != 0)
     transport_log(t, TRANSPORT_LOG_WARNING, "simulation", 0, SIZE_MAX,
                   "simulated packet loss is enabled");
+  t->simulated_flexicast_feedback_loss_rate =
+      config->simulated_flexicast_feedback_loss_rate;
 
   t->last_pathflow_update = ptls_get_time.cb(&ptls_get_time);
 
@@ -1185,6 +1247,8 @@ transport_t *transport_create(const transport_config_t *config) {
   quicly_amend_ptls_context(t->quic_ctx.tls);
   t->quic_ctx.stream_open = &t->stream_open;
   t->quic_ctx.receive_datagram_frame = &t->receive_datagram;
+  t->quic_ctx.receive_flexicast_frame = &t->receive_flexicast;
+  t->quic_ctx.receive_flexicast_ack = &t->receive_flexicast_ack;
 
   /* Never select a validated QUIC path after its owning physical socket has
    * been removed. Datagram scheduling applies the same invariant. */
@@ -1227,6 +1291,8 @@ transport_t *transport_create(const transport_config_t *config) {
 
   t->quic_ctx.transport_params.active_connection_id_limit = 8;
   t->quic_ctx.transport_params.initial_max_path_id = TRANSPORT_MAX_PATHS;
+  t->quic_ctx.transport_params.flexicast_support.ipv4 = t->flexicast_enabled;
+  t->quic_ctx.transport_params.flexicast_support.ipv6 = t->flexicast_enabled;
 
   t->num_remote_addrs = config->num_remote_hosts;
   for (size_t i = 0; i < config->num_bind_hosts; i++) {
@@ -1249,6 +1315,13 @@ transport_t *transport_create(const transport_config_t *config) {
     t->socket_count++;
   }
   resolve_configured_interfaces(t);
+
+  if (!transport_flexicast_configure(t, config->flexicast_group,
+                                     config->flexicast_group_port,
+                                     config->flexicast_interface)) {
+    transport_destroy(t);
+    return NULL;
+  }
 
   if (t->is_server || (config->cert_file && config->key_file)) {
     if (transport_tls_load_certificate_and_key(&t->tls_ctx, &t->sign_cert,
@@ -1391,6 +1464,10 @@ void transport_destroy(transport_t *t) {
     CLOSE_SOCKET(t->ifmon_pipe[1]);
   }
 
+  transport_flexicast_dispose(t);
+  for (size_t i = 0; i < 2; i++)
+    if (t->flexicast_fds[i] >= 0)
+      CLOSE_SOCKET(t->flexicast_fds[i]);
   for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
     destroy_socket(&t->sockets[i]);
 
@@ -1417,6 +1494,8 @@ void transport_destroy(transport_t *t) {
   dispose_tls_identity(&t->tls_ctx, &t->sign_cert);
 
   free(t->conns);
+  if (t->repair_shadow_log)
+    fclose(t->repair_shadow_log);
   free(t);
 }
 
@@ -1491,6 +1570,21 @@ static bool service_interfaces(transport_t *t) {
   ifmon_pipe_msg_t msg;
   while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
     consumed = true;
+    uint8_t version = msg.addr.ss_family == AF_INET    ? 4U
+                      : msg.addr.ss_family == AF_INET6 ? 6U
+                                                       : 0U;
+    const uint8_t *address =
+        msg.addr.ss_family == AF_INET
+            ? (const uint8_t *)&((struct sockaddr_in *)&msg.addr)->sin_addr
+        : msg.addr.ss_family == AF_INET6
+            ? (const uint8_t *)&((struct sockaddr_in6 *)&msg.addr)->sin6_addr
+            : NULL;
+    if (address) {
+      if (msg.is_added)
+        transport_flexicast_interface_added(t, version, address, msg.index);
+      else
+        transport_flexicast_interface_removed(t, version, address, msg.index);
+    }
     if (msg.is_added)
       add_interface(t, &msg);
     else
@@ -1500,10 +1594,23 @@ static bool service_interfaces(transport_t *t) {
 }
 
 static void transport_receive_datagram(transport_t *t, size_t fd_idx,
-                                       const uint8_t *buf, size_t len,
-                                       struct sockaddr_storage *source) {
+                                       uint8_t *buf, size_t len,
+                                       struct sockaddr_storage *source,
+                                       uint8_t ecn) {
   t->sockets[fd_idx].bytes_received += len;
 
+  transport_conn_t *flexicast_source = NULL;
+  ptls_iovec_t flexicast_payload = ptls_iovec_init(NULL, 0);
+  if (transport_flexicast_receive_unicast_ecn(
+          t, buf, len, (struct sockaddr *)source, &flexicast_source,
+          &flexicast_payload, ecn)) {
+    if (flexicast_source && flexicast_payload.base &&
+        !(flexicast_source->authenticated && t->simulated_loss_rate > 0 &&
+          (rand() % 100) < t->simulated_loss_rate))
+      transport_protocol_receive_datagram(flexicast_source, flexicast_payload,
+                                          false);
+    return;
+  }
   struct sockaddr *psa = (struct sockaddr *)source;
 
   quicly_decoded_packet_t decoded;
@@ -1606,6 +1713,32 @@ static bool socket_receive_ready(int fd, const struct pollfd *fds,
 static void receive_packets(transport_t *t, const struct pollfd *fds,
                             size_t count) {
   size_t receive_budget = t->limits.max_packets_per_tick;
+  size_t flexicast_receive_budget = (receive_budget + 1U) / 2U;
+  for (size_t slot = 0;
+       t->flexicast_enabled && slot < 2 && flexicast_receive_budget > 0;
+       slot++) {
+    while (t->flexicast_fds[slot] >= 0 && flexicast_receive_budget > 0) {
+      uint8_t buf[2048];
+      transport_conn_t *flexicast_source = NULL;
+      ptls_iovec_t flexicast_payload = ptls_iovec_init(NULL, 0);
+      ssize_t rret = transport_flexicast_receive_native(
+          t, slot, buf, sizeof(buf), &flexicast_source, &flexicast_payload);
+      if (rret == -1) {
+        if (SOCKET_ERROR_CODE == SOCKET_EINTR)
+          continue;
+        break;
+      }
+      receive_budget--;
+      flexicast_receive_budget--;
+      if (flexicast_source && flexicast_payload.base) {
+        if (flexicast_source->authenticated && t->simulated_loss_rate > 0 &&
+            (rand() % 100) < t->simulated_loss_rate)
+          continue;
+        transport_protocol_receive_datagram(flexicast_source, flexicast_payload,
+                                            false);
+      }
+    }
+  }
   size_t receive_start =
       t->socket_count ? t->receive_cursor % t->socket_count : 0;
   t->receive_cursor =
@@ -1641,7 +1774,7 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
         for (ssize_t i = 0; i < received; i++)
           if (!views[i].dropped)
             transport_receive_datagram(t, fd_idx, views[i].data, views[i].size,
-                                       &views[i].source);
+                                       &views[i].source, views[i].ecn);
       } else {
         transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
         received = transport_udp_receive_batch(socket->fd, datagrams, batch);
@@ -1649,7 +1782,8 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
           /* Preserve recvfrom/recvmmsg's original copied-prefix dispatch. The
            * decoder validates each complete QUIC packet in that prefix. */
           transport_receive_datagram(t, fd_idx, datagrams[i].data,
-                                     datagrams[i].size, &datagrams[i].source);
+                                     datagrams[i].size, &datagrams[i].source,
+                                     datagrams[i].ecn);
         }
         more = received == (ssize_t)batch;
       }
@@ -1838,6 +1972,7 @@ static void service_connections(transport_t *t, uint64_t now) {
         transport_emit_event(t, &ev);
         t->stats.connections_closed++;
 
+        transport_flexicast_remove_connection(t, conn);
         transport_publish_checkpoint_connection_removed(t, conn);
         transport_connection_cache_forget(t, conn);
         destroy_connection(conn);
@@ -1936,9 +2071,12 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
       t->pending_group.flush_retry_cache_releases !=
           t->stats.recovery_cache_releases)
     flush_group_on_timer(t);
+  transport_flexicast_tick(t);
   uint64_t now = ptls_get_time.cb(&ptls_get_time);
   update_path_measurements(t, now);
   service_connections(t, now);
+  transport_protocol_poll_lifecycle(t);
+  transport_publish_poll_lifecycle(t);
   t->tick_active = false;
 }
 
@@ -1956,6 +2094,7 @@ static bool subscribe_connection(transport_conn_t *conn,
       &conn->receive_subscriptions, track_id);
   if (existing && existing->track_id.flags != track_id->flags)
     return false;
+  bool newly_added = false;
   uint8_t alias = existing ? existing->alias : 0;
   if (!existing) {
     if (transport_subscriptions_count(&conn->receive_subscriptions) >=
@@ -1974,6 +2113,7 @@ static bool subscribe_connection(transport_conn_t *conn,
                                      track_id->type, track_id->flags,
                                      track_id->name, alias))
       return false;
+    newly_added = true;
   }
 
   if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_SUBSCRIBE,
@@ -1983,7 +2123,9 @@ static bool subscribe_connection(transport_conn_t *conn,
                                      track_id->type, track_id->name);
     return false;
   }
-
+  if (newly_added && transport_object_gap(conn, alias))
+    memset(transport_object_gap(conn, alias), 0,
+           sizeof(*transport_object_gap(conn, alias)));
   return true;
 }
 
@@ -2030,6 +2172,9 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                           alias, &subscribed_track))
     return false;
 
+  transport_flexicast_unsubscribe(t, conn, &subscribed_track);
+  memset(transport_object_gap(conn, alias), 0,
+         sizeof(*transport_object_gap(conn, alias)));
   for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
     if (conn->assemblers[i].total_symbols &&
         conn->assemblers[i].track_id == alias)
@@ -2042,6 +2187,7 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
 bool transport_unsubscribe(transport_t *t, moq_track_id_t track_id) {
   if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id))
     return false;
+
   if (!t->is_server)
     return t->client_conn &&
            unsubscribe_connection(t, t->client_conn, &track_id);
@@ -2229,6 +2375,9 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
       atomic_load_explicit(&t->cross_thread_violations, memory_order_relaxed);
   stats->active_connections = transport_connection_count(t);
   stats->assembler_memory_bytes = t->assembler_memory_bytes;
+  stats->flexicast_cc_mode = t->flexicast_cc_mode;
+  stats->flexicast_active_flows = 0;
+  stats->flexicast_active_members = 0;
   int64_t now_ms = transport_get_time_ms();
   size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
@@ -2256,6 +2405,87 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
             (uint64_t)(now_ms - ack->oldest_unacked_sent_at_ms);
     }
   }
+  for (size_t f = 0; f < t->flexicast.capacity; f++) {
+    const transport_flexicast_flow_t *flow = &t->flexicast.flows[f];
+    if (!flow->active)
+      continue;
+    stats->flexicast_active_flows++;
+    if (flow->source)
+      stats->flexicast_active_members +=
+          transport_flexicast_listening_members(flow);
+    stats->flexicast_queued_packets +=
+        flow->data_queue.count + flow->repair_queue.count;
+    stats->flexicast_queued_bytes +=
+        flow->data_queue.bytes + flow->repair_queue.bytes;
+    const transport_flexicast_queue_t *queues[] = {&flow->data_queue,
+                                                   &flow->repair_queue};
+    for (size_t q = 0; q < 2; q++) {
+      for (size_t i = 0; i < queues[q]->count; i++) {
+        size_t slot = (queues[q]->head + i) % queues[q]->capacity;
+        const transport_flexicast_queued_payload_t *payload =
+            &queues[q]->entries[slot];
+        if (payload->packet) {
+          stats->flexicast_protected_packets_queued++;
+          stats->flexicast_protected_bytes_queued += payload->packet_size;
+        }
+      }
+    }
+    stats->repair_queued_packets += flow->repair_queue.count;
+    stats->repair_queued_bytes += flow->repair_queue.bytes;
+    stats->repair_pending_objects += flow->pending_repair_count;
+    for (size_t i = 0; i < flow->repair_queue.count; i++) {
+      size_t slot = (flow->repair_queue.head + i) % flow->repair_queue.capacity;
+      int64_t enqueued = flow->repair_queue.entries[slot].enqueued_at_ms;
+      if (enqueued > 0 && now_ms > enqueued &&
+          (uint64_t)(now_ms - enqueued) > stats->repair_oldest_age_ms)
+        stats->repair_oldest_age_ms = (uint64_t)(now_ms - enqueued);
+    }
+    for (size_t i = 0; i < TRANSPORT_FLEXICAST_PENDING_REPAIRS; i++) {
+      int64_t requested = flow->pending_repairs[i].first_request_ms;
+      if (flow->pending_repairs[i].active && requested > 0 &&
+          now_ms > requested &&
+          (uint64_t)(now_ms - requested) > stats->repair_oldest_age_ms)
+        stats->repair_oldest_age_ms = (uint64_t)(now_ms - requested);
+    }
+    if (flow->pacing_rate_bytes_per_second != 0 &&
+        (stats->flexicast_pacing_rate_bytes_per_second == 0 ||
+         flow->pacing_rate_bytes_per_second <
+             stats->flexicast_pacing_rate_bytes_per_second)) {
+      stats->flexicast_pacing_rate_bytes_per_second =
+          flow->pacing_rate_bytes_per_second;
+      if (flow->source && flow->crypto) {
+        quicly_flexicast_cc_output_t output;
+        quicly_flexicast_cc_get_flow_output(flow->crypto, &output);
+        stats->flexicast_cc_rate_bytes_per_second =
+            output.rate_bytes_per_second;
+        stats->flexicast_cc_burst_bytes = output.burst_bytes;
+        stats->flexicast_cc_limiting_member = output.limiting_member_id;
+      }
+    }
+    if (flow->source && flow->crypto) {
+      quicly_flexicast_cc_output_t output;
+      quicly_flexicast_cc_get_flow_output(flow->crypto, &output);
+      stats->flexicast_cc_rate_increase_events += output.rate_increase_events;
+      stats->flexicast_cc_rate_reduction_events += output.rate_reduction_events;
+      stats->flexicast_cc_floor_entry_events += output.floor_entry_events;
+      stats->flexicast_cc_floor_exit_events += output.floor_exit_events;
+      stats->flexicast_cc_ack_growth_events += output.ack_growth_events;
+      stats->flexicast_cc_other_growth_events += output.other_growth_events;
+      stats->flexicast_cc_loss_reduction_events += output.loss_reduction_events;
+      stats->flexicast_cc_rtt_reduction_events += output.rtt_reduction_events;
+      stats->flexicast_cc_ecn_reduction_events += output.ecn_reduction_events;
+      stats->flexicast_cc_timeout_reduction_events +=
+          output.timeout_reduction_events;
+      stats->flexicast_cc_rate_limit_reduction_events +=
+          output.rate_limit_reduction_events;
+      stats->flexicast_cc_other_reduction_events +=
+          output.other_reduction_events;
+      stats->flexicast_cc_external_load_growth_freeze_events +=
+          output.external_load_growth_freeze_events;
+    }
+  }
+  for (size_t m = 0; m < t->flexicast.capacity; m++)
+    stats->flexicast_active_memberships += t->flexicast.memberships[m].active;
   for (size_t i = 0; i < t->socket_count; i++) {
     const transport_egress_t *egress = &t->sockets[i].egress;
     accumulate_egress_stats(stats, egress, false);
@@ -2492,6 +2722,10 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
 
   transport_track_profile_t profile = transport_track_profile(track_id);
 
+  if (!profile.reliable && t->is_server && t->flexicast_enabled &&
+      !transport_flexicast_track_ready(t, track_id))
+    return false;
+
   size_t active_count = transport_connection_count(t);
   if (active_count == 0)
     return true; /* no peers means data is dropped anyway, so it's "ready" */
@@ -2602,6 +2836,10 @@ int64_t transport_get_first_timeout(transport_t *t) {
     }
   }
 
+  int64_t flexicast_timeout = transport_flexicast_get_first_timeout(t);
+  if (flexicast_timeout < first_timeout)
+    first_timeout = flexicast_timeout;
+
   return first_timeout;
 }
 
@@ -2621,9 +2859,15 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
       count++;
     }
   }
-  if (t->ifmon_pipe[0] >= 0 && count < max_fds) {
+  for (size_t i = 0; t->flexicast_enabled && i < 2 && count < max_fds; i++)
+    if (t->flexicast_fds[i] >= 0) {
+      fds[count].fd = t->flexicast_fds[i];
+      fds[count].events = POLLIN;
+      fds[count].revents = 0;
+      count++;
+    }
+  if (t->ifmon_pipe[0] >= 0 && count < max_fds)
     fds[count++] = (struct pollfd){.fd = t->ifmon_pipe[0], .events = POLLIN};
-  }
   return count;
 }
 
@@ -2677,23 +2921,5 @@ bool transport_rx_cadence_mask(transport_t *t, struct pollfd *fds,
     return false;
   for (size_t i = 0; i < udp_count; i++)
     fds[i].events &= (short)~POLLIN;
-  return true;
-}
-
-bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
-                               transport_track_stats_t *stats) {
-  if (!transport_owner_ok(t) || !transport_track_id_valid(track) || !stats)
-    return false;
-  *stats = (transport_track_stats_t){0};
-  size_t count = transport_connection_count(t);
-  for (size_t i = 0; i < count; i++) {
-    transport_conn_t *conn = transport_connection_at(t, i);
-    uint8_t alias;
-    if (conn && conn->authenticated && conn->quic &&
-        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
-        transport_subscriptions_find_alias(&conn->send_subscriptions, track,
-                                           &alias) == 0)
-      stats->subscribers++;
-  }
   return true;
 }
