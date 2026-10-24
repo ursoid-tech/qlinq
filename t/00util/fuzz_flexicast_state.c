@@ -27,6 +27,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
          QUICLY_FLEXICAST_OK);
   uint8_t active = 0, pending[512] = {0};
   uint64_t first = 0, next = 0;
+  uint64_t loss_cursor[8] = {0};
   transport_sent_cache_t cache = {0};
   uint8_t payload[64];
   bool cached[512] = {0};
@@ -43,12 +44,15 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (action == 0) {
       assert(quicly_flexicast_attach_at(source, member + 1, now) ==
              QUICLY_FLEXICAST_OK);
+      if ((active & bit) == 0)
+        loss_cursor[member] = next;
       active |= bit;
     } else if (action == 1) {
       (void)quicly_flexicast_detach_at(source, member + 1, now);
       active &= (uint8_t)~bit;
       for (uint64_t pn = first; pn < next; pn++)
         pending[pn] &= (uint8_t)~bit;
+      loss_cursor[member] = next;
     } else if (action == 2 && active != 0) {
       memset(payload, data[offset + 1], sizeof(payload));
       uint8_t packet[128], duplicate[128];
@@ -88,13 +92,28 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
       }
     } else if ((action == 3 || action == 4) && next != 0) {
       uint64_t pn = data[offset + 1] % next;
-      if (action == 3)
-        (void)quicly_flexicast_ack_at(source, member + 1, pn, &complete, now);
-      else
-        (void)quicly_flexicast_abandon_datagram(source, member + 1, pn,
-                                                &complete);
-      if (active & bit)
-        pending[pn] &= (uint8_t)~bit;
+      if (action == 3) {
+        if (quicly_flexicast_ack_at(source, member + 1, pn, &complete, now) ==
+            QUICLY_FLEXICAST_OK) {
+          pending[pn] &= (uint8_t)~bit;
+          if (pn >= 3) {
+            uint64_t last_lost = pn - 3;
+            uint64_t cursor = loss_cursor[member];
+            if (cursor < first)
+              cursor = first;
+            if (cursor <= last_lost) {
+              for (uint64_t lost_pn = cursor; lost_pn <= last_lost; lost_pn++)
+                pending[lost_pn] &= (uint8_t)~bit;
+              loss_cursor[member] = last_lost + 1;
+            }
+          }
+        }
+      } else {
+        if (quicly_flexicast_abandon_datagram(
+                source, member + 1, pn, &complete) == QUICLY_FLEXICAST_OK) {
+          pending[pn] &= (uint8_t)~bit;
+        }
+      }
     } else if (action == 5) {
       secret[offset % sizeof(secret)]++;
       assert(quicly_flexicast_flow_rekey(
@@ -105,6 +124,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                  now) == QUICLY_FLEXICAST_OK);
       active = 0;
       first = next;
+      for (size_t i = 0; i < 8; i++)
+        loss_cursor[i] = next;
     } else if (action == 6 && next != 0) {
       uint64_t watermark = data[offset + 1] % next;
       size_t released = 0;
