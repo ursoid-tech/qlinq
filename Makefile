@@ -59,6 +59,7 @@ endif
 INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
+              deps/quicly/lib/bplus_ranges.c \
               deps/quicly/lib/defaults.c \
               deps/quicly/lib/frame.c \
               deps/quicly/lib/local_cid.c \
