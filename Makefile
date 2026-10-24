@@ -138,7 +138,7 @@ COMMON_OBJS = src/common/data_uds.o \
 DAEMON_OBJS = src/daemon/main.o \
               $(COMMON_OBJS)
 
-APP_OBJS = src/app/main.o
+APP_OBJS = src/app/main.o src/app/xfer.o src/app/xfer_file.o
 
 FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
@@ -272,6 +272,12 @@ check-transit-smoke: check-transit-reports gencerts
 			--output-dir "$$(mktemp -d "$$PWD/tmp/transit-smoke.XXXXXX")"; \
 	fi
 
+t/00util/test_xfer_protocol: t/00util/test_xfer_protocol.o src/app/xfer.o src/app/xfer_file.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_xfer_file: t/00util/test_xfer_file.o src/app/xfer_file.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 t/00util/test_fec: t/00util/test_fec.o $(FEC_OBJS)
 	$(CC) -o $@ t/00util/test_fec.o $(FEC_OBJS) $(LDFLAGS)
 
@@ -388,7 +394,7 @@ benchmark: t/00util/test_benchmark
 benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
-CHECK_BINARIES = t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
+CHECK_BINARIES = t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \

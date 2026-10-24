@@ -8,6 +8,7 @@
 #include "portable_sockets.h"
 #include "transport.h"
 #include "transport_wire.h"
+#include "xfer.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -52,6 +53,8 @@ typedef struct {
   uint32_t stats_ms;
   bool is_server;
   bool one_shot;
+  bool transfer;
+  uint32_t transfer_timeout_ms;
   bool pv;
   bool verbose;
   bool help;
@@ -78,6 +81,12 @@ typedef struct {
 typedef struct {
   const options_t *options;
   transport_t *transport;
+  app_xfer_t *xfer;
+  transport_conn_t *xfer_conn;
+  int64_t transfer_progress_at;
+  int64_t transfer_notify_at;
+  int64_t transfer_failure_at;
+  uint64_t transfer_disk_bytes;
   FILE *input;
   FILE *output;
   FILE *stats_output;
@@ -135,9 +144,12 @@ static void show_help(FILE *out, const char *program) {
           "  --max-aggregate-repairs N   source-wide repair requests/second\n"
           "  --loss PERCENT              test-only simulated packet loss\n\n"
           "Data:\n"
-          "  --track NAME                default qlinq-app/data\n"
+          "  --track NAME                default qlinq-app/data (xfer-v1 for "
+          "--transfer)\n"
           "  --mode datagram|fixed-fec|rateless|reliable (fec is an alias)\n"
           "  --repair-mode auto|indexed|rateless\n"
+          "  --transfer                  verified, resumable single-file copy\n"
+          "  --transfer-timeout-ms MS     no-progress timeout; default 60000\n"
           "  --input FILE|-              publish fixed-size records\n"
           "  --output FILE|-             write received records\n"
           "  --message-size BYTES        default 1200\n"
@@ -264,15 +276,25 @@ static void on_event(void *user_data, const transport_event_t *event) {
                                   options->auth_token_len) == 0;
     if (!transport_respond_auth(app->transport, event->conn, accepted))
       app->failed = true;
-    if (accepted)
+    if (accepted) {
+      if (app->xfer) {
+        app->xfer_conn = event->conn;
+        app_xfer_link(app->xfer, true);
+      }
       subscribe(app, event->conn);
+    }
     break;
   }
   case TRANSPORT_EVENT_AUTH_COMPLETE:
-    if (event->auth.success)
+    if (event->auth.success) {
+      if (app->xfer) {
+        app->xfer_conn = event->conn;
+        app_xfer_link(app->xfer, true);
+      }
       subscribe(app, event->conn);
-    else
+    } else {
       app->failed = true;
+    }
     break;
   case TRANSPORT_EVENT_SUBSCRIBE:
     if (event->track_id.type == options->track.type &&
@@ -286,6 +308,18 @@ static void on_event(void *user_data, const transport_event_t *event) {
       app->subscriptions--;
     break;
   case TRANSPORT_EVENT_OBJECT:
+    if (app->xfer) {
+      if (event->conn == app->xfer_conn &&
+          event->track_id.type == options->track.type &&
+          strcmp(event->track_id.name, options->track.name) == 0) {
+        (void)app_xfer_receive(app->xfer, event->object.data,
+                               event->object.size);
+        app->received_records++;
+        app->received_bytes += event->object.size;
+        app->transfer_progress_at = transport_get_time_ms();
+      }
+      break;
+    }
     if (event->track_id.type == options->track.type &&
         strcmp(event->track_id.name, options->track.name) == 0 &&
         !write_object(app, event)) {
@@ -294,6 +328,11 @@ static void on_event(void *user_data, const transport_event_t *event) {
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
+    if (app->xfer && event->conn == app->xfer_conn) {
+      app->subscriptions = 0;
+      app->xfer_conn = NULL;
+      app_xfer_link(app->xfer, false);
+    }
     if (options->verbose)
       fprintf(stderr,
               "qlinq-app: peer disconnected origin=%s class=%s code=%" PRIu64
@@ -496,11 +535,14 @@ static bool parse_options(int argc, char **argv, options_t *options) {
                                    .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
                                    .name = "qlinq-app/data"},
                          .drain_ms = 1000,
+                         .transfer_timeout_ms = 60000,
                          .node_id = "qlinq-app",
                          .message_size = 1200,
                          .repair_mode = TRANSPORT_REPAIR_MODE_AUTO,
                          .verify_peer = true};
   uint64_t parsed;
+  bool mode_set = false, raw_options = false, transfer_timeout_set = false;
+  bool track_set = false;
 
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
@@ -511,6 +553,10 @@ static bool parse_options(int argc, char **argv, options_t *options) {
     if (strcmp(arg, "--insecure-no-verify") == 0) {
       options->verify_peer = false;
       options->allow_insecure = true;
+      continue;
+    }
+    if (strcmp(arg, "--transfer") == 0) {
+      options->transfer = true;
       continue;
     }
     if (strcmp(arg, "--one-shot") == 0) {
@@ -528,7 +574,19 @@ static bool parse_options(int argc, char **argv, options_t *options) {
     if (++i >= argc)
       goto invalid;
     const char *value = argv[i];
-    if (strcmp(arg, "--listen") == 0) {
+    if (strcmp(arg, "--message-size") == 0 || strcmp(arg, "--count") == 0 ||
+        strcmp(arg, "--receive-count") == 0 ||
+        strcmp(arg, "--wait-subscribers") == 0 ||
+        strcmp(arg, "--repair-mode") == 0 ||
+        strcmp(arg, "--max-repair-requests") == 0 ||
+        strcmp(arg, "--max-aggregate-repairs") == 0)
+      raw_options = true;
+    if (strcmp(arg, "--transfer-timeout-ms") == 0) {
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed) || parsed == 0)
+        goto invalid;
+      options->transfer_timeout_ms = (uint32_t)parsed;
+      transfer_timeout_set = true;
+    } else if (strcmp(arg, "--listen") == 0) {
       if (!cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
         goto invalid;
       options->listen_port = (uint16_t)parsed;
@@ -566,10 +624,12 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         goto invalid;
       options->simulated_loss = (uint8_t)parsed;
     } else if (strcmp(arg, "--track") == 0) {
+      track_set = true;
       if (strlen(value) >= sizeof(options->track.name))
         goto invalid;
       strcpy(options->track.name, value);
     } else if (strcmp(arg, "--mode") == 0) {
+      mode_set = true;
       if (!cli_parse_track_mode(value, &options->track.flags))
         goto invalid;
     } else if (strcmp(arg, "--repair-mode") == 0) {
@@ -637,6 +697,26 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       (options->one_shot && !options->input_path) || !options->auth_token ||
       !options->auth_token[0])
     goto invalid;
+  if (options->transfer) {
+    if ((options->input_path != NULL) == (options->output_path != NULL) ||
+        strcmp(options->input_path ? options->input_path : options->output_path,
+               "-") == 0 ||
+        raw_options || options->max_connections > 1 ||
+        options->track.name[0] == '\0' ||
+        (mode_set && options->track.flags != MOQ_TRACK_FLAG_RELIABLE)) {
+      fprintf(stderr,
+              "qlinq-app: --transfer requires one regular input or output "
+              "file, reliable mode, and one peer; raw record options "
+              "are incompatible\n");
+      return false;
+    }
+    if (!track_set)
+      strcpy(options->track.name, "qlinq-app/xfer-v1");
+    options->track.flags = MOQ_TRACK_FLAG_RELIABLE;
+    options->max_connections = 1;
+  } else if (transfer_timeout_set) {
+    goto invalid;
+  }
   options->auth_token_len = strlen((const char *)options->auth_token);
   if (options->auth_token_len > UINT16_MAX ||
       ((options->track.flags &
@@ -655,9 +735,84 @@ invalid:
   return false;
 }
 
+/* service transfer worker queue and completion handshake */
+static bool service_transfer(app_t *app, int64_t now) {
+  const options_t *options = app->options;
+  if (now >= app->transfer_notify_at) {
+    app_xfer_progress(app->xfer);
+    uint32_t interval = options->transfer_timeout_ms / 3;
+    if (interval == 0)
+      interval = 1;
+    if (interval > 1000)
+      interval = 1000;
+    app->transfer_notify_at = now + interval;
+  }
+  for (unsigned i = 0; app->subscriptions != 0 && i < 64; i++) {
+    const void *data;
+    size_t size;
+    bool is_data;
+    if (!app_xfer_peek(app->xfer, &data, &size, &is_data) ||
+        (is_data && now < app->next_send_at))
+      break;
+    moq_object_t object = {.track_id = options->track,
+                           .object_id = app->sent_records,
+                           .data = data,
+                           .size = size,
+                           .priority = 1};
+    transport_publish_result_t result =
+        transport_publish_ex(app->transport, &object);
+    if (result == TRANSPORT_PUBLISH_BACKPRESSURE ||
+        result == TRANSPORT_PUBLISH_NO_RECIPIENTS)
+      break;
+    if (result != TRANSPORT_PUBLISH_DELIVERED &&
+        result != TRANSPORT_PUBLISH_BUFFERED) {
+      fprintf(stderr, "qlinq-app: transfer publication failed (%d)\n", result);
+      app->failed = true;
+      return false;
+    }
+    app_xfer_consume(app->xfer);
+    app->sent_records++;
+    app->transfer_progress_at = now;
+    if (is_data)
+      app->next_send_at = now + options->interval_ms;
+  }
+  app_xfer_status_t status;
+  app_xfer_status(app->xfer, &status);
+  transport_stats_t stats;
+  transport_get_stats(app->transport, &stats);
+  if (status.failed) {
+    /* allow time for diagnostic egress to drain */
+    if (app->transfer_failure_at == 0)
+      app->transfer_failure_at = now;
+    if ((!status.output_pending && stats.stream_egress_bytes == 0) ||
+        !app->xfer_conn ||
+        now - app->transfer_failure_at >= options->drain_ms) {
+      fprintf(stderr, "qlinq-app: transfer failed: %s\n", status.error);
+      app->failed = true;
+    }
+    return false;
+  }
+  if (status.done &&
+      ((!status.output_pending && stats.stream_egress_bytes == 0) ||
+       !app->xfer_conn)) {
+    fprintf(stderr, "qlinq-app: transfer committed\n");
+    return true;
+  }
+  if (status.disk_bytes != app->transfer_disk_bytes) {
+    app->transfer_disk_bytes = status.disk_bytes;
+    app->transfer_progress_at = now;
+  }
+  if (now - app->transfer_progress_at >= options->transfer_timeout_ms) {
+    fprintf(stderr, "qlinq-app: transfer timed out without progress\n");
+    app->failed = true;
+  }
+  return false;
+}
+
 static void service_app(app_t *app) {
   const options_t *options = app->options;
   app->started_at = transport_get_time_ms();
+  app->transfer_progress_at = app->started_at;
   app->next_stats_at = app->started_at + options->stats_ms;
   app->pv_last_at = app->started_at;
   app->next_pv_at = app->started_at + APP_PV_INTERVAL_MS;
@@ -678,8 +833,13 @@ static void service_app(app_t *app) {
     }
 #endif
     transport_tick(app->transport);
-    publish_pending(app, now);
-    finish_track(app, now);
+    if (app->xfer) {
+      if (service_transfer(app, now))
+        break;
+    } else {
+      publish_pending(app, now);
+      finish_track(app, now);
+    }
     print_stats(app, now, false);
     print_pv(app, now, false);
 
@@ -689,8 +849,8 @@ static void service_app(app_t *app) {
     bool receive_done =
         options->receive_limit == 0 ||
         (app->received_at != 0 && now - app->received_at >= options->drain_ms);
-    if ((options->one_shot || options->receive_limit != 0) && send_done &&
-        receive_done)
+    if (!app->xfer && (options->one_shot || options->receive_limit != 0) &&
+        send_done && receive_done)
       break;
 
     struct pollfd fds[TRANSPORT_MAX_POLL_FDS + 1];
@@ -715,6 +875,12 @@ static void service_app(app_t *app) {
                        (fds[input_index].revents & (POLLIN | POLLHUP)) != 0;
     load_input(app, input_ready);
   }
+  if (app->xfer) {
+    app_xfer_status_t status;
+    app_xfer_status(app->xfer, &status);
+    if (!status.done || status.failed)
+      app->failed = true;
+  }
   int64_t shutdown_started = transport_get_time_ms();
   transport_shutdown(app->transport,
                      running ? "application complete" : "signal shutdown");
@@ -730,7 +896,7 @@ static void service_app(app_t *app) {
 
 static int run_app(const options_t *options) {
   app_t app = {.options = options};
-  if (options->input_path) {
+  if (options->input_path && !options->transfer) {
     app.input = strcmp(options->input_path, "-") == 0
                     ? stdin
                     : fopen(options->input_path, "rb");
@@ -740,7 +906,7 @@ static int run_app(const options_t *options) {
       goto cleanup;
     }
   }
-  if (options->output_path) {
+  if (options->output_path && !options->transfer) {
     app.output = strcmp(options->output_path, "-") == 0
                      ? stdout
                      : fopen(options->output_path, "wb");
@@ -768,6 +934,14 @@ static int run_app(const options_t *options) {
             "recovery_oldest_checkpoint_age_ms\tegress_current_packets\t"
             "egress_current_bytes\tegress_peak_packets\tegress_peak_bytes\t"
             "udp_would_block\tpublish_backpressure\tpublish_errors\n");
+  }
+  if (options->transfer) {
+    app.xfer = app_xfer_create(options->input_path, options->output_path);
+    if (!app.xfer) {
+      fprintf(stderr, "qlinq-app: unable to create transfer worker\n");
+      app.failed = true;
+      goto cleanup;
+    }
   }
   app.message = malloc(options->message_size);
   if (!app.message) {
@@ -835,6 +1009,7 @@ cleanup_sockets:
     transport_destroy(app.transport);
   portable_socket_cleanup();
 cleanup:
+  app_xfer_destroy(app.xfer);
   cleanup_reorder(&app);
   free(app.message);
   if (app.input && app.input != stdin)

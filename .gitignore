@@ -113,3 +113,6 @@ qlinq-tun-engine
 /t/00util/test_qlinq_policy
 
 /t/00util/test_tun_names
+
+/t/00util/test_xfer_file
+/t/00util/test_xfer_protocol
