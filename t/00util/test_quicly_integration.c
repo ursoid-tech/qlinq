@@ -71,7 +71,7 @@ static void event(void *data, const transport_event_t *ev) {
 static transport_config_t config(bool server) {
   transport_config_t c = {.bind_hosts = {"127.0.0.1"},
                           .num_bind_hosts = 1,
-                          .port = 19938,
+                          .port = 19946,
                           .callback = event,
                           .allow_insecure_peer = true};
   if (server) {
@@ -151,6 +151,10 @@ static void test_fractional_rtt(void) {
       transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);
   assert(fast.b == FP_FROM_INT(48000) && slow.b == FP_FROM_INT(16000));
   assert(fast.l > 0 && fast.l < slow.l && slow.l < FP_ONE / 1000);
+  sample_health.rtt_smoothed = 0.01f;
+  path_t ultra_fast =
+      transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);
+  assert(ultra_fast.l == 1);
   sample_health.rtt_is_sampled = 0;
   path_t cold =
       transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);

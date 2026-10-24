@@ -13,7 +13,8 @@ static path_t estimate_with_rtt(float rtt_ms, const quicly_path_stats_t *stats,
                    .p = FP_FROM_FLOAT(0.01f)};
   if (stats) {
     if (isfinite(rtt_ms) && rtt_ms > 0) {
-      sample.l = FP_FROM_FLOAT(rtt_ms / 2000.0f);
+      fp_t latency = FP_FROM_FLOAT(rtt_ms / 2000.0f);
+      sample.l = latency > 0 ? latency : 1;
       if (stats->cwnd > 0 && symbol_size > 0) {
         /* preserve fractional symbols and sub-symbol rates */
         double rate =

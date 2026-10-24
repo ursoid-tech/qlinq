@@ -1653,8 +1653,10 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
           &decoded);
       if (ret != 0 && ret != QUICLY_ERROR_PACKET_IGNORED &&
           (ret != QUICLY_ERROR_STATE_EXHAUSTION ||
-           quicly_close(target->quic, ret, "receive failure") != 0))
+           quicly_close(target->quic, ret, "receive failure") != 0)) {
         discard_connection(target, ret, "receive failure");
+        break;
+      }
     }
   }
 }

@@ -57,12 +57,22 @@ uint8_t transport_udp_message_ecn(const struct msghdr *message) {
 static void append_ecn(struct msghdr *message, void *control, uint8_t ecn) {
   if (!ecn)
     return;
+  const struct sockaddr *destination = message->msg_name;
+  if (destination->sa_family != AF_INET && destination->sa_family != AF_INET6)
+    return;
+#ifndef IPV6_TCLASS
+  if (destination->sa_family == AF_INET6)
+    return;
+#endif
   struct cmsghdr *mark =
       (struct cmsghdr *)((uint8_t *)control + message->msg_controllen);
-  const struct sockaddr *destination = message->msg_name;
   mark->cmsg_level =
       destination->sa_family == AF_INET ? IPPROTO_IP : IPPROTO_IPV6;
+#ifdef IPV6_TCLASS
   mark->cmsg_type = destination->sa_family == AF_INET ? IP_TOS : IPV6_TCLASS;
+#else
+  mark->cmsg_type = IP_TOS;
+#endif
   mark->cmsg_len = CMSG_LEN(sizeof(int));
   int value = ecn;
   memcpy(CMSG_DATA(mark), &value, sizeof(value));
