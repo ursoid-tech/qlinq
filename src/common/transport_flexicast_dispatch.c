@@ -453,18 +453,28 @@ void tf_sample_supply_at(transport_t *t, transport_flexicast_flow_t *flow,
 static int64_t pacing_ready_at(const transport_t *t,
                                const transport_flexicast_flow_t *flow,
                                size_t cost, int64_t now) {
+  if (flow->pacing_last_refill_ms == 0)
+    return now; /* Let the service pass initialize pacing and CC hints. */
+  uint64_t tokens = flow->pacing_tokens, remainder = flow->pacing_remainder;
+  int64_t refill = flow->pacing_last_refill_ms;
+  refill_tokens(&tokens, &remainder, &refill, flow->pacing_rate_numerator,
+                flow->pacing_rate_divisor, flow->pacing_burst_bytes, now);
+  uint64_t shared = t->flexicast.pacing_tokens;
+  remainder = t->flexicast.pacing_remainder;
+  refill = t->flexicast.pacing_last_refill_ms;
+  refill_tokens(&shared, &remainder, &refill, t->flexicast.pacing_rate, 1,
+                t->flexicast.pacing_burst, now);
   uint64_t delay = 0;
-  if (cost > pacing_available(t, flow)) {
+  if (cost > tokens ||
+      (t->flexicast_cc_aggregate_rate_limit != 0 && cost > shared)) {
     if (flow->pacing_rate_numerator == 0)
       return INT64_MAX;
-    uint64_t deficit =
-        cost > flow->pacing_tokens ? cost - flow->pacing_tokens : 0;
+    uint64_t deficit = cost > tokens ? cost - tokens : 0;
     uint64_t needed = deficit * 1000U * flow->pacing_rate_divisor;
     delay = needed / flow->pacing_rate_numerator +
             (needed % flow->pacing_rate_numerator != 0);
-    if (t->flexicast_cc_aggregate_rate_limit != 0 &&
-        cost > t->flexicast.pacing_tokens) {
-      needed = (cost - t->flexicast.pacing_tokens) * 1000U;
+    if (t->flexicast_cc_aggregate_rate_limit != 0 && cost > shared) {
+      needed = (cost - shared) * 1000U;
       uint64_t shared_delay =
           needed / t->flexicast_cc_aggregate_rate_limit +
           (needed % t->flexicast_cc_aggregate_rate_limit != 0);
@@ -642,13 +652,15 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     }
   }
 
+  /* Snapshot physical addresses once for this dispatch attempt. Route lookup
+   * stays live so interface removal/migration cannot leave a stale fd cache. */
+  struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
+  for (size_t i = 0; i < t->socket_count; i++)
+    local_addrs[i] = t->sockets[i].local_addr;
   if (!queued->replicated && flow->native_multicast &&
       t->flexicast_native_source) {
     struct sockaddr *group = (struct sockaddr *)&t->flexicast_group_addr;
     struct sockaddr_storage source = multicast_source_address(t);
-    struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
-    for (size_t i = 0; i < t->socket_count; i++)
-      local_addrs[i] = t->sockets[i].local_addr;
     size_t fd_index = transport_path_socket_for_source(
         local_addrs, t->socket_count, (struct sockaddr *)&source);
     int result = submit_protected_packet(t, fd_index, group,
@@ -680,9 +692,6 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     if (queued->packet_size > pacing_available(t, flow))
       return FLEXICAST_DISPATCH_BLOCKED;
     struct sockaddr_storage destination;
-    struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
-    for (size_t i = 0; i < t->socket_count; i++)
-      local_addrs[i] = t->sockets[i].local_addr;
     size_t fd_index = transport_path_socket_for_peer(
         member->conn->quic, local_addrs, t->socket_count, &destination);
     int result = submit_protected_packet(
@@ -762,13 +771,20 @@ static bool queue_payload(transport_t *t, transport_flexicast_flow_t *flow,
   return true;
 }
 
-bool transport_flexicast_send_payload(transport_t *t,
-                                      transport_flexicast_flow_t *flow,
-                                      ptls_iovec_t payload) {
+bool tf_enqueue_payload(transport_t *t, transport_flexicast_flow_t *flow,
+                        ptls_iovec_t payload) {
   if (!t || !flow || !flow->source || !flow->crypto || !payload.base ||
       pacing_cost(flow, payload.len) == 0 ||
       pacing_cost(flow, payload.len) > t->limits.max_udp_payload_size ||
       flow->listening_count == 0 || !queue_payload(t, flow, payload))
+    return false;
+  return true;
+}
+
+bool transport_flexicast_send_payload(transport_t *t,
+                                      transport_flexicast_flow_t *flow,
+                                      ptls_iovec_t payload) {
+  if (!tf_enqueue_payload(t, flow, payload))
     return false;
   /* Immediate and deferred publication share exactly the same admission,
    * rekey, pacing, socket-selection and accounting path. */
@@ -1020,7 +1036,6 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
     if ((flow->data_queue.count == 0 && flow->repair_queue.count == 0) ||
         transport_flexicast_listening_members(flow) == 0)
       continue;
-    tf_refresh_pacer_at(t, flow, now);
     flexicast_queue_selection_t selection = select_queued_payload(t, flow);
     if (!selection.payload)
       continue;

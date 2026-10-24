@@ -34,7 +34,9 @@ typedef struct transport_flexicast_member_t {
   bool reoffer_pending;
   bool rejoining;
   bool offer_bind_sent;
+  uint8_t alias; /* subscriber-local alias used in the binding */
   uint32_t offer_epoch;
+  uint32_t join_epoch_floor; /* rejects controls predating demotion/reoffer */
   quicly_flexicast_announce_frame_t offer_announce;
   /* FC_KEY enqueue can fail transiently when a member's control stream is
    * backpressured. Keep membership and retry instead of silently stranding

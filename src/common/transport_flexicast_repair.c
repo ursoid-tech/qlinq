@@ -431,7 +431,12 @@ static uint32_t shared_delivery_ppm(const transport_flexicast_flow_t *flow,
   if (!flow || flow->pacing_rate_bytes_per_second == 0 || delivery_rate == 0)
     return 0;
   __extension__ typedef unsigned __int128 wide_t;
-  wide_t scaled = (wide_t)delivery_rate * 1000000U;
+  size_t divisor = flow->native_multicast && !flow->last_submission_replicated
+                       ? 1U
+                       : flow->listening_count;
+  if (divisor == 0)
+    return 0;
+  wide_t scaled = (wide_t)delivery_rate * divisor * 1000000U;
   scaled /= flow->pacing_rate_bytes_per_second;
   return scaled >= 1000000U ? 1000000U : (uint32_t)scaled;
 }
@@ -485,17 +490,37 @@ static bool build_shadow_observation_snapshot(
       incomplete = true;
       continue;
     }
-    requester->path_count = t->socket_count;
-    for (size_t path = 0; path < requester->path_count; path++) {
-      const path_state_t *state = &conn->paths[path].state;
-      transport_repair_planner_path_t *entry = &requester->paths[path];
-      entry->resource_id = t->sockets[path].interface_index;
-      entry->measurement_known = state->initialized && state->b_ewma > 0;
-      entry->estimate.b = state->b_ewma > 0 ? state->b_ewma : FP_FROM_INT(100);
-      entry->estimate.l = state->l_ewma;
-      entry->estimate.p = state->p_ewma;
-      entry->estimate.q = state->q_ewma;
+    for (size_t physical = 0; physical < t->socket_count; physical++) {
+      quicly_path_stats_t stats;
+      size_t path = transport_path_get_eligible_by_local(
+          conn->quic, &t->sockets[physical].local_addr, &stats);
+      if (path == SIZE_MAX)
+        continue;
+      const transport_conn_path_t *live = &conn->paths[physical];
+      transport_repair_planner_path_t *entry =
+          &requester->paths[requester->path_count++];
+      entry->resource_id = t->sockets[physical].interface_index;
+      entry->estimate = transport_path_estimate_on_path(
+          conn->quic, path, &stats,
+          quicly_get_num_datagram_frames_path(conn->quic, path),
+          t->sockets[physical].egress.bytes, object->symbol_size,
+          live->owd_initialized && live->telemetry_path == path
+              ? live->latest_owd_fp
+              : 0);
+      quicly_path_health_t health;
+      entry->measurement_known =
+          quicly_get_path_health(conn->quic, path, &health) == 0 &&
+          health.rtt_is_sampled;
+      if (live->state_overridden) {
+        entry->estimate.b = live->state.b_ewma;
+        entry->estimate.l = live->state.l_ewma;
+        entry->estimate.p = live->state.p_ewma;
+        entry->estimate.q = live->state.q_ewma;
+        entry->measurement_known = live->state.initialized;
+      }
     }
+    if (requester->path_count == 0)
+      incomplete = true;
   }
 
   *snapshot = (transport_repair_planner_snapshot_t){
@@ -509,7 +534,10 @@ static bool build_shadow_observation_snapshot(
       .deadline_ms = t->repair_shadow_deadline_ms,
       .shared_rate_bytes_per_second = flow->pacing_rate_bytes_per_second,
       .shared_resource_id = flow->interface_index,
-      .shared_physical_copies = flow->native_multicast ? 1U : cohort_members,
+      .shared_physical_copies =
+          flow->native_multicast && !flow->last_submission_replicated
+              ? 1U
+              : cohort_members,
       .cohort_member_count = cohort_members,
       .observation_window_ms = TRANSPORT_FLEXICAST_SHADOW_OBSERVATION_MS,
       .observation_age_ms =
@@ -819,52 +847,99 @@ static bool requester_needs_repair_symbol(
           (UINT64_C(1) << (symbol_index % 64U))) != 0;
 }
 
-static bool
-unicast_repair_can_accept(transport_t *t, transport_flexicast_flow_t *flow,
-                          const transport_flexicast_pending_repair_t *pending,
-                          const uint16_t *indices, size_t count) {
-  size_t matched = 0;
+/* Per-requester demand survives partial fanout. A queued rateless symbol
+ * consumes an ESI even when some peers are blocked; those peers get fresh ESIs
+ * on a later pass, while successful peers are not sent duplicates. */
+static void
+refresh_unicast_pending(transport_t *t, transport_flexicast_flow_t *flow,
+                        transport_flexicast_pending_repair_t *pending) {
+  pending->requested_dof = 0;
+  pending->retained_deficit_sum = 0;
+  pending->maximum_requester_deficit = 0;
+  memset(pending->requested_symbols, 0, sizeof(pending->requested_symbols));
   for (size_t r = 0; r < flow->repair_requesters.count; r++) {
-    const transport_flexicast_repair_requester_t *requester =
+    transport_flexicast_repair_requester_t *requester =
         &flow->repair_requesters.entries[r];
     if (requester->request_id != pending->intent_id)
       continue;
     transport_conn_t *conn = find_connection_by_id(t, requester->member_id);
-    if (!conn || !conn->quic)
-      return false;
-    size_t needed = 0;
-    for (size_t i = 0; i < count; i++) {
-      uint16_t symbol_index =
-          pending->mode == TRANSPORT_REPAIR_MODE_RATELESS ? 0 : indices[i];
-      if (requester_needs_repair_symbol(requester, pending->mode, symbol_index,
-                                        i))
-        needed++;
+    if (!conn || !conn->quic ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING) {
+      requester->deficit = 0;
+      memset(requester->requested_symbols, 0,
+             sizeof(requester->requested_symbols));
+      continue;
     }
-    if (needed > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY ||
-        quicly_get_num_datagram_frames_path(conn->quic, 0) >
-            QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - needed)
-      return false;
-    matched++;
+    if (requester->deficit > pending->requested_dof)
+      pending->requested_dof = requester->deficit;
+    pending->retained_deficit_sum = tf_saturating_add_u64(
+        pending->retained_deficit_sum, requester->deficit);
+    pending->maximum_requester_deficit = pending->requested_dof;
+    for (size_t word = 0; word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
+      pending->requested_symbols[word] |= requester->requested_symbols[word];
   }
-  return matched != 0;
+}
+
+/* Select a batch from currently writable peers. Retain the full union in
+ * pending, so blocked low-index demand cannot hide another peer's symbols. */
+static uint16_t collect_unicast_repair_demand(
+    transport_t *t, transport_flexicast_flow_t *flow,
+    const transport_flexicast_pending_repair_t *pending, uint64_t *symbols) {
+  uint16_t deficit = 0;
+  for (size_t r = 0; r < flow->repair_requesters.count; r++) {
+    const transport_flexicast_repair_requester_t *requester =
+        &flow->repair_requesters.entries[r];
+    if (requester->request_id != pending->intent_id || requester->deficit == 0)
+      continue;
+    transport_conn_t *conn = find_connection_by_id(t, requester->member_id);
+    if (!conn || !conn->quic ||
+        transport_select_datagram_path(conn) == SIZE_MAX)
+      continue;
+    if (requester->deficit > deficit)
+      deficit = requester->deficit;
+    for (size_t word = 0; word < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U; word++)
+      symbols[word] |= requester->requested_symbols[word];
+  }
+  return deficit;
 }
 
 static bool
 queue_unicast_repair_symbol(transport_t *t, transport_flexicast_flow_t *flow,
                             const transport_flexicast_pending_repair_t *pending,
                             ptls_iovec_t packet, uint16_t symbol_index,
-                            size_t rateless_ordinal, size_t *transmissions) {
+                            size_t *transmissions) {
   bool matched = false;
+  qlinq_wire_fec_header_t header;
+  if (qlinq_wire_decode_fec_header(packet.base, packet.len, &header) !=
+      QLINQ_WIRE_OK)
+    return false;
   for (size_t r = 0; r < flow->repair_requesters.count; r++) {
-    const transport_flexicast_repair_requester_t *requester =
+    transport_flexicast_repair_requester_t *requester =
         &flow->repair_requesters.entries[r];
     if (requester->request_id != pending->intent_id ||
         !requester_needs_repair_symbol(requester, pending->mode, symbol_index,
-                                       rateless_ordinal))
+                                       0))
       continue;
     transport_conn_t *conn = find_connection_by_id(t, requester->member_id);
-    if (!conn || !transport_queue_datagram(conn, 0, packet))
-      return false;
+    if (!conn || !conn->quic)
+      continue;
+    size_t path = transport_select_datagram_path(conn);
+    uint8_t alias;
+    if (path == SIZE_MAX ||
+        transport_subscriptions_find_alias(&conn->send_subscriptions,
+                                           &flow->track_id, &alias) != 0)
+      continue;
+    header.alias = alias;
+    header.path_id = (uint8_t)path;
+    if (qlinq_wire_encode_fec_header(packet.base, packet.len, &header) !=
+            QLINQ_WIRE_OK ||
+        !transport_queue_datagram(conn, path, packet))
+      continue;
+    if (requester->deficit != 0)
+      requester->deficit--;
+    if (pending->mode == TRANSPORT_REPAIR_MODE_INDEXED)
+      requester->requested_symbols[symbol_index / 64U] &=
+          ~(UINT64_C(1) << (symbol_index % 64U));
     (*transmissions)++;
     matched = true;
   }
@@ -886,20 +961,41 @@ void tf_materialize_pending_repairs(transport_t *t,
       clear_pending_repair(t, flow, pending);
       continue;
     }
+    bool forced_unicast =
+        t->flexicast_repair_route == TRANSPORT_FLEXICAST_REPAIR_UNICAST;
+    if (forced_unicast)
+      refresh_unicast_pending(t, flow, pending);
+    uint64_t sendable_symbols[QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U] = {0};
+    const uint64_t *requested_symbols = pending->requested_symbols;
+    uint16_t requested_dof = pending->requested_dof;
+    if (forced_unicast) {
+      requested_dof =
+          collect_unicast_repair_demand(t, flow, pending, sendable_symbols);
+      requested_symbols = sendable_symbols;
+      if (requested_dof == 0 && pending->requested_dof != 0) {
+        if (!pending->backpressure_reported) {
+          t->stats.repair_queue_backpressure++;
+          pending->backpressure_reported = true;
+        }
+        pending->ready_at_ms = now + 10;
+        continue;
+      }
+    }
     uint16_t indices[TRANSPORT_REPAIR_MAX_SYMBOLS];
     size_t count = 0;
     if (pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
-      count = pending->requested_dof;
+      count = requested_dof;
     } else {
       for (size_t word_index = 0;
            word_index < QLINQ_WIRE_MAX_NACK_SYMBOLS / 64U &&
            count < TRANSPORT_REPAIR_MAX_SYMBOLS;
            word_index++) {
-        uint64_t word = pending->requested_symbols[word_index];
-        for (uint16_t bit = 0;
-             bit < 64U && count < TRANSPORT_REPAIR_MAX_SYMBOLS; bit++)
-          if ((word & (UINT64_C(1) << bit)) != 0)
-            indices[count++] = (uint16_t)(word_index * 64U + bit);
+        uint64_t word = requested_symbols[word_index];
+        while (word != 0 && count < TRANSPORT_REPAIR_MAX_SYMBOLS) {
+          unsigned bit = (unsigned)__builtin_ctzll(word);
+          indices[count++] = (uint16_t)(word_index * 64U + bit);
+          word &= word - 1U;
+        }
       }
     }
     if (count == 0) {
@@ -907,12 +1003,9 @@ void tf_materialize_pending_repairs(transport_t *t,
       continue;
     }
     size_t packet_size = QLINQ_WIRE_FEC_HEADER_SIZE + object->symbol_size;
-    bool forced_unicast =
-        t->flexicast_repair_route == TRANSPORT_FLEXICAST_REPAIR_UNICAST;
     bool capacity_available =
-        forced_unicast
-            ? unicast_repair_can_accept(t, flow, pending, indices, count)
-            : repair_queue_can_accept(t, flow, count, packet_size * count);
+        forced_unicast ||
+        repair_queue_can_accept(t, flow, count, packet_size * count);
     if (packet_size > SIZE_MAX / count || !capacity_available) {
       if (!pending->backpressure_reported) {
         t->stats.repair_queue_backpressure++;
@@ -967,22 +1060,24 @@ void tf_materialize_pending_repairs(transport_t *t,
           forced_unicast
               ? queue_unicast_repair_symbol(
                     t, flow, pending, ptls_iovec_init(packet, encoded_size),
-                    repair.indices[i], i, &unicast_transmissions)
+                    repair.indices[i], &unicast_transmissions)
               : queue_repair_payload(t, flow,
                                      ptls_iovec_init(packet, encoded_size),
                                      object->group_id, object->object_id,
                                      repair.indices[i], pending->mode, now);
       if (!sent)
         break;
-      if (pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
+      if (!forced_unicast && pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
         if (pending->requested_dof != 0)
           pending->requested_dof--;
-      } else {
+      } else if (!forced_unicast) {
         pending->requested_symbols[repair.indices[i] / 64U] &=
             ~(UINT64_C(1) << (repair.indices[i] % 64U));
       }
       queued++;
     }
+    if (forced_unicast)
+      refresh_unicast_pending(t, flow, pending);
     if (queued != 0 && pending->mode == TRANSPORT_REPAIR_MODE_RATELESS) {
       bool committed =
           systematic_fallback

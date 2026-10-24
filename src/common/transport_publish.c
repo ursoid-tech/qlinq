@@ -3,6 +3,7 @@
 #include "fec.h"
 #include "portable_sockets.h"
 #include "transport_fec_state.h"
+#include "transport_flexicast_internal.h"
 #include "transport_scheduler.h"
 #include "transport_stream.h"
 #include "transport_subscriptions.h"
@@ -464,10 +465,38 @@ static transport_publish_result_t publish_datagram_to_flexicast(
       if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
           !quicly_is_path_available(member->quic, mapped))
         continue;
-      active_states[active_paths++] = member->paths[physical].state;
+      transport_conn_path_t *live = &member->paths[physical];
+      if (!live->state_overridden) {
+        path_t sample = transport_path_estimate_on_path(
+            member->quic, mapped, &stats,
+            quicly_get_num_datagram_frames_path(member->quic, mapped),
+            t->sockets[physical].egress.bytes, symbol_size,
+            live->owd_initialized && live->telemetry_path == mapped
+                ? live->latest_owd_fp
+                : 0);
+        transport_path_update_state(&live->state, &sample, false);
+      }
+      active_states[active_paths] = live->state;
+      quicly_flexicast_member_stats_t shared;
+      if (quicly_flexicast_get_member_stats(flow->crypto, member->id,
+                                            &shared) == QUICLY_FLEXICAST_OK &&
+          (shared.delivered_packets || shared.lost_packets)) {
+        fp_wide_t total =
+            (fp_wide_t)shared.delivered_packets + shared.lost_packets;
+        fp_t loss = (fp_t)((fp_wide_t)shared.lost_packets * FP_ONE / total);
+        if (loss > active_states[active_paths].p_ewma)
+          active_states[active_paths].p_ewma = loss;
+      }
+      active_paths++;
     }
     if (active_paths == 0)
       continue;
+    /* All rateless source packets are systematic, matching unicast. Repair
+     * precomputation is deferred until a receiver actually requests symbols. */
+    if (profile->fec_rateless) {
+      scheduled = true;
+      continue;
+    }
     transport_schedule_t member_schedule;
     size_t scratch_round_robin = member->round_robin_path;
     bool use_fec = profile->fec_enabled || profile->fec_rateless;
@@ -570,11 +599,16 @@ static transport_publish_result_t publish_datagram_to_flexicast(
     const uint8_t *symbol =
         s < data_symbols ? data_blocks[s] : parity_blocks[s - data_symbols];
     memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE, symbol, symbol_size);
-    if (!transport_flexicast_send_payload(t, flow,
-                                          ptls_iovec_init(packet, packet_size)))
+    if (!tf_enqueue_payload(t, flow, ptls_iovec_init(packet, packet_size)))
       break;
     sent++;
   }
+  /* Admission was checked for the whole object; drain once after copying its
+   * symbols into the owned queue, rather than rescanning CC hints per symbol.
+   */
+  tf_drain_paced_payloads(t, flow);
+  if (flow->data_queue.count != 0)
+    t->stats.flexicast_pacing_delays++;
   transport_arena_reset(&t->arena);
   if (sent == total_symbols) {
     return TRANSPORT_PUBLISH_DELIVERED;

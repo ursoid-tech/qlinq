@@ -8,6 +8,14 @@
 #include <limits.h>
 #include <string.h>
 
+static bool
+delivered_history_contains(const transport_object_gap_state_t *state,
+                           uint64_t object_id) {
+  size_t slot = object_id % QLINQ_RECOVERY_HISTORY_OBJECTS;
+  return (state->delivered_mask[slot / 64U] & (UINT64_C(1) << (slot % 64U))) !=
+         0;
+}
+
 bool transport_recovery_was_delivered(const transport_object_gap_state_t *state,
                                       uint64_t object_id) {
   if (!state->delivered_initialized || object_id > state->largest_delivered)
@@ -15,8 +23,7 @@ bool transport_recovery_was_delivered(const transport_object_gap_state_t *state,
   uint64_t distance = state->largest_delivered - object_id;
   if (distance >= QLINQ_RECOVERY_HISTORY_OBJECTS)
     return true;
-  return (state->delivered_mask[distance / 64U] &
-          (UINT64_C(1) << (distance % 64U))) != 0;
+  return delivered_history_contains(state, object_id);
 }
 
 static bool
@@ -24,43 +31,45 @@ object_is_recently_delivered(const transport_object_gap_state_t *state,
                              uint64_t object_id) {
   if (!state->delivered_initialized || object_id > state->largest_delivered)
     return false;
-  uint64_t distance = state->largest_delivered - object_id;
-  return distance < QLINQ_RECOVERY_HISTORY_OBJECTS &&
-         (state->delivered_mask[distance / 64U] &
-          (UINT64_C(1) << (distance % 64U))) != 0;
+  return state->largest_delivered - object_id <
+             QLINQ_RECOVERY_HISTORY_OBJECTS &&
+         delivered_history_contains(state, object_id);
 }
 
 static void mark_object_delivered(transport_object_gap_state_t *state,
                                   uint64_t object_id) {
   if (!state->delivered_initialized) {
+    memset(state->delivered_mask, 0, sizeof(state->delivered_mask));
     state->delivered_initialized = true;
     state->largest_delivered = object_id;
-    state->delivered_mask[0] = 1;
-    return;
-  }
-  if (object_id > state->largest_delivered) {
+  } else if (object_id > state->largest_delivered) {
     uint64_t distance = object_id - state->largest_delivered;
-    uint64_t shifted[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U] = {0};
-    if (distance < QLINQ_RECOVERY_HISTORY_OBJECTS) {
-      size_t word_shift = (size_t)(distance / 64U);
-      unsigned bit_shift = (unsigned)(distance % 64U);
-      for (size_t dst = QLINQ_RECOVERY_HISTORY_OBJECTS / 64U; dst-- > 0;) {
-        if (dst < word_shift)
-          continue;
-        size_t src = dst - word_shift;
-        shifted[dst] = state->delivered_mask[src] << bit_shift;
-        if (bit_shift != 0 && src > 0)
-          shifted[dst] |= state->delivered_mask[src - 1U] >> (64U - bit_shift);
+    if (distance >= QLINQ_RECOVERY_HISTORY_OBJECTS) {
+      memset(state->delivered_mask, 0, sizeof(state->delivered_mask));
+    } else {
+      /* Reuse only the slots that have left the window. Sequential delivery
+       * clears one bit instead of shifting the entire history. */
+      size_t slot =
+          (state->largest_delivered + 1U) % QLINQ_RECOVERY_HISTORY_OBJECTS;
+      while (distance != 0) {
+        unsigned bit = slot % 64U;
+        size_t count = 64U - bit;
+        if (count > distance)
+          count = (size_t)distance;
+        uint64_t mask =
+            count == 64U ? UINT64_MAX : ((UINT64_C(1) << count) - 1U) << bit;
+        state->delivered_mask[slot / 64U] &= ~mask;
+        slot = (slot + count) % QLINQ_RECOVERY_HISTORY_OBJECTS;
+        distance -= count;
       }
     }
-    memcpy(state->delivered_mask, shifted, sizeof(shifted));
-    state->delivered_mask[0] |= 1;
     state->largest_delivered = object_id;
-  } else {
-    uint64_t distance = state->largest_delivered - object_id;
-    if (distance < QLINQ_RECOVERY_HISTORY_OBJECTS)
-      state->delivered_mask[distance / 64U] |= UINT64_C(1) << (distance % 64U);
+  } else if (state->largest_delivered - object_id >=
+             QLINQ_RECOVERY_HISTORY_OBJECTS) {
+    return;
   }
+  size_t slot = object_id % QLINQ_RECOVERY_HISTORY_OBJECTS;
+  state->delivered_mask[slot / 64U] |= UINT64_C(1) << (slot % 64U);
 }
 
 static bool send_checkpoint_ack(transport_conn_t *conn, uint8_t alias,

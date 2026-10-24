@@ -1629,6 +1629,13 @@ int main(int argc, char **argv) {
     frame.data.state.sequence = flow->key_epoch;
     for (size_t i = 0;
          i < TRANSPORT_FLEXICAST_MEMBER_TRANSITIONS_PER_SECOND + 1U; i++) {
+      /* JOINs from the old epoch are intentionally ignored after LEAVE.
+       * Rotate the pending epoch so this test floods valid transitions. */
+      if (!member->joined && flow->rekey_pending) {
+        flow->rekey_ready_at_ms = transport_get_time_ms();
+        transport_flexicast_tick(server);
+      }
+      frame.data.state.sequence = flow->key_epoch;
       frame.data.state.action = member->joined ? QUICLY_FLEXICAST_STATE_LEAVE
                                                : QUICLY_FLEXICAST_STATE_JOIN;
       if (!transport_flexicast_receive_quic_frame(server, member->conn,

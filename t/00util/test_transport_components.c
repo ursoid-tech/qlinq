@@ -6,6 +6,8 @@
 #include "transport_memory.h"
 #include "transport_paths.h"
 #include "transport_repair.h"
+#include "transport_recovery.h"
+#include "transport_flexicast_internal.h"
 #include "transport_repair_planner.h"
 #include "transport_scheduler.h"
 #include "transport_subscriptions.h"
@@ -858,7 +860,181 @@ static int test_path_estimates(void) {
   return 0;
 }
 
+/* A byte-per-object reference deliberately uses the old sliding-window model.
+ */
+static int check_delivery_history(transport_conn_t *conn,
+                                  const uint8_t *reference, uint64_t largest) {
+  transport_object_gap_state_t *state = transport_object_gap(conn, 7);
+  CHECK(state->largest_delivered == largest, "delivery watermark is monotonic");
+  for (size_t distance = 0;
+       distance < QLINQ_RECOVERY_HISTORY_OBJECTS + 2U && distance <= largest;
+       distance++) {
+    bool expected =
+        distance >= QLINQ_RECOVERY_HISTORY_OBJECTS || reference[distance];
+    CHECK(transport_recovery_was_delivered(state, largest - distance) ==
+              expected,
+          "delivery history agrees with independent sliding reference");
+  }
+  if (largest != UINT64_MAX)
+    CHECK(!transport_recovery_was_delivered(state, largest + 1U),
+          "future object has not been delivered");
+  return 0;
+}
+
+static int test_delivery_history(void) {
+  transport_conn_t *conn = calloc(1, sizeof(*conn));
+  CHECK(conn && transport_subscriptions_init(&conn->receive_subscriptions, 1),
+        "create delivery history fixture");
+  CHECK(transport_subscriptions_add(&conn->receive_subscriptions,
+                                    MOQ_TRACK_DATA, MOQ_TRACK_FLAG_FEC_RATELESS,
+                                    "history", 7),
+        "create recovery subscription");
+  transport_object_gap_state_t *state = transport_object_gap(conn, 7);
+  const uint64_t starts[] = {0, 4093, UINT64_MAX - 10000U};
+  const size_t advances[] = {1, 63, 64, 65, 4095, 4096, 4097, 8193};
+  for (size_t phase = 0; phase < sizeof(starts) / sizeof(starts[0]); phase++) {
+    memset(state, 0, sizeof(*state));
+    uint8_t reference[QLINQ_RECOVERY_HISTORY_OBJECTS] = {1};
+    uint64_t largest = starts[phase];
+    CHECK(!transport_recovery_was_delivered(state, largest), "empty history");
+    transport_recovery_delivered(conn, 7, 1, largest);
+    uint64_t random = 0x123456789abcdefULL;
+    for (size_t i = 0; i < 3000; i++) {
+      random ^= random << 13;
+      random ^= random >> 7;
+      random ^= random << 17;
+      uint64_t object;
+      if (i < sizeof(advances) / sizeof(advances[0]) || (random & 3U) == 0) {
+        uint64_t advance = i < sizeof(advances) / sizeof(advances[0])
+                               ? advances[i]
+                               : (random >> 16) % 100U;
+        if (advance > UINT64_MAX - largest)
+          advance = UINT64_MAX - largest;
+        object = largest + advance;
+      } else {
+        uint64_t distance =
+            (random >> 16) % (QLINQ_RECOVERY_HISTORY_OBJECTS + 64U);
+        object = distance > largest ? 0 : largest - distance;
+      }
+      if (object > largest) {
+        uint64_t advance = object - largest;
+        if (advance >= sizeof(reference)) {
+          memset(reference, 0, sizeof(reference));
+        } else {
+          memmove(reference + advance, reference, sizeof(reference) - advance);
+          memset(reference, 0, (size_t)advance);
+        }
+        largest = object;
+      }
+      uint64_t distance = largest - object;
+      if (distance < sizeof(reference))
+        reference[distance] = 1;
+      transport_recovery_delivered(conn, 7, 1, object);
+      CHECK(check_delivery_history(conn, reference, largest) == 0,
+            "window wrap, gaps, late delivery and UINT64_MAX remain exact");
+    }
+    if (largest != UINT64_MAX) {
+      /* Completion must use exact recent history, including holes. */
+      qlinq_wire_track_end_t end = {
+          .alias = 7, .group_id = 1, .final_object_id = largest};
+      CHECK(transport_recovery_finish(conn, &end) == NULL,
+            "create completion window");
+      uint32_t missing = 0;
+      for (unsigned bit = 0; bit < 32; bit++)
+        if (!reference[31U - bit])
+          missing |= UINT32_C(1) << bit;
+      CHECK(state->recovery_windows[0].missing_mask == missing,
+            "checkpoint gaps match delivery history after many wraps");
+    }
+  }
+  transport_subscriptions_destroy(&conn->receive_subscriptions);
+  free(conn);
+  return 0;
+}
+
+static int test_sparse_flexicast_repair(void) {
+  transport_t *t = calloc(1, sizeof(*t));
+  transport_flexicast_flow_t *flow = calloc(1, sizeof(*flow));
+  CHECK(t && flow, "create sparse repair fixture");
+  t->limits.max_egress_bytes_per_socket = 1024U * 1024U;
+  flow->track_id = (moq_track_id_t){.type = MOQ_TRACK_DATA,
+                                    .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                                    .name = "sparse-repair"};
+  uint8_t bytes[1024U * 32U];
+  for (size_t i = 0; i < sizeof(bytes); i++)
+    bytes[i] = (uint8_t)(i / 32U);
+  moq_object_t object = {.track_id = flow->track_id,
+                         .group_id = 7,
+                         .object_id = 9,
+                         .data = bytes,
+                         .size = sizeof(bytes)};
+  CHECK(transport_sent_cache_store(&t->sent_cache, &object, 1024, 1024, 32,
+                                   false),
+        "retain indexed source symbols");
+  const uint16_t sparse[] = {0, 63, 64, 127, 511, 512, 1023};
+  for (size_t phase = 0; phase < 2; phase++) {
+    transport_flexicast_pending_repair_t *pending = &flow->pending_repairs[0];
+    *pending = (transport_flexicast_pending_repair_t){
+        .active = true,
+        .intent_id = phase + 1,
+        .group_id = 7,
+        .object_id = 9,
+        .mode = TRANSPORT_REPAIR_MODE_INDEXED};
+    flow->pending_repair_count = 1;
+    size_t count = phase == 0 ? sizeof(sparse) / sizeof(sparse[0]) : 80U;
+    for (size_t i = 0; i < count; i++) {
+      size_t symbol = phase == 0 ? sparse[i] : i * 11U;
+      pending->requested_symbols[symbol / 64U] |= UINT64_C(1) << (symbol % 64U);
+    }
+    /* Force a partial enqueue in the sparse case; the retry must retain every
+     * remaining request. The dense case spans the 64-symbol batch boundary. */
+    flow->repair_queue.capacity =
+        phase == 0 ? 1 : TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY;
+    size_t delivered = 0;
+    while (pending->active) {
+      tf_materialize_pending_repairs(t, flow, 100);
+      size_t expected_batch =
+          phase == 0 && delivered == 0
+              ? 1
+              : (count - delivered > TRANSPORT_REPAIR_MAX_SYMBOLS
+                     ? TRANSPORT_REPAIR_MAX_SYMBOLS
+                     : count - delivered);
+      CHECK(flow->repair_queue.count == expected_batch,
+            "bounded repair batch makes progress");
+      for (size_t i = 0; i < flow->repair_queue.count; i++) {
+        const transport_flexicast_queued_payload_t *packet =
+            tf_queue_at_const(&flow->repair_queue, i);
+        uint16_t expected =
+            phase == 0 ? sparse[delivered] : (uint16_t)(delivered * 11U);
+        CHECK(packet && packet->symbol_index == expected,
+              "repair output enumerates each requested symbol in order");
+        qlinq_wire_fec_header_t header;
+        CHECK(qlinq_wire_decode_fec_header(packet->data, packet->size,
+                                           &header) == QLINQ_WIRE_OK &&
+                  header.symbol_index == expected &&
+                  memcmp(packet->data + QLINQ_WIRE_FEC_HEADER_SIZE,
+                         bytes + expected * 32U, 32) == 0,
+              "sparse boundary symbols preserve wire identity and payload");
+        delivered++;
+      }
+      tf_queue_dispose(&flow->repair_queue);
+      flow->repair_queue.capacity = TRANSPORT_FLEXICAST_REPAIR_QUEUE_CAPACITY;
+      CHECK(tf_pending_repair_symbol_count(pending) == count - delivered,
+            "partial enqueue and batch limits retain unsent requests");
+    }
+    CHECK(delivered == count && flow->pending_repair_count == 0,
+          "repair completes without losing or duplicating requests");
+  }
+  transport_sent_cache_destroy(&t->sent_cache);
+  transport_fec_cache_destroy(&t->fec_cache);
+  free(flow);
+  free(t);
+  return 0;
+}
+
 int main(void) {
+  CHECK(test_delivery_history() == 0, "circular delivery history");
+  CHECK(test_sparse_flexicast_repair() == 0, "sparse repair enumeration");
   CHECK(test_address_identity() == 0, "scoped address and endpoint identity");
   CHECK(test_stream_path_selection() == 0,
         "reliable stream path selection without FEC parity");

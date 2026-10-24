@@ -140,15 +140,27 @@ static void test_high_rate_pacer(fixture_t *fixture) {
 
 static void test_aggregate_pacer(fixture_t *fixture) {
   transport_t *source = fixture->source.transport;
+  moq_track_id_t second = fixture->track;
+  snprintf(second.name, sizeof(second.name), "aggregate-second");
+  CHECK(transport_subscribe(fixture->clients[0].transport, second));
+  transport_flexicast_flow_t *extra = NULL;
+  for (size_t attempt = 0; attempt < 1000; attempt++) {
+    pump(fixture, 2);
+    extra = transport_flexicast_find_source(source, &second);
+    if (extra && extra->listening_count && !extra->rekey_pending)
+      break;
+  }
+  CHECK(extra && extra->listening_count && !extra->rekey_pending);
   transport_flexicast_flow_t *flows[2] = {0};
   size_t count = 0;
   for (size_t i = 0; i < source->flexicast.capacity; i++) {
     transport_flexicast_flow_t *flow = &source->flexicast.flows[i];
     if (flow->active && flow->source && flow->listening_count != 0 &&
-        transport_track_id_equal(&flow->track_id, &fixture->track)) {
+        (transport_track_id_equal(&flow->track_id, &fixture->track) ||
+         transport_track_id_equal(&flow->track_id, &second))) {
       CHECK(count < 2);
       flows[count++] = flow;
-      /* Keep both independent alias cohorts active during the virtual clock. */
+      /* Keep both independent tracks active during the virtual clock. */
       flow->last_payload_sent_ms = INT64_MAX;
     }
   }
@@ -209,6 +221,8 @@ static void test_aggregate_pacer(fixture_t *fixture) {
   CHECK(source->flexicast.pacing_tokens == cost * 2U);
   uint64_t sent = source->stats.flexicast_physical_packets_sent;
   moq_object_t object = object_for(fixture, bytes, sizeof(bytes));
+  CHECK(transport_publish_ex(source, &object) == TRANSPORT_PUBLISH_DELIVERED);
+  object.track_id = second;
   CHECK(transport_publish_ex(source, &object) == TRANSPORT_PUBLISH_DELIVERED);
   CHECK(source->stats.flexicast_physical_packets_sent == sent + 2);
   CHECK(source->flexicast.pacing_tokens == 0);

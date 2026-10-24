@@ -86,7 +86,8 @@ static void create_fixture(fixture_t *fixture, size_t count, bool adaptive,
     if (strstr(mode, "rateless"))
       fixture->track.flags |= MOQ_TRACK_FLAG_FEC_RATELESS;
   }
-  if (strcmp(mode, "video-rateless") == 0)
+  if (strcmp(mode, "video-rateless") == 0 ||
+      strcmp(mode, "review-systematic-rateless") == 0)
     fixture->track.type = MOQ_TRACK_VIDEO;
   transport_config_t config = {.bind_hosts = {"127.0.0.1"},
                                .num_bind_hosts = 1,
@@ -132,6 +133,11 @@ static void create_fixture(fixture_t *fixture, size_t count, bool adaptive,
                                  .enable_flexicast = true,
                                  .callback = client_event,
                                  .user_data = &fixture->clients[j]};
+    if (strcmp(mode, "review-fixed") == 0 ||
+        strcmp(mode, "review-rateless") == 0) {
+      client.bind_hosts[1] = "127.0.0.2";
+      client.num_bind_hosts = 2;
+    }
     if (native)
       client.flexicast_interface = "127.0.0.1";
     if (strcmp(mode, "limits") == 0 && j == count - 1)
@@ -148,7 +154,7 @@ static void create_fixture(fixture_t *fixture, size_t count, bool adaptive,
     }
     CHECK(transport_subscribe(fixture->clients[j].transport, fixture->track));
   }
-  size_t cohort = strstr(mode, "aliases") != NULL ? count - 1 : count;
+  size_t cohort = count;
   for (size_t attempt = 0; attempt < 1500; attempt++) {
     pump(fixture, 2);
     fixture->flow = transport_flexicast_find_source(fixture->source.transport,
@@ -685,6 +691,43 @@ static void test_video_rateless(fixture_t *fixture) {
         fixture->clients[0].transport->client_conn,
         ptls_iovec_init(payload->data, payload->size), false);
   }
+  CHECK(fixture->clients[0].received == 0);
+  /* Rateless publication is systematic-only. Recover the erased source
+   * symbol using on-demand RaptorQ repair, rather than proactive parity. */
+  /* Video does not retain the reliable-data recovery cache. Seed a local
+   * repair fixture using the exact source envelope to exercise its decoder. */
+  qlinq_wire_fec_header_t source_header;
+  transport_flexicast_queued_payload_t *first = &queue->entries[queue->head];
+  CHECK(qlinq_wire_decode_fec_header(first->data, first->size,
+                                     &source_header) == QLINQ_WIRE_OK);
+  CHECK(transport_sent_cache_store(
+      &source->sent_cache, &object, source_header.total_symbols,
+      source_header.data_symbols, source_header.symbol_size, false));
+  sent_object_cache_t *cached = transport_sent_cache_find(
+      &source->sent_cache, &fixture->track, object.group_id, object.object_id);
+  CHECK(cached);
+  transport_repair_batch_t repair;
+  CHECK(
+      transport_repair_build_rateless(&source->fec_cache, cached, 4, &repair));
+  for (size_t i = 0; i < repair.count; i++) {
+    uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + QLINQ_FEC_MAX_SYMBOL_SIZE];
+    qlinq_wire_fec_header_t header = {.alias = fixture->flow->alias,
+                                      .group_id = object.group_id,
+                                      .object_id = object.object_id,
+                                      .symbol_index = repair.indices[i],
+                                      .total_symbols = repair.total_symbols,
+                                      .data_symbols = cached->data_symbols,
+                                      .symbol_size = repair.symbol_size,
+                                      .original_size = sizeof(bytes)};
+    size_t size = QLINQ_WIRE_FEC_HEADER_SIZE + repair.symbol_size;
+    CHECK(qlinq_wire_encode_fec_header(packet, size, &header) == QLINQ_WIRE_OK);
+    memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE,
+           repair.symbols + i * repair.symbol_size, repair.symbol_size);
+    transport_protocol_receive_datagram(
+        fixture->clients[0].transport->client_conn,
+        ptls_iovec_init(packet, size), false);
+  }
+  transport_repair_batch_destroy(&repair);
   CHECK(fixture->clients[0].received == 1);
   CHECK(fixture->clients[0].last_size == sizeof(bytes));
   CHECK(fixture->clients[0].last_checksum == checksum);
@@ -872,6 +915,7 @@ static void test_feedback_deadline(void) {
 
 #include "test_flexicast_ecn.inc"
 #include "test_flexicast_pacer.inc"
+#include "test_flexicast_review.inc"
 
 int main(int argc, char **argv) {
   test_feedback_deadline();
@@ -880,7 +924,19 @@ int main(int argc, char **argv) {
   CHECK(count > 0 && count <= MAX_CLIENTS);
   fixture_t fixture;
   create_fixture(&fixture, count, argc > 3, mode);
-  if (strcmp(mode, "pacer-high") == 0 || strcmp(mode, "pacer-maximum") == 0)
+  if (strcmp(mode, "review-shadow") == 0)
+    test_review_shadow(&fixture);
+  else if (strcmp(mode, "review-control") == 0)
+    test_review_control(&fixture);
+  else if (strcmp(mode, "review-reoffer") == 0)
+    test_review_reoffer(&fixture);
+  else if (strcmp(mode, "review-systematic-rateless") == 0)
+    test_review_systematic(&fixture);
+  else if (strcmp(mode, "review-fixed") == 0 ||
+           strcmp(mode, "review-rateless") == 0)
+    test_review_repairs(&fixture, strstr(mode, "rateless") != NULL);
+  else if (strcmp(mode, "pacer-high") == 0 ||
+           strcmp(mode, "pacer-maximum") == 0)
     test_high_rate_pacer(&fixture);
   else if (strcmp(mode, "pacer-aliases") == 0)
     test_aggregate_pacer(&fixture);

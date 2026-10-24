@@ -1097,7 +1097,7 @@ static int checkpoint_retires_redundant_recovery(void) {
   gap->pending_mask = 7;
   gap->last_seen = gap->largest_delivered = 11;
   gap->seen_initialized = gap->delivered_initialized = true;
-  gap->delivered_mask[0] = 3;
+  gap->delivered_mask[0] = (UINT64_C(1) << 10) | (UINT64_C(1) << 11);
   /* Covered, future, other-track and other-group partial objects coexist. */
   for (unsigned i = 0; i < 4; i++) {
     frame_assembler_t *a = &conn->assemblers[i];

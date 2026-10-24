@@ -34,6 +34,7 @@ typedef struct {
   int64_t detected_at_ms;
   uint16_t nack_attempt;
   uint64_t largest_delivered;
+  /* Circular history indexed by object_id modulo the history size. */
   uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
   bool delivered_initialized;
   bool shared_delivery;

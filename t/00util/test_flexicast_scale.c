@@ -19,7 +19,41 @@ static uint64_t monotonic_ns(void) {
          (uint64_t)value.tv_nsec;
 }
 
+static bool test_member_churn(void) {
+  transport_flexicast_flow_t flow = {.member_capacity = 4};
+  max_align_t *identities = calloc(4098, sizeof(*identities));
+  if (!identities)
+    return false;
+  transport_conn_t *a = (transport_conn_t *)&identities[0];
+  transport_conn_t *b = (transport_conn_t *)&identities[1];
+  bool ok = transport_flexicast_member_add(&flow, a) &&
+            transport_flexicast_member_add(&flow, b);
+  for (size_t i = 2; i < 4098 && ok; i++) {
+    transport_conn_t *next = (transport_conn_t *)&identities[i];
+    ok = transport_flexicast_member_add(&flow, next) != NULL;
+    transport_flexicast_member_t *member =
+        transport_flexicast_member_find(&flow, a);
+    ok = ok && member && transport_flexicast_member_remove(NULL, &flow, member);
+    ok = ok && transport_flexicast_member_find(&flow, next) &&
+         transport_flexicast_member_find(&flow, b) &&
+         transport_flexicast_member_add(&flow, a);
+    member = transport_flexicast_member_find(&flow, next);
+    ok = ok && member &&
+         transport_flexicast_member_remove(NULL, &flow, member) &&
+         !transport_flexicast_member_find(&flow, next) &&
+         transport_flexicast_member_find(&flow, a) && flow.member_count == 2;
+  }
+  free(flow.members);
+  free(flow.member_map);
+  free(identities);
+  return ok;
+}
+
 int main(void) {
+  if (!test_member_churn()) {
+    fprintf(stderr, "member-map churn or swap-removal failed\n");
+    return 1;
+  }
   transport_flexicast_flow_t flow = {.member_capacity = MEMBER_COUNT};
   max_align_t *identities =
       calloc(MEMBER_COUNT + MEMBER_COUNT / 2U + 1U, sizeof(*identities));
