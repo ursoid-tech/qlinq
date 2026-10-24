@@ -2923,21 +2923,3 @@ bool transport_rx_cadence_mask(transport_t *t, struct pollfd *fds,
     fds[i].events &= (short)~POLLIN;
   return true;
 }
-
-bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
-                               transport_track_stats_t *stats) {
-  if (!transport_owner_ok(t) || !transport_track_id_valid(track) || !stats)
-    return false;
-  *stats = (transport_track_stats_t){0};
-  size_t count = transport_connection_count(t);
-  for (size_t i = 0; i < count; i++) {
-    transport_conn_t *conn = transport_connection_at(t, i);
-    uint8_t alias;
-    if (conn && conn->authenticated && conn->quic &&
-        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
-        transport_subscriptions_find_alias(&conn->send_subscriptions, track,
-                                           &alias) == 0)
-      stats->subscribers++;
-  }
-  return true;
-}
