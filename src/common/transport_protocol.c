@@ -1178,6 +1178,9 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
                                          .size = original_size,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
+      /* Recovery ACKs can retire and free this assembler before delivery.
+       * Keep the compacted payload alive until the callback has returned. */
+      asm_slot->buffer_storage = NULL;
       completed_remember(tconn, track_id, generation, group_id, object_id);
       if (recoverable_data) {
         transport_recovery_delivered(tconn, track_id, group_id, object_id);
@@ -1186,6 +1189,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
       if (!got_all_data)
         t->stats.fec_objects_decoded++;
       transport_emit_event(t, &ev);
+      free(full_data);
       transport_release_assembler(t, asm_slot);
     }
   }
