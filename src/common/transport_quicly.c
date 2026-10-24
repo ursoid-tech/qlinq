@@ -394,8 +394,7 @@ typedef struct {
 static void copy_interface_name(char destination[64], const char *name) {
   if (!destination || !name)
     return;
-  strncpy(destination, name, 63);
-  destination[63] = '\0';
+  snprintf(destination, 64, "%s", name);
 }
 
 static int qlinq_path_is_eligible(quicly_path_scheduler_t *scheduler,
