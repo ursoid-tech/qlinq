@@ -150,6 +150,8 @@ static void show_help(FILE *out, const char *program) {
       "  --loss PERCENT                test-only simulated inbound packet "
       "loss\n\n"
       "Data:\n"
+      "  --transfer                    verified, resumable single-file copy\n"
+      "  --transfer-timeout-ms MS       no-progress timeout (default 60000)\n"
       "  --track NAME                  track name (default qlinq-app/data)\n"
       "  --mode datagram|fec|rateless|reliable\n"
       "  --repair-mode auto|indexed|rateless\n"

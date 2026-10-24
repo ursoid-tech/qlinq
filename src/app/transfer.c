@@ -262,6 +262,10 @@ static void on_event(void *user_data, const transport_event_t *event) {
   app_t *app = user_data;
   const options_t *options = app->options;
   switch (event->type) {
+  case TRANSPORT_EVENT_TRACK_FINISHED:
+  case TRANSPORT_EVENT_TRACK_DRAINED:
+  case TRANSPORT_EVENT_TRACK_ABORTED:
+    break;
   case TRANSPORT_EVENT_CONNECTED:
     if (options->verbose)
       fprintf(stderr, "qlinq-app: peer connected\n");
