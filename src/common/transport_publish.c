@@ -762,6 +762,8 @@ static transport_publish_result_t flush_group(transport_t *t) {
   track_state->has_objects = true;
   group->size = 0;
   group->started_at_ms = 0;
+  group->flush_retry_at_ms = 0;
+  group->flush_retry_cache_releases = 0;
   group->record_count = 0;
   group->pending = false;
   if ((track_state->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
@@ -850,6 +852,8 @@ group_record(transport_t *t, const moq_object_t *obj, size_t fec_limit) {
       peer->fec_group_delivered = false;
     }
     group->started_at_ms = now;
+    group->flush_retry_at_ms = 0;
+    group->flush_retry_cache_releases = 0;
     group->track_id = obj->track_id;
     group->priority = obj->priority;
   }

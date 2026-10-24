@@ -44,6 +44,9 @@ typedef struct {
   uint8_t *data;
   size_t size, capacity;
   uint64_t started_at_ms;
+  /* only timer-driven retries back off; explicit publication remains eager */
+  int64_t flush_retry_at_ms;
+  uint64_t flush_retry_cache_releases;
   moq_track_id_t track_id;
   uint32_t record_count;
   uint8_t priority;

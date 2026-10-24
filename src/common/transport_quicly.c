@@ -45,6 +45,7 @@
 #define QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS 6U
 #define QLINQ_PATHFLOW_UPDATE_MS 25U
 #define QLINQ_GROUP_FLUSH_MS 3U
+#define QLINQ_GROUP_FLUSH_RETRY_MS 1U
 
 uint64_t transport_get_time_ns(void) {
   struct timespec ts;
@@ -1861,6 +1862,38 @@ static void service_connections(transport_t *t, uint64_t now) {
   }
 }
 
+static int64_t group_flush_deadline(const transport_t *t) {
+  const transport_pending_group_t *group = &t->pending_group;
+  if (group->size == 0 ||
+      group->started_at_ms > INT64_MAX - QLINQ_GROUP_FLUSH_MS)
+    return INT64_MAX;
+  int64_t deadline = (int64_t)group->started_at_ms + QLINQ_GROUP_FLUSH_MS;
+  /* a checkpoint ACK can make room before the retry timer; only actual cache
+   * releases bypass backoff, not repeated readiness or timeout queries */
+  if (group->flush_retry_cache_releases == t->stats.recovery_cache_releases &&
+      group->flush_retry_at_ms > deadline)
+    deadline = group->flush_retry_at_ms;
+  return deadline;
+}
+
+static void flush_group_on_timer(transport_t *t) {
+  int64_t deadline = group_flush_deadline(t);
+  if (deadline == INT64_MAX)
+    return;
+  int64_t now = transport_get_time_ms();
+  if (now < deadline || transport_publish_flush_grouped(t))
+    return;
+  /* preserve the group's original age and frozen identity after failure;
+   * explicit publish/flush/finish calls do not consult this timer deadline */
+  now = transport_get_time_ms();
+  t->pending_group.flush_retry_at_ms =
+      now > INT64_MAX - QLINQ_GROUP_FLUSH_RETRY_MS
+          ? INT64_MAX
+          : now + QLINQ_GROUP_FLUSH_RETRY_MS;
+  t->pending_group.flush_retry_cache_releases =
+      t->stats.recovery_cache_releases;
+}
+
 void transport_tick_ready(transport_t *t, const struct pollfd *fds,
                           size_t count) {
   if (!transport_owner_ok(t))
@@ -1890,12 +1923,7 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
 
   transport_recovery_tick(t, now_nack_ms);
 
-  if (t->pending_group.size > 0) {
-    uint64_t now = ptls_get_time.cb(&ptls_get_time);
-    if ((now - t->pending_group.started_at_ms) >= QLINQ_GROUP_FLUSH_MS) {
-      (void)transport_publish_flush_grouped(t);
-    }
-  }
+  flush_group_on_timer(t);
 
   /* Messages arriving after the snapshot remain readable for the next poll.
    * Consumed updates can compact slots and recycle descriptors; even a no-op
@@ -1904,6 +1932,10 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
       service_interfaces(t))
     fds = NULL;
   receive_packets(t, fds, count);
+  if (t->pending_group.size != 0 && t->pending_group.flush_retry_at_ms != 0 &&
+      t->pending_group.flush_retry_cache_releases !=
+          t->stats.recovery_cache_releases)
+    flush_group_on_timer(t);
   uint64_t now = ptls_get_time.cb(&ptls_get_time);
   update_path_measurements(t, now);
   service_connections(t, now);
@@ -2553,12 +2585,9 @@ int64_t transport_get_first_timeout(transport_t *t) {
       (int64_t)t->last_pathflow_update + QLINQ_PATHFLOW_UPDATE_MS <
           first_timeout)
     first_timeout = (int64_t)t->last_pathflow_update + QLINQ_PATHFLOW_UPDATE_MS;
-  if (t->pending_group.size != 0 &&
-      t->pending_group.started_at_ms <= INT64_MAX - QLINQ_GROUP_FLUSH_MS &&
-      (int64_t)t->pending_group.started_at_ms + QLINQ_GROUP_FLUSH_MS <
-          first_timeout)
-    first_timeout =
-        (int64_t)t->pending_group.started_at_ms + QLINQ_GROUP_FLUSH_MS;
+  int64_t group_at = group_flush_deadline(t);
+  if (group_at < first_timeout)
+    first_timeout = group_at;
 
   if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
       !t->shutting_down && t->reconnect_at_ms < first_timeout)

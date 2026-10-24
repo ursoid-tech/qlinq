@@ -1,6 +1,15 @@
 #include "transport_fixture.h"
 #include "transport_publish.h"
+#include "transport_stream.h"
 #include <stdio.h>
+#include <stdlib.h>
+
+static uint64_t group_timer_now;
+
+static uint64_t group_timer_time(ptls_get_time_t *self) {
+  (void)self;
+  return group_timer_now;
+}
 
 static void fill_queue(transport_conn_t *conn, size_t count) {
   /* Unknown application datagrams are discarded by the receiver. Queue them
@@ -303,11 +312,113 @@ static void test_recovery_history_bound(void) {
   fixture_destroy(&f);
 }
 
+static void test_group_timer_backpressure(void) {
+  transport_fixture_t f;
+  transport_limits_t limits = {.max_fec_object_size = 1024};
+  fixture_create(&f, 19937, &limits, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "group-timer"};
+  fixture_subscribe(&f, &f.client, track);
+  transport_t *t = f.server.transport;
+  uint8_t payload[1000] = {42};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  for (size_t i = 0; i < t->sent_cache.capacity; i++) {
+    object.object_id = i;
+    assert(transport_sent_cache_store(&t->sent_cache, &object, 1, 1,
+                                      sizeof(payload), false));
+  }
+  t->fec_tracks[0] =
+      (transport_fec_track_state_t){.track_id = track,
+                                    .active = true,
+                                    .has_objects = true,
+                                    .next_object_id = t->sent_cache.capacity};
+  ptls_get_time_t saved_time = ptls_get_time;
+  group_timer_now = ptls_get_time.cb(&ptls_get_time);
+  ptls_get_time.cb = group_timer_time;
+  assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
+  uint64_t started = t->pending_group.started_at_ms;
+  group_timer_now += 3;
+  uint64_t blocked = t->stats.recovery_cache_backpressure;
+  transport_tick(t);
+  assert(t->stats.recovery_cache_backpressure == blocked + 1 &&
+         t->pending_group.flush_retry_at_ms == (int64_t)group_timer_now + 1 &&
+         t->pending_group.started_at_ms == started);
+  blocked = t->stats.recovery_cache_backpressure;
+  for (size_t i = 0; i < 64; i++)
+    transport_tick(t);
+  assert(t->stats.recovery_cache_backpressure == blocked &&
+         t->pending_group.size == 1002 &&
+         memcmp(t->pending_group.data + 2, payload, sizeof(payload)) == 0);
+
+  /* isolate group deadline from independent QUIC/Pathflow deadlines */
+  transport_t *timer_view = calloc(1, sizeof(*timer_view));
+  assert(timer_view);
+  timer_view->owner_thread = pthread_self();
+  timer_view->pending_group = t->pending_group;
+  timer_view->stats.recovery_cache_releases = t->stats.recovery_cache_releases;
+  assert(transport_get_first_timeout(timer_view) ==
+         (int64_t)group_timer_now + 1);
+  assert(!transport_publish_flush_grouped(t));
+  assert(t->stats.recovery_cache_backpressure == blocked + 1);
+  group_timer_now++;
+  transport_tick(t);
+  assert(t->stats.recovery_cache_backpressure == blocked + 2 &&
+         t->pending_group.flush_retry_at_ms == (int64_t)group_timer_now + 1);
+
+  /* explicit readiness and flush bypass the timer, even without a release
+   * notification; next group starts with fresh age and no retry state */
+  assert(transport_sent_cache_release_through(&t->sent_cache, &track, 0, 0) ==
+         1);
+  assert(transport_is_track_ready(t, &track));
+  assert(transport_publish_flush_grouped(t));
+  assert(t->pending_group.size == 0 && t->pending_group.flush_retry_at_ms == 0);
+  assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED &&
+         t->pending_group.started_at_ms == group_timer_now &&
+         t->pending_group.flush_retry_at_ms == 0);
+  group_timer_now += 3;
+  transport_tick(t);
+  assert(t->pending_group.size != 0 &&
+         t->pending_group.flush_retry_at_ms == (int64_t)group_timer_now + 1);
+
+  /* deliver a real checkpoint ACK while group timer is in the future;
+   * its cache release must allow the same receive tick to flush the group */
+  uint8_t alias;
+  assert(transport_subscriptions_find_alias(&f.server.conn->send_subscriptions,
+                                            &track, &alias) == 0);
+  transport_checkpoint_ack_state_t *ack =
+      transport_checkpoint_ack(f.server.conn, alias);
+  ack->sent_initialized = true;
+  ack->sent_group_id = 0;
+  ack->sent_object_id = t->sent_cache.capacity;
+  assert(transport_stream_write_track_checkpoint_ack_frame(
+      f.client.conn->stream, alias, 0, 31));
+  uint64_t releases = t->stats.recovery_cache_releases;
+  blocked = t->stats.recovery_cache_backpressure;
+  for (size_t i = 0; i < 100 && t->stats.recovery_cache_releases == releases;
+       i++) {
+    transport_tick(f.client.transport);
+    transport_tick(t);
+    if (t->stats.recovery_cache_releases == releases)
+      usleep(1000);
+  }
+  assert(t->stats.recovery_cache_releases == releases + 31 &&
+         t->stats.recovery_cache_backpressure == blocked &&
+         t->pending_group.size == 0 &&
+         t->pending_group.flush_retry_at_ms == 0 && !f.server.failed &&
+         !f.client.failed);
+  ptls_get_time = saved_time;
+  free(timer_view);
+  fixture_destroy(&f);
+}
+
 int main(void) {
   test_queue_boundary();
   test_slow_group_admission();
   test_rateless_queue_boundary();
   test_recovery_history_bound();
+  test_group_timer_backpressure();
   test_partial_group_retry();
   transport_fixture_t fixture;
   transport_limits_t limits = {.max_fec_object_size = 32};
