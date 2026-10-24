@@ -307,7 +307,14 @@ TRANSPORT_TESTS = t/00util/test_transport_bind \
 	t/00util/test_tls \
 	t/00util/test_rateless_benchmark
 
-$(filter-out t/00util/test_multipath_failover t/00util/test_multipath_feedback,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
+ifeq ($(UNAME_S),Linux)
+QUICLY_INTEGRATION_TEST = t/00util/test_quicly_integration
+TRANSPORT_TESTS += $(QUICLY_INTEGRATION_TEST)
+t/00util/test_quicly_integration: t/00util/test_quicly_integration.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=quicly_send,--wrap=quicly_receive,--wrap=quicly_close,--wrap=quicly_get_path_health
+endif
+
+$(filter-out $(QUICLY_INTEGRATION_TEST) t/00util/test_multipath_failover t/00util/test_multipath_feedback,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 API_TESTS = t/00util/test_qlinq_policy \
@@ -395,7 +402,7 @@ benchmark: t/00util/test_benchmark
 benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
-CHECK_BINARIES = t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
+CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
@@ -443,7 +450,7 @@ t/00util/test_rx_cadence_backlog: t/00util/test_rx_cadence_backlog.o $(COMMON_OB
 
 t/00util/transport_egress_cadence.o: src/common/transport_egress.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
-		-Dtransport_udp_send_batch=test_cadence_udp_send_batch -c $< -o $@
+		-Dtransport_udp_send_batch_ecn=test_cadence_udp_send_batch -c $< -o $@
 
 t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_egress_cadence.o $(filter-out src/common/qlinq.o src/common/transport_egress.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -452,6 +459,7 @@ check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
+	rm -f $(QUICLY_INTEGRATION_TEST)
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \

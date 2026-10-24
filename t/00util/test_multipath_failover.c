@@ -8,8 +8,10 @@
 #include <unistd.h>
 
 #define transport_udp_send_batch real_udp_send_batch
+#define transport_udp_send_batch_ecn real_udp_send_batch_ecn
 #include "../../src/common/transport_udp.c"
 #undef transport_udp_send_batch
+#undef transport_udp_send_batch_ecn
 
 /* Replace only the socket send boundary. Both real QLINQ schedulers and
  * encrypted QUIC recovery run unchanged; a dropped send still succeeds. */
@@ -40,10 +42,12 @@ static quicly_error_t force_path(quicly_path_scheduler_t *scheduler,
 
 static quicly_path_scheduler_t forced_scheduler = {.do_send = force_path};
 
-ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
-                                 socklen_t destination_len,
-                                 const struct iovec *datagrams, size_t count,
-                                 size_t max_gso_segments) {
+ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
+                                     socklen_t destination_len,
+                                     const struct iovec *datagrams,
+                                     size_t count, size_t max_gso_segments,
+                                     uint8_t ecn) {
+  (void)ecn; /* fault injector leaves send unmarked */
   assert(max_gso_segments == 0 || max_gso_segments == 6);
   if (startup_client && startup_client->client_conn) {
     quicly_conn_t *quic = startup_client->client_conn->quic;

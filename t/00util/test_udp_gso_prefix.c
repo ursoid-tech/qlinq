@@ -26,6 +26,7 @@ static struct iovec expected[64];
 static uint8_t payload[64][1500];
 static uint8_t contiguous_payload[64 * 1500];
 static bool contiguous_layout;
+static uint8_t expected_ecn;
 static size_t max_gso_segments;
 static size_t accepted, expected_count, ordinary_accepted, gso_accepted;
 static size_t direct_accepted, scatter_accepted;
@@ -48,12 +49,29 @@ static size_t check_message(const struct msghdr *message, size_t first,
     total += message->msg_iov[i].iov_len;
   }
   size_t logical = 0;
-  if (message->msg_controllen) {
+  struct cmsghdr *first_control = CMSG_FIRSTHDR((struct msghdr *)message);
+  bool is_gso = first_control && first_control->cmsg_level == SOL_UDP &&
+                first_control->cmsg_type == UDP_SEGMENT;
+  struct cmsghdr *mark =
+      is_gso ? CMSG_NXTHDR((struct msghdr *)message, first_control)
+             : first_control;
+  if (expected_ecn) {
+    assert(mark && mark->cmsg_level == IPPROTO_IP && mark->cmsg_type == IP_TOS);
+    assert(mark->cmsg_len == CMSG_LEN(sizeof(int)));
+    int value;
+    memcpy(&value, CMSG_DATA(mark), sizeof(value));
+    assert(value == expected_ecn);
+    assert(!CMSG_NXTHDR((struct msghdr *)message, mark));
+  } else {
+    assert(!mark);
+  }
+  if (is_gso) {
     struct cmsghdr *cmsg = CMSG_FIRSTHDR((struct msghdr *)message);
     assert(cmsg && cmsg->cmsg_level == SOL_UDP &&
            cmsg->cmsg_type == UDP_SEGMENT &&
            cmsg->cmsg_len == CMSG_LEN(sizeof(uint16_t)));
-    assert(!CMSG_NXTHDR((struct msghdr *)message, cmsg));
+    assert((CMSG_NXTHDR((struct msghdr *)message, cmsg) != NULL) ==
+           (expected_ecn != 0));
     uint16_t segment;
     memcpy(&segment, CMSG_DATA(cmsg), sizeof(segment));
     assert(segment > 0 && total > segment);
@@ -86,7 +104,7 @@ static size_t check_message(const struct msghdr *message, size_t first,
       }
     }
   } else {
-    assert(!message->msg_control && message->msg_iovlen == 1);
+    assert((expected_ecn || !message->msg_control) && message->msg_iovlen == 1);
     assert(first < expected_count && total == expected[first].iov_len);
     assert(memcmp(bytes, expected[first].iov_base, total) == 0);
     logical = 1;
@@ -107,7 +125,9 @@ static int mock_sendmmsg(int fd, struct mmsghdr *messages, unsigned int count,
   if (send_calls < step_count) {
     step = steps[send_calls];
     assert(count == step.messages);
-    assert((messages[0].msg_hdr.msg_controllen != 0) == step.first_is_gso);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&messages[0].msg_hdr);
+    assert((cmsg && cmsg->cmsg_level == SOL_UDP &&
+            cmsg->cmsg_type == UDP_SEGMENT) == step.first_is_gso);
   }
   send_calls++;
   if (step.result < 0) {
@@ -148,9 +168,9 @@ static void step(int result, int error, unsigned messages, bool gso) {
 
 static ssize_t send_suffix(void) {
   struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(4433)};
-  return transport_udp_send_batch(7, (struct sockaddr *)&address,
-                                  sizeof(address), expected + accepted,
-                                  expected_count - accepted, max_gso_segments);
+  return transport_udp_send_batch_ecn(
+      7, (struct sockaddr *)&address, sizeof(address), expected + accepted,
+      expected_count - accepted, max_gso_segments, expected_ecn);
 }
 
 static void run_limited_layout(void) {
@@ -361,6 +381,13 @@ int main(void) {
   expected[4].iov_base = payload[4];
   assert(send_suffix() == 6 && accepted == 6 && direct_accepted == 0 &&
          scatter_accepted == 1 && send_calls == 1);
+  expected_ecn = 2;
+  contiguous_layout = false;
+  run_layout();
+  run_limited_layout();
+  contiguous_layout = true;
+  run_layout();
+  run_limited_layout();
   puts("UDP GSO grouping and partial-send fault injection passed");
   return 0;
 }

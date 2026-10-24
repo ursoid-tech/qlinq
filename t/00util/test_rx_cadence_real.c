@@ -29,10 +29,11 @@ static bool close_in_masked_wait;
 ssize_t test_cadence_udp_send_batch(int fd, const struct sockaddr *destination,
                                     socklen_t destination_len,
                                     const struct iovec *datagrams, size_t count,
-                                    size_t max_gso_segments) {
+                                    size_t max_gso_segments, uint8_t ecn) {
   if (fd != impaired_fd || !inject_loss || count < 3)
-    return transport_udp_send_batch(fd, destination, destination_len, datagrams,
-                                    count, max_gso_segments);
+    return transport_udp_send_batch_ecn(fd, destination, destination_len,
+                                        datagrams, count, max_gso_segments,
+                                        ecn);
   inject_loss = false;
   injected_bursts++;
   /* This isolated-loopback test requires these small writes to succeed. The
@@ -41,8 +42,8 @@ ssize_t test_cadence_udp_send_batch(int fd, const struct sockaddr *destination,
    */
   for (size_t i = count; i != 0; i--)
     if (i != 2)
-      assert(transport_udp_send_batch(fd, destination, destination_len,
-                                      datagrams + i - 1, 1, 1) == 1);
+      assert(transport_udp_send_batch_ecn(fd, destination, destination_len,
+                                          datagrams + i - 1, 1, 1, ecn) == 1);
   return (ssize_t)count;
 }
 

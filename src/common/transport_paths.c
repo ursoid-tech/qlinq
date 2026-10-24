@@ -1,25 +1,26 @@
 #include "transport_paths.h"
 
+#include <math.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <string.h>
 
-path_t transport_path_estimate(const quicly_path_stats_t *stats,
-                               size_t queued_datagrams, size_t egress_bytes,
-                               size_t symbol_size, fp_t relative_owd) {
+static path_t estimate_with_rtt(float rtt_ms, const quicly_path_stats_t *stats,
+                                size_t queued_datagrams, size_t egress_bytes,
+                                size_t symbol_size, fp_t relative_owd) {
   path_t sample = {.b = FP_FROM_INT(100),
                    .l = FP_FROM_FLOAT(0.050f),
                    .p = FP_FROM_FLOAT(0.01f)};
   if (stats) {
-    if (stats->rtt_smoothed > 0) {
-      sample.l = FP_FROM_INT(stats->rtt_smoothed) / 2000;
+    if (isfinite(rtt_ms) && rtt_ms > 0) {
+      sample.l = FP_FROM_FLOAT(rtt_ms / 2000.0f);
       if (stats->cwnd > 0 && symbol_size > 0) {
-        /* Preserve fractional symbols and sub-one-symbol/second rates.
-         * Wide arithmetic also handles unusually large windows and sizes. */
-        fp_wide_t rate = (fp_wide_t)stats->cwnd * 1000 * FP_ONE /
-                         ((fp_wide_t)symbol_size * stats->rtt_smoothed);
-        fp_t ceiling = FP_FROM_INT(FP_SAFE_WHOLE);
-        sample.b = rate > ceiling ? ceiling : (rate > 0 ? (fp_t)rate : 1);
+        /* preserve fractional symbols and sub-symbol rates */
+        double rate =
+            (double)stats->cwnd * 1000.0 / ((double)symbol_size * rtt_ms);
+        sample.b = rate >= FP_SAFE_WHOLE
+                       ? FP_FROM_INT(FP_SAFE_WHOLE)
+                       : (rate * FP_ONE >= 1 ? (fp_t)(rate * FP_ONE) : 1);
       }
     }
     if (stats->sent > 0) {
@@ -43,6 +44,29 @@ path_t transport_path_estimate(const quicly_path_stats_t *stats,
                   ? FP_SAFE_WHOLE - sample.q
                   : egress_symbols;
   return sample;
+}
+
+path_t transport_path_estimate(const quicly_path_stats_t *stats,
+                               size_t queued_datagrams, size_t egress_bytes,
+                               size_t symbol_size, fp_t relative_owd) {
+  return estimate_with_rtt(stats ? stats->rtt_smoothed : 0, stats,
+                           queued_datagrams, egress_bytes, symbol_size,
+                           relative_owd);
+}
+
+path_t transport_path_estimate_on_path(quicly_conn_t *quic, size_t path_index,
+                                       const quicly_path_stats_t *stats,
+                                       size_t queued_datagrams,
+                                       size_t egress_bytes, size_t symbol_size,
+                                       fp_t relative_owd) {
+  float rtt_ms = stats ? stats->rtt_smoothed : 0;
+  quicly_path_health_t health;
+  if (quic && quicly_get_path_health(quic, path_index, &health) == 0 &&
+      health.rtt_is_sampled && isfinite(health.rtt_smoothed) &&
+      health.rtt_smoothed > 0)
+    rtt_ms = health.rtt_smoothed;
+  return estimate_with_rtt(rtt_ms, stats, queued_datagrams, egress_bytes,
+                           symbol_size, relative_owd);
 }
 
 void transport_path_update_state(path_state_t *state, const path_t *sample,

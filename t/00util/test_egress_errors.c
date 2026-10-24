@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 
+static uint8_t expected_ecn;
+static bool inspect_ecn;
+static unsigned ecn_calls;
 static int failure;
 static size_t calls;
 static bool inspect_payloads;
@@ -19,12 +22,18 @@ static size_t policy_step_count, policy_next_step;
 static bool inspect_policy;
 
 /* The UDP adapter returns zero for blocked sends and retries EINTR itself. */
-ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
-                                 socklen_t destination_len,
-                                 const struct iovec *datagrams, size_t count,
-                                 size_t max_gso_segments) {
+ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
+                                     socklen_t destination_len,
+                                     const struct iovec *datagrams,
+                                     size_t count, size_t max_gso_segments,
+                                     uint8_t ecn) {
   (void)fd;
   (void)destination_len;
+  if (inspect_ecn) {
+    assert(count == 1 && ecn == (ecn_calls++ == 0 ? 2 : 3));
+  } else {
+    assert(ecn == expected_ecn);
+  }
   calls++;
   if (inspect_policy) {
     assert(policy_next_step < policy_step_count);
@@ -242,7 +251,42 @@ static void test_retained_grouping_policy(void) {
   transport_egress_destroy(&egress);
 }
 
+static void test_retained_ecn(void) {
+  transport_egress_t egress;
+  assert(transport_egress_init(&egress, 16, 4096));
+  struct sockaddr_in destination = {.sin_family = AF_INET,
+                                    .sin_port = htons(2)};
+  uint8_t bytes[32] = {0};
+  struct iovec vec = {bytes, sizeof(bytes)};
+  expected_ecn = 2;
+  failure = EAGAIN;
+  assert(transport_egress_submit_ecn(&egress, 1,
+                                     (struct sockaddr *)&destination,
+                                     sizeof(destination), &vec, 1, 0, 2));
+  assert(transport_egress_submit_ecn(&egress, 1,
+                                     (struct sockaddr *)&destination,
+                                     sizeof(destination), &vec, 1, 0, 3));
+  assert(egress.count == 2 && egress.packets[0].ecn == 2 &&
+         egress.packets[1].ecn == 3);
+  failure = EAGAIN;
+  assert(transport_egress_flush(&egress, 1));
+  assert(egress.count == 2);
+  failure = 0;
+  /* separate marking batches */
+  inspect_ecn = true;
+  ecn_calls = 0;
+  assert(transport_egress_flush(&egress, 1));
+  assert(egress.count == 0 && ecn_calls == 2);
+  inspect_ecn = false;
+  expected_ecn = 0;
+  assert(!transport_egress_submit_ecn(&egress, 1,
+                                      (struct sockaddr *)&destination,
+                                      sizeof(destination), &vec, 1, 0, 4));
+  transport_egress_destroy(&egress);
+}
+
 int main(void) {
+  test_retained_ecn();
   test_queue_pressure(false);
   test_queue_pressure(true);
   test_retained_grouping_policy();

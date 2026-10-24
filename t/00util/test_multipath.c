@@ -282,8 +282,9 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
         ok = false;
         break;
       }
-      path_t expected = transport_path_estimate(
-          &stats, quicly_get_num_datagram_frames_path(conn->quic, mapped),
+      path_t expected = transport_path_estimate_on_path(
+          conn->quic, mapped, &stats,
+          quicly_get_num_datagram_frames_path(conn->quic, mapped),
           t->sockets[i].egress.bytes, symbol_size,
           conn->paths[i].latest_owd_fp);
       expected.q += stats.bytes_in_flight / symbol_size +

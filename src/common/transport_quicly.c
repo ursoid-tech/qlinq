@@ -486,8 +486,8 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
         physical_path->owd_initialized && physical_path->telemetry_path == path
             ? physical_path->latest_owd_fp
             : 0;
-    path_t sample = transport_path_estimate(
-        &stats, quicly_get_num_datagram_frames_path(quic, path),
+    path_t sample = transport_path_estimate_on_path(
+        quic, path, &stats, quicly_get_num_datagram_frames_path(quic, path),
         t->sockets[physical].egress.bytes, symbol_size, relative_owd);
     const path_state_t *state = &physical_path->state;
     if (state->initialized &&
@@ -743,6 +743,8 @@ static int open_unicast_socket(int family) {
       return -1;
     }
   }
+  if (fd >= 0)
+    (void)transport_udp_enable_recv_ecn(fd, family);
   return fd;
 }
 
@@ -1499,9 +1501,69 @@ static bool service_interfaces(transport_t *t) {
   return consumed;
 }
 
+/* discard connection without CONNECTION_CLOSE on fatal error */
+static void discard_connection(transport_conn_t *conn, quicly_error_t error,
+                               const char *failure_reason) {
+  transport_t *t = conn->transport;
+  size_t index = 0;
+  if (t->is_server) {
+    while (index < t->conn_count && t->conns[index] != conn)
+      index++;
+    assert(index < t->conn_count);
+  }
+  uint64_t offending_frame_type = UINT64_MAX;
+  const char *reason = "";
+  int is_remote = 0;
+  quicly_error_t close_error = error;
+  if (error == QUICLY_ERROR_FREE_CONNECTION)
+    close_error = quicly_get_close_reason(conn->quic, &offending_frame_type,
+                                          &reason, &is_remote);
+  else
+    reason = failure_reason;
+  bool application_error = QUICLY_ERROR_IS_QUIC_APPLICATION(close_error);
+  uint64_t error_code = QUICLY_ERROR_IS_QUIC(close_error)
+                            ? QUICLY_ERROR_GET_ERROR_CODE(close_error)
+                            : (uint64_t)close_error;
+  if (!reason)
+    reason = "";
+  transport_log(
+      t, TRANSPORT_LOG_INFO, "connection", conn->id, SIZE_MAX,
+      "closed origin=%s class=%s error=%" PRIu64 " raw=%" PRId64 " reason=%s",
+      is_remote ? "remote" : "local",
+      application_error
+          ? "application"
+          : (QUICLY_ERROR_IS_QUIC(close_error) ? "transport" : "internal"),
+      error_code, (int64_t)close_error, reason[0] ? reason : "none");
+  transport_event_t ev = {
+      .type = TRANSPORT_EVENT_DISCONNECTED,
+      .conn = conn,
+      .disconnect = {.error_code = error_code,
+                     .raw_error = (int64_t)close_error,
+                     .application_error = application_error,
+                     .offending_frame_type = offending_frame_type,
+                     .remote = is_remote != 0,
+                     .reason = reason}};
+  transport_emit_event(t, &ev);
+  t->stats.connections_closed++;
+
+  transport_publish_checkpoint_connection_removed(t, conn);
+  transport_connection_cache_forget(t, conn);
+  destroy_connection(conn);
+
+  if (t->is_server) {
+    memmove(t->conns + index, t->conns + index + 1,
+            sizeof(t->conns[0]) * (t->conn_count - index - 1));
+    t->conns[--t->conn_count] = NULL;
+  } else {
+    t->client_conn = NULL;
+    schedule_client_reconnect(t, transport_get_time_ms());
+  }
+}
+
 static void transport_receive_datagram(transport_t *t, size_t fd_idx,
                                        const uint8_t *buf, size_t len,
-                                       struct sockaddr_storage *source) {
+                                       struct sockaddr_storage *source,
+                                       uint8_t ecn) {
   t->sockets[fd_idx].bytes_received += len;
 
   struct sockaddr *psa = (struct sockaddr *)source;
@@ -1513,6 +1575,7 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
         SIZE_MAX)
       break;
 
+    decoded.ecn = ecn;
     transport_conn_t *target = NULL;
     if (t->is_server) {
       /* Ordinary short-header traffic carries our stable master CID.
@@ -1585,9 +1648,13 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
     }
 
     if (target) {
-      quicly_receive(target->quic,
-                     (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
-                     &decoded);
+      quicly_error_t ret = quicly_receive(
+          target->quic, (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
+          &decoded);
+      if (ret != 0 && ret != QUICLY_ERROR_PACKET_IGNORED &&
+          (ret != QUICLY_ERROR_STATE_EXHAUSTION ||
+           quicly_close(target->quic, ret, "receive failure") != 0))
+        discard_connection(target, ret, "receive failure");
     }
   }
 }
@@ -1641,7 +1708,7 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
         for (ssize_t i = 0; i < received; i++)
           if (!views[i].dropped)
             transport_receive_datagram(t, fd_idx, views[i].data, views[i].size,
-                                       &views[i].source);
+                                       &views[i].source, views[i].ecn);
       } else {
         transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
         received = transport_udp_receive_batch(socket->fd, datagrams, batch);
@@ -1649,7 +1716,8 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
           /* Preserve recvfrom/recvmmsg's original copied-prefix dispatch. The
            * decoder validates each complete QUIC packet in that prefix. */
           transport_receive_datagram(t, fd_idx, datagrams[i].data,
-                                     datagrams[i].size, &datagrams[i].source);
+                                     datagrams[i].size, &datagrams[i].source,
+                                     datagrams[i].ecn);
         }
         more = received == (ssize_t)batch;
       }
@@ -1716,9 +1784,9 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
                                     target->paths[i].telemetry_path == mapped
                                 ? target->paths[i].latest_owd_fp
                                 : 0;
-        path_t sample =
-            transport_path_estimate(&stats, queued, t->sockets[i].egress.bytes,
-                                    symbol_size, relative_owd);
+        path_t sample = transport_path_estimate_on_path(
+            target->quic, mapped, &stats, queued, t->sockets[i].egress.bytes,
+            symbol_size, relative_owd);
         fp_t cap = transport_path_probe_cap(&target->paths[i].measurement,
                                             &stats, symbol_size, now);
         if (sample.b > cap)
@@ -1774,8 +1842,9 @@ static void service_connections(transport_t *t, uint64_t now) {
       /* Save this classification: quicly_send may drain queued DATAGRAMs.
        * Stream-only output uses smaller UDP aggregates independently of the
        * native batch size; retained egress must carry the same limit. */
-      int send_res = quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams,
-                                 dgrams_buf, sizeof(dgrams_buf));
+      quicly_error_t send_res =
+          quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams, dgrams_buf,
+                      sizeof(dgrams_buf));
       if (send_res == 0) {
         if (num_dgrams == 0)
           break;
@@ -1797,65 +1866,27 @@ static void service_connections(transport_t *t, uint64_t now) {
           continue;
         }
 
-        if (!transport_egress_submit(
+        if (!transport_egress_submit_ecn(
                 &t->sockets[out_fd_index].egress, t->sockets[out_fd_index].fd,
                 &dest.sa, quicly_get_socklen(&dest.sa), dgrams, num_dgrams,
-                stream_only_multipath ? QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS
-                                      : 0))
+                stream_only_multipath ? QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS : 0,
+                quicly_send_get_ecn_bits(conn->quic)))
           transport_log(t, TRANSPORT_LOG_WARNING, "udp", conn->id, out_fd_index,
                         "egress queue exhausted");
       } else if (send_res == QUICLY_ERROR_FREE_CONNECTION) {
-        uint64_t offending_frame_type = UINT64_MAX;
-        const char *reason = "";
-        int is_remote = 0;
-        quicly_error_t close_error = quicly_get_close_reason(
-            conn->quic, &offending_frame_type, &reason, &is_remote);
-        bool application_error = QUICLY_ERROR_IS_QUIC_APPLICATION(close_error);
-        uint64_t error_code = QUICLY_ERROR_IS_QUIC(close_error)
-                                  ? QUICLY_ERROR_GET_ERROR_CODE(close_error)
-                                  : (uint64_t)close_error;
-        if (!reason)
-          reason = "";
-        transport_log(t, TRANSPORT_LOG_INFO, "connection", conn->id, SIZE_MAX,
-                      "closed origin=%s class=%s error=%" PRIu64 " raw=%" PRId64
-                      " reason=%s",
-                      is_remote ? "remote" : "local",
-                      application_error
-                          ? "application"
-                          : (QUICLY_ERROR_IS_QUIC(close_error) ? "transport"
-                                                               : "internal"),
-                      error_code, (int64_t)close_error,
-                      reason[0] ? reason : "none");
-        transport_event_t ev = {
-            .type = TRANSPORT_EVENT_DISCONNECTED,
-            .conn = conn,
-            .disconnect = {.error_code = error_code,
-                           .raw_error = (int64_t)close_error,
-                           .application_error = application_error,
-                           .offending_frame_type = offending_frame_type,
-                           .remote = is_remote != 0,
-                           .reason = reason}};
-        transport_emit_event(t, &ev);
-        t->stats.connections_closed++;
-
-        transport_publish_checkpoint_connection_removed(t, conn);
-        transport_connection_cache_forget(t, conn);
-        destroy_connection(conn);
-
-        if (t->is_server) {
-          memmove(t->conns + i, t->conns + i + 1,
-                  sizeof(t->conns[0]) * (t->conn_count - i - 1));
-          t->conn_count--;
+        discard_connection(conn, send_res, NULL);
+        if (t->is_server)
           i--;
-          active_count = t->conn_count;
-        } else {
-          t->client_conn = NULL;
-          active_count = 0;
-          schedule_client_reconnect(t, transport_get_time_ms());
-        }
+        active_count = transport_connection_count(t);
         break;
       } else {
-        quicly_close(conn->quic, send_res, "send failure");
+        if (send_res != QUICLY_ERROR_STATE_EXHAUSTION ||
+            quicly_close(conn->quic, send_res, "send failure") != 0) {
+          discard_connection(conn, send_res, "send failure");
+          if (t->is_server)
+            i--;
+          active_count = transport_connection_count(t);
+        }
         break;
       }
     }

@@ -8,6 +8,7 @@
 #include "portable_sockets.h"
 #include "transport.h"
 #include "transport_wire.h"
+#include "quicly/constants.h"
 #include "xfer.h"
 
 #include <errno.h>
@@ -339,8 +340,9 @@ static void on_event(void *user_data, const transport_event_t *event) {
               " raw=%" PRId64 " reason=%s\n",
               event->disconnect.remote ? "remote" : "local",
               event->disconnect.application_error ? "application"
-              : event->disconnect.raw_error >= 0  ? "transport"
-                                                  : "internal",
+              : QUICLY_ERROR_IS_QUIC_TRANSPORT(event->disconnect.raw_error)
+                  ? "transport"
+                  : "internal",
               event->disconnect.error_code, event->disconnect.raw_error,
               event->disconnect.reason && event->disconnect.reason[0]
                   ? event->disconnect.reason

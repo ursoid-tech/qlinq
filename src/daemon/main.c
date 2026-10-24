@@ -9,6 +9,7 @@
 #include "portable_sockets.h"
 #include "transport.h"
 #include "transport_wire.h"
+#include "quicly/constants.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <openssl/crypto.h>
@@ -176,8 +177,9 @@ static void on_transport_event(void *user_data,
            " reason=%s\n",
            event->disconnect.remote ? "remote" : "local",
            event->disconnect.application_error ? "application"
-           : event->disconnect.raw_error >= 0  ? "transport"
-                                               : "internal",
+           : QUICLY_ERROR_IS_QUIC_TRANSPORT(event->disconnect.raw_error)
+               ? "transport"
+               : "internal",
            event->disconnect.error_code, event->disconnect.raw_error,
            event->disconnect.reason && event->disconnect.reason[0]
                ? event->disconnect.reason

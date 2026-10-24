@@ -63,6 +63,7 @@ examples/__pycache__/
 tmp/
 .tmp.dprobes.h
 
+t/00util/test_quicly_integration
 t/00util/test_egress_errors
 t/00util/test_transport_bind
 t/00util/test_interleaved_receive

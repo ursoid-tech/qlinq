@@ -10,6 +10,7 @@
 typedef struct {
   struct sockaddr_storage destination;
   socklen_t destination_len;
+  uint8_t ecn;
   uint8_t max_gso_segments; /* 0 keeps the UDP adapter's default grouping. */
   uint8_t *data;
   size_t size;
@@ -45,6 +46,11 @@ bool transport_egress_submit(transport_egress_t *egress, int fd,
                              socklen_t destination_len,
                              const struct iovec *datagrams, size_t count,
                              size_t max_gso_segments);
+bool transport_egress_submit_ecn(transport_egress_t *egress, int fd,
+                                 const struct sockaddr *destination,
+                                 socklen_t destination_len,
+                                 const struct iovec *datagrams, size_t count,
+                                 size_t max_gso_segments, uint8_t ecn);
 bool transport_egress_flush(transport_egress_t *egress, int fd);
 
 #endif

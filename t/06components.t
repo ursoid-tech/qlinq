@@ -5,7 +5,14 @@ use warnings;
 use Test::More;
 use t::Util;
 
-subtest 'decomposed transport components' => sub {
+subtest 'Quicly errors and fractional RTT integration' => sub {
+    plan skip_all => 'ELF linker fault injection' if $^O ne 'linux';
+    my ($stderr, $stdout) = run_prog('./t/00util/test_quicly_integration');
+    like($stdout, qr/===QUICLY INTEGRATION OK===/,
+         'fatal errors dispose peers, reconnect works, and sub-ms paths retain precision') or diag($stderr);
+};
+
+subtest 'decomposed transport components'  => sub {
     my ($stderr, $stdout) = run_prog('./t/00util/test_transport_components');
     like($stdout, qr/===TRANSPORT COMPONENTS OK===/,
          'component ownership and lookup tests pass') or diag($stderr);

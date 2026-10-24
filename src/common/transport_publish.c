@@ -168,9 +168,9 @@ static size_t collect_paths(transport_t *t, transport_conn_t *conn,
                             : 0;
     candidate->quic = mapped;
     candidate->available = QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - queued;
-    candidate->sample = transport_path_estimate(
-        &stats, queued, t->sockets[physical].egress.bytes, estimate_symbol_size,
-        relative_owd);
+    candidate->sample = transport_path_estimate_on_path(
+        conn->quic, mapped, &stats, queued, t->sockets[physical].egress.bytes,
+        estimate_symbol_size, relative_owd);
     /* Datagram groups leave QLINQ's queue quickly, but remain serialized by
      * QUIC until the path ACKs them.  Include that outstanding work in the
      * Pathflow input, as the stream scheduler does, so a fast path is not
