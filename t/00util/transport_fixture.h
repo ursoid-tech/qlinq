@@ -20,7 +20,7 @@ typedef struct {
   fixture_endpoint_t server, client;
 } transport_fixture_t;
 
-static void fixture_event(void *data, const transport_event_t *event) {
+static inline void fixture_event(void *data, const transport_event_t *event) {
   fixture_endpoint_t *endpoint = data;
   endpoint->conn = event->conn;
   switch (event->type) {
@@ -58,16 +58,16 @@ static void fixture_event(void *data, const transport_event_t *event) {
   }
 }
 
-static void fixture_tick(transport_fixture_t *fixture) {
+static inline void fixture_tick(transport_fixture_t *fixture) {
   transport_tick(fixture->server.transport);
   transport_tick(fixture->client.transport);
   assert(!fixture->server.failed && !fixture->client.failed);
   usleep(1000);
 }
 
-static void fixture_create(transport_fixture_t *fixture, uint16_t port,
-                           const transport_limits_t *server_limits,
-                           const transport_limits_t *client_limits) {
+static inline void fixture_create(transport_fixture_t *fixture, uint16_t port,
+                                  const transport_limits_t *server_limits,
+                                  const transport_limits_t *client_limits) {
   memset(fixture, 0, sizeof(*fixture));
   fixture->server.server = true;
   transport_config_t config = {.bind_hosts = {"127.0.0.1"},
@@ -93,9 +93,9 @@ static void fixture_create(transport_fixture_t *fixture, uint16_t port,
   assert(fixture->client.authenticated && fixture->server.authenticated);
 }
 
-static void fixture_subscribe(transport_fixture_t *fixture,
-                              fixture_endpoint_t *receiver,
-                              moq_track_id_t track) {
+static inline void fixture_subscribe(transport_fixture_t *fixture,
+                                     fixture_endpoint_t *receiver,
+                                     moq_track_id_t track) {
   fixture_endpoint_t *source =
       receiver->server ? &fixture->client : &fixture->server;
   size_t expected = source->subscriptions + 1;
@@ -105,14 +105,15 @@ static void fixture_subscribe(transport_fixture_t *fixture,
   assert(source->subscriptions == expected);
 }
 
-static void fixture_receive(transport_fixture_t *fixture,
-                            fixture_endpoint_t *receiver, size_t expected) {
+static inline void fixture_receive(transport_fixture_t *fixture,
+                                   fixture_endpoint_t *receiver,
+                                   size_t expected) {
   for (size_t i = 0; i < 2000 && receiver->objects < expected; i++)
     fixture_tick(fixture);
   assert(receiver->objects == expected);
 }
 
-static void fixture_destroy(transport_fixture_t *fixture) {
+static inline void fixture_destroy(transport_fixture_t *fixture) {
   transport_destroy(fixture->client.transport);
   transport_destroy(fixture->server.transport);
 }

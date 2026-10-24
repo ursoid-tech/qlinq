@@ -707,7 +707,8 @@ void ifmon_watch_stop(ifmon_watcher_t *w) {
     return;
   atomic_store_explicit(&w->running, 0, memory_order_release);
   char c = 1;
-  (void)write(w->stop_pipe[1], &c, 1);
+  ssize_t rc = write(w->stop_pipe[1], &c, 1);
+  (void)rc;
   pthread_join(w->thread, NULL);
   close(w->stop_pipe[0]);
   close(w->stop_pipe[1]);
