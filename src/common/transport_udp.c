@@ -83,47 +83,6 @@ static void append_ecn(struct msghdr *message, void *control, uint8_t ecn) {
 #define TRANSPORT_UDP_MAX_BATCH 64U
 #define TRANSPORT_UDP_GSO_BUFFER_SIZE 65507U /* IPv4 UDP payload ceiling. */
 
-bool transport_udp_enable_recv_ecn(int fd, int family) {
-  int enabled = 1;
-#if defined(IP_RECVTOS)
-  if (family == AF_INET)
-    return setsockopt(fd, IPPROTO_IP, IP_RECVTOS, &enabled, sizeof(enabled)) ==
-           0;
-#endif
-#if defined(IPV6_RECVTCLASS)
-  if (family == AF_INET6)
-    return setsockopt(fd, IPPROTO_IPV6, IPV6_RECVTCLASS, &enabled,
-                      sizeof(enabled)) == 0;
-#endif
-  (void)fd;
-  (void)family;
-  (void)enabled;
-  return false;
-}
-
-uint8_t transport_udp_message_ecn(const struct msghdr *message) {
-  if (!message || (message->msg_flags & MSG_CTRUNC))
-    return 0;
-  for (struct cmsghdr *header = CMSG_FIRSTHDR(message); header;
-       header = CMSG_NXTHDR((struct msghdr *)message, header)) {
-    if (header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_TOS &&
-        header->cmsg_len >= CMSG_LEN(sizeof(uint8_t))) {
-      /* Linux receives IPv4 TOS as a byte; IPv6 traffic class is an int. */
-      return *(const uint8_t *)CMSG_DATA(header) & 3U;
-    }
-#ifdef IPV6_TCLASS
-    if (header->cmsg_level == IPPROTO_IPV6 &&
-        header->cmsg_type == IPV6_TCLASS &&
-        header->cmsg_len >= CMSG_LEN(sizeof(int))) {
-      int traffic_class;
-      memcpy(&traffic_class, CMSG_DATA(header), sizeof(traffic_class));
-      return (uint8_t)traffic_class & 3U;
-    }
-#endif
-  }
-  return 0;
-}
-
 ssize_t transport_udp_receive_ecn(int fd, void *buffer, size_t capacity,
                                   struct sockaddr_storage *peer,
                                   socklen_t *peer_length, uint8_t *ecn) {

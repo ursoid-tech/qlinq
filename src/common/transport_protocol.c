@@ -967,7 +967,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     tconn->telemetry_reply_at_ns[hdr.path_id] = now_ns + 10000000U;
     size_t reply_path = transport_select_datagram_path(tconn);
     if (reply_path != SIZE_MAX &&
-        quicly_get_num_datagram_frames_path(conn, reply_path) <
+        quicly_get_num_datagram_frames_path(tconn->quic, reply_path) <
             QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY / 2) {
       uint8_t reply[QLINQ_WIRE_TELEMETRY_SIZE];
       qlinq_wire_telemetry_t telemetry = {.path_id = hdr.path_id,
