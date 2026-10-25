@@ -213,7 +213,7 @@ class BandwidthNamespaceTests(unittest.TestCase):
                          [1, 0, 2, 0])
 
     def test_delivery_flags_are_mutually_exclusive(self):
-        for flags in (['--all-modes', '--reliable'], ['--datagram', '--fixed-fec']):
+        for flags in (['--all-modes', '--reliable'], ['--datagram', '--fixedrate']):
             with self.subTest(flags=flags), \
                  mock.patch.object(demo['sys'], 'argv', ['multipath_bw_demo', *flags]), \
                  redirect_stderr(io.StringIO()), \

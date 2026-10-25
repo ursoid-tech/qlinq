@@ -99,7 +99,7 @@ static void usage(FILE *out, const char *program) {
       "  --stats-ms N            Emit JSON health snapshots periodically\n"
       "  --queue-ms N            Local queue age limit (default: 100 ms)\n"
       "  --track NAME            Packet stream (default: tund/tun0)\n"
-      "  --mode MODE             fixed-fec/fec (default), rateless, reliable, "
+      "  --mode MODE             fixedrate/fec (default), rateless, reliable, "
       "datagram\n"
       "  --cert FILE --key FILE  TLS identity (required on listener)\n"
       "  --ca FILE               Trust store for verified peers\n"
@@ -118,7 +118,7 @@ static bool parse_options(int argc, char **argv, options_t *options) {
                          .port = 8888,
                          .mtu = DEFAULT_TUN_MTU,
                          .queue_ms = 100,
-                         .delivery = QLINQ_DELIVERY_FIXED_FEC};
+                         .delivery = QLINQ_DELIVERY_FIXEDRATE};
   bool have_role = false;
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];

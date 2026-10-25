@@ -543,7 +543,7 @@ class ReportTests(unittest.TestCase):
         self.assertFalse(self.report()['checks']['source_cohort_accounting'])
         self.assertIsNone(self.report()['deadline_delivered_fraction_of_offered'])
 
-    def test_fixed_fec_fault_loss_is_reported_without_reliability_gate(self):
+    def test_fixedrate_fault_loss_is_reported_without_reliability_gate(self):
         self.args.scenario = 'capacity'
         self.rx[-1]['received'] = 12000
         # Valid avoidance evidence; the dropped records remain in the report.

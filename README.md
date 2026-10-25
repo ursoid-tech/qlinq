@@ -61,14 +61,14 @@ Receive it with:
   --insecure-no-verify --output received.bin --receive-count 1
 ```
 
-The app also supports reliable, plain datagram, fixed-FEC, and rateless modes,
+The app also supports reliable, plain datagram, fixedrate, and rateless modes,
 IPv6 bracketed peer endpoints, negotiated repair selection, an explicit QUIC
 idle timeout, machine-readable counter snapshots, and `--pv` for pv-style wire
 throughput per physical interface. Run `qlinq-app --help` for the complete
 interface.
 
 Delivery mode names are shared by `qlinq-app`, `qlinqd`, and `qlinq-tun`:
-`datagram`, `reliable`, `fixed-fec` (also accepted as `fec`), and `rateless`.
+`datagram`, `reliable`, `fixedrate` (also accepted as `fec`), and `rateless`.
 The daemon also retains its `--reliable` and `--rateless` aliases. Each tool
 keeps its existing default mode.
 
@@ -90,7 +90,7 @@ sudo qlinq-tun down office
 
 `qlinq-tun` maps each IP packet to one `QLINQ_CONTENT_DATA` record and
 publishes/subscribes to the same named stream in opposite directions. Both
-peers must choose the same `--track` and `--mode` (default `fixed-fec`). The
+peers must choose the same `--track` and `--mode` (default `fixedrate`). The
 listener is limited to one peer; the connecting side reconnects automatically.
 For a real interface, configure the TUN as root and use `--run-as USER` to drop
 privileges before servicing peer traffic. TLS identities and sockets are
@@ -100,12 +100,12 @@ with identities issued by a shared CA:
 
 ```bash
 sudo ./qlinq-tun --listen 8888 --bind 0.0.0.0 --interface tun0 \
-  --ip 10.8.0.1/24 --track vpn/demo --mode fixed-fec \
+  --ip 10.8.0.1/24 --track vpn/demo --mode fixedrate \
   --cert server.crt --key server.key --ca mesh-ca.crt \
   --auth-token 'replace-with-a-secret' --run-as qlinq
 
 sudo ./qlinq-tun --peer SERVER_IP:8888 --interface tun0 \
-  --ip 10.8.0.2/24 --track vpn/demo --mode fixed-fec \
+  --ip 10.8.0.2/24 --track vpn/demo --mode fixedrate \
   --cert client.crt --key client.key --ca mesh-ca.crt \
   --auth-token 'replace-with-a-secret' --run-as qlinq
 ```

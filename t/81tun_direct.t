@@ -6,8 +6,8 @@ use File::Temp qw(tempdir);
 use t::Util;
 
 my $directory = tempdir(CLEANUP => 1);
-my @cases = (['fixed-fec', 0], ['rateless', 0], ['reliable', 0],
-             ['datagram', 0], ['fixed-fec', 1]);
+my @cases = (['fixedrate', 0], ['rateless', 0], ['reliable', 0],
+             ['datagram', 0], ['fixedrate', 1]);
 
 for my $index (0 .. $#cases) {
     my ($mode, $verified) = @{$cases[$index]};

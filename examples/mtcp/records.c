@@ -220,7 +220,7 @@ static void run_qlinq(int paths, const char *cert, const char *key) {
   qlinq_stream_config_t sc = {
       .name = "comparison",
       .content_type = QLINQ_CONTENT_DATA,
-      .delivery = !strcmp(mode, "fec")        ? QLINQ_DELIVERY_FIXED_FEC
+      .delivery = !strcmp(mode, "fec")        ? QLINQ_DELIVERY_FIXEDRATE
                   : !strcmp(mode, "rateless") ? QLINQ_DELIVERY_RATELESS
                                               : QLINQ_DELIVERY_RELIABLE};
   qlinq_stream_t *stream =

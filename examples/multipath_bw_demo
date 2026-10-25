@@ -23,7 +23,7 @@ DEFAULT_OFFERED_MBPS = 2000.0
 DEFAULT_INITIAL_MBPS = 250.0
 UDP_PAYLOAD_SIZE = 1452
 LINK_MTU = 1500
-DELIVERY_MODES = ("datagram", "fixed-fec", "rateless", "reliable")
+DELIVERY_MODES = ("datagram", "fixedrate", "rateless", "reliable")
 MAX_RECORDS = 1048576
 MAX_FPS = 100000
 
@@ -144,7 +144,7 @@ def analyze(output, samples, exit_code, offered_mbps, initial_mbps,
             expected * .99 <= metrics.get("window_attempted_in_interval", 0) <= expected)
     delivery_mode = ("reliable" if "mode: reliable" in output else
                      "datagram" if "mode: datagram" in output else
-                     "rateless" if "mode: rateless" in output else "fixed-fec")
+                     "rateless" if "mode: rateless" in output else "fixedrate")
     return {"rates_mbps": rates, "delivery_mode": delivery_mode,
             "offered_mbps": offered_mbps,
             "initial_offered_mbps": initial_mbps,
@@ -302,9 +302,9 @@ def main():
                           const="datagram", help="use datagrams without FEC")
     delivery.add_argument("--rateless", dest="delivery_mode", action="store_const",
                           const="rateless", help=argparse.SUPPRESS)
-    delivery.add_argument("--fixed-fec", dest="delivery_mode", action="store_const",
-                          const="fixed-fec",
-                          help="use finite fixed FEC instead of rateless repair")
+    delivery.add_argument("--fixedrate", dest="delivery_mode", action="store_const",
+                          const="fixedrate",
+                          help="use fixedrate FEC with a finite parity budget")
     delivery.add_argument("--reliable", dest="delivery_mode", action="store_const",
                           const="reliable",
                           help="use reliable QUIC streams instead of FEC datagrams")

@@ -249,7 +249,8 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     /* Rateless tracks keep their source transmission systematic. They retain
      * the object for on-demand RaptorQ symbols after a NACK, but do not pay a
      * full RaptorQ precompute or speculative parity cost on every healthy
-     * object. Fixed FEC continues to transmit the pathflow-selected parity. */
+     * object. Fixed-rate FEC continues to transmit the pathflow-selected
+     * parity. */
     if (profile->fec_rateless) {
       plan->schedule.parity_symbols = 0;
       size_t source_symbols = 0;

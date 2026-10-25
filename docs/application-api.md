@@ -21,7 +21,7 @@ selected interfaces. Match initial bind addresses to the same interfaces;
 the allowlist does not configure OS routing.
 
 `qlinq_publish` and `qlinq_subscribe` return named stream handles. Each stream
-selects content type and datagram, reliable, fixed-FEC or rateless delivery.
+selects content type and datagram, reliable, fixedrate or rateless delivery.
 Subscriptions created before authentication activate when peers become ready,
 and reactivate after a configured client reconnect. Send and receive streams
 with the same name are independent. Stream names are nonempty and at most

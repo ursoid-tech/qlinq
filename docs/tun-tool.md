@@ -107,7 +107,7 @@ Important fields:
 | Field | Meaning |
 | --- | --- |
 | `uplinks` | Exact Linux interface names; one IPv4 address per available interface at startup |
-| `mode` | `fixed-fec` (default), `rateless`, `datagram`, or `reliable` |
+| `mode` | `fixedrate` (default), `rateless`, `datagram`, or `reliable` |
 | `mtu` | Inner IP MTU, 1280–2000, default 1400; configure the same value on both peers |
 | `routes` | Explicit remote IPv4 subnets, e.g. `["192.168.50.0/24"]` |
 | `queue_ms` | Maximum age of packets in the helper's userspace queues, default 100 ms |

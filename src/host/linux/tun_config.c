@@ -138,7 +138,7 @@ bool tc_validate(const tc_config *c) {
       c->route_count > 16)
     return tc_error(
         "invalid port, MTU, queue limit, interface or service account");
-  if (strcmp(c->mode, "fixed-fec") && strcmp(c->mode, "rateless") &&
+  if (strcmp(c->mode, "fixedrate") && strcmp(c->mode, "rateless") &&
       strcmp(c->mode, "datagram") && strcmp(c->mode, "reliable"))
     return tc_error("invalid delivery mode");
   for (unsigned i = 0; i < c->uplink_count; i++) {
@@ -425,7 +425,7 @@ int tc_init(const tc_args *a, const char *dir) {
     }
     c.port = port;
     strcpy(c.role, "listen");
-    strcpy(c.mode, "fixed-fec");
+    strcpy(c.mode, "fixedrate");
     if (!copy_string(c.local_ip, sizeof(c.local_ip), a->local_ip) ||
         !copy_string(c.peer_ip, sizeof(c.peer_ip), a->peer_ip))
       goto invalid;

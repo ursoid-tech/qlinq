@@ -155,7 +155,7 @@ static bool content_type_valid(qlinq_content_type_t type) {
 static bool delivery_valid(qlinq_delivery_t delivery) {
   return delivery == QLINQ_DELIVERY_DATAGRAM ||
          delivery == QLINQ_DELIVERY_RELIABLE ||
-         delivery == QLINQ_DELIVERY_FIXED_FEC ||
+         delivery == QLINQ_DELIVERY_FIXEDRATE ||
          delivery == QLINQ_DELIVERY_RATELESS;
 }
 
@@ -163,7 +163,7 @@ static uint8_t delivery_flags(qlinq_delivery_t delivery) {
   switch (delivery) {
   case QLINQ_DELIVERY_RELIABLE:
     return MOQ_TRACK_FLAG_RELIABLE;
-  case QLINQ_DELIVERY_FIXED_FEC:
+  case QLINQ_DELIVERY_FIXEDRATE:
     return MOQ_TRACK_FLAG_FEC_ENABLED;
   case QLINQ_DELIVERY_RATELESS:
     return MOQ_TRACK_FLAG_FEC_RATELESS;
@@ -179,7 +179,7 @@ static qlinq_delivery_t flags_delivery(uint8_t flags) {
   if ((flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0)
     return QLINQ_DELIVERY_RATELESS;
   if ((flags & MOQ_TRACK_FLAG_FEC_ENABLED) != 0)
-    return QLINQ_DELIVERY_FIXED_FEC;
+    return QLINQ_DELIVERY_FIXEDRATE;
   return QLINQ_DELIVERY_DATAGRAM;
 }
 

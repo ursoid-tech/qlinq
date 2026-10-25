@@ -12,8 +12,8 @@ bool cli_parse_delivery(const char *text, qlinq_delivery_t *delivery) {
     *delivery = QLINQ_DELIVERY_DATAGRAM;
   else if (strcmp(text, "reliable") == 0)
     *delivery = QLINQ_DELIVERY_RELIABLE;
-  else if (strcmp(text, "fixed-fec") == 0 || strcmp(text, "fec") == 0)
-    *delivery = QLINQ_DELIVERY_FIXED_FEC;
+  else if (strcmp(text, "fixedrate") == 0 || strcmp(text, "fec") == 0)
+    *delivery = QLINQ_DELIVERY_FIXEDRATE;
   else if (strcmp(text, "rateless") == 0)
     *delivery = QLINQ_DELIVERY_RATELESS;
   else
@@ -32,7 +32,7 @@ bool cli_parse_track_mode(const char *text, uint8_t *flags) {
   case QLINQ_DELIVERY_RELIABLE:
     *flags = MOQ_TRACK_FLAG_RELIABLE;
     break;
-  case QLINQ_DELIVERY_FIXED_FEC:
+  case QLINQ_DELIVERY_FIXEDRATE:
     *flags = MOQ_TRACK_FLAG_FEC_ENABLED;
     break;
   case QLINQ_DELIVERY_RATELESS:

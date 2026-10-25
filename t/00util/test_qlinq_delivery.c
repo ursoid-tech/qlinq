@@ -144,7 +144,7 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
       published.egress_peak_bytes < published.queued_bytes)
     goto Exit;
   bool finite =
-      content == QLINQ_CONTENT_DATA && (delivery == QLINQ_DELIVERY_FIXED_FEC ||
+      content == QLINQ_CONTENT_DATA && (delivery == QLINQ_DELIVERY_FIXEDRATE ||
                                         delivery == QLINQ_DELIVERY_RATELESS);
   callback.context = context;
   callback.endpoint = client;
@@ -322,7 +322,7 @@ int main(void) {
   if (run_reliable_boundaries())
     return 1;
   const qlinq_delivery_t modes[] = {
-      QLINQ_DELIVERY_DATAGRAM, QLINQ_DELIVERY_FIXED_FEC,
+      QLINQ_DELIVERY_DATAGRAM, QLINQ_DELIVERY_FIXEDRATE,
       QLINQ_DELIVERY_RATELESS, QLINQ_DELIVERY_RELIABLE};
   const qlinq_content_type_t content[] = {QLINQ_CONTENT_DATA,
                                           QLINQ_CONTENT_VIDEO};

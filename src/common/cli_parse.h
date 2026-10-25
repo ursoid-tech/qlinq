@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* fixed-fec and fec name the same delivery mode. */
+/* fixedrate and fec name the same delivery mode. */
 bool cli_parse_delivery(const char *text, qlinq_delivery_t *delivery);
 bool cli_parse_track_mode(const char *text, uint8_t *flags);
 

@@ -275,7 +275,7 @@ def analyze(sender, receiver, samples, args, exits, faults=()):
         elapsed = steady[-1]['time'] - steady[0]['time']
         wire = sum(b['bytes'] - a['bytes'] for a, b in zip(steady[0]['forward'], steady[-1]['forward'])) * 8 / elapsed / 1e6
     offered, admitted = tx.get('offered', 0), tx.get('admitted', 0)
-    mode = getattr(args, 'mode', 'fixed-fec')
+    mode = getattr(args, 'mode', 'fixedrate')
     receive_delivery = getattr(args, 'receive_delivery', 'queue')
     fault = args.scenario not in ('healthy', 'calibration')
     checks = {
@@ -296,8 +296,8 @@ def analyze(sender, receiver, samples, args, exits, faults=()):
     if mode in ('reliable', 'rateless'):
         delivery_requirement = 'all_admitted_within_bounded_drain'
         checks['all_admitted_delivered'] = admitted > 0 and rx.get('received', 0) == admitted
-    elif mode == 'fixed-fec' and fault:
-        # Fixed FEC intentionally does not repair loss beyond its parity budget.
+    elif mode == 'fixedrate' and fault:
+        # Fixed-rate FEC intentionally does not repair loss beyond its parity budget.
         # Keep the deficit visible without imposing reliable-delivery semantics.
         delivery_requirement = 'best_effort_fault_loss_reported'
     else:
@@ -312,7 +312,7 @@ def analyze(sender, receiver, samples, args, exits, faults=()):
                        math.isclose(e['deadline_ms'], deadline, rel_tol=0, abs_tol=.0005)
                        for e in (tx, rx))
         checks['source_cohort_accounting'] = cohort_complete and declared
-        if args.scenario == 'healthy' and mode == 'fixed-fec':
+        if args.scenario == 'healthy' and mode == 'fixedrate':
             checks['deadline_delivery_99_9pct'] = checks['source_cohort_accounting'] and offered > 0 and received_in_time >= offered * .999
     if args.scenario == 'calibration':
         checks['fixture_wire_headroom'] = measured and wire >= args.calibration_wire_mbps

@@ -86,8 +86,8 @@ static void parsers_and_limits(void) {
   } modes[] = {
       {"datagram", QLINQ_DELIVERY_DATAGRAM, 0},
       {"reliable", QLINQ_DELIVERY_RELIABLE, MOQ_TRACK_FLAG_RELIABLE},
-      {"fixed-fec", QLINQ_DELIVERY_FIXED_FEC, MOQ_TRACK_FLAG_FEC_ENABLED},
-      {"fec", QLINQ_DELIVERY_FIXED_FEC, MOQ_TRACK_FLAG_FEC_ENABLED},
+      {"fixedrate", QLINQ_DELIVERY_FIXEDRATE, MOQ_TRACK_FLAG_FEC_ENABLED},
+      {"fec", QLINQ_DELIVERY_FIXEDRATE, MOQ_TRACK_FLAG_FEC_ENABLED},
       {"rateless", QLINQ_DELIVERY_RATELESS, MOQ_TRACK_FLAG_FEC_RATELESS}};
   for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
     qlinq_delivery_t delivery;

@@ -147,7 +147,7 @@ static void show_help(FILE *out, const char *program) {
           "Data:\n"
           "  --track NAME                default qlinq-app/data (xfer-v1 for "
           "--transfer)\n"
-          "  --mode datagram|fixed-fec|rateless|reliable (fec is an alias)\n"
+          "  --mode datagram|fixedrate|rateless|reliable (fec is an alias)\n"
           "  --repair-mode auto|indexed|rateless\n"
           "  --transfer                  verified, resumable single-file copy\n"
           "  --transfer-timeout-ms MS     no-progress timeout; default 60000\n"

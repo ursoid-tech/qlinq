@@ -563,7 +563,7 @@ int main(int argc, char **argv) {
          use_reliable   ? "reliable stream"
          : use_rateless ? "rateless fec"
          : use_datagram ? "datagram"
-                        : "fixed fec");
+                        : "fixedrate");
   printf("benchmark_options: cc=%s pacing=%s abba=%s cipher=%s "
          "source_batch=%zu duration_ms=%.3f\n",
          cc_names[congestion_control], toggle_names[pacing], toggle_names[abba],
@@ -910,7 +910,7 @@ int main(int argc, char **argv) {
   printf("mode: %s\n", use_reliable   ? "reliable"
                        : use_rateless ? "rateless"
                        : use_datagram ? "datagram"
-                                      : "fixed-fec");
+                                      : "fixedrate");
   printf("offered: %d\nsent: %d\nbackpressured: %d\n", packets_sent,
          packets_admitted, backpressured);
   if (duration_ms)

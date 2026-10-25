@@ -243,7 +243,7 @@ def main():
                    help='application record bytes; default 8000, or 1250 UDP payload bytes for raw-udp')
     p.add_argument('--receive-objects', type=int, choices=range(1, 1025), default=1024, metavar='1..1024',
                    help='receive-object limit; default and maximum: 1024; payload memory is separately bounded')
-    p.add_argument('--mode', choices=['fixed-fec', 'rateless', 'reliable', 'raw-udp'], default='fixed-fec')
+    p.add_argument('--mode', choices=['fixedrate', 'rateless', 'reliable', 'raw-udp'], default='fixedrate')
     p.add_argument('--receive-delivery', choices=['queue', 'callback'], default='queue',
                    help='receiver record bridge: queue copies owned events; callback borrows records during service')
     p.add_argument('--congestion-control', choices=['default', 'reno', 'pico', 'cubic'], default='default')

@@ -257,8 +257,8 @@ seconds, followed by eight seconds at 2,000 Mbps and a three-second drain.
 Publication backpressure is counted as undelivered offered traffic.
 
 All four public delivery modes use 8,000-byte DATA records: `--datagram`
-corresponds to `QLINQ_DELIVERY_DATAGRAM`, `--fixed-fec` to
-`QLINQ_DELIVERY_FIXED_FEC`, `--rateless` to `QLINQ_DELIVERY_RATELESS`, and
+corresponds to `QLINQ_DELIVERY_DATAGRAM`, `--fixedrate` to
+`QLINQ_DELIVERY_FIXEDRATE`, `--rateless` to `QLINQ_DELIVERY_RATELESS`, and
 `--reliable` to `QLINQ_DELIVERY_RELIABLE`. Without a delivery flag the demo runs
 rateless only. `--all-modes` builds once and runs the four modes sequentially,
 each in a fresh user/network namespace, continuing after a failed mode.

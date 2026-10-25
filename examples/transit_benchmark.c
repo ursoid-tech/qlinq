@@ -248,7 +248,7 @@ static void report(const char *event, const char *role,
 
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);
-  const char *role = NULL, *start_file = NULL, *mode = "fixed-fec",
+  const char *role = NULL, *start_file = NULL, *mode = "fixedrate",
              *receive_delivery = "queue";
   bool retry_backpressure = false;
   double seconds = 90, drain = 5, mbps = 1200, deadline_ms = 200;
@@ -392,8 +392,8 @@ int main(int argc, char **argv) {
     return 2;
   qlinq_stream_config_t stream_cfg = {.content_type = QLINQ_CONTENT_DATA,
                                       .name = "transit"};
-  if (!strcmp(mode, "fixed-fec"))
-    stream_cfg.delivery = QLINQ_DELIVERY_FIXED_FEC;
+  if (!strcmp(mode, "fixedrate"))
+    stream_cfg.delivery = QLINQ_DELIVERY_FIXEDRATE;
   else if (!strcmp(mode, "rateless"))
     stream_cfg.delivery = QLINQ_DELIVERY_RATELESS;
   else if (!strcmp(mode, "reliable"))

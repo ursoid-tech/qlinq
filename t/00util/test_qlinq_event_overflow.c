@@ -293,12 +293,12 @@ cleanup:
 
 int main(void) {
   for (unsigned count_pressure = 0; count_pressure < 2; count_pressure++)
-    if (run(QLINQ_DELIVERY_FIXED_FEC, count_pressure) ||
+    if (run(QLINQ_DELIVERY_FIXEDRATE, count_pressure) ||
         run(QLINQ_DELIVERY_RATELESS, count_pressure))
       return 1;
   const qlinq_delivery_t modes[] = {
       QLINQ_DELIVERY_DATAGRAM, QLINQ_DELIVERY_RELIABLE,
-      QLINQ_DELIVERY_FIXED_FEC, QLINQ_DELIVERY_RATELESS};
+      QLINQ_DELIVERY_FIXEDRATE, QLINQ_DELIVERY_RATELESS};
   for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++)
     if (run_callback_rejection(modes[i]))
       return 1;
