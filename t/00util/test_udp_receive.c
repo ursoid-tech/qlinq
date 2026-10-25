@@ -23,8 +23,11 @@ static ssize_t interrupted_recvmsg(int fd, struct msghdr *message, int flags) {
 #define transport_udp_receive_batch portable_receive_batch
 #define transport_udp_send_batch portable_send_batch
 #define transport_udp_send_batch_ecn portable_send_batch_ecn
+#define transport_udp_send_batch_pktinfo portable_send_batch_pktinfo
 #define transport_udp_enable_recv_ecn portable_enable_recv_ecn
+#define transport_udp_enable_recv_pktinfo portable_enable_recv_pktinfo
 #define transport_udp_message_ecn portable_message_ecn
+#define transport_udp_message_pktinfo portable_message_pktinfo
 #define transport_udp_gro_create portable_gro_create
 #define transport_udp_gro_destroy portable_gro_destroy
 #define transport_udp_gro_pending portable_gro_pending
@@ -34,11 +37,14 @@ static ssize_t interrupted_recvmsg(int fd, struct msghdr *message, int flags) {
 #undef transport_udp_gro_destroy
 #undef transport_udp_gro_pending
 #undef transport_udp_gro_receive
-#undef transport_udp_receive_batch
-#undef transport_udp_send_batch
-#undef transport_udp_send_batch_ecn
-#undef transport_udp_enable_recv_ecn
+#undef transport_udp_message_pktinfo
 #undef transport_udp_message_ecn
+#undef transport_udp_enable_recv_pktinfo
+#undef transport_udp_enable_recv_ecn
+#undef transport_udp_send_batch_pktinfo
+#undef transport_udp_send_batch_ecn
+#undef transport_udp_send_batch
+#undef transport_udp_receive_batch
 #undef recvmsg
 
 typedef ssize_t (*receive_fn)(int, transport_udp_datagram_t *, size_t);

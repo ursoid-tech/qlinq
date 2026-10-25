@@ -61,23 +61,37 @@ static bool stream_can_accept_reserved(quicly_stream_t *stream,
   }
   if (frame_limit == 0)
     return false;
-  size_t growth = vector_growth(sb);
   size_t frame_bytes = sizeof(retained_frame_t) + frame_len;
-  size_t bytes = frame_bytes + growth * sizeof(quicly_sendbuf_vec_t);
   size_t stream_bytes = ctx->retained_frame_bytes +
                         sb->vecs.capacity * sizeof(quicly_sendbuf_vec_t);
   if (sb->vecs.size >= frame_limit || stream_bytes > stream_limit ||
-      bytes > stream_limit - stream_bytes ||
+      frame_bytes > stream_limit - stream_bytes ||
       t->stats.stream_egress_bytes > endpoint_limit ||
       *reserved_bytes > endpoint_limit - t->stats.stream_egress_bytes ||
-      bytes > endpoint_limit - t->stats.stream_egress_bytes - *reserved_bytes ||
+      frame_bytes >
+          endpoint_limit - t->stats.stream_egress_bytes - *reserved_bytes ||
       t->stats.stream_egress_vector_capacity > vector_limit ||
-      *reserved_vectors >
-          vector_limit - t->stats.stream_egress_vector_capacity ||
-      growth > vector_limit - t->stats.stream_egress_vector_capacity -
-                   *reserved_vectors)
+      *reserved_vectors > vector_limit - t->stats.stream_egress_vector_capacity)
     return false;
-  *reserved_bytes += bytes;
+  /* Quicly normally doubles the vector array. Near a byte/vector limit, use
+   * the remaining capacity instead of stranding up to half the budget. */
+  size_t growth = vector_growth(sb);
+  size_t available =
+      vector_limit - t->stats.stream_egress_vector_capacity - *reserved_vectors;
+  size_t stream_slots = (stream_limit - stream_bytes - frame_bytes) /
+                        sizeof(quicly_sendbuf_vec_t);
+  size_t endpoint_slots = (endpoint_limit - t->stats.stream_egress_bytes -
+                           *reserved_bytes - frame_bytes) /
+                          sizeof(quicly_sendbuf_vec_t);
+  if (growth > available)
+    growth = available;
+  if (growth > stream_slots)
+    growth = stream_slots;
+  if (growth > endpoint_slots)
+    growth = endpoint_slots;
+  if (sb->vecs.size == sb->vecs.capacity && growth == 0)
+    return false;
+  *reserved_bytes += frame_bytes + growth * sizeof(quicly_sendbuf_vec_t);
   *reserved_vectors += growth;
   return true;
 }
@@ -318,7 +332,9 @@ bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,
   bool application_data =
       type == QLINQ_WIRE_TRACK_OBJECT || type == QLINQ_WIRE_UNICAST;
   size_t frame_len = QLINQ_WIRE_FRAME_HEADER_SIZE + wire_payload_len;
-  if (!transport_stream_can_accept(stream, frame_len, application_data)) {
+  size_t reserved_bytes = 0, planned_growth = 0;
+  if (!stream_can_accept_reserved(stream, frame_len, application_data,
+                                  &reserved_bytes, &planned_growth)) {
     transport_t *t = stream_owner(stream);
     if (t)
       t->stats.stream_egress_blocked++;
@@ -346,6 +362,17 @@ bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,
   quicly_sendbuf_vec_t vec = {&retained_callbacks, frame_len, retained};
   quicly_sendbuf_t *sb = &ctx->streambuf.egress;
   size_t old_size = sb->vecs.size, old_capacity = sb->vecs.capacity;
+  if (planned_growth != vector_growth(sb)) {
+    size_t capacity = old_capacity + planned_growth;
+    quicly_sendbuf_vec_t *entries =
+        realloc(sb->vecs.entries, capacity * sizeof(*entries));
+    if (!entries) {
+      free(retained);
+      return write_failed(stream, application_data);
+    }
+    sb->vecs.entries = entries;
+    sb->vecs.capacity = capacity;
+  }
   int ret = quicly_streambuf_egress_write_vec(stream, &vec);
   transport_stats_t *stats = &ctx->owner->stats;
   size_t growth = sb->vecs.capacity - old_capacity;

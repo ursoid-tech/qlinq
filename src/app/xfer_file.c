@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +22,8 @@
 #define META_SIZE 120
 #define META_DIGEST_OFFSET 88
 #define HASH_BUFFER_SIZE (64 * 1024)
+#define HASH_READ_AHEAD_BLOCK (4 * HASH_BUFFER_SIZE)
+#define HASH_READ_AHEAD_MIN (4 * 1024 * 1024)
 
 struct xfer_file {
   int fd;
@@ -33,6 +36,8 @@ struct xfer_file {
   uint64_t written;
   uint64_t durable;
   uint8_t hash[XFER_FILE_HASH_SIZE];
+  uint8_t identity[XFER_FILE_HASH_SIZE];
+  bool streaming, hash_ready, read_ahead_used;
   EVP_MD_CTX *digest;
   xfer_file_progress_cb progress;
   void *progress_context;
@@ -111,6 +116,145 @@ static bool digest_value(const EVP_MD_CTX *ctx, uint8_t out[32], char *error,
   return ok || fail(error, cap, "SHA-256 failed");
 }
 
+/* Read ahead into two bounded blocks. Publish each 64 KiB slice separately so
+ * the caller retains the existing progress/cancellation granularity. The reader
+ * never calls the application callback or touches the SHA context. */
+typedef struct {
+  uint8_t bytes[HASH_READ_AHEAD_BLOCK];
+  size_t available;
+  bool busy;
+} hash_block_t;
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t changed;
+  int fd;
+  uint64_t length;
+  bool stop, failed;
+  char error[256];
+  hash_block_t blocks[2];
+} hash_reader_t;
+
+static void *hash_reader(void *context) {
+  hash_reader_t *r = context;
+  size_t slot = 0;
+  for (uint64_t offset = 0; offset < r->length; slot ^= 1) {
+    hash_block_t *b = &r->blocks[slot];
+    pthread_mutex_lock(&r->mutex);
+    while (b->busy && !r->stop)
+      pthread_cond_wait(&r->changed, &r->mutex);
+    if (r->stop) {
+      pthread_mutex_unlock(&r->mutex);
+      return NULL;
+    }
+    b->busy = true;
+    pthread_mutex_unlock(&r->mutex);
+    size_t block = r->length - offset < HASH_READ_AHEAD_BLOCK
+                       ? (size_t)(r->length - offset)
+                       : HASH_READ_AHEAD_BLOCK;
+    for (size_t count = 0; count < block;) {
+      pthread_mutex_lock(&r->mutex);
+      bool stop = r->stop;
+      pthread_mutex_unlock(&r->mutex);
+      if (stop)
+        return NULL;
+      size_t n =
+          block - count < HASH_BUFFER_SIZE ? block - count : HASH_BUFFER_SIZE;
+      bool ok = read_exact(r->fd, NULL, offset + count, b->bytes + count, n,
+                           r->error, sizeof(r->error));
+      pthread_mutex_lock(&r->mutex);
+      if (ok) {
+        count += n;
+        b->available = count;
+      } else {
+        r->failed = true;
+      }
+      pthread_cond_broadcast(&r->changed);
+      pthread_mutex_unlock(&r->mutex);
+      if (!ok)
+        return NULL;
+    }
+    offset += block;
+  }
+  return NULL;
+}
+
+/* -1 means setup was unavailable, before any hashing/progress: use serial I/O.
+ * Once started, errors and cancellation must fail rather than restart hashing.
+ */
+static int hash_read_ahead(xfer_file_t *file, uint64_t length, EVP_MD_CTX *ctx,
+                           char *error, size_t cap) {
+  hash_reader_t *r = calloc(1, sizeof(*r));
+  if (r == NULL)
+    return -1;
+  if (pthread_mutex_init(&r->mutex, NULL) != 0) {
+    free(r);
+    return -1;
+  }
+  if (pthread_cond_init(&r->changed, NULL) != 0) {
+    pthread_mutex_destroy(&r->mutex);
+    free(r);
+    return -1;
+  }
+  r->fd = file->fd;
+  r->length = length;
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, hash_reader, r) != 0) {
+    pthread_cond_destroy(&r->changed);
+    pthread_mutex_destroy(&r->mutex);
+    free(r);
+    return -1;
+  }
+  file->read_ahead_used = true;
+  bool ok = true;
+  size_t slot = 0;
+  for (uint64_t offset = 0; ok && offset < length; slot ^= 1) {
+    hash_block_t *b = &r->blocks[slot];
+    size_t block = length - offset < HASH_READ_AHEAD_BLOCK
+                       ? (size_t)(length - offset)
+                       : HASH_READ_AHEAD_BLOCK;
+    for (size_t used = 0; used < block;) {
+      size_t n =
+          block - used < HASH_BUFFER_SIZE ? block - used : HASH_BUFFER_SIZE;
+      pthread_mutex_lock(&r->mutex);
+      while (b->available < used + n && !r->failed)
+        pthread_cond_wait(&r->changed, &r->mutex);
+      if (r->failed) {
+        fail(error, cap, "%s", r->error);
+        ok = false;
+      }
+      pthread_mutex_unlock(&r->mutex);
+      if (!ok)
+        break;
+      if (EVP_DigestUpdate(ctx, b->bytes + used, n) != 1) {
+        ok = fail(error, cap, "updating SHA-256");
+        break;
+      }
+      if (!report_progress(file, n, error, cap)) {
+        ok = false;
+        break;
+      }
+      used += n;
+    }
+    if (ok) {
+      pthread_mutex_lock(&r->mutex);
+      b->available = 0;
+      b->busy = false;
+      pthread_cond_broadcast(&r->changed);
+      pthread_mutex_unlock(&r->mutex);
+      offset += block;
+    }
+  }
+  pthread_mutex_lock(&r->mutex);
+  r->stop = true;
+  pthread_cond_broadcast(&r->changed);
+  pthread_mutex_unlock(&r->mutex);
+  pthread_join(thread, NULL);
+  pthread_cond_destroy(&r->changed);
+  pthread_mutex_destroy(&r->mutex);
+  free(r);
+  return ok ? 1 : 0;
+}
+
 /* hash prefix and optionally retain digest context */
 static bool hash_prefix(xfer_file_t *file, uint64_t length, uint8_t out[32],
                         EVP_MD_CTX **retained, char *error, size_t cap) {
@@ -120,6 +264,13 @@ static bool hash_prefix(xfer_file_t *file, uint64_t length, uint8_t out[32],
   if (ctx == NULL || EVP_DigestInit_ex(ctx, EVP_sha256(), NULL) != 1) {
     fail(error, cap, "initializing SHA-256");
     goto done;
+  }
+  if (length >= HASH_READ_AHEAD_MIN) {
+    int result = hash_read_ahead(file, length, ctx, error, cap);
+    if (result == 0)
+      goto done;
+    if (result > 0)
+      goto hashed;
   }
   for (uint64_t offset = 0; offset < length;) {
     size_t count = length - offset < sizeof(buffer) ? (size_t)(length - offset)
@@ -134,6 +285,7 @@ static bool hash_prefix(xfer_file_t *file, uint64_t length, uint8_t out[32],
     if (!report_progress(file, count, error, cap))
       goto done;
   }
+hashed:
   ok = digest_value(ctx, out, error, cap);
   if (ok && retained != NULL) {
     *retained = ctx;
@@ -166,15 +318,16 @@ static bool source_unchanged(xfer_file_t *file, char *error, size_t cap) {
   return true;
 }
 
-xfer_file_t *xfer_file_source_open(const char *path,
-                                   xfer_file_progress_cb progress,
-                                   void *context, char *error, size_t cap) {
+static xfer_file_t *source_open(const char *path, bool streaming,
+                                xfer_file_progress_cb progress, void *context,
+                                char *error, size_t cap) {
   xfer_file_t *file = allocate_file(error, cap);
   if (file == NULL)
     return NULL;
   file->progress = progress;
   file->progress_context = context;
   file->source = true;
+  file->streaming = streaming;
   file->fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (file->fd < 0) {
     syserr(error, cap, "open source");
@@ -183,13 +336,53 @@ xfer_file_t *xfer_file_source_open(const char *path,
   if (!regular_fd(file->fd, &file->source_stat, error, cap))
     goto failed;
   file->size = (uint64_t)file->source_stat.st_size;
-  if (!hash_prefix(file, file->size, file->hash, NULL, error, cap) ||
-      !source_unchanged(file, error, cap))
+  if (streaming) {
+    /* A resume identity, not a content checksum. Every resumed prefix and the
+     * final contents still require SHA-256 verification. Include ctime so
+     * restoring mtime after a write cannot retain the same identity. */
+    uint64_t fields[] = {(uint64_t)file->source_stat.st_dev,
+                         (uint64_t)file->source_stat.st_ino,
+                         file->size,
+                         (uint64_t)ST_MTIME(file->source_stat).tv_sec,
+                         (uint64_t)ST_MTIME(file->source_stat).tv_nsec,
+                         (uint64_t)ST_CTIME(file->source_stat).tv_sec,
+                         (uint64_t)ST_CTIME(file->source_stat).tv_nsec};
+    uint8_t encoded[sizeof(fields)];
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+      for (unsigned j = 0; j < 8; j++)
+        encoded[i * 8 + j] = (uint8_t)(fields[i] >> (56 - 8 * j));
+    unsigned length = 0;
+    if (EVP_Digest(encoded, sizeof(encoded), file->identity, &length,
+                   EVP_sha256(), NULL) != 1 ||
+        length != 32 ||
+        !hash_prefix(file, 0, file->hash, &file->digest, error, cap)) {
+      fail(error, cap, "initializing streaming source hash");
+      goto failed;
+    }
+  } else {
+    if (!hash_prefix(file, file->size, file->hash, NULL, error, cap))
+      goto failed;
+    memcpy(file->identity, file->hash, 32);
+    file->hash_ready = true;
+  }
+  if (!source_unchanged(file, error, cap))
     goto failed;
   return file;
 failed:
   xfer_file_close(file);
   return NULL;
+}
+
+xfer_file_t *xfer_file_source_open(const char *path,
+                                   xfer_file_progress_cb progress,
+                                   void *context, char *error, size_t cap) {
+  return source_open(path, false, progress, context, error, cap);
+}
+xfer_file_t *xfer_file_source_open_streaming(const char *path,
+                                             xfer_file_progress_cb progress,
+                                             void *context, char *error,
+                                             size_t cap) {
+  return source_open(path, true, progress, context, error, cap);
 }
 
 static char *suffix(const char *name, const char *extension) {
@@ -289,11 +482,12 @@ static bool load_metadata(xfer_file_t *file, uint8_t prefix[32], bool *exists,
   close(fd);
   if (!ok)
     return false;
-  if (memcmp(data, "QLXFER1\n", 8) != 0 || !metadata_digest(data, checksum) ||
+  if (memcmp(data, file->streaming ? "QLXFER2\n" : "QLXFER1\n", 8) != 0 ||
+      !metadata_digest(data, checksum) ||
       CRYPTO_memcmp(checksum, data + META_DIGEST_OFFSET, 32) != 0)
     return fail(error, cap, "corrupt resume metadata");
   if (get64(data + 8) != file->size ||
-      CRYPTO_memcmp(data + 24, file->hash, 32) != 0)
+      CRYPTO_memcmp(data + 24, file->identity, 32) != 0)
     return fail(error, cap, "resume metadata belongs to another source file");
   file->durable = get64(data + 16);
   if (file->durable > file->size)
@@ -313,10 +507,10 @@ static bool sync_data(int fd, char *error, size_t cap) {
 
 static bool save_metadata(xfer_file_t *file, char *error, size_t cap) {
   uint8_t data[META_SIZE];
-  memcpy(data, "QLXFER1\n", 8);
+  memcpy(data, file->streaming ? "QLXFER2\n" : "QLXFER1\n", 8);
   put64(data + 8, file->size);
   put64(data + 16, file->written);
-  memcpy(data + 24, file->hash, 32);
+  memcpy(data + 24, file->identity, 32);
   if (!digest_value(file->digest, data + 56, error, cap) ||
       !metadata_digest(data, data + META_DIGEST_OFFSET))
     return fail(error, cap, "hashing resume metadata");
@@ -365,10 +559,10 @@ static bool save_metadata(xfer_file_t *file, char *error, size_t cap) {
   return ok;
 }
 
-xfer_file_t *xfer_file_sink_open(const char *path, uint64_t size,
-                                 const uint8_t hash[32],
-                                 xfer_file_progress_cb progress, void *context,
-                                 char *error, size_t cap) {
+static xfer_file_t *sink_open(const char *path, uint64_t size, bool streaming,
+                              const uint8_t hash[32],
+                              xfer_file_progress_cb progress, void *context,
+                              char *error, size_t cap) {
   if (size > INT64_MAX || sizeof(off_t) < sizeof(int64_t)) {
     fail(error, cap, "transfer file exceeds supported file offset range");
     return NULL;
@@ -379,7 +573,12 @@ xfer_file_t *xfer_file_sink_open(const char *path, uint64_t size,
   file->progress = progress;
   file->progress_context = context;
   file->size = size;
-  memcpy(file->hash, hash, 32);
+  file->streaming = streaming;
+  memcpy(file->identity, hash, 32);
+  if (!streaming) {
+    memcpy(file->hash, hash, 32);
+    file->hash_ready = true;
+  }
   if (!open_destination_dir(file, path, error, cap))
     goto failed;
 
@@ -397,7 +596,7 @@ xfer_file_t *xfer_file_sink_open(const char *path, uint64_t size,
     }
     if (!hash_prefix(file, size, actual, NULL, error, cap))
       goto failed;
-    if (CRYPTO_memcmp(actual, hash, 32) != 0) {
+    if (!streaming && CRYPTO_memcmp(actual, hash, 32) != 0) {
       fail(error, cap, "destination already exists with different contents");
       goto failed;
     }
@@ -465,11 +664,73 @@ failed:
   return NULL;
 }
 
+xfer_file_t *xfer_file_sink_open(const char *path, uint64_t size,
+                                 const uint8_t hash[32],
+                                 xfer_file_progress_cb progress, void *context,
+                                 char *error, size_t cap) {
+  return sink_open(path, size, false, hash, progress, context, error, cap);
+}
+xfer_file_t *xfer_file_sink_open_streaming(const char *path, uint64_t size,
+                                           const uint8_t identity[32],
+                                           xfer_file_progress_cb progress,
+                                           void *context, char *error,
+                                           size_t cap) {
+  return sink_open(path, size, true, identity, progress, context, error, cap);
+}
+const uint8_t *xfer_file_identity(const xfer_file_t *file) {
+  return file->identity;
+}
+
+bool xfer_file_source_resume(xfer_file_t *file, uint64_t offset,
+                             uint8_t out[32], char *error, size_t cap) {
+  if (!file->source || offset > file->size ||
+      !source_unchanged(file, error, cap))
+    return fail(error, cap, "invalid or changed resume source");
+  EVP_MD_CTX *ctx = NULL;
+  if (!hash_prefix(file, offset, out, file->streaming ? &ctx : NULL, error,
+                   cap))
+    return false;
+  if (file->streaming) {
+    EVP_MD_CTX_free(file->digest);
+    file->digest = ctx;
+    file->written = offset;
+    file->hash_ready = false;
+  }
+  return source_unchanged(file, error, cap);
+}
+
+bool xfer_file_source_finish(xfer_file_t *file, char *error, size_t cap) {
+  if (!file->source || !source_unchanged(file, error, cap))
+    return false;
+  if (file->streaming) {
+    if (file->written != file->size)
+      return fail(error, cap, "source hash is incomplete");
+    if (!digest_value(file->digest, file->hash, error, cap))
+      return false;
+    file->hash_ready = true;
+  }
+  return true;
+}
+
+bool xfer_file_set_expected_hash(xfer_file_t *file, const uint8_t hash[32],
+                                 char *error, size_t cap) {
+  if (file->source || !file->streaming || file->written != file->size ||
+      file->hash_ready)
+    return fail(error, cap, "unexpected final source hash");
+  memcpy(file->hash, hash, 32);
+  file->hash_ready = true;
+  return true;
+}
+
+bool xfer_file_used_read_ahead(const xfer_file_t *file) {
+  return file->read_ahead_used;
+}
+
 uint64_t xfer_file_size(const xfer_file_t *file) {
   return file->size;
 }
 const uint8_t *xfer_file_hash(const xfer_file_t *file) {
-  return file->hash;
+  return file->hash_ready ? file->hash : NULL;
 }
 uint64_t xfer_file_offset(const xfer_file_t *file) {
   return file->durable;
@@ -491,9 +752,19 @@ bool xfer_file_read(xfer_file_t *file, uint64_t offset, void *buffer,
                     size_t size, char *error, size_t cap) {
   if (!file->source || offset > file->size || size > file->size - offset)
     return fail(error, cap, "source read exceeds file size");
-  return source_unchanged(file, error, cap) &&
-         read_exact(file->fd, file, offset, buffer, size, error, cap) &&
-         source_unchanged(file, error, cap);
+  if (file->streaming && offset != file->written)
+    return fail(error, cap, "streaming source reads must be sequential");
+  if (!source_unchanged(file, error, cap) ||
+      !read_exact(file->fd, file, offset, buffer, size, error, cap) ||
+      !source_unchanged(file, error, cap))
+    return false;
+  if (file->streaming) {
+    if (EVP_DigestUpdate(file->digest, buffer, size) != 1)
+      return fail(error, cap, "updating streaming source hash");
+    file->written += size;
+    file->hash_ready = false;
+  }
+  return true;
 }
 
 bool xfer_file_write(xfer_file_t *file, uint64_t offset, const void *data,
@@ -558,7 +829,7 @@ static bool cleanup_completed(xfer_file_t *file, const struct stat *final,
 }
 
 bool xfer_file_commit(xfer_file_t *file, char *error, size_t cap) {
-  if (file->source || file->written != file->size)
+  if (file->source || file->written != file->size || !file->hash_ready)
     return fail(error, cap, "cannot commit an incomplete file");
   uint8_t actual[32];
   struct stat st;
@@ -568,6 +839,15 @@ bool xfer_file_commit(xfer_file_t *file, char *error, size_t cap) {
     return fail(error, cap, "completed file has an unexpected size");
   if (!hash_prefix(file, file->size, actual, NULL, error, cap))
     return false;
+  struct stat verified;
+  if (!regular_fd(file->fd, &verified, error, cap))
+    return false;
+  if (st.st_size != verified.st_size ||
+      ST_MTIME(st).tv_sec != ST_MTIME(verified).tv_sec ||
+      ST_MTIME(st).tv_nsec != ST_MTIME(verified).tv_nsec ||
+      ST_CTIME(st).tv_sec != ST_CTIME(verified).tv_sec ||
+      ST_CTIME(st).tv_nsec != ST_CTIME(verified).tv_nsec)
+    return fail(error, cap, "staging file changed during verification");
   if (CRYPTO_memcmp(actual, file->hash, 32) != 0)
     return fail(error, cap, "completed file failed SHA-256 verification");
   if (!sync_data(file->fd, error, cap))

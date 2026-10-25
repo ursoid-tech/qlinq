@@ -748,6 +748,10 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.congestion_control = config->congestion_control;
   transport_config.pacing = config->pacing;
   transport_config.initial_cwnd_packets = config->initial_cwnd_packets;
+  transport_config.default_jumpstart_packets =
+      config->default_jumpstart_packets;
+  transport_config.max_jumpstart_packets = config->max_jumpstart_packets;
+  transport_config.multihome = config->multihome;
   map_limits(&config->limits, &transport_config.limits);
   transport_config.callback = on_transport_event;
   transport_config.user_data = endpoint;

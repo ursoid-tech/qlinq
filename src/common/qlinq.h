@@ -175,6 +175,12 @@ typedef struct {
    * Quicly applies a two-packet minimum and also uses this window as the
    * temporary flight cap during path recovery. Fixed at endpoint creation. */
   uint32_t initial_cwnd_packets;
+  /* number of packets to jumpstart CWND upon first RTT measurement */
+  uint32_t default_jumpstart_packets;
+  /* maximum jumpstart packets permitted for resumed sessions */
+  uint32_t max_jumpstart_packets;
+  /* automatically detect and bind non-loopback network interfaces */
+  bool multihome;
 } qlinq_endpoint_config_t;
 
 typedef struct {

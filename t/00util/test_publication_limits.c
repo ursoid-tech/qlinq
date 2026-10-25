@@ -6,6 +6,38 @@
 
 static uint64_t group_timer_now;
 
+static void test_send_service_quantum(void) {
+  transport_fixture_t f;
+  fixture_create(&f, 19946, NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_RELIABLE,
+                          .name = "send-service-quantum"};
+  fixture_subscribe(&f, &f.client, track);
+  uint8_t payload[4096] = {37};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  for (size_t i = 0; i < 16; i++) {
+    object.object_id = i;
+    assert(transport_publish_ex(f.server.transport, &object) ==
+           TRANSPORT_PUBLISH_DELIVERED);
+  }
+  f.server.transport->limits.max_packets_per_tick = 4;
+  transport_path_stats_t before, after;
+  assert(transport_get_path_stats(f.server.transport, 0, &before));
+  transport_tick(f.server.transport);
+  assert(transport_get_path_stats(f.server.transport, 0, &after));
+  fprintf(stderr, "send service generated %llu packets with budget 4\n",
+          (unsigned long long)(after.sent - before.sent));
+  assert(after.sent > before.sent && after.sent - before.sent <= 4);
+  /* Exhausting a send turn must yield to the owner without sleeping while
+   * more work may be runnable. Normal ACK/timer service still drains it. */
+  assert(transport_get_first_timeout(f.server.transport) == 0);
+  fixture_receive(&f, &f.client, 16);
+  assert(f.client.payload_size == sizeof(payload) &&
+         memcmp(f.client.payload, payload, sizeof(payload)) == 0);
+  fixture_destroy(&f);
+}
+
 int test_clock_gettime(clockid_t id, struct timespec *ts) {
   if (id != CLOCK_MONOTONIC || group_timer_now == 0)
     return clock_gettime(id, ts);
@@ -37,11 +69,12 @@ static void test_queue_boundary(void) {
   uint8_t payload[2000] = {42};
   moq_object_t object = {
       .track_id = track, .data = payload, .size = sizeof(payload)};
-  fill_queue(conn, 62);
+  fill_queue(conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 2);
   assert(transport_publish_ex(f.server.transport, &object) ==
          TRANSPORT_PUBLISH_BACKPRESSURE);
-  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 62);
-  fill_queue(conn, 64);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) ==
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 2);
+  fill_queue(conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
   uint8_t ignored = 0xff;
   ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
   quicly_send_datagram_frames_path(conn->quic, 0, &frame, 1);
@@ -51,10 +84,11 @@ static void test_queue_boundary(void) {
        i < 2000 && quicly_get_num_datagram_frames_path(conn->quic, 0); i++)
     fixture_tick(&f);
   assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 0);
-  fill_queue(conn, 61);
+  fill_queue(conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 3);
   assert(transport_publish_ex(f.server.transport, &object) ==
          TRANSPORT_PUBLISH_DELIVERED);
-  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 64);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, 0) ==
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
   fixture_receive(&f, &f.client, 1);
   assert(f.client.payload_size == sizeof(payload) &&
          memcmp(f.client.payload, payload, sizeof(payload)) == 0);
@@ -92,7 +126,7 @@ static void test_partial_group_retry(void) {
   assert(f.server.subscriptions == 2);
   transport_t *t = f.server.transport;
   transport_conn_t *first_conn = t->conns[0], *blocked_conn = t->conns[1];
-  fill_queue(blocked_conn, 64);
+  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
   uint8_t original[1000], next[1000];
   memset(original, 17, sizeof(original));
   memset(next, 23, sizeof(next));
@@ -141,7 +175,7 @@ static void test_partial_group_retry(void) {
   assert(t->stats.recovery_cache_backpressure == 0);
   /* The record triggering a partial flush is itself retained, so it must be
    * reported as BUFFERED rather than failed or rejected. */
-  fill_queue(blocked_conn, 64);
+  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
   object.data = original;
   for (size_t i = 0; i < 4; i++)
     assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
@@ -168,7 +202,7 @@ static void test_partial_group_retry(void) {
   transport_subscriptions_remove(&first_conn->send_subscriptions, track.type,
                                  track.name);
   transport_publish_checkpoint_member_removed(t, first_conn, &track, alias);
-  fill_queue(blocked_conn, 64);
+  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
   assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
   assert(!transport_publish_flush_grouped(t));
   uint64_t pending_object_id = t->fec_tracks[0].next_object_id;
@@ -263,17 +297,85 @@ static void test_rateless_queue_boundary(void) {
   uint8_t payload[2000] = {42};
   moq_object_t object = {
       .track_id = track, .data = payload, .size = sizeof(payload)};
-  fill_queue(f.server.conn, 62);
+  fill_queue(f.server.conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 2);
   assert(transport_publish_ex(f.server.transport, &object) ==
          TRANSPORT_PUBLISH_BUFFERED);
   assert(transport_publish_flush_grouped(f.server.transport));
-  assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, 0) == 64);
+  assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, 0) ==
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
   sent_object_cache_t *cached =
       transport_sent_cache_find(&f.server.transport->sent_cache, &track, 0, 0);
   assert(cached && cached->data_symbols == 2 && cached->total_symbols == 2);
   fixture_receive(&f, &f.client, 1);
   assert(f.client.payload_size == 2002 &&
          memcmp(f.client.payload + 2, payload, sizeof(payload)) == 0);
+  fixture_destroy(&f);
+}
+
+/* File-transfer track names must preserve the same repair obligation as any
+ * other rateless DATA track; otherwise admission can evict an unacked prefix.
+ */
+static void test_xfer_recovery_protection(void) {
+  transport_fixture_t f;
+  transport_limits_t limits = {.max_fec_object_size = 1024};
+  fixture_create(&f, 19930, &limits, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "qlinq-xfer-up"};
+  fixture_subscribe(&f, &f.client, track);
+  uint8_t payload[1000] = {42};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  assert(transport_publish(f.server.transport, &object));
+  assert(transport_publish_flush_grouped(f.server.transport));
+  sent_object_cache_t *cached =
+      transport_sent_cache_find(&f.server.transport->sent_cache, &track, 0, 0);
+  assert(cached && cached->recovery_protected);
+  fixture_destroy(&f);
+}
+
+/* An application can pause after a short request while waiting for a reply.
+ * Flush must expose that tail to recovery without ending the track. */
+static void test_short_flush_recovery(void) {
+  transport_fixture_t f;
+  fixture_create(&f, 19929, NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "short-request"};
+  fixture_subscribe(&f, &f.client, track);
+  uint8_t payload[48] = {42};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  assert(transport_publish(f.server.transport, &object));
+  assert(transport_publish_flush_grouped(f.server.transport));
+  unsigned discarded = 0;
+  for (unsigned i = 0; i < 100; i++) {
+    transport_tick(f.server.transport);
+    uint8_t packet[65536];
+    while (recv(f.client.transport->sockets[0].fd, packet, sizeof(packet),
+                MSG_DONTWAIT) > 0)
+      discarded++;
+    usleep(1000);
+  }
+  assert(discarded > 0 && f.client.objects == 0);
+  size_t stream_limit = f.server.transport->limits.max_stream_egress_bytes;
+  f.server.transport->limits.max_stream_egress_bytes = 1;
+  assert(!transport_publish_flush(f.server.transport));
+  assert(f.server.transport->stats.recovery_checkpoints_sent == 0);
+  f.server.transport->limits.max_stream_egress_bytes = stream_limit;
+  assert(transport_publish_flush(f.server.transport));
+  fixture_receive(&f, &f.client, 1);
+  assert(f.client.payload_size == sizeof(payload) + 2 &&
+         memcmp(f.client.payload + 2, payload, sizeof(payload)) == 0);
+  assert(f.server.transport->stats.track_ends_sent == 0);
+  /* Continue through the next automatic boundary. Partial checkpoints must
+   * remain contiguous with later rolling checkpoints. */
+  for (unsigned i = 0; i < 128; i++)
+    assert(transport_publish(f.server.transport, &object));
+  assert(transport_publish_flush(f.server.transport));
+  fixture_receive(&f, &f.client, 33);
+  assert(f.server.transport->stats.recovery_checkpoints_sent == 3 &&
+         f.client.transport->stats.recovery_checkpoints_received == 3);
   fixture_destroy(&f);
 }
 
@@ -298,11 +400,13 @@ static void test_recovery_history_bound(void) {
     assert(transport_sent_cache_store(&t->sent_cache, &object, 1, 1,
                                       sizeof(payload), false));
   }
-  t->fec_tracks[0] =
-      (transport_fec_track_state_t){.track_id = track,
-                                    .active = true,
-                                    .has_objects = true,
-                                    .next_object_id = t->sent_cache.capacity};
+  t->fec_tracks[0] = (transport_fec_track_state_t){
+      .track_id = track,
+      .active = true,
+      .has_objects = true,
+      .next_object_id = t->sent_cache.capacity,
+      .checkpoint_initialized = true,
+      .last_checkpoint_object_id = t->sent_cache.capacity - 1};
   assert(!transport_publish_recovery_ready(t, &track));
   assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
   assert(!transport_publish_flush_grouped(t));
@@ -332,11 +436,13 @@ static void test_group_timer_backpressure(void) {
     assert(transport_sent_cache_store(&t->sent_cache, &object, 1, 1,
                                       sizeof(payload), false));
   }
-  t->fec_tracks[0] =
-      (transport_fec_track_state_t){.track_id = track,
-                                    .active = true,
-                                    .has_objects = true,
-                                    .next_object_id = t->sent_cache.capacity};
+  t->fec_tracks[0] = (transport_fec_track_state_t){
+      .track_id = track,
+      .active = true,
+      .has_objects = true,
+      .next_object_id = t->sent_cache.capacity,
+      .checkpoint_initialized = true,
+      .last_checkpoint_object_id = t->sent_cache.capacity - 1};
   group_timer_now = transport_get_time_ms();
   assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
   uint64_t started = t->pending_group.started_at_ms;
@@ -415,10 +521,13 @@ static void test_group_timer_backpressure(void) {
 }
 
 int main(void) {
+  test_send_service_quantum();
   test_queue_boundary();
   test_slow_group_admission();
   test_rateless_queue_boundary();
   test_recovery_history_bound();
+  test_xfer_recovery_protection();
+  test_short_flush_recovery();
   test_group_timer_backpressure();
   test_partial_group_retry();
   transport_fixture_t fixture;

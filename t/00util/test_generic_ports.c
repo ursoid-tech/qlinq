@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include "cli_parse.h"
 #include "transport_config.h"
 #include "transport_internal.h"
@@ -288,6 +289,9 @@ static void transport_regressions(void) {
   struct sockaddr_storage v6 = {0};
   struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)&v6;
   addr6->sin6_family = AF_INET6;
+  /* Scope identity matters for a concrete link-local address. An all-zero
+   * IPv6 address is a wildcard bind and intentionally matches any local IP. */
+  assert(inet_pton(AF_INET6, "fe80::1", &addr6->sin6_addr) == 1);
   addr6->sin6_scope_id = 2;
   stats.local.sin6 = *addr6;
   assert(transport_path_matches_local(&stats, &v6));

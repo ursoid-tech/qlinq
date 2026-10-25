@@ -25,6 +25,32 @@ bool transport_udp_enable_recv_ecn(int fd, int family) {
   return false;
 }
 
+bool transport_udp_enable_recv_pktinfo(int fd, int family) {
+  int enabled = 1;
+#if defined(IP_PKTINFO)
+  if (family == AF_INET)
+    return setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &enabled, sizeof(enabled)) ==
+           0;
+#elif defined(IP_RECVDSTADDR)
+  if (family == AF_INET)
+    return setsockopt(fd, IPPROTO_IP, IP_RECVDSTADDR, &enabled,
+                      sizeof(enabled)) == 0;
+#endif
+#if defined(IPV6_RECVPKTINFO)
+  if (family == AF_INET6)
+    return setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &enabled,
+                      sizeof(enabled)) == 0;
+#elif defined(IPV6_PKTINFO)
+  if (family == AF_INET6)
+    return setsockopt(fd, IPPROTO_IPV6, IPV6_PKTINFO, &enabled,
+                      sizeof(enabled)) == 0;
+#endif
+  (void)fd;
+  (void)family;
+  (void)enabled;
+  return false;
+}
+
 uint8_t transport_udp_message_ecn(const struct msghdr *message) {
   if (!message || (message->msg_flags & MSG_CTRUNC))
     return 0;
@@ -53,6 +79,67 @@ uint8_t transport_udp_message_ecn(const struct msghdr *message) {
   return 0;
 }
 
+void transport_udp_message_pktinfo(const struct msghdr *message,
+                                   struct sockaddr_storage *destination,
+                                   uint32_t *ifindex) {
+  if (destination)
+    memset(destination, 0, sizeof(*destination));
+  if (ifindex)
+    *ifindex = 0;
+  if (!message || (message->msg_flags & MSG_CTRUNC))
+    return;
+  for (struct cmsghdr *header = CMSG_FIRSTHDR(message); header;
+       header = CMSG_NXTHDR((struct msghdr *)message, header)) {
+#if defined(IP_PKTINFO)
+    if (header->cmsg_level == IPPROTO_IP && header->cmsg_type == IP_PKTINFO &&
+        header->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+      struct in_pktinfo info;
+      memcpy(&info, CMSG_DATA(header), sizeof(info));
+      if (destination) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)destination;
+        sin->sin_family = AF_INET;
+        sin->sin_addr = info.ipi_spec_dst.s_addr != INADDR_ANY
+                            ? info.ipi_spec_dst
+                            : info.ipi_addr;
+      }
+      if (ifindex)
+        *ifindex = (uint32_t)info.ipi_ifindex;
+      return;
+    }
+#elif defined(IP_RECVDSTADDR)
+    if (header->cmsg_level == IPPROTO_IP &&
+        header->cmsg_type == IP_RECVDSTADDR &&
+        header->cmsg_len >= CMSG_LEN(sizeof(struct in_addr))) {
+      if (destination) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)destination;
+        sin->sin_family = AF_INET;
+        memcpy(&sin->sin_addr, CMSG_DATA(header), sizeof(struct in_addr));
+      }
+      return;
+    }
+#endif
+#if defined(IPV6_PKTINFO)
+    if (header->cmsg_level == IPPROTO_IPV6 &&
+        header->cmsg_type == IPV6_PKTINFO &&
+        header->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
+      struct in6_pktinfo info6;
+      memcpy(&info6, CMSG_DATA(header), sizeof(info6));
+      if (destination) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)destination;
+        memset(sin6, 0, sizeof(*sin6));
+        sin6->sin6_family = AF_INET6;
+        sin6->sin6_addr = info6.ipi6_addr;
+        sin6->sin6_scope_id =
+            IN6_IS_ADDR_LINKLOCAL(&info6.ipi6_addr) ? info6.ipi6_ifindex : 0;
+      }
+      if (ifindex)
+        *ifindex = info6.ipi6_ifindex;
+      return;
+    }
+#endif
+  }
+}
+
 /* append per-message ECN control message */
 static void append_ecn(struct msghdr *message, void *control, uint8_t ecn) {
   if (!ecn)
@@ -79,6 +166,64 @@ static void append_ecn(struct msghdr *message, void *control, uint8_t ecn) {
   message->msg_control = control;
   message->msg_controllen += CMSG_SPACE(sizeof(int));
 }
+
+/* append per-message source address and egress interface control */
+static void append_pktinfo(struct msghdr *message, void *control,
+                           const struct sockaddr *source, uint32_t ifindex) {
+  if (!source || source->sa_family == AF_UNSPEC)
+    return;
+  if (source->sa_family == AF_INET) {
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)source;
+    if (sin->sin_addr.s_addr == INADDR_ANY && ifindex == 0)
+      return;
+#if defined(IP_PKTINFO)
+    struct cmsghdr *cmsg =
+        (struct cmsghdr *)((uint8_t *)control + message->msg_controllen);
+    cmsg->cmsg_level = IPPROTO_IP;
+    cmsg->cmsg_type = IP_PKTINFO;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+    struct in_pktinfo info = {0};
+    info.ipi_spec_dst = sin->sin_addr;
+    info.ipi_ifindex = (int)ifindex;
+    memcpy(CMSG_DATA(cmsg), &info, sizeof(info));
+    message->msg_control = control;
+    message->msg_controllen += CMSG_SPACE(sizeof(struct in_pktinfo));
+#elif defined(IP_SENDSRCADDR)
+    struct cmsghdr *cmsg =
+        (struct cmsghdr *)((uint8_t *)control + message->msg_controllen);
+    cmsg->cmsg_level = IPPROTO_IP;
+    cmsg->cmsg_type = IP_RECVDSTADDR;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(struct in_addr));
+    memcpy(CMSG_DATA(cmsg), &sin->sin_addr, sizeof(struct in_addr));
+    message->msg_control = control;
+    message->msg_controllen += CMSG_SPACE(sizeof(struct in_addr));
+#endif
+  } else if (source->sa_family == AF_INET6) {
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)source;
+    static const struct in6_addr in6addr_any_val = IN6ADDR_ANY_INIT;
+    if (memcmp(&sin6->sin6_addr, &in6addr_any_val, sizeof(struct in6_addr)) ==
+            0 &&
+        ifindex == 0)
+      return;
+#if defined(IPV6_PKTINFO)
+    struct cmsghdr *cmsg =
+        (struct cmsghdr *)((uint8_t *)control + message->msg_controllen);
+    cmsg->cmsg_level = IPPROTO_IPV6;
+    cmsg->cmsg_type = IPV6_PKTINFO;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+    struct in6_pktinfo info6 = {0};
+    info6.ipi6_addr = sin6->sin6_addr;
+    info6.ipi6_ifindex = ifindex ? ifindex : sin6->sin6_scope_id;
+    memcpy(CMSG_DATA(cmsg), &info6, sizeof(info6));
+    message->msg_control = control;
+    message->msg_controllen += CMSG_SPACE(sizeof(struct in6_pktinfo));
+#endif
+  }
+}
+
+#define TRANSPORT_UDP_CONTROL_SIZE                                             \
+  (CMSG_SPACE(sizeof(uint16_t)) + CMSG_SPACE(sizeof(int)) +                    \
+   CMSG_SPACE(sizeof(struct in6_pktinfo)))
 
 #define TRANSPORT_UDP_MAX_BATCH 64U
 #define TRANSPORT_UDP_GSO_BUFFER_SIZE 65507U /* IPv4 UDP payload ceiling. */
@@ -146,11 +291,11 @@ static void prepare_gso(struct msghdr *message, struct iovec *iovs,
 }
 #endif
 
-ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
-                                     socklen_t destination_len,
-                                     const struct iovec *datagrams,
-                                     size_t count, size_t max_gso_segments,
-                                     uint8_t ecn) {
+ssize_t transport_udp_send_batch_pktinfo(
+    int fd, const struct sockaddr *destination, socklen_t destination_len,
+    const struct sockaddr *source, uint32_t ifindex,
+    const struct iovec *datagrams, size_t count, size_t max_gso_segments,
+    uint8_t ecn) {
   if (fd < 0 || !destination || (!datagrams && count > 0) ||
       max_gso_segments > TRANSPORT_UDP_MAX_BATCH || ecn > 3 ||
       (destination->sa_family != AF_INET &&
@@ -170,7 +315,7 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
   struct iovec iovs[TRANSPORT_UDP_MAX_BATCH];
   union {
     struct cmsghdr alignment;
-    uint8_t bytes[CMSG_SPACE(sizeof(uint16_t)) + CMSG_SPACE(sizeof(int))];
+    uint8_t bytes[TRANSPORT_UDP_CONTROL_SIZE];
   } control[TRANSPORT_UDP_MAX_BATCH];
   size_t logical_end[TRANSPORT_UDP_MAX_BATCH];
   size_t sent_count = 0;
@@ -200,6 +345,8 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
         message->msg_hdr.msg_iovlen = 1;
       }
       append_ecn(&message->msg_hdr, control[message_count].bytes, ecn);
+      append_pktinfo(&message->msg_hdr, control[message_count].bytes, source,
+                     ifindex);
       first += group;
       logical_end[message_count++] = first;
     }
@@ -239,13 +386,14 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
   for (size_t i = 0; i < count; i++) {
     union {
       struct cmsghdr alignment;
-      uint8_t bytes[CMSG_SPACE(sizeof(int))];
+      uint8_t bytes[TRANSPORT_UDP_CONTROL_SIZE];
     } control = {0};
     struct msghdr message = {.msg_name = (void *)destination,
                              .msg_namelen = destination_len,
                              .msg_iov = (struct iovec *)&datagrams[i],
                              .msg_iovlen = 1};
     append_ecn(&message, control.bytes, ecn);
+    append_pktinfo(&message, control.bytes, source, ifindex);
     ssize_t sent;
     do {
       sent = sendmsg(fd, &message, 0);
@@ -263,6 +411,16 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
   }
   return (ssize_t)sent_count;
 #endif
+}
+
+ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
+                                     socklen_t destination_len,
+                                     const struct iovec *datagrams,
+                                     size_t count, size_t max_gso_segments,
+                                     uint8_t ecn) {
+  return transport_udp_send_batch_pktinfo(fd, destination, destination_len,
+                                          NULL, 0, datagrams, count,
+                                          max_gso_segments, ecn);
 }
 
 ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
@@ -290,7 +448,7 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
   struct iovec iovs[TRANSPORT_UDP_RECEIVE_BATCH];
   union {
     struct cmsghdr alignment;
-    uint8_t bytes[CMSG_SPACE(sizeof(int)) * 2];
+    uint8_t bytes[TRANSPORT_UDP_CONTROL_SIZE];
   } control[TRANSPORT_UDP_RECEIVE_BATCH];
   for (size_t i = 0; i < count; i++) {
     iovs[i] = (struct iovec){.iov_base = datagrams[i].data,
@@ -311,6 +469,8 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
   for (int i = 0; i < received; i++) {
     datagrams[i].size = messages[i].msg_len;
     datagrams[i].ecn = transport_udp_message_ecn(&messages[i].msg_hdr);
+    transport_udp_message_pktinfo(
+        &messages[i].msg_hdr, &datagrams[i].destination, &datagrams[i].ifindex);
     datagrams[i].truncated = (messages[i].msg_hdr.msg_flags & MSG_TRUNC) != 0;
   }
   return received;
@@ -322,7 +482,7 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
                         .iov_len = sizeof(datagram->data)};
     union {
       struct cmsghdr alignment;
-      uint8_t bytes[CMSG_SPACE(sizeof(int)) * 2];
+      uint8_t bytes[TRANSPORT_UDP_CONTROL_SIZE];
     } control;
     struct msghdr message = {.msg_name = &datagram->source,
                              .msg_namelen = sizeof(datagram->source),
@@ -341,6 +501,8 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
     }
     datagram->size = (size_t)size;
     datagram->ecn = transport_udp_message_ecn(&message);
+    transport_udp_message_pktinfo(&message, &datagram->destination,
+                                  &datagram->ifindex);
     datagram->truncated = (message.msg_flags & MSG_TRUNC) != 0;
     received++;
   }
@@ -353,6 +515,8 @@ ssize_t transport_udp_receive_batch(int fd, transport_udp_datagram_t *datagrams,
 
 typedef struct {
   struct sockaddr_storage source;
+  struct sockaddr_storage destination;
+  uint32_t ifindex;
   size_t size;
   size_t segment_size;
   uint8_t ecn;
@@ -444,11 +608,13 @@ static ssize_t gro_refill(transport_udp_gro_t *state, int fd) {
   struct iovec iovs[TRANSPORT_UDP_GRO_BATCH];
   union {
     struct cmsghdr alignment;
-    uint8_t bytes[CMSG_SPACE(sizeof(int)) * 3];
+    uint8_t bytes[TRANSPORT_UDP_CONTROL_SIZE];
   } control[TRANSPORT_UDP_GRO_BATCH];
   for (size_t i = 0; i < TRANSPORT_UDP_GRO_BATCH; i++) {
     transport_udp_gro_message_t *raw = &state->messages[i];
     raw->source = (struct sockaddr_storage){0};
+    raw->destination = (struct sockaddr_storage){0};
+    raw->ifindex = 0;
     iovs[i] = (struct iovec){raw->data, sizeof(raw->data)};
     messages[i].msg_hdr =
         (struct msghdr){.msg_name = &raw->source,
@@ -478,6 +644,9 @@ static ssize_t gro_refill(transport_udp_gro_t *state, int fd) {
         !gro_segment_size(&messages[i].msg_hdr, raw->size, &raw->segment_size);
     raw->ecn =
         raw->dropped ? 0 : transport_udp_message_ecn(&messages[i].msg_hdr);
+    if (!raw->dropped)
+      transport_udp_message_pktinfo(&messages[i].msg_hdr, &raw->destination,
+                                    &raw->ifindex);
   }
   return received;
 }
@@ -511,6 +680,8 @@ ssize_t transport_udp_gro_receive(transport_udp_gro_t *state, int fd,
     transport_udp_gro_message_t *raw = &state->messages[state->index];
     transport_udp_view_t *view = &views[received++];
     *view = (transport_udp_view_t){.source = raw->source,
+                                   .destination = raw->destination,
+                                   .ifindex = raw->ifindex,
                                    .ecn = raw->ecn,
                                    .data = raw->data + state->offset,
                                    .dropped = raw->dropped};

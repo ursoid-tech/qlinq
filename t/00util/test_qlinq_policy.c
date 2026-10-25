@@ -69,6 +69,21 @@ int main(void) {
   }
   config.initial_cwnd_packets = 0;
 
+  /* test jumpstart configuration */
+  config.default_jumpstart_packets = 256;
+  config.max_jumpstart_packets = 1024;
+  qlinq_endpoint_t *js_endpoint = qlinq_connect(context, &config);
+  assert(js_endpoint);
+  assert(js_endpoint->transport->quic_ctx.egress[0].default_jumpstart_packets ==
+         256);
+  assert(js_endpoint->transport->quic_ctx.egress[0].max_jumpstart_packets ==
+         1024);
+  assert(js_endpoint->transport->quic_ctx.egress[0].pacing == 1);
+  assert(js_endpoint->transport->quic_ctx.egress[0].cc.rapid_start == 1);
+  qlinq_endpoint_close(js_endpoint);
+  config.default_jumpstart_packets = 0;
+  config.max_jumpstart_packets = 0;
+
   /* Internal callers bypass the public bridge and require the same bound. */
   transport_config_t native_config = {.bind_hosts = {"127.0.0.1"},
                                       .num_bind_hosts = 1,

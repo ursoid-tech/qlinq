@@ -265,6 +265,40 @@ cleanup:
   return failed;
 }
 
+/* A control reserve below a power-of-two endpoint cap must not strand half
+ * the available vector slots in one busy data stream. */
+static int single_stream_vector_headroom(void) {
+  int failed = 0;
+  transport_t *t = fixture();
+  CHECK(t && t->client_conn);
+  quicly_stream_t *stream;
+  CHECK(quicly_open_stream(t->client_conn->quic, &stream, 1) == 0);
+  size_t accepted = 0;
+  while (accepted < TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS &&
+         transport_stream_write_frame(stream, QLINQ_WIRE_UNICAST, "x", 1))
+    accepted++;
+  CHECK(accepted > 4096);
+  CHECK(accepted >= 5000);
+  CHECK(accepted <= TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS -
+                        TRANSPORT_STREAM_ENDPOINT_CONTROL_VECTOR_RESERVE);
+  CHECK(t->stats.stream_egress_vector_capacity <=
+        TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS -
+            TRANSPORT_STREAM_ENDPOINT_CONTROL_VECTOR_RESERVE);
+  CHECK(transport_stream_write_track_checkpoint_frame(t->client_conn->stream, 1,
+                                                      0, 0, 0, false));
+  CHECK(t->stats.stream_egress_vector_capacity <=
+        TRANSPORT_STREAM_ENDPOINT_MAX_VECTORS);
+  const size_t frame_size = QLINQ_WIRE_FRAME_HEADER_SIZE + 1;
+  CHECK(acknowledge(stream, (accepted - 5000) * frame_size));
+  CHECK(acknowledge(stream, 5000 * frame_size));
+  CHECK(((transport_stream_ctx_t *)stream->data)
+            ->streambuf.egress.vecs.capacity == 0);
+cleanup:
+  if (!dispose(t))
+    failed = 1;
+  return failed;
+}
+
 static int vector_capacity_compaction(void) {
   int failed = 0;
   transport_t *t = fixture();
@@ -1336,8 +1370,8 @@ int main(void) {
       checkpoint_repair_batch(1024, 1024) || checkpoint_repair_batch(2, 1024) ||
       checkpoint_repair_batch(1024, 3) || entry_limit_and_control_failure() ||
       byte_limits_and_recovery() || endpoint_vector_limit() ||
-      vector_capacity_compaction() || configurable_limits() ||
-      configured_frame_capacity(128U * 1024U, 2048) ||
+      single_stream_vector_headroom() || vector_capacity_compaction() ||
+      configurable_limits() || configured_frame_capacity(128U * 1024U, 2048) ||
       configured_frame_capacity(256U * 1024U, 4096) ||
       retained_nack_retries(false) || retained_nack_retries(true) ||
       retained_nack_ack_gap(false) || retained_nack_ack_gap(true) ||

@@ -140,7 +140,8 @@ enum {
   TRANSPORT_CC_DEFAULT,
   TRANSPORT_CC_RENO,
   TRANSPORT_CC_PICO,
-  TRANSPORT_CC_CUBIC
+  TRANSPORT_CC_CUBIC,
+  TRANSPORT_CC_CUBACK
 };
 enum {
   TRANSPORT_PACING_DEFAULT,
@@ -266,6 +267,12 @@ typedef struct {
    * Quicly floors the effective window at two packets and reuses this value
    * as the temporary flight cap during path recovery. */
   uint32_t initial_cwnd_packets;
+  /* number of packets to jumpstart CWND upon first RTT measurement */
+  uint32_t default_jumpstart_packets;
+  /* maximum jumpstart packets permitted for resumed sessions */
+  uint32_t max_jumpstart_packets;
+  /* automatically detect and bind non-loopback network interfaces */
+  bool multihome;
 } transport_config_t;
 
 /* create and destroy transport instances */
@@ -293,6 +300,11 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
 /* Compatibility wrapper: true only when the object was delivered, buffered,
  * or had no eligible recipients. */
 bool transport_publish(transport_t *t, const moq_object_t *obj);
+
+/* Flush pending grouped datagram records. For rateless DATA, reliably
+ * checkpoint the short tail so it can recover while the track stays open.
+ * Retry on false before relying on that boundary. */
+bool transport_publish_flush(transport_t *t);
 
 /* Flush buffered rateless data and reliably announce the last internal FEC
  * object, allowing receivers to discover a wholly unseen tail. */
@@ -470,6 +482,22 @@ typedef struct {
   uint64_t quic_paths_created;
   uint64_t quic_paths_validated;
   uint64_t quic_paths_validation_failed;
+  char congestion_control[24];   /* primary path's native controller */
+  uint64_t jumpstart_applicable; /* any path in this connection */
+  uint32_t
+      primary_jumpstart_cwnd; /* primary path only, bytes; zero if unused */
+  /* Native connection totals across all paths. Late ACKs acknowledge packets
+   * previously declared lost; they are not an estimate of injected loss. */
+  uint64_t quic_packets_sent;
+  uint64_t quic_packets_lost;
+  uint64_t quic_packets_lost_time_threshold;
+  uint64_t quic_packets_late_acked;
+  /* Read-only flow snapshots. Track bytes exclude the control stream;
+   * retained includes sent but not contiguously acknowledged bytes. */
+  uint64_t quic_send_permitted, quic_stream_bytes_sent;
+  uint64_t quic_data_blocked_frames, quic_stream_data_blocked_frames;
+  uint64_t track_unsent_bytes, track_retained_bytes;
+  size_t track_streams, track_flow_limited_streams;
 } transport_conn_stats_t;
 
 /* Snapshot aggregate or per-connection observability. These functions follow

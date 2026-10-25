@@ -19,6 +19,25 @@ xfer_file_t *xfer_file_sink_open(const char *path, uint64_t size,
                                  const uint8_t hash[XFER_FILE_HASH_SIZE],
                                  xfer_file_progress_cb progress, void *context,
                                  char *error, size_t cap);
+/* Experimental streaming source mode: identity keys version-2 resume metadata;
+ * it is not a content checksum. Final SHA is available only after finish. */
+xfer_file_t *xfer_file_source_open_streaming(const char *path,
+                                             xfer_file_progress_cb progress,
+                                             void *context, char *error,
+                                             size_t cap);
+xfer_file_t *xfer_file_sink_open_streaming(const char *path, uint64_t size,
+                                           const uint8_t identity[32],
+                                           xfer_file_progress_cb progress,
+                                           void *context, char *error,
+                                           size_t cap);
+const uint8_t *xfer_file_identity(const xfer_file_t *file);
+bool xfer_file_source_resume(xfer_file_t *file, uint64_t offset,
+                             uint8_t out[32], char *error, size_t cap);
+bool xfer_file_source_finish(xfer_file_t *file, char *error, size_t cap);
+bool xfer_file_set_expected_hash(xfer_file_t *file, const uint8_t hash[32],
+                                 char *error, size_t cap);
+/* True once a bounded read-ahead worker was used for this file's hashes. */
+bool xfer_file_used_read_ahead(const xfer_file_t *file);
 uint64_t xfer_file_size(const xfer_file_t *file);
 const uint8_t *xfer_file_hash(const xfer_file_t *file);
 uint64_t xfer_file_offset(const xfer_file_t *file);

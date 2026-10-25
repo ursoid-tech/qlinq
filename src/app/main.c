@@ -20,9 +20,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
-#define APP_REORDER_OBJECTS 256U
+#define APP_REORDER_OBJECTS 65536U
 #define APP_REORDER_MAX_BYTES (64U * 1024U * 1024U)
 #define APP_PV_INTERVAL_MS 1000U
 
@@ -52,15 +53,28 @@ typedef struct {
   uint32_t interval_ms;
   uint32_t drain_ms;
   uint32_t stats_ms;
+  uint32_t pv_ms;
   bool is_server;
   bool one_shot;
   bool transfer;
+  bool streaming_source_hash;
   uint32_t transfer_timeout_ms;
   bool pv;
   bool verbose;
   bool help;
   const char *bind_host;
+  const char *bind_hosts[TRANSPORT_MAX_PATHS];
+  size_t num_bind_hosts;
   const char *peer_arg;
+  const char *peer_args[TRANSPORT_MAX_PATHS];
+  size_t num_peer_args;
+  size_t stripes;
+  bool multihome;
+  unsigned congestion_control;
+  uint32_t initial_cwnd_packets;
+  size_t max_udp_payload_size;
+  uint32_t jumpstart_packets;
+  bool jumpstart_set;
   const char *cert_file;
   const char *key_file;
   const char *ca_file;
@@ -75,6 +89,8 @@ typedef struct {
   size_t max_repair_requests;
   size_t max_aggregate_repairs;
   transport_repair_mode_t repair_mode;
+  size_t send_batch;
+  double mbps;
   bool verify_peer;
   bool allow_insecure;
 } options_t;
@@ -87,7 +103,10 @@ typedef struct {
   int64_t transfer_progress_at;
   int64_t transfer_notify_at;
   int64_t transfer_failure_at;
+  int64_t transfer_done_at;
   uint64_t transfer_disk_bytes;
+  bool transfer_batch_ready;
+  bool transfer_flush_pending;
   FILE *input;
   FILE *output;
   FILE *stats_output;
@@ -111,7 +130,7 @@ typedef struct {
   uint64_t reorder_group_id;
   uint64_t reorder_next_object_id;
   size_t reorder_bytes;
-  reorder_entry_t reorder[APP_REORDER_OBJECTS];
+  reorder_entry_t *reorder;
   pv_path_t pv_paths[TRANSPORT_MAX_PATHS];
 } app_t;
 
@@ -130,44 +149,59 @@ static void handle_signal(int sig) {
 }
 
 static void show_help(FILE *out, const char *program) {
-  fprintf(out,
-          "usage: %s (--listen PORT | --peer HOST[:PORT]) [options]\n\n"
-          "Network:\n"
-          "  --bind ADDRESS              numeric local address\n"
-          "  --cert FILE --key FILE      TLS identity; required for listeners "
-          "and verified peers\n"
-          "  --ca FILE                   peer CA bundle\n"
-          "  --auth-token TOKEN          application authentication token\n"
-          "  --insecure-no-verify        test-only certificate bypass\n"
-          "  --idle-timeout-ms MS        QUIC session idle timeout\n"
-          "  --max-connections N         listener connection capacity\n"
-          "  --max-repair-requests N     per-peer repair requests/second\n"
-          "  --max-aggregate-repairs N   source-wide repair requests/second\n"
-          "  --loss PERCENT              test-only simulated packet loss\n\n"
-          "Data:\n"
-          "  --track NAME                default qlinq-app/data (xfer-v1 for "
-          "--transfer)\n"
-          "  --mode datagram|fixedrate|rateless|reliable (fec is an alias)\n"
-          "  --repair-mode auto|indexed|rateless\n"
-          "  --transfer                  verified, resumable single-file copy\n"
-          "  --transfer-timeout-ms MS     no-progress timeout; default 60000\n"
-          "  --input FILE|-              publish fixed-size records\n"
-          "  --output FILE|-             write received records\n"
-          "  --message-size BYTES        default 1200\n"
-          "  --count N                   stop after N sent records\n"
-          "  --receive-count N           exit after N received records\n"
-          "  --wait-subscribers N        default 1 when publishing\n"
-          "  --interval-ms MS            minimum send interval\n"
-          "  --one-shot                  exit after input and drain\n"
-          "  --drain-ms MS               default 1000\n"
-          "  --stats-ms MS               periodically print counters\n"
-          "  --stats-file FILE           write TSV counter snapshots\n"
-          "  --pv                        pv-style throughput per interface\n"
-          "  --node-id ID                TSV node label\n"
-          "  --verbose\n\n"
-          "Signals:\n"
-          "  SIGHUP                      reload --cert and --key atomically\n",
-          program);
+  fprintf(
+      out,
+      "usage: %s (--listen PORT | --peer HOST[:PORT]) [options]\n\n"
+      "Network:\n"
+      "  --bind ADDRESS              numeric local address (repeatable)\n"
+      "  --stripes N                 multi-socket striping paths (1..4)\n"
+      "  --multihome                 auto-bind all active non-loopback "
+      "interfaces\n"
+      "  --cc cubic|cuback       congestion controller (default: cubic)\n"
+      "  --initial-cwnd N            initial window packets (default: 4096)\n"
+      "  --udp-payload N             maximum UDP payload, 1200..1500 bytes "
+      "(default: 1280; must fit the path MTU)\n"
+      "  --jumpstart N               quickstart initial window packets "
+      "(default: 256 for transfer)\n"
+      "  --cert FILE --key FILE      TLS identity; required for listeners "
+      "and verified peers\n"
+      "  --ca FILE                   peer CA bundle\n"
+      "  --auth-token TOKEN          application authentication token\n"
+      "  --insecure-no-verify        test-only certificate bypass\n"
+      "  --idle-timeout-ms MS        QUIC session idle timeout\n"
+      "  --max-connections N         listener connection capacity\n"
+      "  --max-repair-requests N     per-peer repair requests/second\n"
+      "  --max-aggregate-repairs N   source-wide repair requests/second\n"
+      "  --loss PERCENT              test-only simulated packet loss\n\n"
+      "Data:\n"
+      "  --track NAME                default qlinq-app/data (xfer-v1 for "
+      "--transfer)\n"
+      "  --mode datagram|fixedrate|rateless|reliable (fec is an alias)\n"
+      "  --repair-mode auto|indexed|rateless\n"
+      "  --transfer                  verified, resumable single-file copy\n"
+      "  --transfer-timeout-ms MS     no-progress timeout; default 60000\n"
+      "  --streaming-source-hash     experimental sender hash during transfer; "
+      "new peers required\n"
+      "  --input FILE|-              publish fixed-size records\n"
+      "  --output FILE|-             write received records\n"
+      "  --message-size BYTES        default 1200\n"
+      "  --count N                   stop after N sent records\n"
+      "  --receive-count N           exit after N received records\n"
+      "  --wait-subscribers N        default 1 when publishing\n"
+      "  --send-batch N              batch send size; default 32\n"
+      "  --mbps RATE                 target send rate in Mbps (0 unpaced)\n"
+      "  --interval-ms MS            minimum send interval\n"
+      "  --one-shot                  exit after input and drain\n"
+      "  --drain-ms MS               default 1000\n"
+      "  --stats-ms MS               periodically print counters\n"
+      "  --stats-file FILE           write TSV counter snapshots\n"
+      "  --pv                        pv-style throughput per interface\n"
+      "  --pv-ms MS                  pv snapshot interval; default 1000\n"
+      "  --node-id ID                TSV node label\n"
+      "  --verbose\n\n"
+      "Signals:\n"
+      "  SIGHUP                      reload --cert and --key atomically\n",
+      program);
 }
 
 static bool write_payload(app_t *app, const moq_track_id_t *track,
@@ -180,26 +214,48 @@ static bool write_payload(app_t *app, const moq_track_id_t *track,
       const uint8_t *record;
       size_t record_size;
       if (!qlinq_wire_next_record(&cursor, &record, &record_size) ||
-          record_size == 0)
+          record_size == 0) {
+        fprintf(stderr, "qlinq-app: invalid wire record remaining=%zu\n",
+                cursor.remaining);
         return false;
-      if (app->output &&
-          fwrite(record, 1, record_size, app->output) != record_size)
+      }
+      if (app->xfer) {
+        if (!app_xfer_receive(app->xfer, record, record_size)) {
+          fprintf(stderr, "qlinq-app: invalid transfer record size=%zu\n",
+                  record_size);
+          return false;
+        }
+        app->transfer_progress_at = transport_get_time_ms();
+      } else if (app->output &&
+                 fwrite(record, 1, record_size, app->output) != record_size) {
         return false;
+      }
       app->received_records++;
       app->received_bytes += record_size;
     }
   } else {
-    if (app->output && size != 0 && fwrite(data, 1, size, app->output) != size)
+    if (app->xfer) {
+      if (!app_xfer_receive(app->xfer, data, size)) {
+        fprintf(stderr,
+                "qlinq-app: app_xfer_receive un-grouped failed size=%zu\n",
+                size);
+        return false;
+      }
+      app->transfer_progress_at = transport_get_time_ms();
+    } else if (app->output && size != 0 &&
+               fwrite(data, 1, size, app->output) != size) {
       return false;
+    }
     app->received_records++;
     app->received_bytes += size;
   }
-  if (app->output && fflush(app->output) != 0)
-    return false;
-  if (app->options->receive_limit != 0 &&
-      app->received_records >= app->options->receive_limit &&
-      app->received_at == 0)
-    app->received_at = transport_get_time_ms();
+  if (!app->xfer && app->options->receive_limit != 0 &&
+      app->received_records >= app->options->receive_limit) {
+    if (app->output && fflush(app->output) != 0)
+      return false;
+    if (app->received_at == 0)
+      app->received_at = transport_get_time_ms();
+  }
   return true;
 }
 
@@ -215,13 +271,32 @@ static bool write_object(app_t *app, const transport_event_t *event) {
     app->reorder_group_id = event->object.group_id;
     app->reorder_next_object_id = 0;
   }
-  if (event->object.group_id != app->reorder_group_id ||
-      event->object.object_id < app->reorder_next_object_id)
-    return event->object.group_id == app->reorder_group_id;
+  if (event->object.group_id > app->reorder_group_id) {
+    /* advance to next group and reset per-group reorder window */
+    for (size_t i = 0; i < APP_REORDER_OBJECTS; i++) {
+      if (app->reorder[i].active) {
+        free(app->reorder[i].data);
+        memset(&app->reorder[i], 0, sizeof(app->reorder[i]));
+      }
+    }
+    app->reorder_bytes = 0;
+    app->reorder_group_id = event->object.group_id;
+    app->reorder_next_object_id = 0;
+  } else if (event->object.group_id < app->reorder_group_id ||
+             event->object.object_id < app->reorder_next_object_id) {
+    /* drop duplicate or stale object from older group */
+    return true;
+  }
   uint64_t distance = event->object.object_id - app->reorder_next_object_id;
   if (distance >= APP_REORDER_OBJECTS ||
-      event->object.size > APP_REORDER_MAX_BYTES - app->reorder_bytes)
+      event->object.size > APP_REORDER_MAX_BYTES - app->reorder_bytes) {
+    fprintf(stderr,
+            "qlinq-app: reorder reject obj=%" PRIu64 " next=%" PRIu64
+            " distance=%" PRIu64 " bytes=%zu (max %u)\n",
+            event->object.object_id, app->reorder_next_object_id, distance,
+            app->reorder_bytes, APP_REORDER_MAX_BYTES);
     return false;
+  }
   size_t slot = (size_t)(event->object.object_id % APP_REORDER_OBJECTS);
   reorder_entry_t *entry = &app->reorder[slot];
   if (entry->active)
@@ -263,6 +338,12 @@ static void on_event(void *user_data, const transport_event_t *event) {
   const options_t *options = app->options;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
+    if (options->pv) {
+      transport_conn_stats_t stats;
+      if (transport_get_conn_stats(app->transport, event->conn, &stats))
+        fprintf(stderr, "qlinq-app: conn=%u cc=%s\n", stats.id,
+                stats.congestion_control);
+    }
     if (options->verbose)
       fprintf(stderr, "qlinq-app: peer connected\n");
     if (!options->is_server &&
@@ -309,23 +390,14 @@ static void on_event(void *user_data, const transport_event_t *event) {
       app->subscriptions--;
     break;
   case TRANSPORT_EVENT_OBJECT:
-    if (app->xfer) {
-      if (event->conn == app->xfer_conn &&
-          event->track_id.type == options->track.type &&
-          strcmp(event->track_id.name, options->track.name) == 0) {
-        (void)app_xfer_receive(app->xfer, event->object.data,
-                               event->object.size);
-        app->received_records++;
-        app->received_bytes += event->object.size;
-        app->transfer_progress_at = transport_get_time_ms();
-      }
-      break;
-    }
     if (event->track_id.type == options->track.type &&
-        strcmp(event->track_id.name, options->track.name) == 0 &&
-        !write_object(app, event)) {
-      fprintf(stderr, "qlinq-app: malformed object or output error\n");
-      app->failed = true;
+        strcmp(event->track_id.name, options->track.name) == 0) {
+      if (app->xfer && event->conn != app->xfer_conn)
+        break;
+      if (!write_object(app, event)) {
+        fprintf(stderr, "qlinq-app: malformed object or output error\n");
+        app->failed = true;
+      }
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
@@ -357,49 +429,71 @@ static void on_event(void *user_data, const transport_event_t *event) {
   }
 }
 
-static void publish_pending(app_t *app, int64_t now) {
-  if (app->pending_size == 0 || now < app->next_send_at)
-    return;
-  moq_object_t object = {.track_id = app->options->track,
-                         .group_id = 0,
-                         .object_id = app->sent_records,
-                         .data = app->message,
-                         .size = app->pending_size,
-                         .priority = 1};
-  transport_publish_result_t result =
-      transport_publish_ex(app->transport, &object);
-  if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
-    return;
-  if (result == TRANSPORT_PUBLISH_INVALID ||
-      result == TRANSPORT_PUBLISH_ERROR ||
-      result == TRANSPORT_PUBLISH_PARTIAL) {
-    fprintf(stderr, "qlinq-app: publication failed (%d)\n", result);
-    app->failed = true;
-    return;
-  }
-  app->pending_size = 0;
-  app->sent_records++;
-  app->next_send_at = now + app->options->interval_ms;
-}
-
-static void load_input(app_t *app, bool ready) {
-  if (!ready || !app->input || app->input_eof || app->pending_size != 0 ||
+static void service_publish(app_t *app, int64_t now) {
+  if (!app->input || app->input_eof ||
       app->subscriptions < app->options->required_subscriptions)
     return;
-  if (app->options->count_limit != 0 &&
-      app->sent_records >= app->options->count_limit) {
-    app->input_eof = true;
-    return;
+
+  uint64_t target_records = UINT64_MAX;
+  if (app->options->mbps > 0) {
+    int64_t elapsed_ms = now - app->started_at;
+    if (elapsed_ms < 0)
+      elapsed_ms = 0;
+    target_records =
+        (uint64_t)((double)elapsed_ms / 1000.0 * (app->options->mbps * 1e6) /
+                   (8.0 * app->options->message_size));
   }
-  ssize_t n =
-      read(fileno(app->input), app->message, app->options->message_size);
-  if (n > 0) {
-    app->pending_size = (size_t)n;
-  } else if (n == 0) {
-    app->input_eof = true;
-  } else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
-    fprintf(stderr, "qlinq-app: input read failed: %s\n", strerror(errno));
-    app->failed = true;
+
+  size_t batch = app->options->send_batch ? app->options->send_batch : 32;
+  for (size_t i = 0; i < batch; i++) {
+    if (app->options->count_limit != 0 &&
+        app->sent_records >= app->options->count_limit) {
+      app->input_eof = true;
+      break;
+    }
+    if (app->sent_records >= target_records)
+      break;
+    if (now < app->next_send_at)
+      break;
+
+    if (app->pending_size == 0) {
+      ssize_t n =
+          read(fileno(app->input), app->message, app->options->message_size);
+      if (n > 0) {
+        app->pending_size = (size_t)n;
+      } else if (n == 0) {
+        app->input_eof = true;
+        break;
+      } else {
+        if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+          fprintf(stderr, "qlinq-app: input read failed: %s\n",
+                  strerror(errno));
+          app->failed = true;
+        }
+        break;
+      }
+    }
+
+    moq_object_t object = {.track_id = app->options->track,
+                           .group_id = 0,
+                           .object_id = app->sent_records,
+                           .data = app->message,
+                           .size = app->pending_size,
+                           .priority = 1};
+    transport_publish_result_t result =
+        transport_publish_ex(app->transport, &object);
+    if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
+      break;
+    if (result == TRANSPORT_PUBLISH_INVALID ||
+        result == TRANSPORT_PUBLISH_ERROR ||
+        result == TRANSPORT_PUBLISH_PARTIAL) {
+      fprintf(stderr, "qlinq-app: publication failed (%d)\n", result);
+      app->failed = true;
+      break;
+    }
+    app->pending_size = 0;
+    app->sent_records++;
+    app->next_send_at = now + app->options->interval_ms;
   }
 }
 
@@ -511,10 +605,15 @@ static void print_pv(app_t *app, int64_t now, bool force) {
       snprintf(label, sizeof(label), "%s", stats.interface_name);
     fprintf(stderr,
             "qlinq-app: pv %s tx %s %" PRIu64 ":%02" PRIu64 ":%02" PRIu64
-            " [%s/s] rx %s [%s/s]\n",
+            " [%s/s] rx %s [%s/s] path=%zu state=%u rtt_ms=%u cwnd=%u "
+            "inflight=%u tx_bytes=%" PRIu64 " rx_bytes=%" PRIu64
+            " packets_sent=%" PRIu64 " acked=%" PRIu64 " lost=%" PRIu64 "\n",
             label, sent_total, elapsed_seconds / 3600U,
             (elapsed_seconds / 60U) % 60U, elapsed_seconds % 60U,
-            sent_per_second, received_total, received_per_second);
+            sent_per_second, received_total, received_per_second, path,
+            (unsigned)stats.lifecycle, stats.rtt, stats.cwnd,
+            stats.bytes_in_flight, stats.bytes_sent, stats.bytes_received,
+            stats.sent, stats.acked, stats.lost);
 
     previous->interface_index = stats.interface_index;
     memcpy(previous->local_address, stats.local_address,
@@ -523,13 +622,59 @@ static void print_pv(app_t *app, int64_t now, bool force) {
     previous->bytes_received = stats.bytes_received;
     previous->initialized = true;
   }
+  transport_conn_stats_t conn_stats;
+  if (app->xfer_conn &&
+      transport_get_conn_stats(app->transport, app->xfer_conn, &conn_stats)) {
+    fprintf(stderr,
+            "qlinq-app: pv conn=%u cc=%s jumpstart_applicable=%" PRIu64
+            " primary_jumpstart_cwnd=%u quic_packets_sent=%" PRIu64
+            " quic_packets_lost=%" PRIu64
+            " quic_packets_lost_time_threshold=%" PRIu64
+            " quic_packets_late_acked=%" PRIu64 "\n",
+            conn_stats.id, conn_stats.congestion_control,
+            conn_stats.jumpstart_applicable, conn_stats.primary_jumpstart_cwnd,
+            conn_stats.quic_packets_sent, conn_stats.quic_packets_lost,
+            conn_stats.quic_packets_lost_time_threshold,
+            conn_stats.quic_packets_late_acked);
+    fprintf(
+        stderr,
+        "qlinq-app: pv stream elapsed_ms=%" PRId64 " send_permitted=%" PRIu64
+        " sent=%" PRIu64 " data_blocked_frames=%" PRIu64
+        " stream_data_blocked_frames=%" PRIu64
+        " tracks=%zu track_unsent=%" PRIu64 " track_retained=%" PRIu64
+        " track_flow_limited=%zu\n",
+        now - app->started_at, conn_stats.quic_send_permitted,
+        conn_stats.quic_stream_bytes_sent, conn_stats.quic_data_blocked_frames,
+        conn_stats.quic_stream_data_blocked_frames, conn_stats.track_streams,
+        conn_stats.track_unsent_bytes, conn_stats.track_retained_bytes,
+        conn_stats.track_flow_limited_streams);
+  }
+  if (app->xfer) {
+    app_xfer_status_t status;
+    app_xfer_status(app->xfer, &status);
+    transport_stats_t aggregate_stats = {0};
+    (void)transport_get_stats(app->transport, &aggregate_stats);
+    fprintf(stderr,
+            "qlinq-app: pv file source_prepare_ms=%" PRIu64
+            " commit_ms=%" PRIu64 " credit_wait_ms=%" PRIu64
+            " input_queue_bytes=%zu output_queue_bytes=%zu"
+            " stream_egress_bytes=%zu publish_backpressure=%" PRIu64 "\n",
+            status.source_prepare_ms, status.commit_ms, status.credit_wait_ms,
+            status.input_queue_bytes, status.output_queue_bytes,
+            aggregate_stats.stream_egress_bytes,
+            aggregate_stats.publish_backpressure);
+  }
   app->pv_last_at = now;
-  app->next_pv_at = now + APP_PV_INTERVAL_MS;
+  app->next_pv_at = now + app->options->pv_ms;
 }
 
 static void cleanup_reorder(app_t *app) {
+  if (!app->reorder)
+    return;
   for (size_t i = 0; i < APP_REORDER_OBJECTS; i++)
     free(app->reorder[i].data);
+  free(app->reorder);
+  app->reorder = NULL;
 }
 
 static bool parse_options(int argc, char **argv, options_t *options) {
@@ -537,9 +682,14 @@ static bool parse_options(int argc, char **argv, options_t *options) {
                                    .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
                                    .name = "qlinq-app/data"},
                          .drain_ms = 1000,
+                         .pv_ms = APP_PV_INTERVAL_MS,
                          .transfer_timeout_ms = 60000,
                          .node_id = "qlinq-app",
                          .message_size = 1200,
+                         .send_batch = 32,
+                         .congestion_control = TRANSPORT_CC_CUBIC,
+                         .initial_cwnd_packets = 4096,
+                         .mbps = 0.0,
                          .repair_mode = TRANSPORT_REPAIR_MODE_AUTO,
                          .verify_peer = true};
   uint64_t parsed;
@@ -559,6 +709,10 @@ static bool parse_options(int argc, char **argv, options_t *options) {
     }
     if (strcmp(arg, "--transfer") == 0) {
       options->transfer = true;
+      continue;
+    }
+    if (strcmp(arg, "--streaming-source-hash") == 0) {
+      options->streaming_source_hash = true;
       continue;
     }
     if (strcmp(arg, "--one-shot") == 0) {
@@ -581,7 +735,9 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         strcmp(arg, "--wait-subscribers") == 0 ||
         strcmp(arg, "--repair-mode") == 0 ||
         strcmp(arg, "--max-repair-requests") == 0 ||
-        strcmp(arg, "--max-aggregate-repairs") == 0)
+        strcmp(arg, "--max-aggregate-repairs") == 0 ||
+        strcmp(arg, "--send-batch") == 0 || strcmp(arg, "--batch") == 0 ||
+        strcmp(arg, "--mbps") == 0)
       raw_options = true;
     if (strcmp(arg, "--transfer-timeout-ms") == 0) {
       if (!cli_parse_u64(value, UINT32_MAX, &parsed) || parsed == 0)
@@ -593,9 +749,42 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         goto invalid;
       options->listen_port = (uint16_t)parsed;
     } else if (strcmp(arg, "--peer") == 0) {
-      options->peer_arg = value;
+      if (options->num_peer_args < TRANSPORT_MAX_PATHS) {
+        options->peer_args[options->num_peer_args++] = value;
+      }
+      options->peer_arg = options->peer_args[0];
     } else if (strcmp(arg, "--bind") == 0) {
-      options->bind_host = value;
+      if (options->num_bind_hosts < TRANSPORT_MAX_PATHS) {
+        options->bind_hosts[options->num_bind_hosts++] = value;
+      }
+      options->bind_host = options->bind_hosts[0];
+    } else if (strcmp(arg, "--stripes") == 0) {
+      if (!cli_parse_u64(value, TRANSPORT_MAX_PATHS, &parsed) || parsed == 0)
+        goto invalid;
+      options->stripes = (size_t)parsed;
+    } else if (strcmp(arg, "--multihome") == 0) {
+      options->multihome = true;
+    } else if (strcmp(arg, "--cc") == 0) {
+      if (strcmp(value, "cubic") == 0)
+        options->congestion_control = TRANSPORT_CC_CUBIC;
+      else if (strcmp(value, "cuback") == 0)
+        options->congestion_control = TRANSPORT_CC_CUBACK;
+      else
+        goto invalid;
+    } else if (strcmp(arg, "--initial-cwnd") == 0) {
+      if (!cli_parse_u64(value, 65535, &parsed) || parsed == 0)
+        goto invalid;
+      options->initial_cwnd_packets = (uint32_t)parsed;
+    } else if (strcmp(arg, "--udp-payload") == 0) {
+      if (!cli_parse_u64(value, 1500, &parsed) || parsed < 1200)
+        goto invalid;
+      options->max_udp_payload_size = (size_t)parsed;
+    } else if (strcmp(arg, "--jumpstart") == 0 ||
+               strcmp(arg, "--quickstart") == 0) {
+      if (!cli_parse_u64(value, 65535, &parsed))
+        goto invalid;
+      options->jumpstart_packets = (uint32_t)parsed;
+      options->jumpstart_set = true;
     } else if (strcmp(arg, "--cert") == 0) {
       options->cert_file = value;
     } else if (strcmp(arg, "--key") == 0) {
@@ -675,12 +864,26 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       if (!cli_parse_u64(value, UINT32_MAX, &parsed))
         goto invalid;
       options->stats_ms = (uint32_t)parsed;
+    } else if (strcmp(arg, "--pv-ms") == 0) {
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed) || parsed == 0)
+        goto invalid;
+      options->pv_ms = (uint32_t)parsed;
     } else if (strcmp(arg, "--stats-file") == 0) {
       options->stats_path = value;
     } else if (strcmp(arg, "--node-id") == 0) {
       if (!value[0] || strchr(value, '\t') || strchr(value, '\n'))
         goto invalid;
       options->node_id = value;
+    } else if (strcmp(arg, "--send-batch") == 0 ||
+               strcmp(arg, "--batch") == 0) {
+      if (!cli_parse_u64(value, 4096, &parsed) || parsed == 0)
+        goto invalid;
+      options->send_batch = (size_t)parsed;
+    } else if (strcmp(arg, "--mbps") == 0) {
+      char *end = NULL;
+      options->mbps = strtod(value, &end);
+      if (end == value || *end != '\0' || options->mbps < 0)
+        goto invalid;
     } else {
       goto invalid;
     }
@@ -699,22 +902,28 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       (options->one_shot && !options->input_path) || !options->auth_token ||
       !options->auth_token[0])
     goto invalid;
+  if (options->streaming_source_hash &&
+      (!options->transfer || !options->input_path))
+    goto invalid;
   if (options->transfer) {
     if ((options->input_path != NULL) == (options->output_path != NULL) ||
         strcmp(options->input_path ? options->input_path : options->output_path,
                "-") == 0 ||
         raw_options || options->max_connections > 1 ||
         options->track.name[0] == '\0' ||
-        (mode_set && options->track.flags != MOQ_TRACK_FLAG_RELIABLE)) {
+        (mode_set && options->track.flags != MOQ_TRACK_FLAG_RELIABLE &&
+         options->track.flags != MOQ_TRACK_FLAG_FEC_ENABLED &&
+         options->track.flags != MOQ_TRACK_FLAG_FEC_RATELESS)) {
       fprintf(stderr,
               "qlinq-app: --transfer requires one regular input or output "
-              "file, reliable mode, and one peer; raw record options "
-              "are incompatible\n");
+              "file, valid mode (reliable, fixedrate, rateless), and one peer; "
+              "raw record options are incompatible\n");
       return false;
     }
     if (!track_set)
       strcpy(options->track.name, "qlinq-app/xfer-v1");
-    options->track.flags = MOQ_TRACK_FLAG_RELIABLE;
+    if (!mode_set)
+      options->track.flags = MOQ_TRACK_FLAG_RELIABLE;
     options->max_connections = 1;
   } else if (transfer_timeout_set) {
     goto invalid;
@@ -740,6 +949,7 @@ invalid:
 /* service transfer worker queue and completion handshake */
 static bool service_transfer(app_t *app, int64_t now) {
   const options_t *options = app->options;
+  app->transfer_batch_ready = false;
   if (now >= app->transfer_notify_at) {
     app_xfer_progress(app->xfer);
     uint32_t interval = options->transfer_timeout_ms / 3;
@@ -749,7 +959,13 @@ static bool service_transfer(app_t *app, int64_t now) {
       interval = 1000;
     app->transfer_notify_at = now + interval;
   }
-  for (unsigned i = 0; app->subscriptions != 0 && i < 64; i++) {
+  unsigned published = 0;
+  for (; app->subscriptions != 0 && published < 64; published++) {
+    if (app->transfer_flush_pending) {
+      if (!transport_publish_flush(app->transport))
+        break;
+      app->transfer_flush_pending = false;
+    }
     const void *data;
     size_t size;
     bool is_data;
@@ -777,7 +993,10 @@ static bool service_transfer(app_t *app, int64_t now) {
     app->transfer_progress_at = now;
     if (is_data)
       app->next_send_at = now + options->interval_ms;
+    else
+      app->transfer_flush_pending = !transport_publish_flush(app->transport);
   }
+  app->transfer_batch_ready = published == 64;
   app_xfer_status_t status;
   app_xfer_status(app->xfer, &status);
   transport_stats_t stats;
@@ -795,8 +1014,17 @@ static bool service_transfer(app_t *app, int64_t now) {
     return false;
   }
   if (status.done &&
-      ((!status.output_pending && stats.stream_egress_bytes == 0) ||
-       !app->xfer_conn)) {
+      (!status.output_pending && stats.stream_egress_bytes == 0)) {
+    (void)transport_publish_flush(app->transport);
+    if (app->transfer_done_at == 0)
+      app->transfer_done_at = now;
+    if (!options->input_path || !app->xfer_conn ||
+        now - app->transfer_done_at >= 100) {
+      fprintf(stderr, "qlinq-app: transfer committed\n");
+      return true;
+    }
+  } else if (status.done && !app->xfer_conn) {
+    (void)transport_publish_flush(app->transport);
     fprintf(stderr, "qlinq-app: transfer committed\n");
     return true;
   }
@@ -817,7 +1045,7 @@ static void service_app(app_t *app) {
   app->transfer_progress_at = app->started_at;
   app->next_stats_at = app->started_at + options->stats_ms;
   app->pv_last_at = app->started_at;
-  app->next_pv_at = app->started_at + APP_PV_INTERVAL_MS;
+  app->next_pv_at = app->started_at + options->pv_ms;
   while (running && !app->failed) {
     int64_t now = transport_get_time_ms();
 #ifdef SIGHUP
@@ -836,10 +1064,11 @@ static void service_app(app_t *app) {
 #endif
     transport_tick(app->transport);
     if (app->xfer) {
+      app_xfer_drain(app->xfer);
       if (service_transfer(app, now))
         break;
     } else {
-      publish_pending(app, now);
+      service_publish(app, now);
       finish_track(app, now);
     }
     print_stats(app, now, false);
@@ -858,24 +1087,64 @@ static void service_app(app_t *app) {
     struct pollfd fds[TRANSPORT_MAX_POLL_FDS + 1];
     size_t num_fds = transport_get_poll_fds(app->transport, fds,
                                             sizeof(fds) / sizeof(fds[0]));
-    size_t input_index = SIZE_MAX;
-    if (app->input && !app->input_eof && app->pending_size == 0 &&
-        app->subscriptions >= options->required_subscriptions &&
-        num_fds < sizeof(fds) / sizeof(fds[0])) {
-      input_index = num_fds;
+    if (app->xfer)
       fds[num_fds++] =
-          (struct pollfd){.fd = fileno(app->input), .events = POLLIN};
-    }
+          (struct pollfd){.fd = app_xfer_get_fd(app->xfer), .events = POLLIN};
     int timeout = 10;
     int64_t deadline = transport_get_first_timeout(app->transport);
-    if (deadline != INT64_MAX && deadline <= now)
+    /* Packet and file service can consume part of a pacing interval. Calculate
+     * the remaining wait against the clock after that work, not loop entry. */
+    int64_t poll_now = transport_get_time_ms();
+    if (deadline != INT64_MAX && deadline <= poll_now)
       timeout = 0;
-    else if (deadline != INT64_MAX && deadline - now < timeout)
-      timeout = (int)(deadline - now);
-    int polled = num_fds ? poll(fds, num_fds, timeout) : 0;
-    bool input_ready = input_index != SIZE_MAX && polled > 0 &&
-                       (fds[input_index].revents & (POLLIN | POLLHUP)) != 0;
-    load_input(app, input_ready);
+    else if (deadline != INT64_MAX && deadline - poll_now < timeout)
+      timeout = (int)(deadline - poll_now);
+
+    /* A full transfer batch is runnable work, not an application idle period.
+     * Sleeping 10 ms after every 64 x 16 KiB batch caps bulk publication near
+     * 839 Mbps. An empty, paced, or backpressured batch still uses normal poll.
+     */
+    if (app->transfer_batch_ready)
+      timeout = 0;
+
+    /* if actively sending and not paced or backpressured, poll with 0 timeout
+     */
+    if (app->input && !app->input_eof && app->pending_size == 0 &&
+        app->subscriptions >= options->required_subscriptions) {
+      if (options->mbps <= 0) {
+        timeout = 0;
+      } else {
+        int64_t elapsed_ms = poll_now - app->started_at;
+        uint64_t target =
+            (uint64_t)((double)elapsed_ms / 1000.0 * (options->mbps * 1e6) /
+                       (8.0 * options->message_size));
+        if (app->sent_records < target)
+          timeout = 0;
+      }
+    }
+    if (num_fds) {
+#ifdef __linux__
+      /* Transport deadlines name absolute millisecond boundaries. Waiting a
+       * whole relative millisecond from partway through the current tick can
+       * oversleep a pacing deadline by almost another millisecond. */
+      struct timespec wait = {.tv_nsec = (long)timeout * 1000000L};
+      if (timeout > 0 && deadline != INT64_MAX) {
+        struct timespec current;
+        clock_gettime(CLOCK_MONOTONIC, &current);
+        int64_t current_ms =
+            (int64_t)current.tv_sec * 1000 + current.tv_nsec / 1000000;
+        int64_t remaining_ms = deadline - current_ms;
+        if (remaining_ms <= 0)
+          wait.tv_nsec = 0;
+        else if (remaining_ms <= timeout)
+          wait.tv_nsec =
+              (long)remaining_ms * 1000000L - current.tv_nsec % 1000000L;
+      }
+      ppoll(fds, num_fds, &wait, NULL);
+#else
+      poll(fds, num_fds, timeout);
+#endif
+    }
   }
   if (app->xfer) {
     app_xfer_status_t status;
@@ -938,7 +1207,10 @@ static int run_app(const options_t *options) {
             "udp_would_block\tpublish_backpressure\tpublish_errors\n");
   }
   if (options->transfer) {
-    app.xfer = app_xfer_create(options->input_path, options->output_path);
+    app.xfer = options->streaming_source_hash
+                   ? app_xfer_create_streaming(options->input_path,
+                                               options->output_path)
+                   : app_xfer_create(options->input_path, options->output_path);
     if (!app.xfer) {
       fprintf(stderr, "qlinq-app: unable to create transfer worker\n");
       app.failed = true;
@@ -947,6 +1219,11 @@ static int run_app(const options_t *options) {
   }
   app.message = malloc(options->message_size);
   if (!app.message) {
+    app.failed = true;
+    goto cleanup;
+  }
+  app.reorder = calloc(APP_REORDER_OBJECTS, sizeof(*app.reorder));
+  if (!app.reorder) {
     app.failed = true;
     goto cleanup;
   }
@@ -961,25 +1238,47 @@ static int run_app(const options_t *options) {
   signal(SIGHUP, handle_signal);
 #endif
 
-  char peer_host[256] = {0};
+  char peer_hosts[TRANSPORT_MAX_PATHS][256];
+  memset(peer_hosts, 0, sizeof(peer_hosts));
   uint16_t port = options->listen_port;
-  if (options->peer_arg) {
+  size_t num_remotes = options->num_peer_args;
+  if (num_remotes > 0) {
     port = 8888;
-    if (!cli_parse_endpoint(options->peer_arg, peer_host, sizeof(peer_host),
-                            &port, NULL)) {
-      app.failed = true;
-      goto cleanup_sockets;
+    for (size_t i = 0; i < num_remotes; i++) {
+      uint16_t p = 8888;
+      if (!cli_parse_endpoint(options->peer_args[i], peer_hosts[i],
+                              sizeof(peer_hosts[i]), &p, NULL)) {
+        app.failed = true;
+        goto cleanup_sockets;
+      }
+      if (i == 0)
+        port = p;
     }
   }
+
   transport_config_t config = {0};
-  config.bind_hosts[0] =
-      options->bind_host
-          ? options->bind_host
-          : (options->peer_arg && strchr(peer_host, ':') ? "::" : "0.0.0.0");
-  config.num_bind_hosts = 1;
-  if (options->peer_arg) {
-    config.remote_hosts[0] = peer_host;
-    config.num_remote_hosts = 1;
+  config.multihome = options->multihome;
+  const char *default_bind =
+      (num_remotes > 0 && strchr(peer_hosts[0], ':')) ? "::" : "0.0.0.0";
+  size_t effective_stripes = options->stripes ? options->stripes : 1;
+  if (options->num_bind_hosts > 0) {
+    for (size_t i = 0; i < options->num_bind_hosts; i++)
+      config.bind_hosts[i] = options->bind_hosts[i];
+    config.num_bind_hosts = options->num_bind_hosts;
+    if (options->num_bind_hosts == 1 && effective_stripes > 1) {
+      for (size_t i = 1; i < effective_stripes && i < TRANSPORT_MAX_PATHS; i++)
+        config.bind_hosts[i] = options->bind_hosts[0];
+      config.num_bind_hosts = effective_stripes;
+    }
+  } else {
+    for (size_t i = 0; i < effective_stripes && i < TRANSPORT_MAX_PATHS; i++)
+      config.bind_hosts[i] = default_bind;
+    config.num_bind_hosts = effective_stripes;
+  }
+  if (num_remotes > 0) {
+    for (size_t i = 0; i < num_remotes && i < TRANSPORT_MAX_PATHS; i++)
+      config.remote_hosts[i] = peer_hosts[i];
+    config.num_remote_hosts = num_remotes;
   }
   config.port = port;
   config.quic_idle_timeout_ms = options->idle_timeout_ms;
@@ -993,10 +1292,32 @@ static int run_app(const options_t *options) {
   config.simulated_loss_rate = options->simulated_loss;
   config.reconnect_enabled = options->peer_arg != NULL;
   config.repair_mode = options->repair_mode;
+  config.congestion_control = options->congestion_control;
+  config.limits.max_stream_egress_bytes = 128 * 1024 * 1024;
+  config.limits.max_total_stream_egress_bytes = 256 * 1024 * 1024;
+  config.limits.max_egress_packets_per_socket = 8192;
+  config.limits.max_egress_bytes_per_socket = 16 * 1024 * 1024;
+  config.limits.max_recovery_cache_bytes = 64 * 1024 * 1024;
+  /* A transfer has one connection. Return to ACK and file-worker service
+   * after a short packet turn rather than draining the full default budget. */
+  if (options->transfer)
+    config.limits.max_packets_per_tick = 128;
   config.limits.max_connections = options->max_connections;
-  config.limits.max_repair_requests_per_second = options->max_repair_requests;
+  config.limits.max_repair_requests_per_second =
+      options->max_repair_requests ? options->max_repair_requests : 16384;
   config.limits.max_aggregate_repair_requests_per_second =
-      options->max_aggregate_repairs;
+      options->max_aggregate_repairs ? options->max_aggregate_repairs : 32768;
+  config.limits.max_aggregate_nack_requests_per_second = 32768;
+  config.initial_cwnd_packets = options->initial_cwnd_packets;
+  config.limits.max_udp_payload_size = options->max_udp_payload_size;
+  if (options->jumpstart_set) {
+    config.default_jumpstart_packets = options->jumpstart_packets;
+    config.max_jumpstart_packets =
+        options->jumpstart_packets != 0 ? options->jumpstart_packets : 4096;
+  } else if (options->transfer) {
+    config.default_jumpstart_packets = 256;
+    config.max_jumpstart_packets = 4096;
+  }
   app.transport = transport_create(&config);
   if (!app.transport) {
     fprintf(stderr, "qlinq-app: unable to create transport\n");

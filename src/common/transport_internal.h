@@ -99,6 +99,7 @@ struct transport_t {
   uint32_t reconnect_current_delay_ms;
   int64_t reconnect_at_ms;
   char server_name[256];
+  bool multihome;
   transport_socket_t sockets[TRANSPORT_MAX_PATHS];
   size_t socket_count;
   uint16_t bind_port; /* Stable while all local interfaces are unavailable. */
@@ -111,6 +112,7 @@ struct transport_t {
   bool tick_active;
   bool log_callback_active;
   size_t receive_cursor;
+  bool send_backlog;
   size_t callback_depth;
 
   struct sockaddr_storage remote_addrs[TRANSPORT_MAX_PATHS];
@@ -199,6 +201,10 @@ struct transport_conn_t {
   /* Owned QUIC slots refreshed once per service pass, not per packet batch. */
   uint64_t scheduler_paths;
   uint8_t scheduler_sockets[TRANSPORT_MAX_QUIC_PATHS];
+  struct {
+    struct sockaddr_storage addr;
+    uint32_t ifindex;
+  } local_ifindex_cache[TRANSPORT_MAX_PATHS];
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
 };

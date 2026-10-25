@@ -683,11 +683,29 @@ static int test_address_identity(void) {
   memcpy(&local, &b, sizeof(b));
   quicly_path_stats_t stats = {0};
   memcpy(&stats.local, &a, sizeof(a));
+  ((struct sockaddr_in6 *)&local)->sin6_port = 0;
   CHECK(transport_path_matches_local(&stats, &local),
         "path lookup uses the same scoped address identity");
+  ((struct sockaddr_in6 *)&local)->sin6_port = htons(443);
+  CHECK(transport_path_matches_local(&stats, &local),
+        "path lookup matches exact endpoint when port is bound");
+  ((struct sockaddr_in6 *)&local)->sin6_port = htons(444);
+  CHECK(!transport_path_matches_local(&stats, &local),
+        "path lookup rejects distinct port when port is bound");
+  ((struct sockaddr_in6 *)&local)->sin6_port = 0;
   ((struct sockaddr_in6 *)&local)->sin6_scope_id++;
   CHECK(!transport_path_matches_local(&stats, &local),
         "path lookup rejects another interface with the same link-local IP");
+  struct sockaddr_in any4 = {.sin_family = AF_INET,
+                             .sin_addr.s_addr = INADDR_ANY};
+  CHECK(transport_address_is_wildcard((const struct sockaddr *)&any4),
+        "0.0.0.0 is identified as wildcard");
+  struct sockaddr_in6 any6 = {.sin6_family = AF_INET6,
+                              .sin6_addr = IN6ADDR_ANY_INIT};
+  CHECK(transport_address_is_wildcard((const struct sockaddr *)&any6),
+        ":: is identified as wildcard");
+  CHECK(!transport_address_is_wildcard(sa),
+        "link-local address is not wildcard");
   CHECK(!transport_address_equal(sa, NULL) &&
             !transport_endpoint_equal(NULL, sb),
         "absent addresses cannot identify a path");
@@ -801,8 +819,62 @@ static int test_path_estimates(void) {
   return 0;
 }
 
+static int test_pktinfo_preservation(void) {
+  int server_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(server_fd >= 0, "server socket creation");
+  CHECK(transport_udp_enable_recv_pktinfo(server_fd, AF_INET),
+        "enable IP_PKTINFO on server socket");
+
+  struct sockaddr_in bind_addr = {
+      .sin_family = AF_INET,
+      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+      .sin_port = 0,
+  };
+  CHECK(bind(server_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) == 0,
+        "bind server socket");
+  socklen_t addr_len = sizeof(bind_addr);
+  CHECK(getsockname(server_fd, (struct sockaddr *)&bind_addr, &addr_len) == 0,
+        "get server bound port");
+
+  int client_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  CHECK(client_fd >= 0, "client socket creation");
+
+  uint8_t ping_data[16] = "ping";
+  struct iovec iov = {.iov_base = ping_data, .iov_len = sizeof(ping_data)};
+  CHECK(transport_udp_send_batch_pktinfo(
+            client_fd, (const struct sockaddr *)&bind_addr, sizeof(bind_addr),
+            NULL, 0, &iov, 1, 0, 0) == 1,
+        "client send to server");
+
+  transport_udp_datagram_t dgram = {0};
+  ssize_t received = transport_udp_receive_batch(server_fd, &dgram, 1);
+  CHECK(received == 1, "server receive datagram");
+  CHECK(dgram.destination.ss_family == AF_INET,
+        "destination family is AF_INET");
+  const struct sockaddr_in *dst =
+      (const struct sockaddr_in *)&dgram.destination;
+  CHECK(dst->sin_addr.s_addr == htonl(INADDR_LOOPBACK),
+        "pktinfo captured local arrival address 127.0.0.1");
+
+  /* test egress source address preservation */
+  uint8_t pong_data[16] = "pong";
+  struct iovec reply_iov = {.iov_base = pong_data,
+                            .iov_len = sizeof(pong_data)};
+  CHECK(transport_udp_send_batch_pktinfo(
+            server_fd, (const struct sockaddr *)&dgram.source,
+            sizeof(dgram.source), (const struct sockaddr *)&dgram.destination,
+            dgram.ifindex, &reply_iov, 1, 0, 0) == 1,
+        "server send reply with preserved destination as source");
+
+  close(client_fd);
+  close(server_fd);
+  return 0;
+}
+
 int main(void) {
   CHECK(test_address_identity() == 0, "scoped address and endpoint identity");
+  CHECK(test_pktinfo_preservation() == 0,
+        "IP_PKTINFO destination capture and egress preservation");
   CHECK(test_stream_path_selection() == 0,
         "reliable stream path selection without FEC parity");
   CHECK(test_datagram_schedule() == 0,

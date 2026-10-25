@@ -73,6 +73,17 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
   return (ssize_t)count;
 }
 
+ssize_t transport_udp_send_batch_pktinfo(
+    int fd, const struct sockaddr *destination, socklen_t destination_len,
+    const struct sockaddr *source, uint32_t ifindex,
+    const struct iovec *datagrams, size_t count, size_t max_gso_segments,
+    uint8_t ecn) {
+  (void)source;
+  (void)ifindex;
+  return transport_udp_send_batch_ecn(fd, destination, destination_len,
+                                      datagrams, count, max_gso_segments, ecn);
+}
+
 static void submit_sequence(transport_egress_t *egress,
                             const struct sockaddr_in *destination,
                             size_t sequence, size_t size) {

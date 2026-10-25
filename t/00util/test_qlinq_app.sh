@@ -16,9 +16,34 @@ cleanup()
 }
 trap cleanup EXIT INT TERM
 
+status=0
+"$app_bin" --peer 127.0.0.1:10093 --cc invalid > /dev/null 2> "$tmp_dir/invalid-cc.log" || status=$?
+test "$status" -eq 1
+grep -q 'invalid command line' "$tmp_dir/invalid-cc.log"
+
+for invalid in 0 65536 -1 invalid; do
+    status=0
+    "$app_bin" --peer 127.0.0.1:10093 --initial-cwnd "$invalid" \
+        > /dev/null 2> "$tmp_dir/invalid-cwnd.log" || status=$?
+    if [ "$status" -ne 1 ] ||
+        ! grep -q 'invalid command line' "$tmp_dir/invalid-cwnd.log"; then
+        cat "$tmp_dir/invalid-cwnd.log" >&2
+        echo "initial congestion window was not rejected: $invalid" >&2
+        exit 1
+    fi
+done
+
+for invalid in 1199 1501 -1 invalid; do
+    status=0
+    "$app_bin" --peer 127.0.0.1:10093 --udp-payload "$invalid" \
+        > /dev/null 2> "$tmp_dir/invalid-udp.log" || status=$?
+    test "$status" -eq 1
+    grep -q 'invalid command line' "$tmp_dir/invalid-udp.log"
+done
+
 timeout 8 "$app_bin" \
     --listen 10093 --bind 127.0.0.1 \
-    --idle-timeout-ms 60000 \
+    --idle-timeout-ms 60000 --initial-cwnd 100 --udp-payload 1432 --cc cuback \
     --cert t/assets/server.crt --key t/assets/server.key \
     --auth-token app-test --insecure-no-verify \
     --input README.md --message-size 512 --count 1 \
@@ -29,7 +54,7 @@ server_pid=$!
 
 timeout 4 "$app_bin" \
     --peer 127.0.0.1:10093 \
-    --idle-timeout-ms 60000 \
+    --idle-timeout-ms 60000 --udp-payload 1200 --cc cuback \
     --auth-token app-test --insecure-no-verify \
     --output "$tmp_dir/output.bin" --mode rateless \
     --receive-count 1 --drain-ms 200 \
@@ -53,6 +78,8 @@ fi
 client_pid=
 
 test "$(wc -c < "$tmp_dir/output.bin")" -eq 512
+grep -q 'cc=cuback' "$tmp_dir/server.log"
+grep -q 'cc=cuback' "$tmp_dir/client.log"
 cmp -n 512 README.md "$tmp_dir/output.bin"
 awk -F '\t' 'NR == 1 { exit !($1 == "elapsed_ms" && $2 == "node" &&
                                   $3 == "tx_records" && $4 == "rx_records" &&

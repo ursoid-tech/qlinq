@@ -48,7 +48,8 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
                                      size_t count, size_t max_gso_segments,
                                      uint8_t ecn) {
   (void)ecn; /* fault injector leaves send unmarked */
-  assert(max_gso_segments == 0 || max_gso_segments == 6);
+  assert(max_gso_segments == 0 || max_gso_segments == 6 ||
+         max_gso_segments == 32);
   if (startup_client && startup_client->client_conn) {
     quicly_conn_t *quic = startup_client->client_conn->quic;
     quicly_stats_t stats;

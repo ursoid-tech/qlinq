@@ -36,9 +36,13 @@ typedef struct {
   const uint64_t *start;
 } record_consumer_t;
 
+/* use realtime clock when requested for multi-host synchronization */
 static uint64_t now_ns(void) {
   struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
+  clockid_t clk = CLOCK_MONOTONIC;
+  if (getenv("QLINQ_CLOCK_REALTIME"))
+    clk = CLOCK_REALTIME;
+  clock_gettime(clk, &ts);
   return (uint64_t)ts.tv_sec * 1000000000U + ts.tv_nsec;
 }
 static void put64(uint8_t *p, uint64_t value) {
@@ -64,8 +68,10 @@ static void consume_record(record_consumer_t *consumer,
     m->corrupt++;
   else {
     uint64_t id = get64(data), sent_at = get64(data + 8);
-    if (!id || !start || sent_at < start || sent_at > received_at ||
-        (sent_at - start) / 1000000000U >= SOURCE_SECONDS)
+    bool realtime = getenv("QLINQ_CLOCK_REALTIME") != NULL;
+    if (!id || !start ||
+        (!realtime && (sent_at < start || sent_at > received_at ||
+                       (sent_at - start) / 1000000000U >= SOURCE_SECONDS)))
       m->corrupt++;
     else if (m->seen[id % SEEN_SLOTS] == id)
       m->duplicates++;
@@ -75,13 +81,16 @@ static void consume_record(record_consumer_t *consumer,
       m->seen[id % SEEN_SLOTS] = id;
       m->received++;
       m->bytes += record_bytes;
-      size_t cohort = (sent_at - start) / 1000000000U;
+      size_t cohort = sent_at >= start ? (sent_at - start) / 1000000000U : 0;
+      if (cohort >= SOURCE_SECONDS)
+        cohort = SOURCE_SECONDS - 1;
       m->source_cohorts[cohort].received++;
-      if (received_at - sent_at > m->deadline_ns) {
+      if (received_at > sent_at && received_at - sent_at > m->deadline_ns) {
         m->received_late++;
         m->source_cohorts[cohort].late++;
       }
-      size_t bin = (received_at - sent_at) / 1000000;
+      size_t bin =
+          received_at > sent_at ? (received_at - sent_at) / 1000000 : 0;
       if (bin >= HIST_BINS)
         bin = HIST_BINS - 1;
       m->hist[bin]++;

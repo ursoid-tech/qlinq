@@ -1099,6 +1099,11 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                          .size = original_size,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
+      /* Completing a recovery window can retire this assembler while queuing
+       * its checkpoint ACK. Detach the payload before that bookkeeping, and
+       * retain it through the callback (which may itself unsubscribe). */
+      asm_slot->buffer_storage = NULL;
+      transport_release_assembler(t, asm_slot);
       completed_remember(tconn, track_id, generation, group_id, object_id);
       if (rateless_data) {
         transport_recovery_delivered(tconn, track_id, group_id, object_id);
@@ -1107,7 +1112,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       if (!got_all_data)
         t->stats.fec_objects_decoded++;
       transport_emit_event(t, &ev);
-      transport_release_assembler(t, asm_slot);
+      free(full_data);
     }
   }
   return;

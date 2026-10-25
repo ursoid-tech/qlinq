@@ -107,6 +107,19 @@ bool transport_endpoint_equal(const struct sockaddr *a,
          ((const struct sockaddr_in6 *)b)->sin6_port;
 }
 
+bool transport_address_is_wildcard(const struct sockaddr *sa) {
+  if (!sa)
+    return false;
+  if (sa->sa_family == AF_INET)
+    return ((const struct sockaddr_in *)sa)->sin_addr.s_addr == INADDR_ANY;
+  if (sa->sa_family == AF_INET6) {
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+    static const struct in6_addr any6 = IN6ADDR_ANY_INIT;
+    return memcmp(&sin6->sin6_addr, &any6, sizeof(any6)) == 0;
+  }
+  return false;
+}
+
 bool transport_path_measure(transport_path_measurement_t *m,
                             const quicly_path_stats_t *stats, size_t quic_path,
                             size_t queued_datagrams, uint64_t now_ms) {
@@ -244,8 +257,23 @@ uint64_t transport_path_budget_wait(const transport_path_budget_t *budget,
 
 bool transport_path_matches_local(const quicly_path_stats_t *stats,
                                   const struct sockaddr_storage *local) {
-  return stats && local &&
-         transport_address_equal(&stats->local.sa,
+  if (!stats || !local)
+    return false;
+  uint16_t port = local->ss_family == AF_INET
+                      ? ((const struct sockaddr_in *)local)->sin_port
+                      : ((const struct sockaddr_in6 *)local)->sin6_port;
+  if (transport_address_is_wildcard((const struct sockaddr *)local)) {
+    uint16_t stats_port =
+        stats->local.sa.sa_family == AF_INET
+            ? ((const struct sockaddr_in *)&stats->local.sa)->sin_port
+            : ((const struct sockaddr_in6 *)&stats->local.sa)->sin6_port;
+    return (port == 0 || port == stats_port) &&
+           (local->ss_family == stats->local.sa.sa_family);
+  }
+  if (port != 0)
+    return transport_endpoint_equal(&stats->local.sa,
+                                    (const struct sockaddr *)local);
+  return transport_address_equal(&stats->local.sa,
                                  (const struct sockaddr *)local);
 }
 

@@ -43,6 +43,7 @@
 
 #define QLINQ_STREAM_MULTIPATH_SEND_BATCH 32U
 #define QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS 6U
+#define QLINQ_STREAM_GSO_SEGMENTS 32U
 #define QLINQ_PATHFLOW_UPDATE_MS 25U
 #define QLINQ_GROUP_FLUSH_MS 3U
 #define QLINQ_GROUP_FLUSH_RETRY_MS 1U
@@ -409,9 +410,16 @@ static int qlinq_path_is_eligible(quicly_path_scheduler_t *scheduler,
     return 0;
   transport_t *t = conn->transport;
   for (size_t i = 0; i < t->socket_count; i++)
-    if (transport_address_equal(
+    if (transport_endpoint_equal(
             (const struct sockaddr *)&t->sockets[i].local_addr,
-            &tuple.address.local.sa))
+            &tuple.address.local.sa) ||
+        transport_address_equal(
+            (const struct sockaddr *)&t->sockets[i].local_addr,
+            &tuple.address.local.sa) ||
+        (t->sockets[i].local_addr.ss_family ==
+             tuple.address.local.sa.sa_family &&
+         transport_address_is_wildcard(
+             (const struct sockaddr *)&t->sockets[i].local_addr)))
       return 1;
   return 0;
 }
@@ -439,13 +447,29 @@ static void refresh_scheduler_paths(transport_conn_t *conn) {
     if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
         !quicly_is_path_available(conn->quic, path))
       continue;
-    for (size_t physical = 0; physical < t->socket_count; physical++)
+    size_t matched = SIZE_MAX;
+    for (size_t physical = 0; physical < t->socket_count; physical++) {
       if (transport_path_matches_local(&stats,
                                        &t->sockets[physical].local_addr)) {
-        conn->scheduler_paths |= UINT64_C(1) << path;
-        conn->scheduler_sockets[path] = (uint8_t)physical;
+        matched = physical;
         break;
       }
+    }
+    if (matched == SIZE_MAX) {
+      for (size_t physical = 0; physical < t->socket_count; physical++) {
+        if (t->sockets[physical].local_addr.ss_family ==
+                stats.local.sa.sa_family &&
+            transport_address_is_wildcard(
+                (const struct sockaddr *)&t->sockets[physical].local_addr)) {
+          matched = physical;
+          break;
+        }
+      }
+    }
+    if (matched != SIZE_MAX) {
+      conn->scheduler_paths |= UINT64_C(1) << path;
+      conn->scheduler_sockets[path] = (uint8_t)matched;
+    }
   }
 }
 
@@ -674,7 +698,25 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
   transport_t *t = userdata;
 
   if (update->is_initial) {
-    /* For now, ignore initial snapshot since we bind via config->bind_hosts */
+    if (!t->multihome)
+      return;
+    for (int j = 0; j < update->interfaces->count; j++) {
+      const ifmon_iface_t *iface = &update->interfaces->ifaces[j];
+      if (!iface->is_up)
+        continue;
+      if (strncmp(iface->name, "lo", 2) == 0 && update->interfaces->count > 1)
+        continue;
+      for (int k = 0; k < iface->addr_count; k++) {
+        const ifmon_addr_t *a = &iface->addrs[k];
+        ifmon_pipe_msg_t msg = {0};
+        msg.index = iface->index;
+        copy_interface_name(msg.name, iface->name);
+        msg.is_added = 1;
+        msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
+        ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
+        (void)w;
+      }
+    }
     return;
   }
 
@@ -781,19 +823,56 @@ static int open_unicast_socket(int family) {
       return -1;
     }
   }
-  if (fd >= 0)
+  if (fd >= 0) {
     (void)transport_udp_enable_recv_ecn(fd, family);
+    (void)transport_udp_enable_recv_pktinfo(fd, family);
+  }
   return fd;
 }
 
 static void configure_socket_buffers(transport_t *t, int fd) {
-  int buf_size = 2 * 1024 * 1024; /* 2mb buffer size */
+  int buf_size = 32 * 1024 * 1024; /* 32mb buffer size for multi-gigabit bdp */
+#ifdef SO_SNDBUFFORCE
+  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &buf_size, sizeof(buf_size)) !=
+          0 &&
+      setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) != 0)
+#else
   if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) != 0)
+#endif
     transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, SIZE_MAX,
                   "unable to enlarge send buffer: %s", strerror(errno));
+#ifdef SO_RCVBUFFORCE
+  if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &buf_size, sizeof(buf_size)) !=
+          0 &&
+      setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) != 0)
+#else
   if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) != 0)
+#endif
     transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, SIZE_MAX,
                   "unable to enlarge receive buffer: %s", strerror(errno));
+  int send_size = 0, receive_size = 0;
+  socklen_t size_len = sizeof(send_size);
+  bool sizes_known =
+      getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_size, &size_len) == 0;
+  size_len = sizeof(receive_size);
+  sizes_known =
+      getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_size, &size_len) == 0 &&
+      sizes_known;
+  if (sizes_known) {
+    int expected_size = buf_size;
+#ifdef __linux__
+    /* Linux reports twice the requested value, including kernel overhead.
+     * SO_*BUF can succeed while silently clamping to net.core.*mem_max. */
+    expected_size *= 2;
+#endif
+    bool clamped = send_size < expected_size || receive_size < expected_size;
+    transport_log(
+        t, clamped ? TRANSPORT_LOG_WARNING : TRANSPORT_LOG_INFO, "udp", 0,
+        SIZE_MAX,
+        "socket buffers requested=%d send=%d receive=%d expected=%d%s",
+        buf_size, send_size, receive_size, expected_size,
+        clamped ? "; clamped by host socket buffer limits" : "");
+  }
 }
 
 static void set_address_port(struct sockaddr_storage *address, uint16_t port) {
@@ -842,6 +921,11 @@ static const char *open_local_socket(transport_t *t,
   if (bind(socket->fd, (struct sockaddr *)&socket->local_addr,
            socket->local_addr_len) != 0)
     goto Fail;
+  socklen_t actual_len = sizeof(socket->local_addr);
+  if (getsockname(socket->fd, (struct sockaddr *)&socket->local_addr,
+                  &actual_len) == 0) {
+    socket->local_addr_len = actual_len;
+  }
   configure_socket_buffers(t, socket->fd);
   error = "failed to make socket nonblocking";
   if (!set_fd_nonblocking(socket->fd))
@@ -948,8 +1032,29 @@ static void try_open_pending_paths(transport_t *t, transport_conn_t *conn,
       continue;
     }
 
-    struct sockaddr *local =
-        (struct sockaddr *)&t->sockets[local_index].local_addr;
+    struct sockaddr_storage local_address = t->sockets[local_index].local_addr;
+    if (remote_index == t->sockets[0].remote_index &&
+        transport_address_is_wildcard(
+            (const struct sockaddr *)&local_address)) {
+      for (size_t k = 0; k < TRANSPORT_MAX_PATHS; k++) {
+        const struct sockaddr_storage *observed =
+            &conn->local_ifindex_cache[k].addr;
+        if (observed->ss_family != local_address.ss_family ||
+            transport_address_is_wildcard((const struct sockaddr *)observed))
+          continue;
+        /* PATH_RESPONSE validation compares concrete endpoints. Packet info
+         * from the established route supplies the IP, not this stripe's port.
+         */
+        uint16_t port =
+            local_address.ss_family == AF_INET
+                ? ((struct sockaddr_in *)&local_address)->sin_port
+                : ((struct sockaddr_in6 *)&local_address)->sin6_port;
+        local_address = *observed;
+        set_address_port(&local_address, ntohs(port));
+        break;
+      }
+    }
+    struct sockaddr *local = (struct sockaddr *)&local_address;
     struct sockaddr *remote = (struct sockaddr *)&t->remote_addrs[remote_index];
     if (transport_path_find_by_addresses(conn->quic, local, remote) !=
         SIZE_MAX) {
@@ -1053,7 +1158,7 @@ transport_t *transport_create(const transport_config_t *config) {
       config->num_path_interface_names > TRANSPORT_MAX_PATHS ||
       config->num_remote_hosts > TRANSPORT_MAX_PATHS ||
       config->simulated_loss_rate > 100 ||
-      config->congestion_control > TRANSPORT_CC_CUBIC ||
+      config->congestion_control > TRANSPORT_CC_CUBACK ||
       config->pacing > TRANSPORT_PACING_ENABLED ||
       (config->num_remote_hosts != 0 &&
        (config->reconnect_initial_delay_ms != 0
@@ -1143,6 +1248,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->log_user_data = config->log_user_data;
   t->is_server = (config->num_remote_hosts == 0);
   t->bind_port = t->is_server ? config->port : 0;
+  t->multihome = config->multihome;
   t->reconnect_enabled = !t->is_server && config->reconnect_enabled;
   t->reconnect_initial_delay_ms =
       config->reconnect_initial_delay_ms != 0
@@ -1206,8 +1312,20 @@ transport_t *transport_create(const transport_config_t *config) {
     t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_pico_init;
   else if (config->congestion_control == TRANSPORT_CC_CUBIC)
     t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_cubic_init;
+  else if (config->congestion_control == TRANSPORT_CC_CUBACK)
+    t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_cuback_init;
   if (config->pacing != TRANSPORT_PACING_DEFAULT)
     t->quic_ctx.egress[0].pacing = config->pacing == TRANSPORT_PACING_ENABLED;
+  if (config->default_jumpstart_packets != 0 ||
+      config->max_jumpstart_packets != 0) {
+    t->quic_ctx.egress[0].default_jumpstart_packets =
+        config->default_jumpstart_packets;
+    t->quic_ctx.egress[0].max_jumpstart_packets = config->max_jumpstart_packets;
+    /* jumpstart requires pacing and benefits from rapid start */
+    if (config->pacing != TRANSPORT_PACING_DISABLED)
+      t->quic_ctx.egress[0].pacing = 1;
+    t->quic_ctx.egress[0].cc.rapid_start = 1;
+  }
   if (config->initial_rtt_ms != 0)
     t->quic_ctx.egress[0].loss.default_initial_rtt = config->initial_rtt_ms;
   if (config->handshake_timeout_rtt_multiplier != 0)
@@ -1517,6 +1635,9 @@ static void add_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
                 "opened socket for local IP %s", ip_str);
 }
 
+static void discard_connection(transport_conn_t *conn, quicly_error_t error,
+                               const char *failure_reason);
+
 static void remove_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
   for (size_t i = 0; i < t->socket_count; i++) {
     bool match = msg->addr.ss_family == AF_UNSPEC
@@ -1535,6 +1656,13 @@ static void remove_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
         (transport_socket_t){.fd = -1, .remote_index = SIZE_MAX};
     transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, i,
                   "removed socket for local IP");
+    /* A returning client socket gets a new ephemeral port. With no surviving
+     * local endpoint, the old QUIC paths cannot carry a migration handshake.
+     * Retire that connection and let the configured reconnect policy establish
+     * a fresh session when an interface returns. */
+    if (t->socket_count == 0 && t->client_conn && t->reconnect_enabled)
+      discard_connection(t->client_conn, QUICLY_TRANSPORT_ERROR_NO_VIABLE_PATH,
+                         "all local interfaces removed");
     break;
   }
 }
@@ -1613,13 +1741,31 @@ static void discard_connection(transport_conn_t *conn, quicly_error_t error,
   }
 }
 
-static void transport_receive_datagram(transport_t *t, size_t fd_idx,
-                                       const uint8_t *buf, size_t len,
-                                       struct sockaddr_storage *source,
-                                       uint8_t ecn) {
+static void
+transport_receive_datagram(transport_t *t, size_t fd_idx, const uint8_t *buf,
+                           size_t len, struct sockaddr_storage *source,
+                           const struct sockaddr_storage *destination,
+                           uint32_t ifindex, uint8_t ecn) {
   t->sockets[fd_idx].bytes_received += len;
 
   struct sockaddr *psa = (struct sockaddr *)source;
+
+  struct sockaddr_storage effective_dest = t->sockets[fd_idx].local_addr;
+  if (transport_address_is_wildcard(
+          (const struct sockaddr *)&t->sockets[fd_idx].local_addr) &&
+      destination && destination->ss_family != AF_UNSPEC) {
+    effective_dest = *destination;
+    uint16_t port =
+        t->sockets[fd_idx].local_addr.ss_family == AF_INET
+            ? ((const struct sockaddr_in *)&t->sockets[fd_idx].local_addr)
+                  ->sin_port
+            : ((const struct sockaddr_in6 *)&t->sockets[fd_idx].local_addr)
+                  ->sin6_port;
+    if (effective_dest.ss_family == AF_INET)
+      ((struct sockaddr_in *)&effective_dest)->sin_port = port;
+    else if (effective_dest.ss_family == AF_INET6)
+      ((struct sockaddr_in6 *)&effective_dest)->sin6_port = port;
+  }
 
   quicly_decoded_packet_t decoded;
   size_t off = 0;
@@ -1639,17 +1785,15 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
           !QUICLY_PACKET_IS_LONG_HEADER(decoded.octets.base[0])) {
         transport_conn_t *hint =
             transport_connection_cache_find(t, &decoded.cid.dest.plaintext);
-        if (hint &&
-            quicly_is_destination(
-                hint->quic, (struct sockaddr *)&t->sockets[fd_idx].local_addr,
-                psa, &decoded))
+        if (hint && quicly_is_destination(hint->quic,
+                                          (struct sockaddr *)&effective_dest,
+                                          psa, &decoded))
           target = hint;
       }
       for (size_t i = 0; !target && i < t->conn_count; ++i) {
-        if (quicly_is_destination(
-                t->conns[i]->quic,
-                (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
-                &decoded)) {
+        if (quicly_is_destination(t->conns[i]->quic,
+                                  (struct sockaddr *)&effective_dest, psa,
+                                  &decoded)) {
           target = t->conns[i];
           transport_connection_cache_remember(t, target);
           break;
@@ -1659,10 +1803,9 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
           t->conn_count < t->limits.max_connections) {
         quicly_conn_t *new_quic = NULL;
         quicly_cid_plaintext_t connection_cid = t->next_cid;
-        int accept_res =
-            quicly_accept(&new_quic, &t->quic_ctx,
-                          (struct sockaddr *)&t->sockets[fd_idx].local_addr,
-                          psa, &decoded, NULL, &connection_cid, NULL, NULL);
+        int accept_res = quicly_accept(
+            &new_quic, &t->quic_ctx, (struct sockaddr *)&effective_dest, psa,
+            &decoded, NULL, &connection_cid, NULL, NULL);
         if (accept_res == 0 && new_quic) {
           t->next_cid.master_id++;
           target = calloc(1, sizeof(transport_conn_t));
@@ -1694,6 +1837,19 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
       target = t->client_conn;
     }
 
+    if (target && ifindex != 0) {
+      for (size_t k = 0; k < TRANSPORT_MAX_PATHS; k++) {
+        if (transport_address_equal(
+                (const struct sockaddr *)&target->local_ifindex_cache[k].addr,
+                (const struct sockaddr *)&effective_dest) ||
+            target->local_ifindex_cache[k].addr.ss_family == AF_UNSPEC) {
+          target->local_ifindex_cache[k].addr = effective_dest;
+          target->local_ifindex_cache[k].ifindex = ifindex;
+          break;
+        }
+      }
+    }
+
     if (target && target->authenticated && t->simulated_loss_rate > 0 &&
         (rand() % 100) < t->simulated_loss_rate) {
       continue; /* simulate packet loss on wire after connection is
@@ -1702,8 +1858,7 @@ static void transport_receive_datagram(transport_t *t, size_t fd_idx,
 
     if (target) {
       quicly_error_t ret = quicly_receive(
-          target->quic, (struct sockaddr *)&t->sockets[fd_idx].local_addr, psa,
-          &decoded);
+          target->quic, (struct sockaddr *)&effective_dest, psa, &decoded);
       if (ret != 0 && ret != QUICLY_ERROR_PACKET_IGNORED &&
           (ret != QUICLY_ERROR_STATE_EXHAUSTION ||
            quicly_close(target->quic, ret, "receive failure") != 0)) {
@@ -1763,7 +1918,8 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
         for (ssize_t i = 0; i < received; i++)
           if (!views[i].dropped)
             transport_receive_datagram(t, fd_idx, views[i].data, views[i].size,
-                                       &views[i].source, views[i].ecn);
+                                       &views[i].source, &views[i].destination,
+                                       views[i].ifindex, views[i].ecn);
       } else {
         transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
         received = transport_udp_receive_batch(socket->fd, datagrams, batch);
@@ -1772,7 +1928,8 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
            * decoder validates each complete QUIC packet in that prefix. */
           transport_receive_datagram(t, fd_idx, datagrams[i].data,
                                      datagrams[i].size, &datagrams[i].source,
-                                     datagrams[i].ecn);
+                                     &datagrams[i].destination,
+                                     datagrams[i].ifindex, datagrams[i].ecn);
         }
         more = received == (ssize_t)batch;
       }
@@ -1855,6 +2012,12 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
 
 static void service_connections(transport_t *t, uint64_t now) {
   size_t active_count = transport_connection_count(t);
+  t->send_backlog = false;
+  size_t quantum =
+      active_count == 0
+          ? 0
+          : t->limits.max_packets_per_tick / active_count +
+                (t->limits.max_packets_per_tick % active_count != 0);
   for (size_t i = 0; i < active_count; ++i) {
     transport_conn_t *conn = transport_connection_at(t, i);
     if (!conn)
@@ -1870,7 +2033,10 @@ static void service_connections(transport_t *t, uint64_t now) {
     transport_protocol_maybe_emit_connected(conn);
     refresh_scheduler_paths(conn);
 
-    while (1) {
+    /* Return to ACK reception and the application after a bounded send turn.
+     * A fast path must not drain an entire stream window in this loop. */
+    size_t remaining = quantum;
+    while (remaining != 0) {
       bool egress_has_room = true;
       for (size_t p = 0; p < t->socket_count; p++) {
         if (!transport_egress_can_accept(&t->sockets[p].egress, 64U,
@@ -1894,6 +2060,8 @@ static void service_connections(transport_t *t, uint64_t now) {
           !quicly_has_datagram_frames(conn->quic);
       if (stream_only_multipath)
         num_dgrams = QLINQ_STREAM_MULTIPATH_SEND_BATCH;
+      if (num_dgrams > remaining)
+        num_dgrams = remaining;
       /* Save this classification: quicly_send may drain queued DATAGRAMs.
        * Stream-only output uses smaller UDP aggregates independently of the
        * native batch size; retained egress must carry the same limit. */
@@ -1903,14 +2071,52 @@ static void service_connections(transport_t *t, uint64_t now) {
       if (send_res == 0) {
         if (num_dgrams == 0)
           break;
+        remaining -= num_dgrams;
+        if (remaining == 0)
+          t->send_backlog = true;
 
         size_t out_fd_index = SIZE_MAX;
         for (size_t k = 0; k < t->socket_count; k++) {
-          if (transport_address_equal(
+          if (transport_endpoint_equal(
                   (const struct sockaddr *)&t->sockets[k].local_addr,
                   &src.sa)) {
             out_fd_index = k;
             break;
+          }
+        }
+        if (out_fd_index == SIZE_MAX) {
+          /* A validated wildcard-bound path learns a concrete local IP.
+           * Preserve its ephemeral port when choosing among striped sockets;
+           * address-only wildcard fallback otherwise sends its replies through
+           * the first socket and prevents the alternate path validating. */
+          quicly_path_stats_t source_stats = {.local = src};
+          for (size_t k = 0; k < t->socket_count; k++) {
+            if (transport_path_matches_local(&source_stats,
+                                             &t->sockets[k].local_addr)) {
+              out_fd_index = k;
+              break;
+            }
+          }
+        }
+        if (out_fd_index == SIZE_MAX) {
+          for (size_t k = 0; k < t->socket_count; k++) {
+            if (transport_address_equal(
+                    (const struct sockaddr *)&t->sockets[k].local_addr,
+                    &src.sa)) {
+              out_fd_index = k;
+              break;
+            }
+          }
+        }
+
+        if (out_fd_index == SIZE_MAX) {
+          for (size_t k = 0; k < t->socket_count; k++) {
+            if (t->sockets[k].local_addr.ss_family == src.sa.sa_family &&
+                transport_address_is_wildcard(
+                    (const struct sockaddr *)&t->sockets[k].local_addr)) {
+              out_fd_index = k;
+              break;
+            }
           }
         }
 
@@ -1921,10 +2127,35 @@ static void service_connections(transport_t *t, uint64_t now) {
           continue;
         }
 
-        if (!transport_egress_submit_ecn(
+        uint8_t gso_segments =
+            stream_only_multipath
+                ? QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS
+                : (quicly_is_multipath(conn->quic) ? 0
+                                                   : QLINQ_STREAM_GSO_SEGMENTS);
+
+        const struct sockaddr *egress_source = NULL;
+        uint32_t egress_ifindex = 0;
+        if (transport_address_is_wildcard(
+                (const struct sockaddr *)&t->sockets[out_fd_index]
+                    .local_addr)) {
+          egress_source = (const struct sockaddr *)&src.sa;
+          for (size_t idx = 0; idx < TRANSPORT_MAX_PATHS; idx++) {
+            if (transport_address_equal(
+                    (const struct sockaddr *)&conn->local_ifindex_cache[idx]
+                        .addr,
+                    &src.sa)) {
+              egress_ifindex = conn->local_ifindex_cache[idx].ifindex;
+              break;
+            }
+          }
+          if (egress_ifindex == 0)
+            egress_ifindex = t->sockets[out_fd_index].interface_index;
+        }
+
+        if (!transport_egress_submit_pktinfo(
                 &t->sockets[out_fd_index].egress, t->sockets[out_fd_index].fd,
-                &dest.sa, quicly_get_socklen(&dest.sa), dgrams, num_dgrams,
-                stream_only_multipath ? QLINQ_STREAM_MULTIPATH_GSO_SEGMENTS : 0,
+                &dest.sa, quicly_get_socklen(&dest.sa), egress_source,
+                egress_ifindex, dgrams, num_dgrams, gso_segments,
                 quicly_send_get_ecn_bits(conn->quic)))
           transport_log(t, TRANSPORT_LOG_WARNING, "udp", conn->id, out_fd_index,
                         "egress queue exhausted");
@@ -2371,8 +2602,40 @@ bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
   stats->stream_frames_received = conn->stream_frames_received;
   stats->datagrams_received = conn->datagrams_received;
   stats->malformed_datagrams = conn->malformed_datagrams;
+  quicly_get_max_data(conn->quic, &stats->quic_send_permitted,
+                      &stats->quic_stream_bytes_sent, NULL, NULL);
+  for (size_t i = 0; i < conn->send_subscriptions.capacity; i++) {
+    const track_subscription_t *sub = &conn->send_subscriptions.entries[i];
+    quicly_stream_t *stream = sub->stream;
+    if (!sub->active || !stream || !stream->data)
+      continue;
+    const transport_stream_ctx_t *ctx = stream->data;
+    uint64_t written = ctx->streambuf.egress.bytes_written;
+    uint64_t sent = stream->sendstate.size_inflight;
+    uint64_t acked = stream->sendstate.acked.ranges[0].end;
+    stats->track_streams++;
+    if (written > acked)
+      stats->track_retained_bytes += written - acked;
+    if (written > sent) {
+      stats->track_unsent_bytes += written - sent;
+      if (sent >= stream->_send_aux.max_stream_data)
+        stats->track_flow_limited_streams++;
+    }
+  }
   quicly_stats_t quic_stats;
   if (quicly_get_stats(conn->quic, &quic_stats) == 0) {
+    stats->quic_packets_sent = quic_stats.num_packets.sent;
+    stats->quic_packets_lost = quic_stats.num_packets.lost;
+    stats->quic_packets_lost_time_threshold =
+        quic_stats.num_packets.lost_time_threshold;
+    stats->quic_packets_late_acked = quic_stats.num_packets.late_acked;
+    stats->quic_data_blocked_frames = quic_stats.num_frames_sent.data_blocked;
+    stats->quic_stream_data_blocked_frames =
+        quic_stats.num_frames_sent.stream_data_blocked;
+    snprintf(stats->congestion_control, sizeof(stats->congestion_control), "%s",
+             quic_stats.cc.type->name);
+    stats->jumpstart_applicable = quic_stats.num_jumpstart_applicable;
+    stats->primary_jumpstart_cwnd = quic_stats.jumpstart.cwnd;
     stats->quic_paths_created = quic_stats.num_paths.created;
     stats->quic_paths_validated = quic_stats.num_paths.validated;
     stats->quic_paths_validation_failed =
@@ -2647,6 +2910,8 @@ int64_t transport_get_time_ms(void) {
 int64_t transport_get_first_timeout(transport_t *t) {
   if (!transport_owner_ok(t))
     return INT64_MAX;
+  if (t->send_backlog)
+    return 0;
 
   /* A GRO read can empty the kernel socket while leaving logical datagrams
    * in userspace. Poll readiness alone cannot schedule the remaining work. */

@@ -786,7 +786,11 @@ static bool emit_rolling_checkpoint(transport_t *t,
     if (!ack->participating)
       transport_publish_checkpoint_member_added(t, conn, &track->track_id,
                                                 alias);
-    if (!transport_stream_write_track_checkpoint_frame(
+    if (!transport_stream_can_accept(conn->stream,
+                                     QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                         QLINQ_WIRE_TRACK_CHECKPOINT_SIZE,
+                                     false) ||
+        !transport_stream_write_track_checkpoint_frame(
             conn->stream, alias, group_id, first_object_id, final_object_id,
             false)) {
       succeeded = false;
@@ -795,10 +799,28 @@ static bool emit_rolling_checkpoint(transport_t *t,
     checkpoint_mark_sent(ack, group_id, final_object_id);
     t->stats.recovery_checkpoints_sent++;
   }
-  track->checkpoint_initialized = true;
-  track->checkpoint_group_id = group_id;
-  track->last_checkpoint_object_id = final_object_id;
+  if (succeeded) {
+    track->checkpoint_initialized = true;
+    track->checkpoint_group_id = group_id;
+    track->last_checkpoint_object_id = final_object_id;
+  }
   return succeeded;
+}
+
+static bool flush_recovery_checkpoint(transport_t *t,
+                                      transport_fec_track_state_t *track) {
+  if (!track->active || !track->has_objects ||
+      (track->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+    return true;
+  uint64_t final_object_id = track->next_object_id - 1U;
+  if (track->checkpoint_initialized &&
+      track->last_checkpoint_object_id >= final_object_id)
+    return true;
+  uint64_t first_object_id =
+      track->checkpoint_initialized ? track->last_checkpoint_object_id + 1U : 0;
+  if (final_object_id - first_object_id >= QLINQ_RECOVERY_WINDOW_OBJECTS)
+    return false;
+  return emit_rolling_checkpoint(t, track, 0, first_object_id, final_object_id);
 }
 
 static transport_publish_result_t flush_group(transport_t *t) {
@@ -809,6 +831,13 @@ static transport_publish_result_t flush_group(transport_t *t) {
       find_fec_track_state(t, &group->track_id, true);
   if (!track_state)
     return TRANSPORT_PUBLISH_ERROR;
+  /* A failed rolling checkpoint must be retried before admitting another
+   * window. Otherwise a control-stream allocation failure can leave a gap
+   * larger than the receiver's bounded recovery history. */
+  if (track_state->has_objects &&
+      track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0 &&
+      !flush_recovery_checkpoint(t, track_state))
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
   moq_object_t obj = {.track_id = group->track_id,
                       .group_id = 0,
                       .object_id = track_state->next_object_id,
@@ -834,10 +863,7 @@ static transport_publish_result_t flush_group(transport_t *t) {
   group->pending = false;
   if ((track_state->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
       track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
-    uint64_t first_object_id =
-        track_state->next_object_id - QLINQ_RECOVERY_WINDOW_OBJECTS;
-    (void)emit_rolling_checkpoint(t, track_state, 0, first_object_id,
-                                  track_state->next_object_id - 1U);
+    (void)flush_recovery_checkpoint(t, track_state);
   }
   return TRANSPORT_PUBLISH_DELIVERED;
 }
@@ -846,6 +872,16 @@ bool transport_publish_flush_grouped(transport_t *t) {
   transport_publish_result_t result = flush_group(t);
   return result == TRANSPORT_PUBLISH_DELIVERED ||
          result == TRANSPORT_PUBLISH_NO_RECIPIENTS;
+}
+
+bool transport_publish_flush(transport_t *t) {
+  if (!transport_owner_ok(t) || !transport_publish_flush_grouped(t))
+    return false;
+  bool succeeded = true;
+  for (size_t i = 0; i < TRANSPORT_HARD_MAX_SUBSCRIPTIONS; i++)
+    if (!flush_recovery_checkpoint(t, &t->fec_tracks[i]))
+      succeeded = false;
+  return succeeded;
 }
 
 bool transport_publish_finish_grouped(transport_t *t,

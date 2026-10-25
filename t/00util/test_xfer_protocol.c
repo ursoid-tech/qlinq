@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <openssl/evp.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,7 +17,7 @@
 #include <unistd.h>
 
 #define HEADER 16U
-#define PAYLOAD_MAX (32U * 1024U)
+#define PAYLOAD_MAX (16U * 1024U)
 
 enum { OFFER = 1, ACCEPT = 2, DATA = 3, COMMITTED = 6, PROGRESS = 9 };
 
@@ -127,12 +128,17 @@ static void wait_message(unsigned type) {
       app_xfer_consume(active);
       if (actual_type == type)
         return;
+      continue;
     }
     app_xfer_status_t status;
     app_xfer_status(active, &status);
     CHECK(!status.failed && !status.done);
     CHECK(now_ms() < deadline);
-    usleep(1000);
+    /* Worker output must wake an owner sleeping without a transport timer. */
+    struct pollfd ready = {.fd = app_xfer_get_fd(active), .events = POLLIN};
+    CHECK(poll(&ready, 1, 1000) == 1);
+    CHECK(ready.revents == POLLIN);
+    app_xfer_drain(active);
   }
 }
 
@@ -230,6 +236,29 @@ static void check_oversized_record(void) {
   stop();
 }
 
+static void check_streaming_finish(void) {
+  for (unsigned variant = 0; variant < 3; variant++) {
+    const char *names[] = {"streaming-missing-hash", "streaming-false-hash",
+                           "streaming-early-finish"};
+    start(names[variant], false);
+    unsigned char record[HEADER + 32];
+    size_t size = frame(record, 10, sizeof(contents), content_hash, 32);
+    CHECK(app_xfer_receive(active, record, size));
+    wait_message(ACCEPT);
+    if (variant != 2) {
+      size = frame(record, DATA, 0, contents, sizeof(contents));
+      CHECK(app_xfer_receive(active, record, size));
+    }
+    unsigned char wrong[32] = {0};
+    size = variant == 0 ? frame(record, 5, sizeof(contents), NULL, 0)
+                        : frame(record, 11, sizeof(contents), wrong, 32);
+    CHECK(app_xfer_receive(active, record, size));
+    wait_failure();
+    no_destination();
+    stop();
+  }
+}
+
 int main(void) {
   test_case = "setup";
   CHECK(mkdtemp(directory) != NULL);
@@ -251,6 +280,7 @@ int main(void) {
   check_bad_resume();
   check_early_commit();
   check_oversized_record();
+  check_streaming_finish();
   puts("===QLINQ XFER PROTOCOL OK===");
   return 0;
 }

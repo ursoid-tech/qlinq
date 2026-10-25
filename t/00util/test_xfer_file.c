@@ -7,6 +7,8 @@
 #include <assert.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <openssl/evp.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -317,11 +319,203 @@ static void check_progress(void) {
   xfer_file_close(src);
 }
 
+static bool count_streaming_progress(void *context, size_t size) {
+  *(size_t *)context += size;
+  return true;
+}
+
+static void check_streaming(void) {
+  char filename[512], target[512];
+  path(filename, "source");
+  size_t progress = 0;
+  xfer_file_t *src = xfer_file_source_open_streaming(
+      filename, count_streaming_progress, &progress, error, sizeof(error));
+  CHECK(src != NULL && progress == 0 && xfer_file_hash(src) == NULL);
+  CHECK(!xfer_file_source_finish(src, error, sizeof(error)));
+  uint8_t identity[32], expected[32], prefix[32], buffer[8192];
+  memcpy(identity, xfer_file_identity(src), 32);
+  xfer_file_t *ordinary = source("source");
+  CHECK(ordinary != NULL);
+  memcpy(expected, xfer_file_hash(ordinary), 32);
+  xfer_file_close(ordinary);
+  CHECK(!xfer_file_read(src, 1, buffer, 1, error, sizeof(error)));
+  CHECK(xfer_file_read(src, 0, buffer, sizeof(buffer), error, sizeof(error)));
+  CHECK(memcmp(buffer, bytes, sizeof(buffer)) == 0);
+  CHECK(xfer_file_source_finish(src, error, sizeof(error)));
+  CHECK(memcmp(xfer_file_hash(src), expected, 32) == 0);
+
+  path(target, "stream-resume");
+  xfer_file_t *dst = xfer_file_sink_open_streaming(
+      target, sizeof(bytes), identity, NULL, NULL, error, sizeof(error));
+  CHECK(dst != NULL && xfer_file_hash(dst) == NULL);
+  CHECK(!xfer_file_commit(dst, error, sizeof(error)));
+  CHECK(xfer_file_write(dst, 0, bytes, 4096, error, sizeof(error)));
+  CHECK(xfer_file_checkpoint(dst, error, sizeof(error)));
+  xfer_file_close(dst);
+  uint8_t different[32];
+  memcpy(different, identity, 32);
+  different[0] ^= 1;
+  CHECK(xfer_file_sink_open_streaming(target, sizeof(bytes), different, NULL,
+                                      NULL, error, sizeof(error)) == NULL);
+  CHECK(xfer_file_sink_open(target, sizeof(bytes), expected, NULL, NULL, error,
+                            sizeof(error)) == NULL);
+  dst = xfer_file_sink_open_streaming(target, sizeof(bytes), identity, NULL,
+                                      NULL, error, sizeof(error));
+  CHECK(dst != NULL && xfer_file_offset(dst) == 4096);
+  CHECK(xfer_file_source_resume(src, 4096, prefix, error, sizeof(error)));
+  CHECK(xfer_file_hash(src) == NULL);
+  uint8_t peer_prefix[32];
+  CHECK(xfer_file_prefix_hash(dst, 4096, peer_prefix, error, sizeof(error)));
+  CHECK(memcmp(prefix, peer_prefix, 32) == 0);
+  CHECK(xfer_file_read(src, 4096, buffer, 4096, error, sizeof(error)));
+  CHECK(xfer_file_source_finish(src, error, sizeof(error)));
+  CHECK(memcmp(xfer_file_hash(src), expected, 32) == 0);
+  CHECK(xfer_file_write(dst, 4096, buffer, 4096, error, sizeof(error)));
+  CHECK(!xfer_file_commit(dst, error, sizeof(error)));
+  CHECK(xfer_file_set_expected_hash(dst, expected, error, sizeof(error)));
+  CHECK(xfer_file_commit(dst, error, sizeof(error)));
+  xfer_file_close(dst);
+  dst = xfer_file_sink_open_streaming(target, sizeof(bytes), identity, NULL,
+                                      NULL, error, sizeof(error));
+  CHECK(dst != NULL && xfer_file_offset(dst) == sizeof(bytes));
+  CHECK(xfer_file_set_expected_hash(dst, expected, error, sizeof(error)));
+  CHECK(xfer_file_commit(dst, error, sizeof(error)));
+  xfer_file_close(dst);
+
+  path(target, "stream-corrupt");
+  dst = xfer_file_sink_open_streaming(target, sizeof(bytes), identity, NULL,
+                                      NULL, error, sizeof(error));
+  CHECK(dst != NULL);
+  CHECK(xfer_file_write(dst, 0, bytes, sizeof(bytes), error, sizeof(error)));
+  CHECK(xfer_file_checkpoint(dst, error, sizeof(error)));
+  CHECK(xfer_file_set_expected_hash(dst, expected, error, sizeof(error)));
+  mutate("stream-corrupt.qlinq-part", 0);
+  CHECK(!xfer_file_commit(dst, error, sizeof(error)));
+  CHECK(access(target, F_OK) != 0);
+  xfer_file_close(dst);
+  CHECK(xfer_file_sink_open_streaming(target, sizeof(bytes), identity, NULL,
+                                      NULL, error, sizeof(error)) == NULL);
+
+  mutate("source", 0);
+  CHECK(!xfer_file_source_finish(src, error, sizeof(error)));
+  xfer_file_close(src);
+  src = xfer_file_source_open_streaming(filename, NULL, NULL, error,
+                                        sizeof(error));
+  CHECK(src != NULL && memcmp(identity, xfer_file_identity(src), 32) != 0);
+  xfer_file_close(src);
+  write_path("source", bytes, sizeof(bytes));
+
+  write_path("stream-empty-source", "", 0);
+  path(filename, "stream-empty-source");
+  src = xfer_file_source_open_streaming(filename, NULL, NULL, error,
+                                        sizeof(error));
+  CHECK(src != NULL && xfer_file_source_finish(src, error, sizeof(error)));
+  path(target, "stream-empty-target");
+  dst = xfer_file_sink_open_streaming(target, 0, xfer_file_identity(src), NULL,
+                                      NULL, error, sizeof(error));
+  CHECK(dst != NULL);
+  CHECK(xfer_file_set_expected_hash(dst, xfer_file_hash(src), error,
+                                    sizeof(error)));
+  CHECK(xfer_file_commit(dst, error, sizeof(error)));
+  xfer_file_close(dst);
+  xfer_file_close(src);
+}
+
+typedef struct {
+  pthread_t owner;
+  size_t bytes;
+  bool armed, mutated, cancel, truncate;
+  const char *target;
+} readback_progress_t;
+
+static bool readback_progress(void *context, size_t count) {
+  readback_progress_t *p = context;
+  CHECK(pthread_equal(pthread_self(), p->owner));
+  CHECK(count <= 64 * 1024);
+  if (!p->armed)
+    return true;
+  p->bytes += count;
+  if (p->truncate && !p->mutated) {
+    char name[512];
+    path(name, p->target);
+    CHECK(truncate(name, 0) == 0);
+    p->mutated = true;
+  } else if (p->target && !p->mutated && p->bytes >= 128 * 1024) {
+    mutate(p->target, 0); /* this byte has already been hashed */
+    p->mutated = true;
+  }
+  return !p->cancel;
+}
+
+static void check_verification_mutation(void) {
+  size_t size = 8 * 1024 * 1024 + 17;
+  uint8_t *data = malloc(size);
+  CHECK(data != NULL);
+  for (size_t i = 0; i < size; i++)
+    data[i] = (uint8_t)(i * 17 + 3);
+  uint8_t expected[32];
+  unsigned length;
+  CHECK(EVP_Digest(data, size, expected, &length, EVP_sha256(), NULL) == 1 &&
+        length == 32);
+  write_path("readback-source", data, size);
+  char filename[512];
+  path(filename, "readback-source");
+  readback_progress_t normal = {.owner = pthread_self(), .armed = true};
+  xfer_file_t *src = xfer_file_source_open(filename, readback_progress, &normal,
+                                           error, sizeof(error));
+  CHECK(src != NULL && xfer_file_used_read_ahead(src));
+  CHECK(normal.bytes == size && memcmp(xfer_file_hash(src), expected, 32) == 0);
+  xfer_file_close(src);
+  readback_progress_t cancel = {
+      .owner = pthread_self(), .armed = true, .cancel = true};
+  CHECK(xfer_file_source_open(filename, readback_progress, &cancel, error,
+                              sizeof(error)) == NULL);
+  CHECK(cancel.bytes == 64 * 1024 && strstr(error, "cancelled") != NULL);
+  write_path("readback-truncated", data, size);
+  path(filename, "readback-truncated");
+  readback_progress_t truncated = {.owner = pthread_self(),
+                                   .armed = true,
+                                   .truncate = true,
+                                   .target = "readback-truncated"};
+  CHECK(xfer_file_source_open(filename, readback_progress, &truncated, error,
+                              sizeof(error)) == NULL);
+  CHECK(truncated.mutated && strstr(error, "truncated") != NULL);
+
+  char target[512];
+  path(target, "readback-valid");
+  normal = (readback_progress_t){.owner = pthread_self()};
+  xfer_file_t *valid = xfer_file_sink_open(
+      target, size, expected, readback_progress, &normal, error, sizeof(error));
+  CHECK(valid != NULL &&
+        xfer_file_write(valid, 0, data, size, error, sizeof(error)));
+  normal.armed = true;
+  CHECK(xfer_file_commit(valid, error, sizeof(error)));
+  CHECK(normal.bytes == size && xfer_file_used_read_ahead(valid));
+  xfer_file_close(valid);
+  path(target, "readback-changing");
+  readback_progress_t progress = {.owner = pthread_self(),
+                                  .target = "readback-changing.qlinq-part"};
+  xfer_file_t *dst =
+      xfer_file_sink_open(target, size, expected, readback_progress, &progress,
+                          error, sizeof(error));
+  CHECK(dst != NULL);
+  CHECK(xfer_file_write(dst, 0, data, size, error, sizeof(error)));
+  CHECK(xfer_file_checkpoint(dst, error, sizeof(error)));
+  progress.armed = true;
+  CHECK(!xfer_file_commit(dst, error, sizeof(error)));
+  CHECK(progress.mutated && access(target, F_OK) != 0);
+  CHECK(strstr(error, "changed during verification") != NULL);
+  xfer_file_close(dst);
+  free(data);
+}
+
 int main(void) {
   CHECK(mkdtemp(directory) != NULL);
   for (size_t i = 0; i < sizeof(bytes); ++i)
     bytes[i] = (uint8_t)(i * 37 + 11);
   write_path("source", bytes, sizeof(bytes));
+  check_verification_mutation();
+  check_streaming();
   xfer_file_t *src = source("source");
   CHECK(src != NULL && xfer_file_size(src) == sizeof(bytes));
   check_resume(src);

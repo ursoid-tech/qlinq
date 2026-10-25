@@ -24,14 +24,26 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
                                      const struct iovec *datagrams,
                                      size_t count, size_t max_gso_segments,
                                      uint8_t ecn);
+/* send UDP batch with source IP preservation and egress interface control */
+ssize_t transport_udp_send_batch_pktinfo(
+    int fd, const struct sockaddr *destination, socklen_t destination_len,
+    const struct sockaddr *source, uint32_t ifindex,
+    const struct iovec *datagrams, size_t count, size_t max_gso_segments,
+    uint8_t ecn);
 bool transport_udp_enable_recv_ecn(int fd, int family);
+bool transport_udp_enable_recv_pktinfo(int fd, int family);
 uint8_t transport_udp_message_ecn(const struct msghdr *message);
+void transport_udp_message_pktinfo(const struct msghdr *message,
+                                   struct sockaddr_storage *destination,
+                                   uint32_t *ifindex);
 
 #define TRANSPORT_UDP_RECEIVE_BATCH 32U
 #define TRANSPORT_UDP_RECEIVE_SIZE 2048U
 
 typedef struct {
   struct sockaddr_storage source;
+  struct sockaddr_storage destination;
+  uint32_t ifindex;
   uint8_t ecn;
   size_t size;
   bool truncated;
@@ -55,6 +67,8 @@ bool transport_udp_gro_pending(const transport_udp_gro_t *state);
 
 typedef struct {
   struct sockaddr_storage source;
+  struct sockaddr_storage destination;
+  uint32_t ifindex;
   uint8_t ecn;
   uint8_t *data;
   size_t size;

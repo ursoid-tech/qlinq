@@ -11,7 +11,9 @@
 #include <sys/socket.h>
 
 #define TRANSPORT_MAX_QUIC_PATHS 64U
+#ifndef TRANSPORT_PATH_BURST_MAX
 #define TRANSPORT_PATH_BURST_MAX 64U
+#endif
 
 /* Counter windows belong to one QUIC path, rather than its physical socket.
  * They provide recent loss and a per-path ACK-rate lower bound for probing. */
@@ -75,6 +77,7 @@ bool transport_address_equal(const struct sockaddr *a,
                              const struct sockaddr *b);
 bool transport_endpoint_equal(const struct sockaddr *a,
                               const struct sockaddr *b);
+bool transport_address_is_wildcard(const struct sockaddr *sa);
 
 /* Match the same interface identity as link lookup (IPv6 scope included;
  * transport ports do not identify a physical link). */
