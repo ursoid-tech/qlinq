@@ -841,9 +841,9 @@ static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
         t->limits.max_aggregate_repair_requests_per_second * 1000U;
     int64_t now = transport_get_time_ms();
     conn->repair_request_limiter =
-        (transport_repair_limiter_t){peer_tokens, now};
+        (transport_repair_limiter_t){peer_tokens, now, true};
     t->aggregate_repair_limiter =
-        (transport_repair_limiter_t){aggregate_tokens, now};
+        (transport_repair_limiter_t){aggregate_tokens, now, true};
     CHECK(
         receive_control(conn->stream, QLINQ_WIRE_NACK, payload, payload_size));
     CHECK(conn->repair_request_limiter.tokens_milli == peer_tokens - 1000U &&

@@ -3,6 +3,7 @@
 #include "fec.h"
 #include "portable_sockets.h"
 #include "transport_fec_state.h"
+#include "transport_policy_scheduler.h"
 #include "transport_scheduler.h"
 #include "transport_stream.h"
 #include "transport_subscriptions.h"
@@ -120,14 +121,7 @@ static void note_admission_retry(transport_conn_t *conn, size_t physical,
 }
 
 typedef struct {
-  size_t physical, quic, available;
-  path_state_t state;
-  path_t sample;
-  bool rate_known;
-} publication_path_t;
-
-typedef struct {
-  publication_path_t paths[TRANSPORT_MAX_PATHS];
+  transport_publication_path_t paths[TRANSPORT_MAX_PATHS];
   size_t path_count;
   transport_schedule_t schedule;
   size_t symbol_size, estimate_symbol_size, data_symbols, total_symbols;
@@ -137,21 +131,33 @@ typedef struct {
   uint8_t **data, **parity;
 } publication_symbols_t;
 
-static size_t collect_paths(transport_t *t, transport_conn_t *conn,
-                            size_t estimate_symbol_size, uint64_t admission_now,
-                            publication_path_t *paths) {
+size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
+                                       size_t estimate_symbol_size,
+                                       uint64_t admission_now,
+                                       transport_publication_path_t *paths) {
   size_t active_paths = 0;
   uint64_t measure_now = transport_get_time_ms();
   for (size_t physical = 0; physical < t->socket_count; physical++) {
     quicly_path_stats_t stats;
-    size_t mapped = transport_path_get_eligible_by_local(
-        conn->quic, &t->sockets[physical].local_addr, &stats);
+    size_t mapped = SIZE_MAX, queued = 0;
+    for (size_t native = 0; native < TRANSPORT_MAX_QUIC_PATHS; native++) {
+      quicly_path_health_t health;
+      if (quicly_get_path_stats(conn->quic, native, &stats) != 0 ||
+          !transport_path_matches_local(&stats,
+                                        &t->sockets[physical].local_addr) ||
+          !quicly_is_path_available(conn->quic, native) ||
+          (quicly_get_path_health(conn->quic, native, &health) == 0 &&
+           health.state == QUICLY_PATH_SUSPECT))
+        continue;
+      queued = quicly_get_num_datagram_frames_path(conn->quic, native);
+      if (queued >= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY)
+        continue;
+      mapped = native;
+      break;
+    }
     if (mapped == SIZE_MAX)
       continue;
-    size_t queued = quicly_get_num_datagram_frames_path(conn->quic, mapped);
-    if (queued >= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY)
-      continue;
-    publication_path_t *candidate = &paths[active_paths];
+    transport_publication_path_t *candidate = &paths[active_paths];
     transport_conn_path_t *path = &conn->paths[physical];
     /* Publications can precede the first periodic measurement. Establish its
      * native owner now so the sampled state and queue remain available to the
@@ -217,6 +223,22 @@ static size_t collect_paths(transport_t *t, transport_conn_t *conn,
   return active_paths;
 }
 
+size_t transport_publish_path_capacity(transport_conn_t *conn,
+                                       const transport_publication_path_t *path,
+                                       uint64_t now_ns) {
+  if (conn->paths[path->physical].state_overridden)
+    return path->available;
+  const transport_path_budget_t *budget = &conn->paths[path->physical].budget;
+  size_t burst = transport_path_budget_burst(budget->rate);
+  for (size_t count = path->available; count > 0; count--) {
+    size_t allowance = burst > count ? burst : count;
+    if (transport_path_budget_wait(budget, allowance, count) == 0)
+      return count;
+  }
+  note_admission_retry(conn, path->physical, burst, 1, now_ns);
+  return 0;
+}
+
 static transport_publish_result_t
 plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                const transport_track_profile_t *profile,
@@ -225,10 +247,10 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
   size_t symbol_size = plan->symbol_size;
   size_t estimate_symbol_size = plan->estimate_symbol_size;
   size_t data_symbols = plan->data_symbols;
-  publication_path_t *paths = plan->paths;
+  transport_publication_path_t *paths = plan->paths;
   conn->admission_retry_at_ns = 0;
-  size_t active_paths =
-      collect_paths(t, conn, estimate_symbol_size, admission_now, paths);
+  size_t active_paths = transport_publish_collect_paths(
+      t, conn, estimate_symbol_size, admission_now, paths);
   if (active_paths == 0)
     return TRANSPORT_PUBLISH_BACKPRESSURE;
 
@@ -239,8 +261,12 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
    * Preflight before encoding, and never enqueue only a prefix of a plan. */
   for (;;) {
     path_state_t states[TRANSPORT_MAX_PATHS];
-    for (size_t i = 0; i < active_paths; i++)
+    size_t capacities[TRANSPORT_MAX_PATHS];
+    for (size_t i = 0; i < active_paths; i++) {
       states[i] = paths[i].state;
+      capacities[i] =
+          transport_publish_path_capacity(conn, &paths[i], admission_now);
+    }
     if (!transport_schedule_build(&conn->scheduler_context, states,
                                   active_paths, data_symbols, symbol_size,
                                   use_fec, obj->priority,
@@ -271,8 +297,8 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
       if (symbols == 0)
         continue;
       size_t physical = paths[i].physical;
-      bool budget_blocked = false;
-      if (!conn->paths[physical].state_overridden) {
+      if (!conn->paths[physical].state_overridden &&
+          symbols <= paths[i].available && symbols > capacities[i]) {
         /* Admit one whole allocation even when it exceeds 50 ms of work.
          * It must first repay all prior debt; charging every symbol after
          * enqueue preserves the long-term rate and bounds bursts by the
@@ -281,19 +307,56 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
             transport_path_budget_burst(conn->paths[physical].budget.rate);
         if (burst < symbols)
           burst = symbols;
-        budget_blocked =
-            transport_path_budget_wait(&conn->paths[physical].budget, burst,
-                                       symbols) != 0;
-        if (budget_blocked)
-          note_admission_retry(conn, physical, burst, symbols, admission_now);
+        note_admission_retry(conn, physical, burst, symbols, admission_now);
       }
-      if (symbols > paths[i].available || budget_blocked) {
+      if (symbols > capacities[i]) {
         blocked = i;
         break;
       }
     }
     if (blocked == active_paths)
       break;
+    if (active_paths > 1 && capacities[blocked] > 0 &&
+        active_paths <= TRANSPORT_POLICY_PATHS) {
+      transport_policy_path_t candidates[TRANSPORT_POLICY_PATHS];
+      for (size_t i = 0; i < active_paths; i++) {
+        fp_t b = paths[i].state.b_ewma;
+        if (!profile->fec_enabled) {
+          fp_t success = FP_ONE - paths[i].state.p_ewma;
+          b = success > 0 ? FP_MUL(b, success) : 0;
+        }
+        candidates[i] = (transport_policy_path_t){
+            .measurement = {.b = b,
+                            .l = paths[i].state.l_ewma,
+                            .p = paths[i].state.p_ewma,
+                            .q = paths[i].state.q_ewma},
+            .capacity = capacities[i]};
+      }
+      qlinq_effective_repair_policy_t policy = {
+          .enabled = true,
+          .proactive_confidence = profile->fec_enabled ? 99U : 0U,
+          .max_extra_percent =
+              profile->fec_enabled ? QLINQ_REPAIR_MAX_PERCENT : 0U,
+          .min_initial_parity_symbols =
+              (uint16_t)(profile->fec_enabled && data_symbols > 1 ? 1U : 0U),
+          .max_initial_extra_percent =
+              profile->fec_enabled ? QLINQ_REPAIR_MAX_PERCENT : 0U};
+      transport_policy_schedule_t constrained;
+      if (transport_policy_schedule(&policy, candidates, active_paths,
+                                    data_symbols, QLINQ_FEC_MAX_TOTAL_SYMBOLS,
+                                    FP_MAX, &constrained) &&
+          (constrained.protection.reasons &
+           (TRANSPORT_PROTECTION_QUEUE_LIMIT |
+            TRANSPORT_PROTECTION_MINIMUM_UNMET)) == 0) {
+        plan->schedule.parity_symbols = constrained.protection.initial_parity;
+        for (size_t i = 0; i < active_paths; i++) {
+          plan->schedule.paths[i].m = constrained.source[i];
+          plan->schedule.paths[i].x =
+              constrained.source[i] + constrained.parity[i];
+        }
+        break;
+      }
+    }
     if (--active_paths == 0)
       return TRANSPORT_PUBLISH_BACKPRESSURE;
     for (size_t i = blocked; i < active_paths; i++)
@@ -395,7 +458,7 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
   size_t data_symbols = plan->data_symbols;
   size_t total_symbols = plan->total_symbols;
   size_t active_paths = plan->path_count;
-  const publication_path_t *paths = plan->paths;
+  const transport_publication_path_t *paths = plan->paths;
   uint8_t alias;
   if (transport_subscriptions_find_alias(&conn->send_subscriptions,
                                          &obj->track_id, &alias) != 0)

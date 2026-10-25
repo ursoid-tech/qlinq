@@ -2,6 +2,7 @@
 #include "transport_recovery.h"
 
 #include "fec.h"
+#include "transport_policy_scheduler.h"
 #include "transport_publish.h"
 #include "transport_repair.h"
 #include "transport_stream.h"
@@ -203,13 +204,50 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
 static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
                             const sent_object_cache_t *cached,
                             const transport_repair_batch_t *repair) {
+  transport_publication_path_t native[TRANSPORT_MAX_PATHS];
+  transport_policy_path_t candidates[TRANSPORT_POLICY_PATHS];
+  transport_policy_schedule_t schedule = {0};
+  path_t planned_paths[TRANSPORT_POLICY_PATHS] = {0};
+  size_t packet_len = QLINQ_WIRE_FEC_HEADER_SIZE + repair->symbol_size;
+  uint64_t admission_ns = transport_get_monotonic_ns();
+  size_t path_count = transport_publish_collect_paths(
+      conn->transport, conn, packet_len, admission_ns, native);
+  if (path_count > TRANSPORT_POLICY_PATHS)
+    path_count = TRANSPORT_POLICY_PATHS;
+  for (size_t i = 0; i < path_count; i++) {
+    fp_t success = FP_ONE - native[i].state.p_ewma;
+    fp_t usable_b = success > 0 ? FP_MUL(native[i].state.b_ewma, success) : 0;
+    candidates[i] =
+        (transport_policy_path_t){.measurement = {.b = usable_b,
+                                                  .l = native[i].state.l_ewma,
+                                                  .p = native[i].state.p_ewma,
+                                                  .q = native[i].sample.q},
+                                  .capacity = native[i].available};
+  }
+  qlinq_effective_repair_policy_t placement = {.enabled = true};
+  size_t planned_count = repair->count;
+  while (planned_count > 0 &&
+         !transport_policy_schedule(&placement, candidates, path_count,
+                                    planned_count, planned_count, FP_MAX,
+                                    &schedule))
+    planned_count--;
+  for (size_t i = 0; i < path_count; i++)
+    planned_paths[i].x = schedule.source[i];
+
   size_t queued = 0;
   for (size_t i = 0; i < repair->count; i++) {
-    size_t path = transport_select_datagram_path(conn);
+    size_t path = SIZE_MAX;
+    if (i < planned_count) {
+      size_t slot =
+          transport_path_select_physical(planned_paths, path_count, i);
+      if (slot < path_count)
+        path = native[slot].quic;
+    }
+    if (path == SIZE_MAX)
+      path = transport_select_datagram_path(conn);
     if (path == SIZE_MAX)
       break;
     uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + QLINQ_FEC_MAX_SYMBOL_SIZE];
-    size_t packet_len = QLINQ_WIRE_FEC_HEADER_SIZE + repair->symbol_size;
     qlinq_wire_fec_header_t header = {.alias = alias,
                                       .is_keyframe = cached->is_keyframe,
                                       .priority = cached->priority,

@@ -1,6 +1,7 @@
 #include "fec.h"
 #include "transport_internal.h"
 #include "transport_protocol.h"
+#include "transport_recovery.h"
 #include "transport_subscriptions.h"
 #include "transport_wire.h"
 
@@ -134,6 +135,22 @@ static int check_stalled_object_eviction(void) {
                conn->assemblers[0].total_symbols != 0 ||
                conn->assemblers[1].total_symbols != 0 ||
                t->assembler_memory_bytes != 0;
+  if (!failed) {
+    /* trickle symbols must not keep an incomplete object pinned forever */
+    receive_symbol(conn, 8, 9, 0, 4);
+    frame_assembler_t *trickle = transport_find_assembler(conn, 8, 0, 9);
+    if (!trickle)
+      abort();
+    int64_t max_age = (int64_t)t->fec_assembler_timeout_ms *
+                      (int64_t)QLINQ_FEC_ASSEMBLER_MAX_AGE_FACTOR;
+    trickle->first_symbol_time_ms = now - max_age;
+    trickle->last_activity_time_ms = now - 1;
+    failed = transport_recovery_deadline(conn) != now ||
+             (transport_recovery_tick(t, now),
+              t->stats.fec_objects_lost != 2 ||
+                  transport_find_assembler(conn, 8, 0, 9) != NULL ||
+                  t->assembler_memory_bytes != 0);
+  }
   if (failed)
     fputs("stalled-object eviction discarded progressing data\n", stderr);
   transport_destroy(t);

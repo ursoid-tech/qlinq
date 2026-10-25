@@ -318,8 +318,8 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
   }
   ok &= client->objects_received == received_before + 3;
   /* A preferred path with one slot left cannot fit this three-symbol object.
-   * Admission must replan onto an empty alternate, without partially filling
-   * the preferred path or requiring an event-loop tick first. */
+   * Admission must fill its remaining slot and place the other symbols on
+   * alternate paths, without requiring an event-loop tick first. */
   if (ok) {
     for (size_t i = 0; i < t->socket_count; i++)
       ok &= transport_mock_path_state(t, i, i == 0 ? 10000 : 1000,
@@ -328,13 +328,15 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
         transport_path_find_by_local(conn->quic, &t->sockets[0].local_addr);
     uint8_t ignored = 0xff;
     ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
-    while (ok && quicly_get_num_datagram_frames_path(conn->quic, primary) < 63)
+    while (ok && quicly_get_num_datagram_frames_path(conn->quic, primary) <
+                     QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1U)
       ok &= transport_queue_datagram(conn, primary, frame);
     uint8_t small_payload[2000] = {19};
     object.data = small_payload;
     object.size = sizeof(small_payload);
     ok &= transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED;
-    ok &= quicly_get_num_datagram_frames_path(conn->quic, primary) == 63;
+    ok &= quicly_get_num_datagram_frames_path(conn->quic, primary) ==
+          QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY;
     for (size_t i = 0;
          i < 2000 && ok && client->objects_received < received_before + 4;
          i++) {

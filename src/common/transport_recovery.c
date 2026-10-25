@@ -421,6 +421,24 @@ bool transport_recovery_send_nack(transport_conn_t *conn, uint8_t alias,
   return sent;
 }
 
+/* bound both idle gaps between symbols and total incomplete lifetime */
+static int64_t assembler_deadline_ms(const transport_t *t,
+                                     const frame_assembler_t *assembler) {
+  int64_t idle_timeout = (int64_t)t->fec_assembler_timeout_ms;
+  int64_t max_age =
+      idle_timeout > INT64_MAX / (int64_t)QLINQ_FEC_ASSEMBLER_MAX_AGE_FACTOR
+          ? INT64_MAX
+          : idle_timeout * (int64_t)QLINQ_FEC_ASSEMBLER_MAX_AGE_FACTOR;
+  int64_t idle_expires =
+      assembler->last_activity_time_ms > INT64_MAX - idle_timeout
+          ? INT64_MAX
+          : assembler->last_activity_time_ms + idle_timeout;
+  int64_t age_expires = assembler->first_symbol_time_ms > INT64_MAX - max_age
+                            ? INT64_MAX
+                            : assembler->first_symbol_time_ms + max_age;
+  return idle_expires < age_expires ? idle_expires : age_expires;
+}
+
 void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
   /* Expiration releases memory and reports loss even when the receiver-wide
    * NACK budget is exhausted. It must not be gated by request admission. */
@@ -437,8 +455,7 @@ void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
       frame_assembler_t *asm_slot = &conn->assemblers[i];
       if (asm_slot->total_symbols == 0)
         continue;
-      if (now_nack_ms - asm_slot->last_activity_time_ms >=
-          t->fec_assembler_timeout_ms) {
+      if (now_nack_ms >= assembler_deadline_ms(t, asm_slot)) {
         moq_track_id_t resolved_track;
         if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                                   asm_slot->track_id,
@@ -631,11 +648,7 @@ int64_t transport_recovery_deadline(const transport_conn_t *conn) {
     const frame_assembler_t *assembler = &conn->assemblers[i];
     if (assembler->total_symbols == 0)
       continue;
-    int64_t expires =
-        assembler->last_activity_time_ms >
-                INT64_MAX - t->fec_assembler_timeout_ms
-            ? INT64_MAX
-            : assembler->last_activity_time_ms + t->fec_assembler_timeout_ms;
+    int64_t expires = assembler_deadline_ms(t, assembler);
     if (expires < first_timeout)
       first_timeout = expires;
   }

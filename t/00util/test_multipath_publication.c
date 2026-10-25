@@ -1,8 +1,125 @@
 #include "transport_fixture.h"
 #include "transport_paths.h"
+#include "transport_publish.h"
+#include "transport_stream.h"
 #include "transport_wire.h"
 
 #include <stdio.h>
+
+static void inject_nack(quicly_stream_t *stream, uint8_t alias,
+                        uint64_t group_id, uint64_t object_id,
+                        const uint16_t *missing, uint16_t count) {
+  uint8_t nack[64], frame[128];
+  size_t nack_len = 0;
+  assert(qlinq_wire_encode_nack(nack, sizeof(nack), alias, 0, group_id,
+                                object_id, missing, count,
+                                &nack_len) == QLINQ_WIRE_OK);
+  assert(qlinq_wire_encode_frame_header(
+             frame, sizeof(frame), QLINQ_WIRE_NACK, nack_len,
+             TRANSPORT_WIRE_MAX_STREAM_PAYLOAD) == QLINQ_WIRE_OK);
+  memcpy(frame + QLINQ_WIRE_FRAME_HEADER_SIZE, nack, nack_len);
+  size_t size = QLINQ_WIRE_FRAME_HEADER_SIZE + nack_len;
+  size_t offset = transport_stream_ingress_get(stream).len;
+  size_t received = size;
+  assert(quicly_recvstate_update(&stream->recvstate,
+                                 stream->recvstate.data_off + offset, &received,
+                                 0, UINT64_MAX) == 0 &&
+         received == size);
+  stream->callbacks->on_receive(stream, offset, frame, size);
+}
+
+static void check_constrained_multipath(void) {
+  transport_fixture_t f = {0};
+  f.server.server = true;
+  transport_config_t config = {.bind_hosts = {"127.84.3.1", "127.84.4.1"},
+                               .num_bind_hosts = 2,
+                               .port = 19877,
+                               .cert_file = "t/assets/server.crt",
+                               .key_file = "t/assets/server.key",
+                               .allow_insecure_peer = true,
+                               .callback = fixture_event,
+                               .user_data = &f.server};
+  f.server.transport = transport_create(&config);
+  assert(f.server.transport);
+  config.bind_hosts[0] = "127.84.3.2";
+  config.bind_hosts[1] = "127.84.4.2";
+  config.remote_hosts[0] = "127.84.3.1";
+  config.remote_hosts[1] = "127.84.4.1";
+  config.num_remote_hosts = 2;
+  config.user_data = &f.client;
+  f.client.transport = transport_create(&config);
+  assert(f.client.transport);
+
+  transport_publication_path_t paths[TRANSPORT_MAX_PATHS];
+  size_t path_count = 0;
+  for (size_t attempt = 0; attempt < 2000; attempt++) {
+    fixture_tick(&f);
+    if (f.server.authenticated && f.client.authenticated) {
+      path_count = transport_publish_collect_paths(
+          f.server.transport, f.server.conn, 1200, transport_get_monotonic_ns(),
+          paths);
+      if (path_count == 2)
+        break;
+    }
+  }
+  assert(path_count == 2);
+
+  moq_track_id_t track = {.type = MOQ_TRACK_VIDEO,
+                          .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                          .name = "partial-capacity"};
+  fixture_subscribe(&f, &f.client, track);
+  for (size_t i = 0; i < 100; i++)
+    fixture_tick(&f);
+
+  transport_t *t = f.server.transport;
+  transport_conn_t *conn = f.server.conn;
+
+  /* leave 2 datagram slots on each path so a 3-symbol object must split */
+  uint8_t ignored = 0xff;
+  ptls_iovec_t frame = ptls_iovec_init(&ignored, 1);
+  for (size_t p = 0; p < 2; p++) {
+    while (quicly_get_num_datagram_frames_path(conn->quic, paths[p].quic) <
+           QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 2U)
+      assert(transport_queue_datagram(conn, paths[p].quic, frame));
+  }
+  assert(transport_mock_path_state(t, 0, 100000, 10, 0));
+  assert(transport_mock_path_state(t, 1, 20000, 10, 0));
+
+  uint8_t payload[2000];
+  memset(payload, 0x3c, sizeof(payload));
+  moq_object_t object = {.track_id = track,
+                         .group_id = 1,
+                         .object_id = 0,
+                         .data = payload,
+                         .size = sizeof(payload)};
+  assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1U);
+  fixture_receive(&f, &f.client, 1);
+  assert(f.client.payload_size == sizeof(payload) &&
+         memcmp(f.client.payload, payload, sizeof(payload)) == 0);
+
+  /* repair responses must avoid a degraded path when a healthy path exists */
+  assert(transport_sent_cache_store(&t->sent_cache, &object, 2, 2, 1000, true));
+  uint8_t alias = 0;
+  assert(transport_subscriptions_find_alias(&conn->send_subscriptions, &track,
+                                            &alias) == 0);
+  assert(transport_mock_path_state(t, 0, 100000, 10, 0.95f));
+  assert(transport_mock_path_state(t, 1, 100000, 10, 0.0f));
+  size_t p0_before =
+      quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic);
+  size_t p1_before =
+      quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic);
+  const uint16_t missing[2] = {0, 1};
+  inject_nack(conn->stream, alias, 1, 0, missing, 2);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         p0_before);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
+         p1_before + 2U);
+  fixture_destroy(&f);
+}
 
 static void create_shared_socket(transport_fixture_t *f, size_t paths[2]) {
   memset(f, 0, sizeof(*f));
@@ -122,6 +239,20 @@ int main(void) {
     assert(transport_queue_datagram(f.server.conn, paths[0], frame));
   assert(transport_select_datagram_path(f.server.conn) == paths[1]);
   assert(transport_is_track_ready(f.server.transport, &track));
+  uint8_t shared_payload[2000];
+  memset(shared_payload, 0x24, sizeof(shared_payload));
+  moq_object_t shared_obj = {.track_id = track,
+                             .group_id = 0,
+                             .object_id = 0,
+                             .data = shared_payload,
+                             .size = sizeof(shared_payload)};
+  assert(transport_publish_ex(f.server.transport, &shared_obj) ==
+         TRANSPORT_PUBLISH_DELIVERED);
+  assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[1]) >
+         0);
+  fixture_receive(&f, &f.client, 1);
+  assert(f.client.payload_size == sizeof(shared_payload) &&
+         memcmp(f.client.payload, shared_payload, sizeof(shared_payload)) == 0);
   for (size_t i = 0; i < 100; i++)
     fixture_tick(&f);
 
@@ -204,10 +335,11 @@ int main(void) {
          physical->measurement.quic_path == paths[1]);
   assert(physical->state.p_ewma < FP_ONE / 2);
   assert(physical->state.l_ewma < FP_ONE);
-  fixture_receive(&f, &f.client, 1);
+  fixture_receive(&f, &f.client, 2);
   assert(f.client.payload_size == sizeof(payload) &&
          memcmp(f.client.payload, payload, sizeof(payload)) == 0);
   fixture_destroy(&f);
+  check_constrained_multipath();
   puts("===MULTIPATH PUBLICATION OK===");
   return 0;
 }
