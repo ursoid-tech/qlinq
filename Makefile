@@ -106,6 +106,8 @@ PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
 TRANSPORT_OBJS = src/common/qlinq.o \
+              src/common/transport_repair_policy.o \
+              src/common/transport_policy_scheduler.o \
               src/common/cli_parse.o \
               src/common/transport_config.o \
               src/common/transport_egress.o \
@@ -402,7 +404,13 @@ benchmark: t/00util/test_benchmark
 benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
-CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
+t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .build-config
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -Dtransport_policy_schedule=policy_schedule_reference -Dtransport_policy_estimate_parity=policy_estimate_reference -c $< -o $@
+
+t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
