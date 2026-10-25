@@ -11,11 +11,19 @@ static bool refill_limiter(transport_repair_limiter_t *limiter,
     return false;
 
   uint64_t capacity = (uint64_t)requests_per_second * 1000U;
-  if (limiter->last_refill_ms == 0 || now_ms < limiter->last_refill_ms) {
+  if (!limiter->initialized) {
+    limiter->initialized = true;
+    if (limiter->last_refill_ms == 0) {
+      limiter->tokens_milli = capacity;
+      limiter->last_refill_ms = now_ms;
+    }
+  }
+  if (limiter->tokens_milli > capacity)
     limiter->tokens_milli = capacity;
-    limiter->last_refill_ms = now_ms;
-  } else if (now_ms > limiter->last_refill_ms) {
-    uint64_t elapsed = (uint64_t)(now_ms - limiter->last_refill_ms);
+  /* a caller's saved tick timestamp can precede a later admission timestamp.
+   * neither stale inspection nor wall-clock rollback may mint a fresh burst. */
+  if (now_ms > limiter->last_refill_ms) {
+    uint64_t elapsed = (uint64_t)now_ms - (uint64_t)limiter->last_refill_ms;
     uint64_t added = 0;
     if (elapsed > UINT64_MAX / requests_per_second) {
       added = capacity;
@@ -39,7 +47,11 @@ uint64_t transport_repair_limiter_wait_ms(transport_repair_limiter_t *limiter,
   if (limiter->tokens_milli >= 1000U)
     return 0;
   uint64_t missing = 1000U - limiter->tokens_milli;
-  return (missing + requests_per_second - 1U) / requests_per_second;
+  uint64_t wait = (missing + requests_per_second - 1U) / requests_per_second;
+  uint64_t lag = now_ms < limiter->last_refill_ms
+                     ? (uint64_t)limiter->last_refill_ms - (uint64_t)now_ms
+                     : 0;
+  return wait > UINT64_MAX - lag ? UINT64_MAX : lag + wait;
 }
 
 bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
@@ -121,78 +133,74 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
   if (batch->count == 0)
     return false;
 
-  uint16_t highest = 0;
-  for (size_t i = 0; i < batch->count; i++) {
-    if (batch->indices[i] > highest)
-      highest = batch->indices[i];
-  }
-  size_t parity_symbols = highest >= object->data_symbols
-                              ? (size_t)highest - object->data_symbols + 1U
-                              : 0U;
   bool rateless = (object->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
-  size_t original_parity = object->total_symbols >= object->data_symbols
-                               ? object->total_symbols - object->data_symbols
-                               : 0;
-  if (!rateless && parity_symbols < original_parity)
-    parity_symbols = original_parity;
-  size_t total_symbols = object->data_symbols + parity_symbols;
-  if (total_symbols > UINT16_MAX)
+  size_t total_symbols = object->total_symbols;
+  if (total_symbols < object->data_symbols ||
+      total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+      object->data_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+      object->symbol_size > QLINQ_FEC_MAX_SYMBOL_SIZE ||
+      object->size > (size_t)object->data_symbols * object->symbol_size)
     return false;
-
-  if (batch->count > SIZE_MAX / object->symbol_size)
-    return false;
+  for (size_t i = 0; i < batch->count; i++) {
+    size_t extent = (size_t)batch->indices[i] + 1U;
+    if (extent > total_symbols) {
+      if (!rateless)
+        return false; /* fixed geometry must never grow during repair */
+      total_symbols = extent;
+    }
+  }
   batch->symbols = calloc(batch->count, object->symbol_size);
   if (!batch->symbols)
     return false;
 
   bool encoded = false;
-  uint8_t **data_blocks = calloc(object->data_symbols, sizeof(*data_blocks));
-  uint8_t *data_storage = calloc(object->data_symbols, object->symbol_size);
-  uint8_t **parity_blocks = parity_symbols > 0
-                                ? calloc(parity_symbols, sizeof(*parity_blocks))
-                                : NULL;
-  uint8_t *parity_storage =
-      parity_symbols > 0 ? calloc(parity_symbols, object->symbol_size) : NULL;
-  if (!data_blocks || !data_storage ||
-      (parity_symbols > 0 && (!parity_blocks || !parity_storage)))
+  const uint8_t **data_blocks =
+      calloc(object->data_symbols, sizeof(*data_blocks));
+  uint8_t *tail = NULL;
+  uint32_t parity_ids[TRANSPORT_REPAIR_MAX_SYMBOLS];
+  uint8_t *parity_outputs[TRANSPORT_REPAIR_MAX_SYMBOLS];
+  size_t parity_count = 0;
+  if (!data_blocks)
     goto cleanup;
-
   for (size_t i = 0; i < object->data_symbols; i++) {
-    data_blocks[i] = data_storage + i * object->symbol_size;
     size_t offset = i * object->symbol_size;
     size_t chunk = offset < object->size ? object->size - offset : 0;
-    if (chunk > object->symbol_size)
-      chunk = object->symbol_size;
-    if (chunk > 0)
-      memcpy(data_blocks[i], object->data + offset, chunk);
+    if (chunk >= object->symbol_size) {
+      data_blocks[i] = object->data + offset;
+    } else {
+      /* valid geometry needs at most one padded tail, never a source copy */
+      if (i + 1U != object->data_symbols)
+        goto cleanup;
+      tail = calloc(1, object->symbol_size);
+      if (!tail)
+        goto cleanup;
+      if (chunk != 0)
+        memcpy(tail, object->data + offset, chunk);
+      data_blocks[i] = tail;
+    }
   }
-
+  for (size_t i = 0; i < batch->count; i++) {
+    uint16_t index = batch->indices[i];
+    uint8_t *output = batch->symbols + i * object->symbol_size;
+    if (index < object->data_symbols) {
+      memcpy(output, data_blocks[index], object->symbol_size);
+    } else {
+      parity_ids[parity_count] = index;
+      parity_outputs[parity_count++] = output;
+    }
+  }
   encoded = true;
-  if (parity_symbols > 0) {
-    for (size_t i = 0; i < parity_symbols; i++)
-      parity_blocks[i] = parity_storage + i * object->symbol_size;
+  if (parity_count > 0) {
     fec_type_t type = fec_select_type(rateless, total_symbols);
     fec_t *fec = transport_fec_cache_get(fec_cache, type, object->data_symbols,
-                                         parity_symbols, object->symbol_size);
-    encoded = fec && fec_encode(fec, (const uint8_t *const *)data_blocks,
-                                parity_blocks);
-  }
-
-  if (encoded) {
-    for (size_t i = 0; i < batch->count; i++) {
-      uint16_t index = batch->indices[i];
-      const uint8_t *source = index < object->data_symbols
-                                  ? data_blocks[index]
-                                  : parity_blocks[index - object->data_symbols];
-      memcpy(batch->symbols + i * object->symbol_size, source,
-             object->symbol_size);
-    }
+                                         total_symbols - object->data_symbols,
+                                         object->symbol_size);
+    encoded = fec && fec_encode_symbols(fec, data_blocks, parity_ids,
+                                        parity_count, parity_outputs);
   }
 cleanup:
   free(data_blocks);
-  free(data_storage);
-  free(parity_blocks);
-  free(parity_storage);
+  free(tail);
   if (!encoded) {
     transport_repair_batch_destroy(batch);
     return false;

@@ -12,6 +12,7 @@
 typedef struct {
   uint64_t tokens_milli;
   int64_t last_refill_ms;
+  bool initialized;
 } transport_repair_limiter_t;
 
 typedef struct {
@@ -42,7 +43,8 @@ bool transport_repair_commit_systematic_fallback(
     size_t admitted);
 void transport_repair_batch_destroy(transport_repair_batch_t *batch);
 
-/* Inspect admission without spending a token; UINT64_MAX means disabled. */
+/* inspect without spending; UINT64_MAX means disabled or an unrepresentable
+ * wait. stale/backward clock snapshots never refill the bucket. */
 uint64_t transport_repair_limiter_wait_ms(transport_repair_limiter_t *limiter,
                                           size_t requests_per_second,
                                           int64_t now_ms);

@@ -2,6 +2,7 @@
 
 #include "fec.h"
 #include "oblas_common.h"
+#include <assert.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,7 +164,8 @@ static int test_raptorq_extra_equations(void) {
   uint8_t original[K + P][T], received[K + P][T];
   uint8_t *data[K + P], *blocks[K + P];
   bool missing[K + P] = {false};
-  fec_t *f = fec_create_ex(FEC_RAPTORQ, K, P, T);
+  fec_memory_budget_t budget = {.limit = 16U * 1024U * 1024U};
+  fec_t *f = fec_create_bounded(FEC_RAPTORQ, K, P, T, &budget);
   if (!f)
     return 1;
   for (size_t i = 0; i < K + P; ++i) {
@@ -191,6 +193,11 @@ static int test_raptorq_extra_equations(void) {
   }
   for (size_t i = K + 3; i < K + P; ++i)
     missing[i] = false;
+  budget.limit = budget.current;
+  if (fec_decode(f, blocks, missing) || !budget.refusals ||
+      budget.current > budget.limit)
+    goto cleanup;
+  budget.limit = 16U * 1024U * 1024U;
   if (!fec_decode(f, blocks, missing) ||
       memcmp(received, original, K * T) != 0) {
     fprintf(stderr, "additional RaptorQ repairs did not recover all data\n");
@@ -211,6 +218,8 @@ static int test_raptorq_extra_equations(void) {
   printf("RaptorQ additional equations and workspace reuse OK\n");
 cleanup:
   fec_destroy(f);
+  if (budget.current || budget.peak > budget.limit)
+    return 1;
   return result;
 }
 
@@ -252,12 +261,125 @@ static int test_short_symbols(void) {
   return 0;
 }
 
+static int test_selective_symbols(void) {
+  const size_t sizes[] = {1, 3, 257, 1200};
+  for (unsigned type = 0; type < 2; type++) {
+    size_t k = 32, n = type == 0 ? 255 : 1024, parity = n - k;
+    for (size_t z = 0; z < sizeof(sizes) / sizeof(sizes[0]); z++) {
+      size_t bytes = sizes[z];
+      fec_t *f = fec_create_ex((fec_type_t)type, k, parity, bytes);
+      uint8_t **blocks = calloc(n, sizeof(*blocks));
+      bool *missing = calloc(n, sizeof(*missing));
+      uint8_t *storage = calloc(n, bytes);
+      uint8_t *selected = malloc(4 * bytes);
+      uint8_t *original = malloc(bytes);
+      if (!f || !blocks || !missing || !storage || !selected || !original)
+        return 1;
+      for (size_t i = 0; i < n; i++) {
+        blocks[i] = storage + i * bytes;
+        for (size_t j = 0; j < bytes && i < k; j++)
+          blocks[i][j] = (uint8_t)(i * 17 + j * 3 + 91);
+        missing[i] = i >= k;
+      }
+      memcpy(original, blocks[0], bytes);
+      uint32_t ids[] = {(uint32_t)n - 1, (uint32_t)k, (uint32_t)n - 2,
+                        (uint32_t)n - 3};
+      uint8_t *outputs[] = {selected, selected + bytes, selected + 2 * bytes,
+                            selected + 3 * bytes};
+      /* only four output buffers, including the highest reserved ID */
+      if (!fec_encode_symbols(f, NULL, NULL, 0, NULL) ||
+          !fec_encode_symbols(f, (const uint8_t *const *)blocks, ids, 4,
+                              outputs) ||
+          !fec_encode(f, (const uint8_t *const *)blocks, blocks + k))
+        return 1;
+      for (size_t i = 0; i < 4; i++) {
+        if (memcmp(outputs[i], blocks[ids[i]], bytes))
+          return 1;
+        missing[ids[i]] = false;
+      }
+      uint32_t invalid = (uint32_t)n;
+      if (fec_encode_symbols(f, (const uint8_t *const *)blocks, &invalid, 1,
+                             outputs))
+        return 1;
+      invalid = (uint32_t)k - 1;
+      if (fec_encode_symbols(f, (const uint8_t *const *)blocks, &invalid, 1,
+                             outputs))
+        return 1;
+      memset(blocks[0], 0, bytes);
+      missing[0] = true;
+      if (!fec_decode(f, blocks, missing) || memcmp(original, blocks[0], bytes))
+        return 1;
+      fec_destroy(f);
+      free(blocks);
+      free(missing);
+      free(storage);
+      free(selected);
+      free(original);
+    }
+  }
+  puts("Selective high-ID parity matches full encoding and recovers fixed "
+       "geometry");
+  return 0;
+}
+
+static int test_memory_budget(void) {
+  fec_t *probe = fec_create_ex(FEC_REED_SOLOMON, 32, 8, 100);
+  assert(probe);
+  size_t base = fec_memory_usage(probe);
+  assert(base);
+  fec_destroy(probe);
+  fec_memory_budget_t budget = {.limit = base - 1};
+  assert(!fec_create_bounded(FEC_REED_SOLOMON, 32, 8, 100, &budget));
+  assert(!budget.current && budget.refusals == 1 && !budget.peak);
+  budget.limit = base;
+  probe = fec_create_bounded(FEC_REED_SOLOMON, 32, 8, 100, &budget);
+  assert(probe && budget.current == base && budget.peak == base);
+  assert(!fec_create_bounded(FEC_REED_SOLOMON, 32, 8, 100, &budget));
+  assert(budget.current == base);
+  fec_destroy(probe);
+  assert(!budget.current);
+  budget.limit = 1024U * 1024U;
+  probe = fec_create_bounded(FEC_RAPTORQ, 32, 8, 100, &budget);
+  assert(probe);
+  base = fec_memory_usage(probe);
+  budget.limit = base;
+  uint8_t source[32][100], output[100];
+  const uint8_t *blocks[32];
+  for (size_t i = 0; i < 32; i++) {
+    memset(source[i], (int)i, 100);
+    blocks[i] = source[i];
+  }
+  uint8_t *outputs[] = {output};
+  uint32_t id = 32;
+  assert(fec_encode_symbols(probe, NULL, NULL, 0, NULL));
+  assert(budget.current == base); /* geometry alone does not prepare RaptorQ */
+  uint64_t refused = budget.refusals;
+  assert(!fec_encode_symbols(probe, blocks, &id, 1, outputs));
+  assert(budget.current == base && budget.refusals == refused + 1);
+  budget.limit = 16U * 1024U * 1024U;
+  assert(fec_encode_symbols(probe, blocks, &id, 1, outputs));
+  assert(budget.current > base && budget.current == fec_memory_usage(probe) &&
+         budget.peak <= budget.limit);
+  size_t prepared = budget.current;
+  assert(fec_encode_symbols(probe, blocks, &id, 1, outputs));
+  assert(budget.current == prepared);
+  fec_destroy(probe);
+  assert(!budget.current);
+  puts("Aggregate FEC memory bounds, lazy preparation and release OK");
+  return 0;
+}
+
 int main(void) {
   printf("running FEC test suite...\n");
+  if (test_memory_budget() != 0)
+    return 1;
+  if (test_selective_symbols() != 0)
+    return 1;
   if (test_row_swaps() != 0)
     return 1;
   if (fec_create_ex((fec_type_t)99, 4, 2, 1024) != NULL ||
       fec_create_ex(FEC_REED_SOLOMON, 0, 2, 1024) != NULL ||
+      fec_create_ex(FEC_RAPTORQ, 60000, 1, 1) != NULL ||
       fec_create_ex(FEC_REED_SOLOMON, 250, 10, 1024) != NULL) {
     fprintf(stderr, "invalid FEC parameters were accepted\n");
     return 1;

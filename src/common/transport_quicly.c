@@ -168,7 +168,9 @@ size_t transport_assembler_window(transport_conn_t *conn,
   if (bdp_bytes != 0) {
     uint64_t double_bdp =
         bdp_bytes > UINT64_MAX / 2U ? UINT64_MAX : bdp_bytes * 2U;
-    target += (double_bdp + object_bytes - 1U) / object_bytes;
+    uint64_t extra =
+        double_bdp / object_bytes + (double_bdp % object_bytes != 0);
+    target = extra > cap - minimum ? cap : minimum + extra;
   }
   if (target > cap)
     target = cap;
@@ -1110,6 +1112,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->limits = limits;
   t->ifmon_pipe[0] = -1;
   t->ifmon_pipe[1] = -1;
+  t->fec_cache.memory.limit = limits.max_codec_memory_bytes;
   size_t recovery_object_bytes =
       limits.max_fec_object_size < TRANSPORT_MAX_FEC_GROUP_SIZE
           ? limits.max_fec_object_size
@@ -1432,9 +1435,22 @@ void transport_destroy(transport_t *t) {
 
   for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
     destroy_socket(&t->sockets[i]);
+  t->socket_count = 0;
 
-  for (size_t i = 0; i < transport_connection_count(t); i++)
-    destroy_connection(transport_connection_at(t, i));
+  while (transport_connection_count(t) != 0) {
+    transport_conn_t *conn;
+    if (t->is_server) {
+      conn = t->conns[--t->conn_count];
+      t->conns[t->conn_count] = NULL;
+    } else {
+      conn = t->client_conn;
+      t->client_conn = NULL;
+    }
+    /* retirement callbacks and maintenance scans can inspect the remaining
+     * peers. remove the dying connection before any such scan or free. */
+    transport_connection_cache_forget(t, conn);
+    destroy_connection(conn);
+  }
 
   transport_sent_cache_destroy(&t->sent_cache);
   transport_fec_cache_destroy(&t->fec_cache);
@@ -2291,6 +2307,9 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
   if (!transport_owner_ok(t) || !stats)
     return false;
   *stats = t->stats;
+  stats->codec_memory_bytes = t->fec_cache.memory.current;
+  stats->codec_peak_memory_bytes = t->fec_cache.memory.peak;
+  stats->codec_memory_refusals = t->fec_cache.memory.refusals;
   stats->recovery_cache_payload_bytes = t->sent_cache.payload_bytes;
   stats->recovery_cache_peak_payload_bytes = t->sent_cache.peak_payload_bytes;
   stats->recovery_cache_entries = t->sent_cache.count;

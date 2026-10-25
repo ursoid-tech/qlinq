@@ -50,6 +50,9 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   resolved->max_assembler_memory_bytes =
       value_or_default(configured->max_assembler_memory_bytes,
                        TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET);
+  resolved->max_codec_memory_bytes =
+      value_or_default(configured->max_codec_memory_bytes,
+                       TRANSPORT_DEFAULT_CODEC_MEMORY_BUDGET);
   resolved->max_stream_egress_bytes =
       value_or_default(configured->max_stream_egress_bytes,
                        TRANSPORT_DEFAULT_STREAM_EGRESS_BYTES);
@@ -97,6 +100,9 @@ bool transport_limits_resolve(const transport_limits_t *configured,
   if (resolved->max_assembler_memory_bytes < 1024U * 1024U)
     return fail(error, error_capacity,
                 "max_assembler_memory_bytes must be at least 1 MiB");
+  if (resolved->max_codec_memory_bytes < 1024U * 1024U)
+    return fail(error, error_capacity,
+                "max_codec_memory_bytes must be at least 1 MiB");
   if (resolved->max_reliable_object_size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE)
     return fail(error, error_capacity,
                 "max_reliable_object_size exceeds wire implementation");

@@ -489,6 +489,12 @@ static int test_path_pacing_inputs(void) {
   CHECK(transport_assembler_window(&receiver_conn, 8, 1000) == 633,
         "derived receive window keeps two BDPs plus reorder floor");
 
+  receiver_conn.assembler_limit = 0;
+  receiver_conn.assembler_rx_rate = UINT64_MAX;
+  CHECK(
+      transport_assembler_window(&receiver_conn, 1, 1) == 1024,
+      "saturated receive BDP clamps to cap without wrapping the reorder floor");
+
   transport_path_measurement_t measurement = {0};
   quicly_path_stats_t stats = {.cwnd = 1000000, .rtt_smoothed = 40};
   stats.local.sa.sa_family = stats.remote.sa.sa_family = AF_INET;
@@ -990,6 +996,11 @@ int main(void) {
         "repair preserves original FEC dimensions");
   transport_repair_batch_destroy(&repair);
 
+  uint16_t outside_geometry = cached->total_symbols;
+  CHECK(!transport_repair_build(&repair_fec_cache, cached, false,
+                                &outside_geometry, 1, &repair),
+        "fixed repair rejects requests that would change encoding geometry");
+
   moq_track_id_t rateless_track = {.type = MOQ_TRACK_DATA,
                                    .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
                                    .name = "rateless-data"};
@@ -1074,6 +1085,29 @@ int main(void) {
             !transport_repair_limiter_take(&limiter, 4, 100) &&
             transport_repair_limiter_take(&limiter, 4, 350),
         "repair limiter burst and smooth refill");
+  CHECK(
+      !transport_repair_limiter_take(&limiter, 4, 349) &&
+          limiter.last_refill_ms == 350 && !limiter.tokens_milli &&
+          transport_repair_limiter_wait_ms(&limiter, 4, 349) == 251 &&
+          !transport_repair_limiter_take(&limiter, 4, 599) &&
+          transport_repair_limiter_take(&limiter, 4, 600),
+      "stale tick timestamps cannot refill feedback tokens or schedule early");
+  limiter = (transport_repair_limiter_t){0};
+  CHECK(
+      transport_repair_limiter_take(&limiter, 1, 0) &&
+          !transport_repair_limiter_take(&limiter, 1, 0) &&
+          transport_repair_limiter_wait_ms(&limiter, 1, -1) == 1001 &&
+          transport_repair_limiter_take(&limiter, 1, 1000),
+      "zero-time initialization and backwards clock preserve the burst bound");
+  limiter = (transport_repair_limiter_t){.last_refill_ms = INT64_MIN,
+                                         .initialized = true};
+  CHECK(transport_repair_limiter_take(&limiter, 1, INT64_MAX),
+        "forward refill arithmetic cannot overflow signed clock range");
+  limiter.tokens_milli = 0;
+  CHECK(transport_repair_limiter_wait_ms(&limiter, 1, INT64_MIN) ==
+                UINT64_MAX &&
+            !transport_repair_limiter_take(&limiter, 1, INT64_MIN),
+        "unrepresentable backwards-clock wait saturates instead of refilling");
   uint16_t unordered_request[] = {7, 1, 7};
   CHECK(transport_repair_normalize_indices(unordered_request, 3) == 2 &&
             unordered_request[0] == 1 && unordered_request[1] == 7,
@@ -1245,6 +1279,60 @@ int main(void) {
   CHECK(transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 8) == fec,
         "FEC cache reuse");
   transport_fec_cache_destroy(&fec_cache);
+
+  configured.max_codec_memory_bytes = 1;
+  CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                  sizeof(limit_error)),
+        "reject tiny codec byte budget");
+  configured.max_codec_memory_bytes = 2U * 1024U * 1024U;
+  CHECK(transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                 sizeof(limit_error)) &&
+            resolved_limits.max_codec_memory_bytes ==
+                configured.max_codec_memory_bytes,
+        "resolve endpoint codec budget");
+  fec = transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 8);
+  CHECK(fec, "bounded codec seed");
+  size_t codec_base = fec_memory_usage(fec);
+  fec_cache.memory.limit = codec_base * 2;
+  CHECK(transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 9) &&
+            transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 10),
+        "idle codecs reclaimed under aggregate byte pressure");
+  size_t codecs = 0;
+  for (size_t i = 0; i < TRANSPORT_FEC_CACHE_SIZE; i++)
+    codecs += fec_cache.entries[i].fec != NULL;
+  CHECK(codecs == 2 && fec_cache.memory.current == codec_base * 2 &&
+            fec_cache.memory.peak <= fec_cache.memory.limit,
+        "byte pressure bounds retained codec entries");
+  fec_cache.memory.limit = codec_base - 1;
+  CHECK(!transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 11) &&
+            !fec_cache.memory.current && fec_cache.memory.refusals,
+        "overlarge codec refused after idle reclamation");
+  transport_fec_cache_destroy(&fec_cache);
+  fec_cache.memory.limit = 16U * 1024U * 1024U;
+  fec = transport_fec_cache_get(&fec_cache, FEC_RAPTORQ, 32, 8, 100);
+  CHECK(fec && transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 8),
+        "shared encode/decode cache metadata");
+  fec_cache.memory.limit = fec_cache.memory.current;
+  uint8_t codec_data[32][100], codec_output[100];
+  const uint8_t *codec_sources[32];
+  for (size_t i = 0; i < 32; i++) {
+    memset(codec_data[i], (int)i, 100);
+    codec_sources[i] = codec_data[i];
+  }
+  uint8_t *codec_outputs[] = {codec_output};
+  uint32_t codec_id = 32;
+  CHECK(
+      !fec_encode_symbols(fec, codec_sources, &codec_id, 1, codec_outputs) &&
+          fec_cache.memory.current == fec_memory_usage(fec) &&
+          transport_fec_cache_get(&fec_cache, FEC_RAPTORQ, 32, 8, 100) == fec,
+      "workspace pressure reclaims idle codecs but preserves the active codec");
+  fec_cache.memory.limit = 16U * 1024U * 1024U;
+  CHECK(fec_encode_symbols(fec, codec_sources, &codec_id, 1, codec_outputs) &&
+            fec_cache.memory.current == fec_memory_usage(fec) &&
+            fec_cache.memory.peak <= fec_cache.memory.limit,
+        "codec can retry after a refused workspace allocation");
+  transport_fec_cache_destroy(&fec_cache);
+  CHECK(!fec_cache.memory.current, "all retained codec bytes released");
 
   printf("===TRANSPORT COMPONENTS OK===\n");
   return 0;

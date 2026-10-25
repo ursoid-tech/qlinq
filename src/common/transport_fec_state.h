@@ -89,6 +89,7 @@ typedef struct {
 
 typedef struct {
   transport_fec_cache_entry_t entries[TRANSPORT_FEC_CACHE_SIZE];
+  fec_memory_budget_t memory;
 } transport_fec_cache_t;
 
 fec_t *transport_fec_cache_get(transport_fec_cache_t *cache, fec_type_t type,

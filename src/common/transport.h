@@ -168,6 +168,7 @@ enum {
 #define TRANSPORT_DEFAULT_TOTAL_STREAM_EGRESS_BYTES (16U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_RECOVERY_CACHE_BYTES (16U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET (64U * 1024U * 1024U)
+#define TRANSPORT_DEFAULT_CODEC_MEMORY_BUDGET (64U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_MAX_PACKETS_PER_TICK 1024U
 #define TRANSPORT_DEFAULT_RECONNECT_INITIAL_DELAY_MS 250U
 #define TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS 30000U
@@ -190,6 +191,7 @@ typedef struct {
   size_t max_egress_packets_per_socket;
   size_t max_egress_bytes_per_socket;
   size_t max_assembler_memory_bytes;
+  size_t max_codec_memory_bytes; /* shared retained codec state/workspaces */
   /* Retained recovery payloads, in addition to the fixed cache entry table. */
   size_t max_recovery_cache_bytes;
   /* Frame allocations and send-vector capacity retained until QUIC releases
@@ -450,6 +452,8 @@ typedef struct {
   size_t egress_peak_bytes;
   size_t active_connections;
   size_t assembler_memory_bytes;
+  size_t codec_memory_bytes, codec_peak_memory_bytes;
+  uint64_t codec_memory_refusals;
 } transport_stats_t;
 
 typedef struct {
