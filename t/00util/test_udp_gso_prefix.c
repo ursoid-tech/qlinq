@@ -204,7 +204,32 @@ static void run_limited_layout(void) {
   max_gso_segments = 6;
   expected[6].iov_len = 0;
   assert(send_suffix() == 16 && send_calls == 1 && groups[0] == 6 &&
-         gso_accepted == 1 && ordinary_accepted == 10);
+         gso_accepted == 3 && ordinary_accepted == 1 && groups[1] == 6 &&
+         groups[2] == 3);
+  /* leading ack-sized packet must not disable full-sized suffix */
+  setup(16, 1280);
+  max_gso_segments = 6;
+  expected[0].iov_len = 13;
+  assert(send_suffix() == 16 && send_calls == 1 && ordinary_accepted == 1 &&
+         group_count == 3 && groups[0] == 6 && groups[1] == 6 &&
+         groups[2] == 3);
+  /* ordinary prefix can succeed before later aggregate fails; retry suffix */
+  setup(16, 1280);
+  max_gso_segments = 6;
+  expected[0].iov_len = 13;
+  step(1, 0, 4, false);
+  step(-1, EOPNOTSUPP, 3, true);
+  step(15, 0, 15, false);
+  assert(send_suffix() == 16 && accepted == 16 && ordinary_accepted == 16 &&
+         gso_accepted == 0 && send_calls == 3);
+  setup(16, 1280);
+  max_gso_segments = 6;
+  expected[0].iov_len = 13;
+  step(2, 0, 4, false);
+  step(-1, EAGAIN, 2, true);
+  step(9, 0, 9, false);
+  assert(send_suffix() == 16 && accepted == 16 && ordinary_accepted == 10 &&
+         gso_accepted == 1 && groups[0] == 6 && send_calls == 3);
   setup(13, 1280);
   max_gso_segments = 6;
   assert(send_suffix() == 13 && send_calls == 1 && group_count == 2 &&
@@ -281,7 +306,11 @@ static void run_layout(void) {
   setup(64, 1280);
   expected[20].iov_len = 0;
   assert(send_suffix() == 64 && send_calls == 1 && groups[0] == 20 &&
-         gso_accepted == 1 && ordinary_accepted == 44);
+         gso_accepted == 2 && ordinary_accepted == 1 && groups[1] == 43);
+  setup(64, 1280);
+  expected[0].iov_len = 13;
+  assert(send_suffix() == 64 && send_calls == 1 && ordinary_accepted == 1 &&
+         gso_accepted == 2 && groups[0] == 51 && groups[1] == 12);
   setup(64, 1280);
   expected[20].iov_len = 1500;
   assert(send_suffix() == 64 && send_calls == 1 && group_count == 3 &&
@@ -346,12 +375,13 @@ static void run_layout(void) {
   step(1, 0, 1, true);
   assert(send_suffix() == 64 && accepted == 64 && send_calls == 3);
 
-  /* Accepted GSO + an empty ordinary datagram precede a blocked flat suffix. */
+  /* accepted GSO and empty packet precede blocked aggregate; avoid replay */
   setup(64, 1280);
   expected[20].iov_len = 0;
-  step(2, 0, 45, true);
+  step(2, 0, 3, true);
+  step(-1, EAGAIN, 1, true);
   step(-1, EAGAIN, 43, false);
-  assert(send_suffix() == 21 && accepted == 21 && send_calls == 2);
+  assert(send_suffix() == 21 && accepted == 21 && send_calls == 3);
   assert(send_suffix() == 43 && accepted == 64);
   setup(2, 1280);
   expected[0].iov_len = 0;
