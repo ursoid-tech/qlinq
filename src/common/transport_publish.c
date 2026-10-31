@@ -616,6 +616,28 @@ static void release_acked_checkpoints(transport_t *t,
   t->stats.recovery_cache_releases += released;
 }
 
+static bool flush_checkpoint_baseline(transport_t *t, transport_conn_t *conn,
+                                      uint8_t alias,
+                                      transport_checkpoint_ack_state_t *ack) {
+  if (!ack->baseline_pending)
+    return true;
+  if (!conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
+      !transport_stream_can_accept(conn->stream,
+                                   QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                       QLINQ_WIRE_TRACK_CHECKPOINT_SIZE,
+                                   false) ||
+      !transport_stream_write_track_checkpoint_frame(
+          conn->stream, alias, ack->acked_group_id, ack->acked_object_id,
+          ack->acked_object_id, true))
+    return false;
+  ack->baseline_pending = false;
+  ack->sent_initialized = true;
+  ack->sent_group_id = ack->acked_group_id;
+  ack->sent_object_id = ack->acked_object_id;
+  t->stats.recovery_checkpoints_sent++;
+  return true;
+}
+
 void transport_publish_checkpoint_member_added(transport_t *t,
                                                transport_conn_t *conn,
                                                const moq_track_id_t *track_id,
@@ -637,19 +659,13 @@ void transport_publish_checkpoint_member_added(transport_t *t,
   ack->participating = true;
 
   transport_fec_track_state_t *track = find_fec_track_state(t, track_id, false);
-  if (track && track->checkpoint_initialized && conn->stream &&
-      quicly_sendstate_is_open(&conn->stream->sendstate) &&
-      transport_stream_write_track_checkpoint_frame(
-          conn->stream, alias, track->checkpoint_group_id,
-          track->last_checkpoint_object_id, track->last_checkpoint_object_id,
-          true)) {
-    ack->sent_initialized = true;
-    ack->sent_group_id = track->checkpoint_group_id;
-    ack->sent_object_id = track->last_checkpoint_object_id;
+  /* new recipient owes no records before join; retry failed baseline */
+  if (track && track->has_objects) {
+    ack->baseline_pending = true;
     ack->acked_initialized = true;
-    ack->acked_group_id = track->checkpoint_group_id;
-    ack->acked_object_id = track->last_checkpoint_object_id;
-    t->stats.recovery_checkpoints_sent++;
+    ack->acked_group_id = 0;
+    ack->acked_object_id = track->next_object_id - 1U;
+    (void)flush_checkpoint_baseline(t, conn, alias, ack);
   }
 }
 
@@ -789,13 +805,24 @@ static bool emit_rolling_checkpoint(transport_t *t,
     if (!ack->participating)
       transport_publish_checkpoint_member_added(t, conn, &track->track_id,
                                                 alias);
+    if (!flush_checkpoint_baseline(t, conn, alias, ack)) {
+      succeeded = false;
+      continue;
+    }
+    uint64_t recipient_first_object_id = first_object_id;
+    if (ack->sent_initialized && ack->sent_group_id == group_id &&
+        ack->sent_object_id >= recipient_first_object_id) {
+      if (ack->sent_object_id >= final_object_id)
+        continue;
+      recipient_first_object_id = ack->sent_object_id + 1U;
+    }
     if (!transport_stream_can_accept(conn->stream,
                                      QLINQ_WIRE_FRAME_HEADER_SIZE +
                                          QLINQ_WIRE_TRACK_CHECKPOINT_SIZE,
                                      false) ||
         !transport_stream_write_track_checkpoint_frame(
-            conn->stream, alias, group_id, first_object_id, final_object_id,
-            false)) {
+            conn->stream, alias, group_id, recipient_first_object_id,
+            final_object_id, false)) {
       succeeded = false;
       continue;
     }

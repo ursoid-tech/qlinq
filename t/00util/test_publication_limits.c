@@ -385,6 +385,73 @@ static void test_short_flush_recovery(void) {
   fixture_destroy(&f);
 }
 
+/* verify late-joining rateless subscriber skips pre-join tail */
+static void test_rateless_late_join_tail(void) {
+  for (unsigned warm = 25; warm <= 37; warm += 12) {
+    transport_fixture_t f;
+    fixture_create(&f, 19947, NULL, NULL);
+    moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                            .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                            .name = "late-join-tail"};
+    fixture_subscribe(&f, &f.client, track);
+    uint8_t payload[48] = {17};
+    moq_object_t object = {
+        .track_id = track, .data = payload, .size = sizeof(payload)};
+    for (unsigned i = 0; i < warm; i++) {
+      assert(transport_publish(f.server.transport, &object));
+      assert(transport_publish_flush_grouped(f.server.transport));
+      fixture_receive(&f, &f.client, i + 1);
+    }
+    fixture_endpoint_t second = {0};
+    transport_config_t config = {.bind_hosts = {"127.0.0.1"},
+                                 .num_bind_hosts = 1,
+                                 .remote_hosts = {"127.0.0.1"},
+                                 .num_remote_hosts = 1,
+                                 .port = 19947,
+                                 .allow_insecure_peer = true,
+                                 .callback = fixture_event,
+                                 .user_data = &second};
+    second.transport = transport_create(&config);
+    assert(second.transport);
+    for (unsigned i = 0; i < 2000 && !second.authenticated; i++) {
+      fixture_tick(&f);
+      transport_tick(second.transport);
+    }
+    assert(second.authenticated);
+    size_t limit = f.server.transport->limits.max_stream_egress_bytes;
+    f.server.transport->limits.max_stream_egress_bytes = 1;
+    assert(transport_subscribe_conn(second.transport, second.conn, track));
+    for (unsigned i = 0; i < 2000 && f.server.subscriptions < 2; i++) {
+      fixture_tick(&f);
+      transport_tick(second.transport);
+    }
+    assert(f.server.subscriptions == 2);
+    f.server.transport->limits.max_stream_egress_bytes = limit;
+    for (unsigned i = 0; i < 64; i++) {
+      assert(transport_publish(f.server.transport, &object));
+      bool flushed = false;
+      for (unsigned retry = 0; retry < 2000 && !flushed; retry++) {
+        flushed = transport_publish_flush_grouped(f.server.transport);
+        fixture_tick(&f);
+        transport_tick(second.transport);
+      }
+      assert(flushed);
+    }
+    assert(transport_publish_flush(f.server.transport));
+    for (unsigned i = 0; i < 2000 && (second.objects < 64 ||
+                                      f.server.transport->sent_cache.count);
+         i++) {
+      fixture_tick(&f);
+      transport_tick(second.transport);
+    }
+    assert(!second.failed && second.objects == 64);
+    assert(f.client.objects == warm + 64);
+    assert(f.server.transport->sent_cache.count == 0);
+    transport_destroy(second.transport);
+    fixture_destroy(&f);
+  }
+}
+
 /* Small objects used to derive 16384 cache slots, exceeding the receiver's
  * 4096-object history. A missing prefix must stop new admission before the
  * sender can produce a checkpoint that the receiver cannot retain. */
@@ -636,6 +703,7 @@ int main(void) {
   test_recovery_history_bound();
   test_xfer_recovery_protection();
   test_short_flush_recovery();
+  test_rateless_late_join_tail();
   test_group_timer_backpressure();
   test_partial_group_retry();
   transport_fixture_t fixture;
