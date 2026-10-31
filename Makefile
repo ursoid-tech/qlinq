@@ -234,7 +234,11 @@ install-tun: qlinq-tun
 	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
 	install -m 644 packaging/qlinq.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/qlinq.conf
 
-check-tun-tool: qlinq-tun t/00util/test_tun_names
+t/00util/test_tun_queue: t/00util/test_tun_queue.o src/host/linux/tun_device.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write
+
+check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue
+	./t/00util/test_tun_queue
 	./t/00util/test_tun_names
 	python3 t/test_tun_tool.py
 	python3 t/test_tun_metrics.py
@@ -410,7 +414,7 @@ t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .bu
 t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
+CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \

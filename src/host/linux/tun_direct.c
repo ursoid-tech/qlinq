@@ -329,6 +329,50 @@ static bool flush_packets(receive_queue_t *queue, int tun_fd,
   return true;
 }
 
+typedef struct {
+  receive_queue_t *queue;
+  qlinq_stream_t *subscriber;
+  int fd;
+  size_t mtu;
+  uint64_t max_age, received, bytes;
+} tunnel_receiver_t;
+
+/* service borrowed records directly before queueing to avoid copies */
+static bool receive_packet(void *data, const qlinq_event_t *event) {
+  tunnel_receiver_t *receiver = data;
+  if (event->stream != receiver->subscriber)
+    return true;
+  if (!valid_packet(event->record.data, event->record.size) ||
+      event->record.size > receiver->mtu) {
+    receiver->queue->dropped++;
+    return true;
+  }
+  receiver->received++;
+  receiver->bytes += event->record.size;
+  if (receiver->fd < 0)
+    return true;
+  if (!flush_packets(receiver->queue, receiver->fd, receiver->max_age))
+    return false;
+  if (receiver->queue->count) {
+    enqueue_packet(receiver->queue, event->record.data, event->record.size);
+    return true;
+  }
+  ssize_t written;
+  do {
+    written = tun_write(receiver->fd, event->record.data, event->record.size);
+  } while (written < 0 && errno == EINTR);
+  if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    enqueue_packet(receiver->queue, event->record.data, event->record.size);
+    return true;
+  }
+  if (written != (ssize_t)event->record.size) {
+    fprintf(stderr, "direct TUN packet write failed: %s\n",
+            written < 0 ? strerror(errno) : "short write");
+    return false;
+  }
+  return true;
+}
+
 static void make_mock_packet(packet_t *packet, uint64_t sequence) {
   packet->size = 64;
   memset(packet->bytes, 0, packet->size);
@@ -439,7 +483,14 @@ static int run_tunnel(const options_t *options) {
     }
   }
 
-  qlinq_context_t *context = qlinq_context_create(NULL);
+  receive_queue_t queue = {0};
+  tunnel_receiver_t receiver = {.queue = &queue,
+                                .fd = tun_fd,
+                                .mtu = options->mtu,
+                                .max_age = options->queue_ms};
+  qlinq_context_config_t context_config = {.record_callback = receive_packet,
+                                           .record_user_data = &receiver};
+  qlinq_context_t *context = qlinq_context_create(&context_config);
   if (!context) {
     fprintf(stderr, "failed to create qlinq context\n");
     if (tun_fd >= 0)
@@ -486,6 +537,7 @@ static int run_tunnel(const options_t *options) {
       endpoint ? qlinq_publish(endpoint, &stream_config) : NULL;
   qlinq_stream_t *subscriber =
       endpoint ? qlinq_subscribe(endpoint, &stream_config) : NULL;
+  receiver.subscriber = subscriber;
   if (!endpoint || !publisher || !subscriber) {
     fprintf(stderr, "failed to open direct packet stream (status=%d)\n",
             qlinq_context_last_status(context));
@@ -517,10 +569,9 @@ static int run_tunnel(const options_t *options) {
          options->listen ? "listening" : "connecting", options->track,
          options->delivery, interface_name, options->mock ? " (mock)" : "");
 
-  receive_queue_t queue = {0};
   packet_t pending = {0};
-  uint64_t sent = 0, received = 0, partial = 0;
-  uint64_t tx_bytes = 0, rx_bytes = 0, tx_dropped = 0, last_stats = 0;
+  uint64_t sent = 0, partial = 0;
+  uint64_t tx_bytes = 0, tx_dropped = 0, last_stats = 0;
   const char *state = options->listen ? "listening" : "connecting";
   uint64_t started = monotonic_ms(), last_mock = 0;
   int result = 0;
@@ -538,17 +589,7 @@ static int run_tunnel(const options_t *options) {
     }
     qlinq_event_t event;
     while (qlinq_next_event(context, &event)) {
-      if (event.type == QLINQ_EVENT_RECORD && event.stream == subscriber) {
-        if (valid_packet(event.record.data, event.record.size) &&
-            event.record.size <= options->mtu) {
-          received++;
-          rx_bytes += event.record.size;
-          if (!options->mock)
-            enqueue_packet(&queue, event.record.data, event.record.size);
-        } else {
-          queue.dropped++;
-        }
-      } else if (event.type == QLINQ_EVENT_PEER_READY) {
+      if (event.type == QLINQ_EVENT_PEER_READY) {
         state = "connected";
         fprintf(stderr, "peer %u ready\n", event.peer_id);
       } else if (event.type == QLINQ_EVENT_PEER_DISCONNECTED ||
@@ -568,8 +609,8 @@ static int run_tunnel(const options_t *options) {
     }
     uint64_t now_ms = monotonic_ms();
     if (options->stats_ms && now_ms - last_stats >= options->stats_ms) {
-      print_stats(endpoint, state, sent, received, tx_bytes, rx_bytes,
-                  queue.dropped + tx_dropped);
+      print_stats(endpoint, state, sent, receiver.received, tx_bytes,
+                  receiver.bytes, queue.dropped + tx_dropped);
       last_stats = now_ms;
     }
     if (pending.size && now_ms - pending.queued_ms >= options->queue_ms) {
@@ -648,14 +689,14 @@ static int run_tunnel(const options_t *options) {
     }
   }
   if (options->stats_ms)
-    print_stats(endpoint, "stopped", sent, received, tx_bytes, rx_bytes,
-                queue.dropped + tx_dropped);
+    print_stats(endpoint, "stopped", sent, receiver.received, tx_bytes,
+                receiver.bytes, queue.dropped + tx_dropped);
   printf("direct TUN summary: sent=%llu received=%llu partial=%llu "
          "dropped=%llu\n",
-         (unsigned long long)sent, (unsigned long long)received,
+         (unsigned long long)sent, (unsigned long long)receiver.received,
          (unsigned long long)partial,
          (unsigned long long)(queue.dropped + tx_dropped));
-  if (options->mock && options->run_ms && (!sent || !received))
+  if (options->mock && options->run_ms && (!sent || !receiver.received))
     result = 1;
   qlinq_endpoint_shutdown(endpoint, "tunnel stopped");
   uint64_t drain_until = monotonic_ms() + 250;
