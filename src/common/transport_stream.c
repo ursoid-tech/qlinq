@@ -14,6 +14,14 @@ typedef struct {
   uint8_t bytes[];
 } retained_frame_t;
 
+bool transport_stream_control_pending(const quicly_stream_t *stream) {
+  if (!stream || !stream->data)
+    return false;
+  const transport_stream_ctx_t *ctx = stream->data;
+  return stream->sendstate.pending.num_ranges != 0 &&
+         stream->sendstate.pending.ranges[0].start < ctx->control_end;
+}
+
 static transport_t *stream_owner(quicly_stream_t *stream) {
   transport_conn_t *conn = *quicly_get_data(stream->conn);
   return conn ? conn->transport : NULL;
@@ -380,6 +388,8 @@ bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,
   stats->stream_egress_bytes += growth * sizeof(quicly_sendbuf_vec_t);
   bool appended = sb->vecs.size != old_size;
   if (appended) {
+    if (!application_data)
+      ctx->control_end = sb->bytes_written;
     size_t bytes = sizeof(*retained) + frame_len;
     ctx->retained_frame_bytes += bytes;
     stats->stream_egress_bytes += bytes;
