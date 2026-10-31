@@ -105,8 +105,9 @@ NANORQ_CODEC_OBJS = $(NANORQ_OBJS) deps/nanors/deps/obl/oblas_common.o \
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
-TRANSPORT_OBJS = src/common/qlinq.o \
-              src/common/transport_repair_policy.o \
+# The protocol engine has an independent positive object list. Native network
+# I/O and the application polling loop are composed only into the public host.
+ENGINE_OBJS = src/common/transport_repair_policy.o \
               src/common/transport_policy_scheduler.o \
               src/common/cli_parse.o \
               src/common/transport_config.o \
@@ -123,17 +124,20 @@ TRANSPORT_OBJS = src/common/qlinq.o \
               src/common/transport_subscriptions.o \
               src/common/transport_tls.o \
               src/common/transport_tracks.o \
-              src/common/transport_udp.o \
               src/common/transport_wire.o \
-              src/common/transport_quicly.o \
+              src/common/transport_drive.o src/common/transport_quicly.o \
+              src/common/transport_time.o \
               src/common/fec.o \
               deps/nanors/rs.o \
               deps/nanors/deps/obl/oblas_common.o \
               deps/nanors/deps/obl/oblas_lite.o \
               $(QUICLY_OBJS) \
               $(NANORQ_OBJS) \
-              $(PATHFLOW_OBJS) \
-              $(IFMON_OBJS)
+              $(PATHFLOW_OBJS)
+
+
+POLL_HOST_OBJS = src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
+TRANSPORT_OBJS = src/common/qlinq.o $(ENGINE_OBJS) $(POLL_HOST_OBJS)
 
 COMMON_OBJS = src/common/data_uds.o \
               $(TRANSPORT_OBJS)
@@ -165,6 +169,8 @@ NANORQ_NATIVE_CFLAGS=$(NANORQ_NATIVE_CFLAGS)
 WITH_FUSION=$(WITH_FUSION)
 FUSION_CFLAGS=$(FUSION_CFLAGS)
 LDFLAGS=$(LDFLAGS)
+ENGINE_OBJS=$(ENGINE_OBJS)
+POLL_HOST_OBJS=$(POLL_HOST_OBJS)
 TRANSPORT_OBJS=$(TRANSPORT_OBJS)
 endef
 
@@ -459,7 +465,19 @@ t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .bu
 t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
+t/00util/test_transport_drive: t/00util/test_transport_drive.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=socket,--wrap=pipe,--wrap=clock_gettime
+
+t/00util/test_transport_engine.o: t/00util/test_transport_drive.c .build-config
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -DTRANSPORT_ENGINE_ONLY=1 -c $< -o $@
+
+t/00util/test_transport_engine: t/00util/test_transport_engine.o $(ENGINE_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=clock_gettime,-Map,$@.map
+
+t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=clock_gettime,-Map,$@.map
+
+CHECK_BINARIES = t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
@@ -482,7 +500,7 @@ CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util
 t/00util/test_multipath_failover: t/00util/test_multipath_failover.o $(filter-out src/common/transport_udp.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/transport_quicly_clock.o: src/common/transport_quicly.c Makefile
+t/00util/transport_time_clock.o: src/common/transport_time.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dclock_gettime=test_clock_gettime -c $< -o $@
 
@@ -490,7 +508,7 @@ t/00util/transport_publish_admission.o: src/common/transport_publish.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dtransport_path_admission_rate=test_path_admission_rate -c $< -o $@
 
-t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_quicly_clock.o t/00util/transport_publish_admission.o $(filter-out src/common/transport_quicly.o src/common/transport_publish.o,$(COMMON_OBJS))
+t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_time_clock.o t/00util/transport_publish_admission.o $(filter-out src/common/transport_time.o src/common/transport_publish.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # The feedback fixture delegates native operations except during its explicit
@@ -516,17 +534,18 @@ t/00util/test_rx_cadence: t/00util/test_rx_cadence.o $(filter-out src/common/qli
 t/00util/test_rx_cadence_backlog: t/00util/test_rx_cadence_backlog.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/transport_egress_cadence.o: src/common/transport_egress.c Makefile
+t/00util/transport_poll_host_cadence.o: src/common/transport_poll_host.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dtransport_udp_send_batch_ecn=test_cadence_udp_send_batch -c $< -o $@
 
-t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_egress_cadence.o $(filter-out src/common/qlinq.o src/common/transport_egress.o,$(COMMON_OBJS))
+t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_poll_host_cadence.o $(filter-out src/common/qlinq.o src/common/transport_poll_host.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
+	rm -f t/00util/test_transport_engine t/00util/test_transport_engine.map t/00util/test_recovery_latency t/00util/test_recovery_latency.map
 	rm -f $(QUICLY_INTEGRATION_TEST)
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete

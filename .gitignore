@@ -127,3 +127,9 @@ qlinq-tun-engine
 /t/00util/test_tun_vnet
 /t/00util/test_tun_tx_kernel
 /t/00util/test_tun_rx_kernel
+
+/t/00util/test_transport_drive
+/t/00util/test_transport_engine
+/t/00util/test_transport_engine.map
+/t/00util/test_recovery_latency
+/t/00util/test_recovery_latency.map

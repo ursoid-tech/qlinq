@@ -1,22 +1,22 @@
 #ifndef QLINQ_TRANSPORT_INTERNAL_H
 #define QLINQ_TRANSPORT_INTERNAL_H
 
-#include "ifmon.h"
 #include "pathflow.h"
 #include "transport.h"
+#include "transport_drive.h"
 #include "transport_egress.h"
 #include "transport_fec_state.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
 #include "transport_repair.h"
 #include "transport_subscriptions.h"
-#include "transport_udp.h"
 
 #include "picotls.h"
 #include "picotls/openssl.h"
 #include "quicly.h"
 
 #include <pthread.h>
+#include <string.h>
 #include <stdatomic.h>
 
 #define QLINQ_FEC_ASSEMBLER_TIMEOUT_MS 2000
@@ -54,24 +54,32 @@ typedef struct {
   bool pending; /* Attempted bytes and identity stay fixed until completion. */
 } transport_pending_group_t;
 
-/* Physical sockets are shared by all peers. Connection path records use the
- * same socket slot; QUIC path IDs are resolved separately and may differ. */
+/* logical local paths are shared by all peers; QUIC path IDs may differ */
 typedef struct {
-  int fd;
+  int egress_id; /* bounded opaque incarnation used by retained egress */
+  uint64_t drive_id;
+  transport_t *owner;
   struct sockaddr_storage local_addr;
   socklen_t local_addr_len;
   uint32_t interface_index;
   char interface_name[64];
   uint64_t bytes_received;
   transport_egress_t egress;
-  transport_udp_gro_t *gro;
-  /* A receive quantum ended without proving this socket drained. Retain
-   * through timer-only ticks; socket compaction moves the flag with its fd. */
-  bool receive_backlog;
   size_t remote_index;
   bool open_pending;
   uint64_t open_retry_at_ms;
-} transport_socket_t;
+} transport_local_path_t;
+
+static inline transport_drive_path_t
+transport_local_path_info(const transport_local_path_t *path) {
+  transport_drive_path_t info = {.id = path->drive_id,
+                                 .local = path->local_addr,
+                                 .local_len = path->local_addr_len,
+                                 .interface_index = path->interface_index};
+  memcpy(info.interface_name, path->interface_name,
+         sizeof(info.interface_name));
+  return info;
+}
 
 typedef struct {
   path_state_t state;
@@ -86,6 +94,13 @@ typedef struct {
 } transport_conn_path_t;
 
 struct transport_t {
+  transport_drive_host_t drive_host;
+  bool host_callback_active, turn_active;
+  void *host_context; /* optional owner of the public polling wrapper */
+  void (*host_dispose)(void *);
+  uint64_t drive_now_ns, next_drive_id;
+  quicly_now_t driver_quic_now;
+  ptls_get_time_t driver_tls_now;
   transport_callback_t callback;
   void *user_data;
   transport_log_callback_t log_callback;
@@ -99,8 +114,7 @@ struct transport_t {
   uint32_t reconnect_current_delay_ms;
   int64_t reconnect_at_ms;
   char server_name[256];
-  bool multihome;
-  transport_socket_t sockets[TRANSPORT_MAX_PATHS];
+  transport_local_path_t sockets[TRANSPORT_MAX_PATHS];
   size_t socket_count;
   uint16_t bind_port; /* Stable while all local interfaces are unavailable. */
   char path_interface_names[TRANSPORT_MAX_PATHS][64];
@@ -111,7 +125,6 @@ struct transport_t {
   pthread_t owner_thread;
   bool tick_active;
   bool log_callback_active;
-  size_t receive_cursor;
   bool send_backlog;
   size_t callback_depth;
 
@@ -148,8 +161,6 @@ struct transport_t {
   transport_pending_group_t pending_group;
   transport_fec_track_state_t fec_tracks[TRANSPORT_HARD_MAX_SUBSCRIPTIONS];
 
-  ifmon_watcher_t ifmon_w;
-  int ifmon_pipe[2];
   transport_fec_cache_t fec_cache;
   size_t assembler_memory_bytes;
 };
@@ -267,6 +278,20 @@ transport_checkpoint_ack(const transport_conn_t *conn, uint8_t alias) {
   return state ? &state->checkpoint_ack : NULL;
 }
 
+typedef struct {
+  uint32_t index;
+  char name[64];
+  struct sockaddr_storage addr;
+  socklen_t addr_len;
+  int is_added;
+} transport_interface_event_t;
+const char *transport_engine_open_path(transport_t *, transport_local_path_t *);
+bool transport_drive_input_pending(transport_t *t);
+bool transport_engine_begin_turn(transport_t *t);
+void transport_engine_end_turn(transport_t *t);
+uint64_t transport_now_ns(const transport_t *t);
+int64_t transport_now_ms(const transport_t *t);
+void transport_drive_setup_clocks(transport_t *t);
 uint64_t transport_get_time_ns(void);
 uint64_t transport_get_monotonic_ns(void);
 bool transport_owner_ok(transport_t *t);

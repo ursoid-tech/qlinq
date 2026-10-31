@@ -84,6 +84,15 @@ ssize_t transport_udp_send_batch_pktinfo(
                                       datagrams, count, max_gso_segments, ecn);
 }
 
+static ssize_t test_sender(void *context, int fd, const struct sockaddr *dest,
+                           socklen_t len, const struct sockaddr *source,
+                           uint32_t ifindex, const struct iovec *datagrams,
+                           size_t count, size_t gso, uint8_t ecn) {
+  (void)context;
+  return transport_udp_send_batch_pktinfo(fd, dest, len, source, ifindex,
+                                          datagrams, count, gso, ecn);
+}
+
 static void submit_sequence(transport_egress_t *egress,
                             const struct sockaddr_in *destination,
                             size_t sequence, size_t size) {
@@ -109,6 +118,7 @@ static void test_queue_pressure(bool byte_pressure) {
   struct sockaddr_in destination = {.sin_family = AF_INET,
                                     .sin_port = htons(2)};
   assert(transport_egress_init(&egress, capacity, byte_limit));
+  (&egress)->sender = test_sender;
   failure = EAGAIN;
   inspect_payloads = false;
   for (size_t i = 0; i < accepted; ++i)
@@ -195,6 +205,7 @@ static void test_retained_grouping_policy(void) {
   struct sockaddr_in destination = {.sin_family = AF_INET,
                                     .sin_port = htons(2)};
   assert(transport_egress_init(&egress, 12, 12 * 32));
+  (&egress)->sender = test_sender;
   failure = EAGAIN;
   inspect_payloads = inspect_policy = false;
   for (size_t sequence = 0; sequence < 5; sequence++)
@@ -265,6 +276,7 @@ static void test_retained_grouping_policy(void) {
 static void test_retained_ecn(void) {
   transport_egress_t egress;
   assert(transport_egress_init(&egress, 16, 4096));
+  (&egress)->sender = test_sender;
   struct sockaddr_in destination = {.sin_family = AF_INET,
                                     .sin_port = htons(2)};
   uint8_t bytes[32] = {0};
@@ -303,6 +315,7 @@ int main(void) {
   test_retained_grouping_policy();
   transport_egress_t egress;
   assert(transport_egress_init(&egress, 128, 4096));
+  (&egress)->sender = test_sender;
   struct sockaddr_in bad = {.sin_family = AF_INET, .sin_port = htons(1)};
   struct sockaddr_in good = {.sin_family = AF_INET, .sin_port = htons(2)};
   char bytes[] = "packet";
