@@ -163,8 +163,8 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
      * native owner now so the sampled state and queue remain available to the
      * next publication; an unowned automatic EWMA is not usable history. */
     if (!path->state_overridden && !path->measurement.initialized) {
-      (void)transport_path_measure(&path->measurement, &stats, mapped, queued,
-                                   measure_now);
+      (void)transport_path_measure_on_path(&path->measurement, conn->quic,
+                                           &stats, mapped, queued, measure_now);
       memset(&path->state, 0, sizeof(path->state));
     }
     bool measured =
@@ -194,10 +194,12 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
                                    estimate_symbol_size, measure_now);
       if (candidate->sample.b > cap)
         candidate->sample.b = cap;
-      fp_t rate = measured && path->state.initialized ? path->state.b_ewma
-                                                      : candidate->sample.b;
+      /* use current estimate rather than lagging ewma for admission rate */
+      fp_t rate = candidate->sample.b;
       if (rate > cap)
         rate = cap;
+      /* supply admission headroom up to capacity ceiling so cwnd can grow */
+      rate = transport_path_admission_rate(rate, cap);
       size_t reserved =
           transport_path_budget_update(&path->budget, rate, admission_now);
       if (reserved > candidate->sample.q)

@@ -498,6 +498,21 @@ static int test_path_pacing_inputs(void) {
       "saturated receive BDP clamps to cap without wrapping the reorder floor");
 
   transport_path_measurement_t measurement = {0};
+  quicly_path_stats_t cold = {.cwnd = 1000000, .rtt_smoothed = 66};
+  cold.local.sa.sa_family = cold.remote.sa.sa_family = AF_INET;
+  CHECK(transport_path_measure_on_path(&measurement, NULL, &cold, 0, 1, 1000) &&
+            measurement.minimum_rtt == 0,
+        "an unverified initial RTT cannot establish a queueing baseline");
+  cold.rtt_smoothed = 100;
+  cold.acked = cold.sent = 100;
+  cold.bytes_acked = 100000;
+  transport_path_measure(&measurement, &cold, 0, 1, 1200);
+  CHECK(measurement.minimum_rtt == 100 &&
+            transport_path_probe_cap(&measurement, &cold, 1120, 1200) ==
+                FP_FROM_INT(FP_SAFE_WHOLE),
+        "first measured 100 ms RTT is not queue growth from a 66 ms estimate");
+  memset(&measurement, 0, sizeof(measurement));
+
   quicly_path_stats_t stats = {.cwnd = 1000000, .rtt_smoothed = 40};
   stats.local.sa.sa_family = stats.remote.sa.sa_family = AF_INET;
   CHECK(transport_path_measure(&measurement, &stats, 0, 1, 1000),
@@ -539,6 +554,18 @@ static int test_path_pacing_inputs(void) {
         "loss counter reset starts fresh measurement");
 
   transport_path_budget_t budget = {0};
+  CHECK(transport_path_admission_rate(FP_FROM_INT(100), FP_FROM_INT(200)) ==
+            FP_FROM_INT(125),
+        "healthy admission has headroom to fill native CWND");
+  CHECK(transport_path_admission_rate(FP_FROM_INT(100), FP_FROM_INT(110)) ==
+                FP_FROM_INT(110) &&
+            transport_path_admission_rate(FP_FROM_INT(100), FP_FROM_INT(75)) ==
+                FP_FROM_INT(75),
+        "measured capacity still bounds admission headroom");
+  CHECK(transport_path_admission_rate(FP_MAX, FP_FROM_INT(FP_SAFE_WHOLE)) ==
+            FP_FROM_INT(FP_SAFE_WHOLE),
+        "admission headroom cannot overflow fixed-point capacity");
+
   CHECK(transport_path_budget_burst(FP_FROM_INT(100)) == 8 &&
             transport_path_budget_burst(FP_FROM_INT(2000)) == 64,
         "burst scales from low-rate latency budget to QUIC queue bound");

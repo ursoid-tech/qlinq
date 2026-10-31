@@ -31,6 +31,12 @@ typedef struct {
 bool transport_path_measure(transport_path_measurement_t *measurement,
                             const quicly_path_stats_t *stats, size_t quic_path,
                             size_t queued_datagrams, uint64_t now_ms);
+/* cold-start rtt is not a measured propagation baseline */
+bool transport_path_measure_on_path(transport_path_measurement_t *measurement,
+                                    quicly_conn_t *quic,
+                                    const quicly_path_stats_t *stats,
+                                    size_t quic_path, size_t queued_datagrams,
+                                    uint64_t now_ms);
 /* A recent ACK rate is demand-limited on an underused path. It caps the
  * cwnd/RTT estimate only while a busy path has RTT inflation; an absent,
  * stale, or clean-RTT sample deliberately leaves that estimate alone. */
@@ -48,6 +54,8 @@ typedef struct {
 /* Limit a path to about 50 ms of scheduler-visible work, while retaining a
  * small cold-start burst and never exceeding the QUIC path queue boundary. */
 size_t transport_path_budget_burst(fp_t rate);
+/* provide headroom for native paced sender up to measured ceiling */
+fp_t transport_path_admission_rate(fp_t estimate, fp_t ceiling);
 size_t transport_path_budget_update(transport_path_budget_t *budget, fp_t rate,
                                     uint64_t now_ns);
 void transport_path_budget_charge(transport_path_budget_t *budget);
