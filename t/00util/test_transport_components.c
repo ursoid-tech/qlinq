@@ -262,7 +262,9 @@ static int test_udp_batch_boundaries(int family) {
                {3, {80, 0, 40}, 0, 0, 0, 0},  {64, {0}, 1280, 64, 0, 0},
                {64, {0}, 1500, 64, 0, 0},     {64, {0}, 1280, 63, 13, 0},
                {64, {0}, 1280, 31, 0, 0},     {16, {0}, 1280, 16, 0, 6},
-               {32, {0}, 1280, 32, 0, 6},     {64, {0}, 1280, 64, 0, 6}};
+               {32, {0}, 1280, 32, 0, 6},     {64, {0}, 1280, 64, 0, 6},
+               {64, {0}, 1280, 0, 40, 0},     {64, {0}, 1280, 0, 0, 0},
+               {64, {0}, 1280, 0, 40, 6},     {64, {0}, 1280, 0, 0, 6}};
   int version = family == AF_INET ? 4 : 6;
   /* Match the UDP receive/GRO fixtures: both address families are required.
    * A missing IPv6 stack or loopback address is a visible setup failure. */
