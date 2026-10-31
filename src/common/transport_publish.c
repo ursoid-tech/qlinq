@@ -26,6 +26,8 @@ bool transport_publish_recipient_eligible(const transport_t *t,
                                           const moq_track_id_t *track) {
   return t && conn && track && conn->quic && conn->protocol_ready &&
          conn->authenticated &&
+         (t->tls_group_policy == QLINQ_TLS_GROUP_CLASSICAL ||
+          conn->tls.policy_accepted) &&
          quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
          (!t->is_server ||
           transport_subscriptions_contains(&conn->send_subscriptions, track));

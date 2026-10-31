@@ -112,6 +112,67 @@ int main(void) {
   config.pacing = (qlinq_pacing_t)(QLINQ_PACING_ENABLED + 1);
   assert(!qlinq_connect(context, &config));
   assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
+  config.initial_cwnd_packets = 0;
+  config.congestion_control = QLINQ_CC_DEFAULT;
+  config.pacing = QLINQ_PACING_DEFAULT;
+  for (int policy = 0; policy <= QLINQ_TLS_GROUP_REQUIRE_HYBRID; policy++) {
+    config.security.tls_group_policy = policy;
+    qlinq_endpoint_t *endpoint = qlinq_connect(context, &config);
+    if (!endpoint) {
+      assert(policy == QLINQ_TLS_GROUP_REQUIRE_HYBRID);
+      continue;
+    }
+    assert(endpoint->transport->tls_group_policy ==
+           config.security.tls_group_policy);
+    config.security.tls_group_policy = QLINQ_TLS_GROUP_CLASSICAL;
+    assert(endpoint->transport->tls_group_policy ==
+           (qlinq_tls_group_policy_t)policy);
+    qlinq_endpoint_close(endpoint);
+  }
+  config.security.tls_group_policy = -1;
+  assert(!qlinq_connect(context, &config));
+  assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
+  config.security.tls_group_policy = 3;
+  assert(!qlinq_connect(context, &config));
+  assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
+  /* Verify the public peer snapshot carries the actual verified TLS result. */
+  qlinq_endpoint_config_t server_config = {
+      .bind_addresses = {"127.0.0.1"},
+      .bind_address_count = 1,
+      .port = 20203,
+      .security = {.certificate_file = "t/assets/verified.crt",
+                   .private_key_file = "t/assets/verified.key",
+                   .trust_store_file = "t/assets/verified.crt",
+                   .verify_peer = true,
+                   .tls_group_policy = QLINQ_TLS_GROUP_PREFER_HYBRID}};
+  qlinq_endpoint_t *server = qlinq_listen(context, &server_config);
+  assert(server);
+  qlinq_endpoint_config_t client_config = server_config;
+  client_config.remote_addresses[0] = "127.0.0.1";
+  client_config.remote_address_count = 1;
+  qlinq_endpoint_t *client = qlinq_connect(context, &client_config);
+  assert(client);
+  for (int i = 0; i < 3000; i++) {
+    assert(qlinq_service(context, 1) == QLINQ_STATUS_OK);
+    qlinq_event_t event;
+    while (qlinq_next_event(context, &event))
+      qlinq_event_release(&event);
+    if (server->peers && client->peers && server->peers->ready &&
+        client->peers->ready)
+      break;
+  }
+  assert(server->peers && client->peers);
+  qlinq_peer_info_t server_info, client_info;
+  assert(qlinq_endpoint_get_peer(server, server->peers->id, &server_info));
+  assert(qlinq_endpoint_get_peer(client, client->peers->id, &client_info));
+  assert(server_info.ready && client_info.ready);
+  assert(server_info.tls.complete && client_info.tls.complete);
+  assert(server_info.tls.policy_accepted && client_info.tls.policy_accepted);
+  assert(server_info.tls.verify_peer && client_info.tls.verify_peer);
+  assert(server_info.tls.selected_group == client_info.tls.selected_group);
+  assert(server_info.tls.selected_group ==
+         (server->transport->tls_hybrid_available ? PTLS_GROUP_X25519MLKEM768
+                                                  : PTLS_GROUP_SECP256R1));
   qlinq_context_destroy(context);
   puts("===QLINQ POLICY OK===");
   return 0;

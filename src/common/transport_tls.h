@@ -6,6 +6,15 @@
 #include "picotls/openssl.h"
 #include "quicly/cid.h"
 
+/* Resolve once at creation; sessions/reconnects reuse endpoint-owned lists. */
+bool transport_tls_configure_groups(transport_t *transport,
+                                    qlinq_tls_group_policy_t policy);
+/* Observe actual local TLS state; never use QUIC readiness as completion. */
+void transport_tls_observe(transport_conn_t *conn);
+void transport_tls_note_failure(transport_conn_t *conn);
+bool transport_tls_application_allowed(transport_conn_t *conn);
+void transport_tls_get_info(const transport_conn_t *conn,
+                            qlinq_tls_info_t *info);
 /* OpenSSL by default; explicit Fusion selection has build/CPU fallback. */
 bool transport_tls_configure_crypto_backend(transport_t *transport);
 /* Call after backend configuration; inherits its explicit selection/CPU guard.

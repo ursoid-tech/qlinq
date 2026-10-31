@@ -131,6 +131,49 @@ typedef struct {
   size_t max_packets_per_service;
 } qlinq_limits_t;
 
+/* TLS key agreement only; authentication is configured independently.
+ * Zero preserves the existing P-256 default. */
+typedef enum {
+  QLINQ_TLS_GROUP_CLASSICAL = 0,
+  QLINQ_TLS_GROUP_PREFER_HYBRID,
+  QLINQ_TLS_GROUP_REQUIRE_HYBRID
+} qlinq_tls_group_policy_t;
+
+typedef enum {
+  QLINQ_TLS_EXCHANGE_PENDING = 0,
+  QLINQ_TLS_EXCHANGE_CLASSICAL,
+  QLINQ_TLS_EXCHANGE_HYBRID,
+  QLINQ_TLS_EXCHANGE_REJECTED
+} qlinq_tls_exchange_t;
+typedef enum {
+  QLINQ_TLS_HANDSHAKE_PENDING = 0,
+  QLINQ_TLS_HANDSHAKE_FULL,
+  QLINQ_TLS_HANDSHAKE_PSK
+} qlinq_tls_handshake_t;
+typedef enum {
+  QLINQ_TLS_HYBRID_NOT_PROBED = 0, /* classical policy */
+  QLINQ_TLS_HYBRID_AVAILABLE,
+  QLINQ_TLS_HYBRID_UNAVAILABLE
+} qlinq_tls_hybrid_capability_t;
+typedef struct {
+  qlinq_tls_group_policy_t configured_policy;
+  qlinq_tls_hybrid_capability_t local_hybrid_capability;
+  char local_hybrid_reason[64];
+  bool complete;
+  uint16_t selected_group; /* zero explicitly means unknown/no key share */
+  char selected_group_name[32];
+  qlinq_tls_exchange_t exchange;
+  bool policy_accepted;
+  qlinq_tls_handshake_t handshake;
+  bool verify_peer;
+  char rejection_reason[64];
+} qlinq_tls_info_t;
+
+/* Strict spellings: classical, prefer-hybrid, require-hybrid. */
+const char *qlinq_tls_group_policy_name(qlinq_tls_group_policy_t policy);
+bool qlinq_tls_group_policy_parse(const char *text,
+                                  qlinq_tls_group_policy_t *policy);
+
 typedef struct {
   /* qlinq copies the secret. An empty secret is valid but is intended only for
    * isolated deployments. */
@@ -141,6 +184,7 @@ typedef struct {
   const char *trust_store_file;
   bool verify_peer;
   bool allow_insecure_peer;
+  qlinq_tls_group_policy_t tls_group_policy;
 } qlinq_security_config_t;
 
 typedef struct {
@@ -400,6 +444,7 @@ typedef struct {
   bool quic_ready;
   bool protocol_ready;
   bool authenticated;
+  qlinq_tls_info_t tls;
   /* Alternate-path validation events; the initial handshake path is excluded.
    */
   uint64_t paths_validated;

@@ -667,6 +667,7 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
       (config->security.shared_secret_size != 0 &&
        !config->security.shared_secret) ||
       config->security.shared_secret_size > UINT16_MAX ||
+      !qlinq_tls_group_policy_name(config->security.tls_group_policy) ||
       (unsigned)config->congestion_control > QLINQ_CC_CUBIC ||
       (unsigned)config->pacing > QLINQ_PACING_ENABLED ||
       config->initial_cwnd_packets > QLINQ_MAX_INITIAL_CWND_PACKETS ||
@@ -738,6 +739,7 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.reconnect_initial_delay_ms =
       config->reconnect_initial_delay_ms;
   transport_config.reconnect_max_delay_ms = config->reconnect_max_delay_ms;
+  transport_config.tls_group_policy = config->security.tls_group_policy;
   transport_config.cert_file = config->security.certificate_file;
   transport_config.key_file = config->security.private_key_file;
   transport_config.ca_file = config->security.trust_store_file;
@@ -899,6 +901,7 @@ bool qlinq_endpoint_get_peer(qlinq_endpoint_t *endpoint, uint32_t id,
                                 .quic_ready = stats.quic_ready,
                                 .protocol_ready = stats.protocol_ready,
                                 .authenticated = stats.authenticated,
+                                .tls = stats.tls,
                                 .paths_validated = stats.quic_paths_validated,
                                 .paths_validation_failed =
                                     stats.quic_paths_validation_failed};

@@ -60,6 +60,7 @@ typedef struct {
   uint16_t port;
   uint64_t run_ms;
   qlinq_delivery_t delivery;
+  qlinq_tls_group_policy_t tls_group_policy;
 } options_t;
 
 typedef struct {
@@ -102,6 +103,8 @@ static void usage(FILE *out, const char *program) {
       "  --mode MODE             fixedrate/fec (default), rateless, reliable, "
       "datagram\n"
       "  --cert FILE --key FILE  TLS identity (required on listener)\n"
+      "  --tls-group-policy POLICY classical (default), prefer-hybrid, "
+      "require-hybrid\n"
       "  --ca FILE               Trust store for verified peers\n"
       "  --insecure-no-verify    Disable certificate verification (tests "
       "only)\n"
@@ -189,6 +192,9 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         options->cert = value;
       } else if (strcmp(arg, "--key") == 0) {
         options->key = value;
+      } else if (strcmp(arg, "--tls-group-policy") == 0) {
+        if (!qlinq_tls_group_policy_parse(value, &options->tls_group_policy))
+          return false;
       } else if (strcmp(arg, "--ca") == 0) {
         options->ca = value;
       } else if (strcmp(arg, "--run-as") == 0) {
@@ -395,7 +401,46 @@ static void json_string(const char *value) {
   putchar('"');
 }
 
-static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
+static void print_tls(qlinq_endpoint_t *endpoint, uint32_t peer_id,
+                      qlinq_tls_group_policy_t policy) {
+  printf("\"tls_group_policy\":\"%s\",\"peer_id\":%u,\"tls\":",
+         qlinq_tls_group_policy_name(policy), peer_id);
+  qlinq_peer_info_t peer;
+  if (!peer_id || !qlinq_endpoint_get_peer(endpoint, peer_id, &peer)) {
+    fputs("null", stdout);
+    return;
+  }
+  const qlinq_tls_info_t *tls = &peer.tls;
+  printf("{\"complete\":%s,\"policy_accepted\":%s,\"selected_group\":%u,"
+         "\"verify_peer\":%s,\"selected_group_name\":",
+         tls->complete ? "true" : "false",
+         tls->policy_accepted ? "true" : "false", tls->selected_group,
+         tls->verify_peer ? "true" : "false");
+  json_string(tls->selected_group_name);
+  fputs(",\"exchange\":", stdout);
+  json_string(tls->exchange == QLINQ_TLS_EXCHANGE_HYBRID      ? "hybrid"
+              : tls->exchange == QLINQ_TLS_EXCHANGE_CLASSICAL ? "classical"
+              : tls->exchange == QLINQ_TLS_EXCHANGE_REJECTED  ? "rejected"
+                                                              : "pending");
+  fputs(",\"handshake\":", stdout);
+  json_string(tls->handshake == QLINQ_TLS_HANDSHAKE_FULL  ? "full"
+              : tls->handshake == QLINQ_TLS_HANDSHAKE_PSK ? "psk"
+                                                          : "pending");
+  fputs(",\"local_hybrid_capability\":", stdout);
+  json_string(tls->local_hybrid_capability == QLINQ_TLS_HYBRID_AVAILABLE
+                  ? "available"
+              : tls->local_hybrid_capability == QLINQ_TLS_HYBRID_UNAVAILABLE
+                  ? "unavailable"
+                  : "not-probed");
+  fputs(",\"local_hybrid_reason\":", stdout);
+  json_string(tls->local_hybrid_reason);
+  fputs(",\"rejection_reason\":", stdout);
+  json_string(tls->rejection_reason);
+  putchar('}');
+}
+
+static void print_stats(qlinq_endpoint_t *endpoint, uint32_t peer_id,
+                        qlinq_tls_group_policy_t policy, const char *state,
                         uint64_t sent, uint64_t received, uint64_t tx_bytes,
                         uint64_t rx_bytes, uint64_t dropped) {
   qlinq_endpoint_stats_t stats = {0};
@@ -408,7 +453,9 @@ static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
   }
   if (strcmp(state, "connected") == 0 && !have_active_path)
     state = "degraded";
-  printf("QLINQ_STATUS {\"state\":\"%s\",\"sent\":%llu,\"received\":%llu,"
+  fputs("QLINQ_STATUS {", stdout);
+  print_tls(endpoint, peer_id, policy);
+  printf(",\"state\":\"%s\",\"sent\":%llu,\"received\":%llu,"
          "\"tx_bytes\":%llu,\"rx_bytes\":%llu,\"dropped\":%llu,"
          "\"fec_recovered\":%llu,\"fec_decoded\":%llu,\"fec_lost\":%llu,"
          "\"reconnects\":%llu,"
@@ -513,6 +560,7 @@ static int run_tunnel(const options_t *options) {
                    .certificate_file = options->cert,
                    .private_key_file = options->key,
                    .trust_store_file = options->ca,
+                   .tls_group_policy = options->tls_group_policy,
                    .verify_peer = !options->insecure,
                    .allow_insecure_peer = options->insecure}};
   if (options->bind_count) {
@@ -569,9 +617,12 @@ static int run_tunnel(const options_t *options) {
          options->listen ? "listening" : "connecting", options->track,
          options->delivery, interface_name, options->mock ? " (mock)" : "");
 
+  fprintf(stderr, "qlinq-tun: tls-group-policy=%s\n",
+          qlinq_tls_group_policy_name(options->tls_group_policy));
   packet_t pending = {0};
   uint64_t sent = 0, partial = 0;
   uint64_t tx_bytes = 0, tx_dropped = 0, last_stats = 0;
+  uint32_t peer_id = 0;
   const char *state = options->listen ? "listening" : "connecting";
   uint64_t started = monotonic_ms(), last_mock = 0;
   int result = 0;
@@ -591,10 +642,13 @@ static int run_tunnel(const options_t *options) {
     while (qlinq_next_event(context, &event)) {
       if (event.type == QLINQ_EVENT_PEER_READY) {
         state = "connected";
+        peer_id = event.peer_id;
         fprintf(stderr, "peer %u ready\n", event.peer_id);
       } else if (event.type == QLINQ_EVENT_PEER_DISCONNECTED ||
                  event.type == QLINQ_EVENT_SUBSCRIBER_LEFT) {
         /* do not replay an old IP packet after reconnect */
+        if (event.type == QLINQ_EVENT_PEER_DISCONNECTED)
+          peer_id = 0;
         pending.size = 0;
         queue.dropped += queue.count;
         queue.count = 0;
@@ -609,8 +663,9 @@ static int run_tunnel(const options_t *options) {
     }
     uint64_t now_ms = monotonic_ms();
     if (options->stats_ms && now_ms - last_stats >= options->stats_ms) {
-      print_stats(endpoint, state, sent, receiver.received, tx_bytes,
-                  receiver.bytes, queue.dropped + tx_dropped);
+      print_stats(endpoint, peer_id, options->tls_group_policy, state, sent,
+                  receiver.received, tx_bytes, receiver.bytes,
+                  queue.dropped + tx_dropped);
       last_stats = now_ms;
     }
     if (pending.size && now_ms - pending.queued_ms >= options->queue_ms) {
@@ -689,8 +744,9 @@ static int run_tunnel(const options_t *options) {
     }
   }
   if (options->stats_ms)
-    print_stats(endpoint, "stopped", sent, receiver.received, tx_bytes,
-                receiver.bytes, queue.dropped + tx_dropped);
+    print_stats(endpoint, peer_id, options->tls_group_policy, "stopped", sent,
+                receiver.received, tx_bytes, receiver.bytes,
+                queue.dropped + tx_dropped);
   printf("direct TUN summary: sent=%llu received=%llu partial=%llu "
          "dropped=%llu\n",
          (unsigned long long)sent, (unsigned long long)receiver.received,

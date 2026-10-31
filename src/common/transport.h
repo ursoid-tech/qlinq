@@ -12,6 +12,7 @@
 #define TRANSPORT_H
 
 #include "quicly/constants.h"
+#include "qlinq.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -216,6 +217,8 @@ typedef struct {
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x100U)
 #define TRANSPORT_APP_ERROR_AUTHENTICATION                                     \
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x101U)
+#define TRANSPORT_APP_ERROR_TLS_POLICY                                         \
+  QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x103U)
 #define TRANSPORT_APP_ERROR_RESOURCE_LIMIT                                     \
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x102U)
 
@@ -246,6 +249,7 @@ typedef struct {
   bool verify_peer;      /* require and verify peer certificate (mTLS) */
   bool allow_insecure_peer; /* explicit opt-in for tests; never use in
                                production */
+  qlinq_tls_group_policy_t tls_group_policy;
   transport_callback_t callback;
   void *user_data;
   /* Optional structured diagnostics. When omitted, WARNING and ERROR records
@@ -473,6 +477,7 @@ typedef struct {
   bool quic_ready;
   bool protocol_ready;
   bool authenticated;
+  qlinq_tls_info_t tls;
   size_t subscriptions; /* active send plus receive subscriptions */
   uint32_t peer_capabilities;
   transport_limits_t negotiated_limits;
