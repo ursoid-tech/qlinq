@@ -27,8 +27,10 @@ static void help(void) {
        "    [--interface NAME] [--local-ip IP] [--peer-ip IP]\n"
        "    [--run-as USER] [--route CIDR ...]\n"
        "  pair NAME PEER.json       Trust the client's public identity\n"
-       "  up NAME [--mock]          Start in the background\n"
-       "  run NAME [--mock]         Run in foreground (for systemd)\n"
+       "  up NAME [--mock] [--tx-gso] [--rx-gro]          Start in the "
+       "background\n"
+       "  run NAME [--mock] [--tx-gso] [--rx-gro]         Run in foreground "
+       "(for systemd)\n"
        "  down NAME                 Stop the tunnel\n"
        "  status NAME [--json]      Show live health\n"
        "  metrics NAME [--output /PATH/FILE.prom] [--interval SECONDS]\n"
@@ -74,6 +76,13 @@ static bool parse(int argc, char **argv, tc_args *a) {
   }
   for (; i < argc; i++) {
     const char *option = argv[i];
+    if (!strcmp(option, "--rx-gro") && runtime) {
+      a->rx_gro = true;
+      continue;
+    } else if (!strcmp(option, "--tx-gso") && runtime) {
+      a->tx_gso = true;
+      continue;
+    }
     if (!strcmp(option, "--mock") && (runtime || diag)) {
       a->mock = true;
       continue;
@@ -316,6 +325,10 @@ static int worker(const tc_args *a, const char *dir, const tc_config *c,
   OPT("--mode", c->mode);
   OPT("--mtu", mtu);
   OPT("--queue-ms", queue);
+  if (a->tx_gso)
+    ARG("--tx-gso");
+  if (a->rx_gro)
+    ARG("--rx-gro");
   OPT("--stats-ms", "500");
   OPT("--cert", cert);
   OPT("--key", key);

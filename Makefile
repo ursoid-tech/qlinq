@@ -223,7 +223,7 @@ qlinq-app: $(APP_OBJS) libqlinq.a
 qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
+qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 PREFIX ?= /usr/local
@@ -234,10 +234,55 @@ install-tun: qlinq-tun
 	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
 	install -m 644 packaging/qlinq.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/qlinq.conf
 
-t/00util/test_tun_queue: t/00util/test_tun_queue.o src/host/linux/tun_device.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write
+t/00util/test_tun_queue.o: src/host/linux/tun_direct.c
 
-check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue
+t/00util/test_tun_queue: t/00util/test_tun_queue.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write,--wrap=tun_read_vnet,--wrap=tun_write_vnet,--wrap=tun_write_offload
+
+t/00util/test_tun_segment: t/00util/test_tun_segment.o src/common/tun_segment.o src/common/tun_packet.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_tun_coalesce: t/00util/test_tun_coalesce.o src/common/tun_coalesce.o src/common/tun_segment.o src/common/tun_packet.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+ifeq ($(UNAME_S),Linux)
+TUN_VNET_TEST = t/00util/test_tun_vnet
+t/00util/test_tun_vnet: t/00util/test_tun_vnet.o src/host/linux/tun_device.o
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=open,--wrap=close,--wrap=ioctl,--wrap=readv,--wrap=writev
+endif
+
+t/00util/test_tun_tx_kernel.o: src/host/linux/tun_direct.c
+
+t/00util/test_tun_tx_kernel: t/00util/test_tun_tx_kernel.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_tun_rx_kernel.o: src/host/linux/tun_direct.c
+
+t/00util/test_tun_rx_kernel: t/00util/test_tun_rx_kernel.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+check-tun-offloads: qlinq-tun t/00util/test_tun_tx_kernel t/00util/test_tun_rx_kernel
+	unshare --net ./t/00util/test_tun_tx_kernel 4 on
+	unshare --net ./t/00util/test_tun_tx_kernel 6 on
+	unshare --net ./t/00util/test_tun_tx_kernel 4 off
+	unshare --net ./t/00util/test_tun_tx_kernel 6 off
+	unshare --net ./t/00util/test_tun_rx_kernel 4 on
+	unshare --net ./t/00util/test_tun_rx_kernel 6 on
+	unshare --net ./t/00util/test_tun_rx_kernel 4 off
+	unshare --net ./t/00util/test_tun_rx_kernel 6 off
+
+t/00util/test_tun_packet: t/00util/test_tun_packet.o src/common/tun_packet.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_tun_receive_batch: t/00util/test_tun_receive_batch.o src/common/tun_receive_batch.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST)
+	./t/00util/test_tun_packet
+	./t/00util/test_tun_segment
+	./t/00util/test_tun_coalesce
+	$(if $(TUN_VNET_TEST),./$(TUN_VNET_TEST),true)
+	./t/00util/test_tun_receive_batch
 	./t/00util/test_tun_queue
 	./t/00util/test_tun_names
 	python3 t/test_tun_tool.py
@@ -414,7 +459,7 @@ t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .bu
 t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue \
+CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
@@ -537,3 +582,5 @@ indent:
          $(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
          deps/nanors/deps/obl/oblas_common.d \
          deps/nanors/deps/obl/oblas_lite.d
+
+.PHONY: check-tun-offloads

@@ -83,12 +83,14 @@ class TunnelTool(unittest.TestCase):
         self.call("init", "../escape", "--listen", "127.0.0.1", "--uplink", "lo", expected=1)
 
     def test_lifecycle_reconnect_and_redaction(self):
-        self.call("up", "server", "--mock")
+        self.call("up", "server", "--mock", "--tx-gso", "--rx-gro")
         self.call("up", "client", "--mock")
         for name in ("server", "client"):
             snapshot = self.connected(name)
             self.assertGreater(snapshot["sent"], 0)
             self.assertTrue(snapshot["paths"])
+            self.assertFalse(snapshot["rx_gro_active"])
+            self.assertFalse(snapshot["tx_gso_active"])  # Mock never negotiates a device.
         self.assertIn("already", self.call("up", "server", "--mock").stdout)
         self.call("run", "server", "--mock", expected=1)
         token = json.loads((self.directory / "server/config.json").read_text())["token"]

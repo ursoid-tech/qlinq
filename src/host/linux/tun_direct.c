@@ -2,6 +2,9 @@
 #include "qlinq.h"
 #include "tun_control.h"
 #include "tun_device.h"
+#include "tun_packet.h"
+#include "tun_receive_batch.h"
+#include "tun_coalesce.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -23,8 +26,8 @@
 #endif
 
 #define DEFAULT_TUN_MTU 1400U
-#define PACKET_CAPACITY 2048U
-#define RECEIVE_QUEUE_CAPACITY 64U
+#define PACKET_CAPACITY TUN_RX_PACKET_CAPACITY
+#define RECEIVE_WRITE_BUDGET 2048U
 
 typedef struct {
   uint8_t bytes[PACKET_CAPACITY];
@@ -35,6 +38,7 @@ typedef struct {
 typedef struct {
   bool listen;
   bool mock;
+  bool tx_gso, rx_gro;
   bool insecure;
   const char *bind;
   const char *interface_name;
@@ -61,13 +65,6 @@ typedef struct {
   uint64_t run_ms;
   qlinq_delivery_t delivery;
 } options_t;
-
-typedef struct {
-  packet_t packets[RECEIVE_QUEUE_CAPACITY];
-  size_t head;
-  size_t count;
-  uint64_t dropped;
-} receive_queue_t;
 
 static volatile sig_atomic_t stopping;
 
@@ -106,6 +103,10 @@ static void usage(FILE *out, const char *program) {
       "  --insecure-no-verify    Disable certificate verification (tests "
       "only)\n"
       "  --run-as USER           Drop root privileges after TUN setup\n"
+      "  --rx-gro                Try Linux TCP receive coalescing (default: "
+      "off)\n"
+      "  --tx-gso                Try Linux TCP transmit offloads (default: "
+      "off)\n"
       "  --mock                  Generate/receive packets without a TUN\n"
       "  --run-ms N              Stop mock mode after N milliseconds\n",
       program);
@@ -126,7 +127,11 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       usage(stdout, argv[0]);
       exit(0);
     }
-    if (strcmp(arg, "--mock") == 0) {
+    if (strcmp(arg, "--rx-gro") == 0) {
+      options->rx_gro = true;
+    } else if (strcmp(arg, "--tx-gso") == 0) {
+      options->tx_gso = true;
+    } else if (strcmp(arg, "--mock") == 0) {
       options->mock = true;
     } else if (strcmp(arg, "--insecure-no-verify") == 0) {
       options->insecure = true;
@@ -271,105 +276,189 @@ static bool set_nonblocking(int fd) {
   return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-static bool valid_packet(const void *data, size_t size) {
-  if (!data || size == 0 || size > PACKET_CAPACITY)
+typedef struct {
+  tun_rx_batch_t *queue;
+  qlinq_stream_t *subscriber;
+  int fd;
+  size_t mtu, write_budget;
+  uint64_t received, bytes;
+  bool write_blocked, stopped, failed, vnet, coalesce;
+  uint8_t aggregate[TUN_RX_AGGREGATE_CAPACITY];
+  uint64_t write_calls, written_packets, aggregates, coalesced_packets,
+      copied_bytes;
+} tunnel_receiver_t;
+
+static ssize_t write_receive_packet(tunnel_receiver_t *receiver,
+                                    const void *data, size_t size) {
+  receiver->write_calls++;
+  return receiver->vnet ? tun_write_vnet(receiver->fd, data, size)
+                        : tun_write(receiver->fd, data, size);
+}
+
+static void begin_receive_batch(tunnel_receiver_t *receiver) {
+  (void)tun_rx_batch_begin(receiver->queue);
+  receiver->write_budget = RECEIVE_WRITE_BUDGET;
+  receiver->write_blocked = false;
+}
+
+/* consume owned storage only after whole-packet writes; bound syscalls */
+static bool flush_packets(tunnel_receiver_t *receiver, uint64_t now_ms) {
+  if (receiver->failed)
     return false;
-  const uint8_t *bytes = data;
-  const uint8_t version = bytes[0] >> 4;
-  if (version == 4 && size >= 20) {
-    size_t header_size = (size_t)(bytes[0] & 15U) * 4U;
-    size_t total_size = ((size_t)bytes[2] << 8) | bytes[3];
-    return header_size >= 20 && header_size <= size && total_size == size;
-  }
-  if (version == 6 && size >= 40) {
-    size_t payload_size = ((size_t)bytes[4] << 8) | bytes[5];
-    return payload_size + 40U == size;
-  }
-  return false;
-}
-
-static void enqueue_packet(receive_queue_t *queue, const void *data,
-                           size_t size) {
-  if (!valid_packet(data, size) || queue->count == RECEIVE_QUEUE_CAPACITY) {
-    queue->dropped++;
-    return;
-  }
-  size_t tail = (queue->head + queue->count) % RECEIVE_QUEUE_CAPACITY;
-  memcpy(queue->packets[tail].bytes, data, size);
-  queue->packets[tail].size = size;
-  queue->packets[tail].queued_ms = monotonic_ms();
-  queue->count++;
-}
-
-static bool flush_packets(receive_queue_t *queue, int tun_fd,
-                          uint64_t max_age) {
-  while (queue->count > 0) {
-    packet_t *packet = &queue->packets[queue->head];
-    if (monotonic_ms() - packet->queued_ms >= max_age) {
-      queue->head = (queue->head + 1) % RECEIVE_QUEUE_CAPACITY;
-      queue->count--;
-      queue->dropped++;
-      continue;
+  if (!receiver->queue->count)
+    return true;
+  tun_rx_batch_expire(receiver->queue, now_ms);
+  tun_rx_view_t view;
+  while (receiver->queue->count && !receiver->write_blocked &&
+         receiver->write_budget &&
+         tun_rx_batch_peek(receiver->queue, now_ms, &view)) {
+    receiver->write_budget--;
+    tun_coalesce_output_t output = {.packet = view.packet, .count = 1};
+    if (receiver->coalesce) {
+      tun_packet_view_t packets[TUN_RX_BATCH_CAPACITY];
+      size_t count = 0;
+      while (count < receiver->queue->count) {
+        const tun_rx_slot_t *slot =
+            &receiver->queue->slots[(receiver->queue->head + count) %
+                                    TUN_RX_BATCH_CAPACITY];
+        if (slot->batch_id != view.batch_id)
+          break;
+        packets[count++] = (tun_packet_view_t){.data = slot->bytes,
+                                               .size = slot->size,
+                                               .header_size = slot->header_size,
+                                               .version = slot->version};
+        if (slot->end_of_batch)
+          break;
+      }
+      (void)tun_coalesce(packets, count, receiver->aggregate,
+                         sizeof(receiver->aggregate), &output);
     }
-    ssize_t written = tun_write(tun_fd, packet->bytes, packet->size);
+    ssize_t written;
+    if (output.count > 1) {
+      receiver->write_calls++;
+      receiver->copied_bytes += output.packet.size;
+      written = tun_write_offload(receiver->fd, output.packet.data,
+                                  output.packet.size, &output.offload);
+    } else
+      written = write_receive_packet(receiver, output.packet.data,
+                                     output.packet.size);
     if (written < 0 && errno == EINTR)
       continue;
-    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      receiver->write_blocked = true;
       return true;
-    if (written != (ssize_t)packet->size) {
-      if (written < 0)
-        perror("writing TUN packet");
-      else
-        fprintf(stderr, "short TUN packet write\n");
+    }
+    if (written != (ssize_t)output.packet.size) {
+      fprintf(stderr, "queued TUN packet write failed: %s\n",
+              written < 0 ? strerror(errno) : "short write");
+      receiver->failed = true;
       return false;
     }
-    queue->head = (queue->head + 1) % RECEIVE_QUEUE_CAPACITY;
-    queue->count--;
+    receiver->written_packets += output.count;
+    if (output.count > 1) {
+      receiver->aggregates++;
+      receiver->coalesced_packets += output.count;
+    }
+    for (size_t i = 0; i < output.count; i++)
+      tun_rx_batch_consume(receiver->queue);
   }
   return true;
 }
 
-typedef struct {
-  receive_queue_t *queue;
-  qlinq_stream_t *subscriber;
-  int fd;
-  size_t mtu;
-  uint64_t max_age, received, bytes;
-} tunnel_receiver_t;
+static bool end_receive_batch(tunnel_receiver_t *receiver, uint64_t now_ms) {
+  tun_rx_batch_end(receiver->queue);
+  return receiver->fd < 0 || flush_packets(receiver, now_ms);
+}
 
-/* service borrowed records directly before queueing to avoid copies */
+/* use earliest batch expiry for poll wakeups to avoid EAGAIN spinning */
+static int receive_poll_timeout(tunnel_receiver_t *receiver, int timeout_ms,
+                                uint64_t now_ms) {
+  uint64_t deadline;
+  if (tun_rx_batch_deadline(receiver->queue, &deadline)) {
+    uint64_t remaining = deadline > now_ms ? deadline - now_ms : 0;
+    if (remaining < (uint64_t)timeout_ms)
+      timeout_ms = (int)remaining;
+  }
+  return timeout_ms;
+}
+
+/* borrow immediate records when queue is empty; copy retained packets */
 static bool receive_packet(void *data, const qlinq_event_t *event) {
   tunnel_receiver_t *receiver = data;
-  if (event->stream != receiver->subscriber)
+  if (receiver->stopped || event->stream != receiver->subscriber)
     return true;
-  if (!valid_packet(event->record.data, event->record.size) ||
-      event->record.size > receiver->mtu) {
+  if (receiver->failed)
+    return false;
+  tun_packet_config_t config = {.mtu = receiver->mtu,
+                                .max_packet_size = PACKET_CAPACITY};
+  tun_packet_input_t input = {.data = event->record.data,
+                              .size = event->record.size,
+                              .origin = TUN_PACKET_FROM_PEER};
+  tun_packet_output_t output;
+  tun_packet_result_t processed =
+      tun_packet_process(&config, &input, &output, 1);
+  if (processed.status != TUN_PACKET_OK) {
     receiver->queue->dropped++;
     return true;
   }
+  const tun_packet_view_t *packet = &output.packet;
   receiver->received++;
-  receiver->bytes += event->record.size;
+  receiver->bytes += packet->size;
   if (receiver->fd < 0)
     return true;
-  if (!flush_packets(receiver->queue, receiver->fd, receiver->max_age))
+  uint64_t now_ms = monotonic_ms();
+  if (receiver->coalesce &&
+      (receiver->queue->count || tun_coalesce_candidate(packet))) {
+    /* copy before callback returns; flush on pressure or incompatible prefix */
+    if (receiver->queue->count && !flush_packets(receiver, now_ms))
+      return false;
+    bool incompatible = false;
+    if (receiver->queue->count) {
+      const tun_rx_slot_t *tail =
+          &receiver->queue
+               ->slots[(receiver->queue->head + receiver->queue->count - 1) %
+                       TUN_RX_BATCH_CAPACITY];
+      tun_packet_view_t previous = {.data = tail->bytes, .size = tail->size};
+      incompatible = !tun_coalesce_pair(&previous, packet);
+    }
+    if (incompatible ||
+        receiver->queue->count == receiver->queue->limits.packets ||
+        packet->size > receiver->queue->limits.bytes - receiver->queue->bytes) {
+      tun_rx_batch_end(receiver->queue);
+      if (!flush_packets(receiver, now_ms))
+        return false;
+      (void)tun_rx_batch_begin(receiver->queue);
+    }
+    (void)tun_rx_batch_push(receiver->queue, packet, now_ms);
+    return flush_packets(receiver, now_ms);
+  }
+  if (!flush_packets(receiver, now_ms))
     return false;
-  if (receiver->queue->count) {
-    enqueue_packet(receiver->queue, event->record.data, event->record.size);
+  if (receiver->queue->count || receiver->write_blocked ||
+      !receiver->write_budget) {
+    (void)tun_rx_batch_push(receiver->queue, packet, now_ms);
     return true;
   }
-  ssize_t written;
-  do {
-    written = tun_write(receiver->fd, event->record.data, event->record.size);
-  } while (written < 0 && errno == EINTR);
-  if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-    enqueue_packet(receiver->queue, event->record.data, event->record.size);
+  ssize_t written = -1;
+  while (receiver->write_budget) {
+    receiver->write_budget--;
+    written = write_receive_packet(receiver, packet->data, packet->size);
+    if (written >= 0 || errno != EINTR)
+      break;
+  }
+  if (written < 0 &&
+      (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+    receiver->write_blocked = errno != EINTR;
+    (void)tun_rx_batch_push(receiver->queue, packet, now_ms);
     return true;
   }
-  if (written != (ssize_t)event->record.size) {
+  if (written != (ssize_t)packet->size) {
     fprintf(stderr, "direct TUN packet write failed: %s\n",
             written < 0 ? strerror(errno) : "short write");
+    receiver->failed = true;
     return false;
   }
+  receiver->written_packets++;
   return true;
 }
 
@@ -382,6 +471,76 @@ static void make_mock_packet(packet_t *packet, uint64_t sequence) {
   packet->bytes[8] = 64;
   packet->bytes[9] = 17;
   memcpy(packet->bytes + 20, &sequence, sizeof(sequence));
+}
+
+typedef struct {
+  tun_segment_t plan;
+  uint64_t queued_ms, read_calls, frames, gso_reads, gso_packets, checksums,
+      dropped;
+  bool vnet, offload;
+} tunnel_transmitter_t;
+
+static void expire_transmit(tunnel_transmitter_t *tx, uint64_t now,
+                            uint64_t max_age) {
+  if (tx->plan.pending && now - tx->queued_ms >= max_age)
+    tx->dropped += tun_segment_cancel(&tx->plan);
+}
+
+/* read and segment TUN transmit frames */
+static ssize_t read_transmit(tunnel_transmitter_t *tx, int fd, uint8_t *frame,
+                             packet_t *packet, tun_packet_output_t *output,
+                             const tun_packet_config_t *config, uint64_t now) {
+  if (!tx->offload) {
+    tx->read_calls++;
+    tun_offload_t metadata = {0};
+    ssize_t n = tx->vnet ? tun_read_vnet(fd, packet->bytes,
+                                         sizeof(packet->bytes), &metadata)
+                         : tun_read(fd, packet->bytes, sizeof(packet->bytes));
+    if (n > 0 && tx->vnet &&
+        (metadata.flags || metadata.gso_type || metadata.gso_size)) {
+      tx->dropped++;
+      errno = EBADMSG;
+      return -1;
+    }
+    if (n > 0)
+      tx->frames++;
+    packet->queued_ms = now;
+    return n;
+  }
+  if (!tx->plan.pending) {
+    tun_offload_t metadata;
+    tx->read_calls++;
+    ssize_t n = tun_read_vnet(fd, frame, TUN_TX_FRAME_CAPACITY + 1, &metadata);
+    if (n <= 0) {
+      if (n < 0 && errno == EBADMSG)
+        tx->dropped++;
+      return n;
+    }
+    tx->frames++;
+    tun_packet_input_t input = {
+        .data = frame, .size = (size_t)n, .origin = TUN_PACKET_FROM_DEVICE};
+    if (!tun_segment_prepare(&tx->plan, config, &input, &metadata)) {
+      tx->dropped++;
+      errno = EBADMSG;
+      return -1;
+    }
+    tx->queued_ms = now;
+    if (tx->plan.segmented)
+      tx->gso_reads++;
+  }
+  tun_packet_result_t result =
+      tun_segment_next(&tx->plan, packet->bytes, sizeof(packet->bytes), output);
+  if (result.status != TUN_PACKET_OK) {
+    tx->dropped += tun_segment_cancel(&tx->plan);
+    errno = EBADMSG;
+    return -1;
+  }
+  if (tx->plan.segmented)
+    tx->gso_packets++;
+  if (tx->plan.partial)
+    tx->checksums++;
+  packet->queued_ms = tx->queued_ms;
+  return (ssize_t)output->packet.size;
 }
 
 static void json_string(const char *value) {
@@ -397,7 +556,9 @@ static void json_string(const char *value) {
 
 static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
                         uint64_t sent, uint64_t received, uint64_t tx_bytes,
-                        uint64_t rx_bytes, uint64_t dropped) {
+                        uint64_t rx_bytes, uint64_t dropped,
+                        const tunnel_transmitter_t *tx,
+                        const tunnel_receiver_t *rx) {
   qlinq_endpoint_stats_t stats = {0};
   qlinq_endpoint_get_stats(endpoint, &stats);
   bool have_active_path = false;
@@ -412,14 +573,29 @@ static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
          "\"tx_bytes\":%llu,\"rx_bytes\":%llu,\"dropped\":%llu,"
          "\"fec_recovered\":%llu,\"fec_decoded\":%llu,\"fec_lost\":%llu,"
          "\"reconnects\":%llu,"
-         "\"queued_bytes\":%zu,\"paths\":[",
+         "\"queued_bytes\":%zu,\"tx_gso_active\":%s,"
+         "\"rx_gro_active\":%s,\"rx_tun_writes\":%llu,"
+         "\"rx_written_packets\":%llu,\"rx_aggregates\":%llu,"
+         "\"rx_coalesced_packets\":%llu,\"rx_aggregate_copy_bytes\":%llu,"
+         "\"tx_tun_reads\":%llu,\"tx_tun_frames\":%llu,"
+         "\"tx_gso_reads\":%llu,\"tx_gso_packets\":%llu,"
+         "\"tx_csum_packets\":%llu,\"tx_gso_pending_packets\":%zu,\"paths\":[",
          state, (unsigned long long)sent, (unsigned long long)received,
          (unsigned long long)tx_bytes, (unsigned long long)rx_bytes,
          (unsigned long long)dropped,
          (unsigned long long)stats.fec_objects_recovered,
          (unsigned long long)stats.fec_objects_decoded,
          (unsigned long long)stats.fec_objects_lost,
-         (unsigned long long)stats.reconnect_attempts, stats.queued_bytes);
+         (unsigned long long)stats.reconnect_attempts, stats.queued_bytes,
+         tx->offload ? "true" : "false", rx->coalesce ? "true" : "false",
+         (unsigned long long)rx->write_calls,
+         (unsigned long long)rx->written_packets,
+         (unsigned long long)rx->aggregates,
+         (unsigned long long)rx->coalesced_packets,
+         (unsigned long long)rx->copied_bytes,
+         (unsigned long long)tx->read_calls, (unsigned long long)tx->frames,
+         (unsigned long long)tx->gso_reads, (unsigned long long)tx->gso_packets,
+         (unsigned long long)tx->checksums, tun_segment_remaining(&tx->plan));
   bool first = true;
   for (size_t i = 0; i < QLINQ_MAX_PATHS; i++) {
     qlinq_path_stats_t path;
@@ -444,6 +620,8 @@ static void print_stats(qlinq_endpoint_t *endpoint, const char *state,
 
 static int run_tunnel(const options_t *options) {
   int tun_fd = -1;
+  tunnel_transmitter_t tx = {0};
+  uint8_t tx_frame[TUN_TX_FRAME_CAPACITY + 1];
   char interface_name[IFNAMSIZ];
   snprintf(interface_name, sizeof(interface_name), "%s",
            options->interface_name);
@@ -461,9 +639,13 @@ static int run_tunnel(const options_t *options) {
       fprintf(stderr, "--run-as requires root for initial TUN setup\n");
       return 1;
     }
-    tun_fd = tun_alloc(interface_name);
+    tun_fd = options->tx_gso || options->rx_gro
+                 ? tun_alloc_vnet(interface_name, options->tx_gso, &tx.vnet)
+                 : tun_alloc(interface_name);
     if (tun_fd < 0)
       return 1;
+    if ((options->tx_gso || options->rx_gro) && !tx.vnet)
+      fprintf(stderr, "TUN offloads unavailable; using ordinary TUN I/O\n");
     int configured =
         options->peer_ip
             ? tun_configure_peer(interface_name, options->ip, options->peer_ip)
@@ -483,11 +665,23 @@ static int run_tunnel(const options_t *options) {
     }
   }
 
-  receive_queue_t queue = {0};
+  tx.offload = tx.vnet && options->tx_gso;
+  tun_rx_batch_t queue;
+  tun_rx_limits_t receive_limits = {.packets = TUN_RX_BATCH_CAPACITY,
+                                    .bytes =
+                                        TUN_RX_BATCH_CAPACITY * options->mtu,
+                                    .max_age_ms = options->queue_ms,
+                                    .flush_delay_ms = 1};
+  if (!tun_rx_batch_init(&queue, &receive_limits)) {
+    if (tun_fd >= 0)
+      close(tun_fd);
+    return 1;
+  }
   tunnel_receiver_t receiver = {.queue = &queue,
                                 .fd = tun_fd,
                                 .mtu = options->mtu,
-                                .max_age = options->queue_ms};
+                                .vnet = tx.vnet,
+                                .coalesce = options->rx_gro && tx.vnet};
   qlinq_context_config_t context_config = {.record_callback = receive_packet,
                                            .record_user_data = &receiver};
   qlinq_context_t *context = qlinq_context_create(&context_config);
@@ -570,6 +764,10 @@ static int run_tunnel(const options_t *options) {
          options->delivery, interface_name, options->mock ? " (mock)" : "");
 
   packet_t pending = {0};
+  /* pending_output borrows pending.bytes until sent, expired, or cancelled */
+  tun_packet_output_t pending_output = {0};
+  tun_packet_config_t packet_config = {.mtu = options->mtu,
+                                       .max_packet_size = PACKET_CAPACITY};
   uint64_t sent = 0, partial = 0;
   uint64_t tx_bytes = 0, tx_dropped = 0, last_stats = 0;
   const char *state = options->listen ? "listening" : "connecting";
@@ -578,12 +776,28 @@ static int run_tunnel(const options_t *options) {
   while (!stopping &&
          (!options->run_ms || monotonic_ms() - started < options->run_ms)) {
     short ready_events = 0;
-    qlinq_status_t status = qlinq_service_fd(
-        context, options->mock ? 10 : 50, tun_fd,
-        (pending.size ? 0 : POLLIN) | (queue.count ? POLLOUT : 0),
-        &ready_events);
+    uint64_t turn_now = monotonic_ms();
+    expire_transmit(&tx, turn_now, options->queue_ms);
+    int timeout_ms = receive_poll_timeout(&receiver, options->mock ? 10 : 50,
+                                          monotonic_ms());
+    /* handle disconnect events before closing or flushing the receive batch */
+    if (!pending.size && tx.plan.pending)
+      timeout_ms = 0; /* buffered segments need service without fd readiness */
+    if (pending.size) {
+      uint64_t age = turn_now - pending.queued_ms;
+      uint64_t left = age < options->queue_ms ? options->queue_ms - age : 0;
+      if (left < (uint64_t)timeout_ms)
+        timeout_ms = (int)left;
+    }
+    begin_receive_batch(&receiver);
+    qlinq_status_t status =
+        qlinq_service_fd(context, timeout_ms, tun_fd,
+                         (pending.size || tx.plan.pending ? 0 : POLLIN) |
+                             (queue.count ? POLLOUT : 0),
+                         &ready_events);
     if (status < QLINQ_STATUS_OK) {
       fprintf(stderr, "qlinq service failed: %d\n", status);
+      tun_rx_batch_cancel(&queue);
       result = 1;
       break;
     }
@@ -595,9 +809,11 @@ static int run_tunnel(const options_t *options) {
       } else if (event.type == QLINQ_EVENT_PEER_DISCONNECTED ||
                  event.type == QLINQ_EVENT_SUBSCRIBER_LEFT) {
         /* do not replay an old IP packet after reconnect */
+        if (pending.size)
+          tx_dropped++;
         pending.size = 0;
-        queue.dropped += queue.count;
-        queue.count = 0;
+        tx.dropped += tun_segment_cancel(&tx.plan);
+        tun_rx_batch_cancel(&queue);
         state = options->listen ? "listening" : "reconnecting";
       } else if (event.type == QLINQ_EVENT_PEER_REJECTED ||
                  event.type == QLINQ_EVENT_ERROR) {
@@ -610,28 +826,35 @@ static int run_tunnel(const options_t *options) {
     uint64_t now_ms = monotonic_ms();
     if (options->stats_ms && now_ms - last_stats >= options->stats_ms) {
       print_stats(endpoint, state, sent, receiver.received, tx_bytes,
-                  receiver.bytes, queue.dropped + tx_dropped);
+                  receiver.bytes, queue.dropped + tx_dropped + tx.dropped, &tx,
+                  &receiver);
       last_stats = now_ms;
     }
     if (pending.size && now_ms - pending.queued_ms >= options->queue_ms) {
       pending.size = 0;
       tx_dropped++;
     }
-    if (tun_fd >= 0 && !flush_packets(&queue, tun_fd, options->queue_ms)) {
+    if (!end_receive_batch(&receiver, now_ms)) {
       result = 1;
       break;
     }
     for (size_t batch = 0; batch < 32; batch++) {
+      uint64_t packet_now = monotonic_ms();
+      expire_transmit(&tx, packet_now, options->queue_ms);
       if (pending.size == 0) {
         if (options->mock) {
-          uint64_t now = monotonic_ms();
+          uint64_t now = packet_now;
           if (now - last_mock < 100)
             break;
           make_mock_packet(&pending, sent + 1);
+          pending.queued_ms = now;
           last_mock = now;
         } else {
           ssize_t count =
-              tun_read(tun_fd, pending.bytes, sizeof(pending.bytes));
+              read_transmit(&tx, tun_fd, tx_frame, &pending, &pending_output,
+                            &packet_config, packet_now);
+          if (count < 0 && errno == EBADMSG)
+            continue;
           if (count < 0 && errno == EINTR)
             continue;
           if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
@@ -643,35 +866,51 @@ static int run_tunnel(const options_t *options) {
             break;
           }
           pending.size = (size_t)count;
-          if (!valid_packet(pending.bytes, pending.size) ||
-              pending.size > options->mtu) {
+        }
+        if (!tx.offload) {
+          tun_packet_input_t input = {.data = pending.bytes,
+                                      .size = pending.size,
+                                      .origin = TUN_PACKET_FROM_DEVICE};
+          tun_packet_result_t processed =
+              tun_packet_process(&packet_config, &input, &pending_output, 1);
+          if (processed.status != TUN_PACKET_OK) {
             pending.size = 0;
             tx_dropped++;
             continue;
           }
         }
-        pending.queued_ms = monotonic_ms();
+      }
+      if (monotonic_ms() - pending.queued_ms >= options->queue_ms) {
+        pending.size = 0;
+        tx_dropped++;
+        continue;
       }
       if (strcmp(state, "connected") != 0) {
         /* drain kernel packets while disconnected instead of replaying a
          * stale burst when connectivity returns */
         pending.size = 0;
         tx_dropped++;
+        tx.dropped += tun_segment_cancel(&tx.plan);
         if (options->mock)
           break;
         continue;
       }
       if (!qlinq_stream_is_writable(publisher))
-        break; /* Preserve pending until the configured queue age expires. */
-      qlinq_record_t record = {.data = pending.bytes,
-                               .size = pending.size,
+        break; /* preserve pending until the configured queue age expires */
+      qlinq_record_t record = {.data = pending_output.packet.data,
+                               .size = pending_output.packet.size,
                                .sequence = sent + 1,
                                .priority = 1};
       qlinq_send_result_t send_result = qlinq_stream_send(publisher, &record);
       if (send_result == QLINQ_SEND_WOULD_BLOCK)
         break;
-      if (send_result == QLINQ_SEND_NO_SUBSCRIBERS)
+      if (send_result == QLINQ_SEND_NO_SUBSCRIBERS) {
+        /* drop packet and segment tail when peer has no subscribers */
+        pending.size = 0;
+        tx_dropped++;
+        tx.dropped += tun_segment_cancel(&tx.plan);
         break;
+      }
       if (send_result == QLINQ_SEND_INVALID ||
           send_result == QLINQ_SEND_FAILED) {
         fprintf(stderr, "packet send failed: %d\n", send_result);
@@ -682,20 +921,40 @@ static int run_tunnel(const options_t *options) {
       if (send_result == QLINQ_SEND_PARTIAL)
         partial++;
       sent++;
-      tx_bytes += pending.size;
+      tx_bytes += pending_output.packet.size;
       pending.size = 0;
       if (options->mock)
         break;
     }
   }
+  if (pending.size) {
+    tx_dropped++;
+    pending.size = 0;
+  }
+  tx.dropped += tun_segment_cancel(&tx.plan);
+  receiver.stopped = true;
+  tun_rx_batch_cancel(&queue);
   if (options->stats_ms)
     print_stats(endpoint, "stopped", sent, receiver.received, tx_bytes,
-                receiver.bytes, queue.dropped + tx_dropped);
+                receiver.bytes, queue.dropped + tx_dropped + tx.dropped, &tx,
+                &receiver);
   printf("direct TUN summary: sent=%llu received=%llu partial=%llu "
          "dropped=%llu\n",
          (unsigned long long)sent, (unsigned long long)receiver.received,
          (unsigned long long)partial,
-         (unsigned long long)(queue.dropped + tx_dropped));
+         (unsigned long long)(queue.dropped + tx_dropped + tx.dropped));
+  printf("TUN RX: coalescing=%u write_calls=%llu packets=%llu aggregates=%llu "
+         "coalesced_packets=%llu aggregate_copy_bytes=%llu\n",
+         receiver.coalesce, (unsigned long long)receiver.write_calls,
+         (unsigned long long)receiver.written_packets,
+         (unsigned long long)receiver.aggregates,
+         (unsigned long long)receiver.coalesced_packets,
+         (unsigned long long)receiver.copied_bytes);
+  printf("TUN TX: offload=%u read_calls=%llu frames=%llu gso_reads=%llu "
+         "gso_packets=%llu checksum_packets=%llu\n",
+         tx.offload, (unsigned long long)tx.read_calls,
+         (unsigned long long)tx.frames, (unsigned long long)tx.gso_reads,
+         (unsigned long long)tx.gso_packets, (unsigned long long)tx.checksums);
   if (options->mock && options->run_ms && (!sent || !receiver.received))
     result = 1;
   qlinq_endpoint_shutdown(endpoint, "tunnel stopped");

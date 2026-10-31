@@ -119,3 +119,11 @@ qlinq-tun-engine
 /t/00util/test_xfer_file
 /t/00util/test_xfer_protocol
 /t/00util/test_repair_policy
+
+/t/00util/test_tun_packet
+/t/00util/test_tun_receive_batch
+/t/00util/test_tun_segment
+/t/00util/test_tun_coalesce
+/t/00util/test_tun_vnet
+/t/00util/test_tun_tx_kernel
+/t/00util/test_tun_rx_kernel
