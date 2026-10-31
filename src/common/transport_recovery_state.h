@@ -37,6 +37,8 @@ typedef struct {
 
 typedef struct {
   bool participating;
+  /* join boundary is retained in acked_* until announced */
+  bool baseline_pending;
   bool sent_initialized;
   uint64_t sent_group_id;
   uint64_t sent_object_id;

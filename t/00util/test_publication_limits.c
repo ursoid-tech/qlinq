@@ -5,6 +5,42 @@
 #include <stdlib.h>
 
 static uint64_t group_timer_now;
+static fp_t admission_ceiling;
+
+/* isolate whole-group debt check from native capacity estimation */
+fp_t test_path_admission_rate(fp_t estimate, fp_t ceiling) {
+  if (admission_ceiling > 0 && ceiling > admission_ceiling)
+    ceiling = admission_ceiling;
+  return transport_path_admission_rate(estimate, ceiling);
+}
+
+/* stale ewma must not starve native cwnd with available capacity */
+static void test_native_window_admission(void) {
+  transport_fixture_t f;
+  fixture_create(&f, 19948, NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "native-window-admission"};
+  fixture_subscribe(&f, &f.client, track);
+  transport_conn_t *conn = f.server.conn;
+  quicly_path_stats_t stats;
+  size_t mapped = transport_path_get_eligible_by_local(
+      conn->quic, &f.server.transport->sockets[0].local_addr, &stats);
+  assert(mapped != SIZE_MAX);
+  (void)transport_path_measure(&conn->paths[0].measurement, &stats, mapped, 0,
+                               (uint64_t)transport_get_time_ms());
+  conn->paths[0].state.initialized = true;
+  conn->paths[0].state.b_ewma = FP_FROM_INT(1);
+  uint8_t payload[1000] = {17};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  assert(transport_publish_ex(f.server.transport, &object) ==
+         TRANSPORT_PUBLISH_BUFFERED);
+  assert(transport_publish_flush_grouped(f.server.transport));
+  assert(conn->paths[0].budget.rate > FP_FROM_INT(10));
+  fixture_receive(&f, &f.client, 1);
+  fixture_destroy(&f);
+}
 
 static void test_send_service_quantum(void) {
   transport_fixture_t f;
@@ -258,6 +294,7 @@ static void test_slow_group_admission(void) {
                                  (uint64_t)transport_get_time_ms());
     conn->paths[0].state.initialized = true;
     conn->paths[0].state.b_ewma = FP_FROM_INT(100);
+    admission_ceiling = FP_FROM_INT(100);
     uint8_t payload[8000] = {42};
     moq_object_t object = {
         .track_id = track, .data = payload, .size = sizeof(payload)};
@@ -282,6 +319,7 @@ static void test_slow_group_admission(void) {
     assert(transport_publish_flush_grouped(f.server.transport));
     assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 2 * queued);
     assert(f.server.transport->pending_group.size == 0);
+    admission_ceiling = 0;
     fixture_destroy(&f);
   }
 }
@@ -372,11 +410,84 @@ static void test_short_flush_recovery(void) {
    * remain contiguous with later rolling checkpoints. */
   for (unsigned i = 0; i < 128; i++)
     assert(transport_publish(f.server.transport, &object));
-  assert(transport_publish_flush(f.server.transport));
+  /* rolling checkpoint can pause grouped tail; retry without duplicating */
+  bool flushed = false;
+  for (unsigned i = 0; i < 2000 && !flushed; i++) {
+    flushed = transport_publish_flush(f.server.transport);
+    fixture_tick(&f);
+  }
+  assert(flushed);
   fixture_receive(&f, &f.client, 33);
   assert(f.server.transport->stats.recovery_checkpoints_sent == 3 &&
          f.client.transport->stats.recovery_checkpoints_received == 3);
   fixture_destroy(&f);
+}
+
+/* verify late-joining rateless subscriber skips pre-join tail */
+static void test_rateless_late_join_tail(void) {
+  for (unsigned warm = 25; warm <= 37; warm += 12) {
+    transport_fixture_t f;
+    fixture_create(&f, 19947, NULL, NULL);
+    moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                            .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                            .name = "late-join-tail"};
+    fixture_subscribe(&f, &f.client, track);
+    uint8_t payload[48] = {17};
+    moq_object_t object = {
+        .track_id = track, .data = payload, .size = sizeof(payload)};
+    for (unsigned i = 0; i < warm; i++) {
+      assert(transport_publish(f.server.transport, &object));
+      assert(transport_publish_flush_grouped(f.server.transport));
+      fixture_receive(&f, &f.client, i + 1);
+    }
+    fixture_endpoint_t second = {0};
+    transport_config_t config = {.bind_hosts = {"127.0.0.1"},
+                                 .num_bind_hosts = 1,
+                                 .remote_hosts = {"127.0.0.1"},
+                                 .num_remote_hosts = 1,
+                                 .port = 19947,
+                                 .allow_insecure_peer = true,
+                                 .callback = fixture_event,
+                                 .user_data = &second};
+    second.transport = transport_create(&config);
+    assert(second.transport);
+    for (unsigned i = 0; i < 2000 && !second.authenticated; i++) {
+      fixture_tick(&f);
+      transport_tick(second.transport);
+    }
+    assert(second.authenticated);
+    size_t limit = f.server.transport->limits.max_stream_egress_bytes;
+    f.server.transport->limits.max_stream_egress_bytes = 1;
+    assert(transport_subscribe_conn(second.transport, second.conn, track));
+    for (unsigned i = 0; i < 2000 && f.server.subscriptions < 2; i++) {
+      fixture_tick(&f);
+      transport_tick(second.transport);
+    }
+    assert(f.server.subscriptions == 2);
+    f.server.transport->limits.max_stream_egress_bytes = limit;
+    for (unsigned i = 0; i < 64; i++) {
+      assert(transport_publish(f.server.transport, &object));
+      bool flushed = false;
+      for (unsigned retry = 0; retry < 2000 && !flushed; retry++) {
+        flushed = transport_publish_flush_grouped(f.server.transport);
+        fixture_tick(&f);
+        transport_tick(second.transport);
+      }
+      assert(flushed);
+    }
+    assert(transport_publish_flush(f.server.transport));
+    for (unsigned i = 0; i < 2000 && (second.objects < 64 ||
+                                      f.server.transport->sent_cache.count);
+         i++) {
+      fixture_tick(&f);
+      transport_tick(second.transport);
+    }
+    assert(!second.failed && second.objects == 64);
+    assert(f.client.objects == warm + 64);
+    assert(f.server.transport->sent_cache.count == 0);
+    transport_destroy(second.transport);
+    fixture_destroy(&f);
+  }
 }
 
 /* Small objects used to derive 16384 cache slots, exceeding the receiver's
@@ -520,7 +631,110 @@ static void test_group_timer_backpressure(void) {
   fixture_destroy(&f);
 }
 
+/* checkpoint acks must progress under continuous datagram pressure */
+static void test_checkpoint_progress_under_datagram_pressure(bool drop_first) {
+  transport_fixture_t f;
+  fixture_create(&f, (uint16_t)(19954 + drop_first), NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "checkpoint-under-load"};
+  fixture_subscribe(&f, &f.client, track);
+  quicly_stream_t *control = f.server.conn->stream;
+  transport_stream_ctx_t *ctx = control->data;
+  for (size_t i = 0; i < 1000 && control->sendstate.size_inflight <
+                                     ctx->streambuf.egress.bytes_written;
+       i++)
+    fixture_tick(&f);
+  assert(control->sendstate.size_inflight ==
+         ctx->streambuf.egress.bytes_written);
+  assert(transport_mock_path_state(f.server.transport, 0, 100000, 1, 0));
+  f.server.transport->limits.max_packets_per_tick = 1;
+  uint8_t payload[1024] = {77};
+  moq_object_t object = {.track_id = track,
+                         .data = payload,
+                         .size = sizeof(payload),
+                         .priority = 1};
+  size_t accepted = 0;
+  for (size_t i = 0; i < 32; i++) {
+    assert(transport_publish_ex(f.server.transport, &object) ==
+           TRANSPORT_PUBLISH_BUFFERED);
+    accepted++;
+    assert(transport_publish_flush_grouped(f.server.transport));
+  }
+  uint8_t alias;
+  assert(transport_subscriptions_find_alias(&f.server.conn->send_subscriptions,
+                                            &track, &alias) == 0);
+  transport_checkpoint_ack_state_t *ack =
+      transport_checkpoint_ack(f.server.conn, alias);
+  assert(ack->sent_initialized && ack->sent_object_id == 31);
+  uint64_t control_end = ctx->streambuf.egress.bytes_written;
+  bool progressed = false, resumed_before_ack = false, discarded = false;
+  size_t blocked = 0;
+  for (size_t turn = 0; turn < 600; turn++) {
+    for (size_t i = 0; i < 64; i++) {
+      transport_publish_result_t result =
+          transport_publish_ex(f.server.transport, &object);
+      if (result == TRANSPORT_PUBLISH_BACKPRESSURE) {
+        blocked++;
+        break;
+      }
+      assert(result == TRANSPORT_PUBLISH_BUFFERED ||
+             result == TRANSPORT_PUBLISH_DELIVERED);
+      accepted++;
+      if (!transport_publish_flush_grouped(f.server.transport))
+        break;
+    }
+    transport_tick(f.server.transport);
+    if (!resumed_before_ack &&
+        control->sendstate.size_inflight >= control_end) {
+      assert(!ack->acked_initialized || ack->acked_object_id < 31);
+      if (drop_first) {
+        /* drop initial checkpoint packet to verify control retransmission */
+        uint8_t packet[65536];
+        assert(recv(f.client.transport->sockets[0].fd, packet, sizeof(packet),
+                    MSG_DONTWAIT) > 0);
+        discarded = true;
+      }
+      transport_publish_result_t result =
+          transport_publish_ex(f.server.transport, &object);
+      assert(result == TRANSPORT_PUBLISH_BUFFERED ||
+             result == TRANSPORT_PUBLISH_DELIVERED);
+      accepted++;
+      assert(transport_publish_flush_grouped(f.server.transport));
+      resumed_before_ack = true;
+    }
+    transport_tick(f.client.transport);
+    assert(!f.server.failed && !f.client.failed);
+    usleep(1000);
+    if (ack->acked_initialized && ack->acked_group_id == 0 &&
+        ack->acked_object_id >= 31) {
+      progressed = true;
+      break;
+    }
+  }
+  fprintf(stderr,
+          "checkpoint pressure: ack=%d objects=%zu blocked=%zu "
+          "queued=%zu cache=%zu\n",
+          progressed, accepted, blocked,
+          quicly_get_num_datagram_frames_path(f.server.conn->quic, 0),
+          f.server.transport->sent_cache.count);
+  assert(progressed &&
+         "continuous DATAGRAM publication starved checkpoint ACK");
+  assert(resumed_before_ack && discarded == drop_first);
+  for (size_t i = 0; i < 4000 && f.client.objects < accepted; i++) {
+    (void)transport_publish_flush(f.server.transport);
+    fixture_tick(&f);
+  }
+  assert(f.client.objects == accepted);
+  assert(f.client.payload_size == sizeof(payload) + 2 &&
+         memcmp(f.client.payload + 2, payload, sizeof(payload)) == 0);
+  fixture_destroy(&f);
+}
+
 int main(void) {
+  test_checkpoint_progress_under_datagram_pressure(false);
+  test_checkpoint_progress_under_datagram_pressure(true);
+  test_native_window_admission();
   test_send_service_quantum();
   test_queue_boundary();
   test_slow_group_admission();
@@ -528,6 +742,7 @@ int main(void) {
   test_recovery_history_bound();
   test_xfer_recovery_protection();
   test_short_flush_recovery();
+  test_rateless_late_join_tail();
   test_group_timer_backpressure();
   test_partial_group_retry();
   transport_fixture_t fixture;

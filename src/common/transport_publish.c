@@ -26,6 +26,8 @@ bool transport_publish_recipient_eligible(const transport_t *t,
                                           const moq_track_id_t *track) {
   return t && conn && track && conn->quic && conn->protocol_ready &&
          conn->authenticated &&
+         (t->tls_group_policy == QLINQ_TLS_GROUP_CLASSICAL ||
+          conn->tls.policy_accepted) &&
          quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
          (!t->is_server ||
           transport_subscriptions_contains(&conn->send_subscriptions, track));
@@ -163,8 +165,8 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
      * native owner now so the sampled state and queue remain available to the
      * next publication; an unowned automatic EWMA is not usable history. */
     if (!path->state_overridden && !path->measurement.initialized) {
-      (void)transport_path_measure(&path->measurement, &stats, mapped, queued,
-                                   measure_now);
+      (void)transport_path_measure_on_path(&path->measurement, conn->quic,
+                                           &stats, mapped, queued, measure_now);
       memset(&path->state, 0, sizeof(path->state));
     }
     bool measured =
@@ -194,10 +196,12 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
                                    estimate_symbol_size, measure_now);
       if (candidate->sample.b > cap)
         candidate->sample.b = cap;
-      fp_t rate = measured && path->state.initialized ? path->state.b_ewma
-                                                      : candidate->sample.b;
+      /* use current estimate rather than lagging ewma for admission rate */
+      fp_t rate = candidate->sample.b;
       if (rate > cap)
         rate = cap;
+      /* supply admission headroom up to capacity ceiling so cwnd can grow */
+      rate = transport_path_admission_rate(rate, cap);
       size_t reserved =
           transport_path_budget_update(&path->budget, rate, admission_now);
       if (reserved > candidate->sample.q)
@@ -243,6 +247,9 @@ static transport_publish_result_t
 plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                const transport_track_profile_t *profile,
                publication_plan_t *plan) {
+  /* yield new datagram admission until pending control can be emitted */
+  if (transport_stream_control_pending(conn->stream))
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
   uint64_t admission_now = transport_get_monotonic_ns();
   size_t symbol_size = plan->symbol_size;
   size_t estimate_symbol_size = plan->estimate_symbol_size;
@@ -613,6 +620,28 @@ static void release_acked_checkpoints(transport_t *t,
   t->stats.recovery_cache_releases += released;
 }
 
+static bool flush_checkpoint_baseline(transport_t *t, transport_conn_t *conn,
+                                      uint8_t alias,
+                                      transport_checkpoint_ack_state_t *ack) {
+  if (!ack->baseline_pending)
+    return true;
+  if (!conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
+      !transport_stream_can_accept(conn->stream,
+                                   QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                       QLINQ_WIRE_TRACK_CHECKPOINT_SIZE,
+                                   false) ||
+      !transport_stream_write_track_checkpoint_frame(
+          conn->stream, alias, ack->acked_group_id, ack->acked_object_id,
+          ack->acked_object_id, true))
+    return false;
+  ack->baseline_pending = false;
+  ack->sent_initialized = true;
+  ack->sent_group_id = ack->acked_group_id;
+  ack->sent_object_id = ack->acked_object_id;
+  t->stats.recovery_checkpoints_sent++;
+  return true;
+}
+
 void transport_publish_checkpoint_member_added(transport_t *t,
                                                transport_conn_t *conn,
                                                const moq_track_id_t *track_id,
@@ -634,19 +663,13 @@ void transport_publish_checkpoint_member_added(transport_t *t,
   ack->participating = true;
 
   transport_fec_track_state_t *track = find_fec_track_state(t, track_id, false);
-  if (track && track->checkpoint_initialized && conn->stream &&
-      quicly_sendstate_is_open(&conn->stream->sendstate) &&
-      transport_stream_write_track_checkpoint_frame(
-          conn->stream, alias, track->checkpoint_group_id,
-          track->last_checkpoint_object_id, track->last_checkpoint_object_id,
-          true)) {
-    ack->sent_initialized = true;
-    ack->sent_group_id = track->checkpoint_group_id;
-    ack->sent_object_id = track->last_checkpoint_object_id;
+  /* new recipient owes no records before join; retry failed baseline */
+  if (track && track->has_objects) {
+    ack->baseline_pending = true;
     ack->acked_initialized = true;
-    ack->acked_group_id = track->checkpoint_group_id;
-    ack->acked_object_id = track->last_checkpoint_object_id;
-    t->stats.recovery_checkpoints_sent++;
+    ack->acked_group_id = 0;
+    ack->acked_object_id = track->next_object_id - 1U;
+    (void)flush_checkpoint_baseline(t, conn, alias, ack);
   }
 }
 
@@ -786,13 +809,24 @@ static bool emit_rolling_checkpoint(transport_t *t,
     if (!ack->participating)
       transport_publish_checkpoint_member_added(t, conn, &track->track_id,
                                                 alias);
+    if (!flush_checkpoint_baseline(t, conn, alias, ack)) {
+      succeeded = false;
+      continue;
+    }
+    uint64_t recipient_first_object_id = first_object_id;
+    if (ack->sent_initialized && ack->sent_group_id == group_id &&
+        ack->sent_object_id >= recipient_first_object_id) {
+      if (ack->sent_object_id >= final_object_id)
+        continue;
+      recipient_first_object_id = ack->sent_object_id + 1U;
+    }
     if (!transport_stream_can_accept(conn->stream,
                                      QLINQ_WIRE_FRAME_HEADER_SIZE +
                                          QLINQ_WIRE_TRACK_CHECKPOINT_SIZE,
                                      false) ||
         !transport_stream_write_track_checkpoint_frame(
-            conn->stream, alias, group_id, first_object_id, final_object_id,
-            false)) {
+            conn->stream, alias, group_id, recipient_first_object_id,
+            final_object_id, false)) {
       succeeded = false;
       continue;
     }

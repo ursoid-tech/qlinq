@@ -561,7 +561,17 @@ int main(void) {
                            .data = checkpoint_record,
                            .size = sizeof(checkpoint_record),
                            .priority = 1};
-    if (!transport_publish(server, &record)) {
+    transport_publish_result_t result = TRANSPORT_PUBLISH_BACKPRESSURE;
+    for (unsigned retry = 0; retry < 500; retry++) {
+      result = transport_publish_ex(server, &record);
+      if (result != TRANSPORT_PUBLISH_BACKPRESSURE)
+        break;
+      transport_tick(server);
+      transport_tick(client);
+      usleep(1000);
+    }
+    if (result != TRANSPORT_PUBLISH_DELIVERED &&
+        result != TRANSPORT_PUBLISH_BUFFERED) {
       fprintf(stderr,
               "rolling checkpoint publication failed at record %" PRIu64 "\n",
               i);

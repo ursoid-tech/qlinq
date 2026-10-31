@@ -2,6 +2,7 @@
 #define QLINQ_TUN_CONTROL_H
 
 #include "tun_json.h"
+#include "qlinq.h"
 #include <limits.h>
 #include <stddef.h>
 
@@ -9,12 +10,14 @@ typedef struct {
   char id[33], role[8], endpoint[16], local_ip[16], peer_ip[16];
   char interface[16], uplinks[4][16], routes[16][32], mode[16], run_as[33];
   char token[65];
+  qlinq_tls_group_policy_t tls_group_policy;
   unsigned port, mtu, queue_ms, uplink_count, route_count;
 } tc_config;
 
 typedef struct {
   const char *root, *action, *name, *identity, *invite, *listen;
   const char *interface, *local_ip, *peer_ip, *run_as, *metrics_output;
+  const char *tls_group_policy;
   const char *uplinks[4], *routes[16];
   unsigned uplink_count, route_count, metrics_interval;
   bool mock, json;

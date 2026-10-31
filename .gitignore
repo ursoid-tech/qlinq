@@ -31,6 +31,8 @@ t/00util/test_multipath_failover
 t/00util/test_multipath_nack
 t/00util/test_operational
 t/00util/test_tls
+t/00util/test_tls_barrier
+t/00util/test_tls_groups
 t/00util/test_crypto_backend
 t/assets/
 *.o
@@ -114,6 +116,7 @@ qlinq-tun-engine
 /t/00util/test_qlinq_policy
 
 /t/00util/test_tun_names
+/t/00util/test_tun_queue
 
 /t/00util/test_xfer_file
 /t/00util/test_xfer_protocol

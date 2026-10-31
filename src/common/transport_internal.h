@@ -119,6 +119,10 @@ struct transport_t {
   size_t num_remote_addrs;
   quicly_context_t quic_ctx;
   ptls_context_t tls_ctx;
+  qlinq_tls_group_policy_t tls_group_policy;
+  bool tls_hybrid_available;
+  const char *tls_hybrid_reason; /* static, never a secret */
+  ptls_key_exchange_algorithm_t *tls_key_exchanges[3];
   ptls_openssl_sign_certificate_t sign_cert;
   quicly_cid_plaintext_t next_cid;
 
@@ -167,6 +171,11 @@ struct transport_conn_t {
   bool protocol_ready;
   bool connected_emitted;
   bool authenticated;
+  qlinq_tls_info_t tls;
+  bool tls_logged;
+  bool tls_deferred;
+  quicly_stream_t *tls_deferred_head;
+  size_t tls_deferred_bytes;
   bool fec_group_delivered; /* This peer accepted the current grouped object. */
   uint32_t peer_capabilities;
   transport_limits_t negotiated_limits;

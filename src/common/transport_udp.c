@@ -319,7 +319,7 @@ ssize_t transport_udp_send_batch_pktinfo(
   } control[TRANSPORT_UDP_MAX_BATCH];
   size_t logical_end[TRANSPORT_UDP_MAX_BATCH];
   size_t sent_count = 0;
-  bool use_gso = true;
+  bool use_gso = max_gso_segments != 1;
   while (sent_count < count) {
     size_t message_count = 0;
     for (size_t first = sent_count; first < count;) {
@@ -328,8 +328,8 @@ ssize_t transport_udp_send_batch_pktinfo(
         available = max_gso_segments;
       size_t group = use_gso ? gso_prefix(datagrams + first, available) : 0;
       if (group < 2) {
-        /* Preserve the ordinary suffix after the first non-GSO prefix. */
-        use_gso = false;
+        /* disable GSO only after kernel rejection, not mixed-batch singletons
+         */
         group = 1;
       }
       struct mmsghdr *message = &messages[message_count];

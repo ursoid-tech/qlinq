@@ -6,4 +6,6 @@ my ($name_stderr, $name_stdout) = run_prog("./t/00util/test_tun_names");
 like($name_stdout, qr/=== TUN INTERFACE NAMES OK ===/, "TUN path names resolve devices, loopback and fallback");
 my ($stderr, $stdout) = run_prog("python3 t/test_tun_metrics.py");
 like($stderr, qr/\bOK\b/, "TUN Prometheus metrics, freshness and atomic textfiles");
+my ($queue_stderr, $queue_stdout) = run_prog("./t/00util/test_tun_queue");
+like($queue_stdout, qr/===TUN DIRECT RECEIVE OK===/, "TUN receive batches write directly and preserve backpressure ordering");
 done_testing;

@@ -15,8 +15,10 @@ ifeq ($(UNAME_S),Darwin)
   INCLUDES_OPENSSL = $(OPENSSL_CFLAGS)
   LDFLAGS = $(OPENSSL_LIBS) -lpthread -ldl -lm
 else
-  INCLUDES_OPENSSL =
-  LDFLAGS = -lpthread -lrt -ldl -lm -lcrypto -lssl
+  OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null)
+  OPENSSL_LIBS ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -lssl -lcrypto)
+  INCLUDES_OPENSSL = $(OPENSSL_CFLAGS)
+  LDFLAGS = -lpthread -lrt -ldl -lm $(OPENSSL_LIBS)
 endif
 
 # Default CFLAGS for our code
@@ -122,6 +124,8 @@ TRANSPORT_OBJS = src/common/qlinq.o \
               src/common/transport_stream.o \
               src/common/transport_subscriptions.o \
               src/common/transport_tls.o \
+              src/common/transport_tls_groups.o \
+              src/common/transport_tls_state.o \
               src/common/transport_tracks.o \
               src/common/transport_udp.o \
               src/common/transport_wire.o \
@@ -159,6 +163,8 @@ CFLAGS=$(CFLAGS)
 CFLAGS_COMMON=$(CFLAGS_COMMON)
 DEPFLAGS=$(DEPFLAGS)
 INCLUDES=$(INCLUDES)
+OPENSSL_CFLAGS=$(OPENSSL_CFLAGS)
+OPENSSL_LIBS=$(OPENSSL_LIBS)
 FEC_CFLAGS=$(FEC_CFLAGS)
 FEC_NATIVE_CFLAGS=$(FEC_NATIVE_CFLAGS)
 NANORQ_NATIVE_CFLAGS=$(NANORQ_NATIVE_CFLAGS)
@@ -168,7 +174,11 @@ LDFLAGS=$(LDFLAGS)
 TRANSPORT_OBJS=$(TRANSPORT_OBJS)
 endef
 
-.build-config: FORCE
+.PHONY: prepare-picotls
+prepare-picotls:
+	python3 scripts/prepare_picotls.py
+
+.build-config: FORCE | prepare-picotls
 	$(file >$@.tmp,$(BUILD_CONFIG))
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
@@ -203,7 +213,7 @@ tmp/fusion-config: FORCE_FUSION_CONFIG
 
 src/common/transport_tls.o t/00util/test_crypto_backend.o: tmp/fusion-config Makefile
 
-deps/quicly/deps/picotls/lib/fusion.o: deps/quicly/deps/picotls/lib/fusion.c Makefile
+deps/quicly/deps/picotls/lib/fusion.o: deps/quicly/deps/picotls/lib/fusion.c Makefile .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(FUSION_CFLAGS) -w -c $< -o $@
 
 $(NANORQ_CODEC_OBJS): private CODEC_CFLAGS = $(FEC_CFLAGS) $(NANORQ_NATIVE_CFLAGS) -fstack-protector-strong
@@ -234,7 +244,11 @@ install-tun: qlinq-tun
 	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
 	install -m 644 packaging/qlinq.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/qlinq.conf
 
-check-tun-tool: qlinq-tun t/00util/test_tun_names
+t/00util/test_tun_queue: t/00util/test_tun_queue.o src/host/linux/tun_device.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write
+
+check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue
+	./t/00util/test_tun_queue
 	./t/00util/test_tun_names
 	python3 t/test_tun_tool.py
 	python3 t/test_tun_metrics.py
@@ -410,7 +424,11 @@ t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .bu
 t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-CHECK_BINARIES = $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names \
+ifeq ($(UNAME_S),Linux)
+TLS_BARRIER_TEST = t/00util/test_tls_barrier
+endif
+
+CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
@@ -437,7 +455,11 @@ t/00util/transport_quicly_clock.o: src/common/transport_quicly.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dclock_gettime=test_clock_gettime -c $< -o $@
 
-t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_quicly_clock.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
+t/00util/transport_publish_admission.o: src/common/transport_publish.c Makefile
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
+		-Dtransport_path_admission_rate=test_path_admission_rate -c $< -o $@
+
+t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_quicly_clock.o t/00util/transport_publish_admission.o $(filter-out src/common/transport_quicly.o src/common/transport_publish.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # The feedback fixture delegates native operations except during its explicit
@@ -529,3 +551,13 @@ indent:
          $(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
          deps/nanors/deps/obl/oblas_common.d \
          deps/nanors/deps/obl/oblas_lite.d
+
+# Compile the real policy code without hybrid references, even on modern hosts.
+t/00util/transport_tls_groups_legacy.o: src/common/transport_tls_groups.c t/00util/tls_groups_legacy.h .build-config
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -include t/00util/tls_groups_legacy.h -c $< -o $@
+
+t/00util/test_tls_groups: t/00util/test_tls_groups.o t/00util/transport_tls_groups_legacy.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=ptls_handshake_is_complete,--wrap=ptls_get_negotiated_group,--wrap=ptls_is_psk_handshake,--wrap=transport_stream_write_frame,--wrap=quicly_receive
