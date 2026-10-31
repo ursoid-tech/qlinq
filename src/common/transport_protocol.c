@@ -7,6 +7,7 @@
 #include "transport_repair.h"
 #include "transport_stream.h"
 #include "transport_tracks.h"
+#include "transport_tls.h"
 #include "transport_wire.h"
 
 #include "quicly/sendstate.h"
@@ -26,6 +27,8 @@ static uint32_t local_capabilities(void) {
 }
 
 bool transport_protocol_send_hello(transport_conn_t *conn) {
+  if (!transport_tls_application_allowed(conn))
+    return false;
   if (!conn || conn->hello_sent || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return conn && conn->hello_sent;
@@ -53,7 +56,7 @@ bool transport_protocol_send_hello(transport_conn_t *conn) {
 
 void transport_protocol_maybe_emit_connected(transport_conn_t *conn) {
   if (!conn || conn->connected_emitted || !conn->quic_ready ||
-      !conn->protocol_ready)
+      !conn->protocol_ready || !transport_tls_application_allowed(conn))
     return;
   conn->connected_emitted = true;
   transport_t *t = conn->transport;
@@ -385,6 +388,8 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
 
 static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
                                   const qlinq_wire_frame_t *frame) {
+  if (!transport_tls_application_allowed(conn))
+    return false;
   ptls_iovec_t input = ptls_iovec_init(frame->payload, frame->payload_len);
   switch (frame->type) {
   case QLINQ_WIRE_HELLO: {
@@ -543,6 +548,8 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
 /* The dispatcher borrows payload bytes; consume each accepted frame once. */
 static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                                    quicly_stream_t *stream) {
+  if (!transport_tls_application_allowed(conn))
+    return;
   while (true) {
     ptls_iovec_t input = transport_stream_ingress_get(stream);
     if (input.len == 0)
@@ -568,9 +575,28 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
   }
 }
 
+static void release_deferred(transport_conn_t *conn, quicly_stream_t *stream) {
+  transport_stream_ctx_t *ctx = stream->data;
+  if (!ctx->tls_deferred)
+    return;
+  quicly_stream_t **link = &conn->tls_deferred_head;
+  while (*link && *link != stream)
+    link = &((transport_stream_ctx_t *)(*link)->data)->tls_deferred_next;
+  if (*link)
+    *link = ctx->tls_deferred_next;
+  conn->tls_deferred_bytes -= ctx->tls_deferred_extent;
+  ctx->tls_deferred_extent = 0;
+  ctx->tls_deferred_next = NULL;
+  ctx->tls_deferred = false;
+  conn->tls_deferred = conn->tls_deferred_head != NULL;
+}
+
 static void on_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
   transport_conn_t *conn = *quicly_get_data(stream->conn);
   if (conn) {
+    transport_stream_ctx_t *ctx = stream->data;
+    if (ctx)
+      release_deferred(conn, stream);
     transport_subscriptions_clear_stream(&conn->receive_subscriptions, stream);
     transport_subscriptions_clear_stream(&conn->send_subscriptions, stream);
   }
@@ -579,6 +605,8 @@ static void on_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
 
 static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
                                         quicly_stream_t *stream) {
+  if (!transport_tls_application_allowed(conn))
+    return;
   transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
   ptls_iovec_t input = transport_stream_ingress_get(stream);
   size_t consumed = 0;
@@ -668,21 +696,71 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
     transport_stream_ingress_shift(stream, consumed);
 }
 
-/* control stream receive callbacks */
+/* Pending application input stays in QUIC's ingress buffer, under explicit
+ * per-stream and per-connection bounds. ACK/CRYPTO processing is unaffected. */
+static void dispatch_stream(transport_conn_t *conn, quicly_stream_t *stream) {
+  transport_stream_ctx_t *ctx = stream->data;
+  release_deferred(conn, stream);
+  if (ctx->is_control)
+    parse_control_messages(conn->transport, conn, stream);
+  else
+    parse_track_stream_messages(conn->transport, conn, stream);
+}
+
+void transport_protocol_resume_deferred(transport_conn_t *conn) {
+  if (!conn->tls_deferred || !transport_tls_application_allowed(conn))
+    return;
+  /* Pop owned stream entries rather than walking Quicly's mutable hash table:
+   * application callbacks can open/reset streams while controls are replayed.
+   */
+  if (conn->stream &&
+      ((transport_stream_ctx_t *)conn->stream->data)->tls_deferred)
+    dispatch_stream(conn, conn->stream);
+  while (conn->tls_deferred_head && transport_tls_application_allowed(conn))
+    dispatch_stream(conn, conn->tls_deferred_head);
+}
+
 static void on_receive(quicly_stream_t *stream, size_t off, const void *src,
                        size_t len) {
-  if (transport_stream_ingress_receive(stream, off, src, len) != 0)
-    return;
-
   transport_conn_t *conn = *quicly_get_data(stream->conn);
-  if (conn) {
-    transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
-    if (ctx->is_control) {
-      parse_control_messages(conn->transport, conn, stream);
-    } else {
-      parse_track_stream_messages(conn->transport, conn, stream);
+  if (!conn)
+    return;
+  bool allowed = transport_tls_application_allowed(conn);
+  if (!allowed) {
+    if (len == 0 || conn->tls.exchange == QLINQ_TLS_EXCHANGE_REJECTED)
+      return;
+    transport_stream_ctx_t *ctx = stream->data;
+    enum {
+      STREAM_PENDING_MAX = 64 * 1024,
+      CONNECTION_PENDING_MAX = 256 * 1024
+    };
+    if (off > STREAM_PENDING_MAX || len > STREAM_PENDING_MAX - off) {
+      conn->transport->stats.resource_limit_errors++;
+      quicly_close(conn->quic, TRANSPORT_APP_ERROR_RESOURCE_LIMIT,
+                   "pending TLS stream bound exceeded");
+      return;
     }
+    size_t extent = off + len > ctx->tls_deferred_extent
+                        ? off + len
+                        : ctx->tls_deferred_extent;
+    size_t growth = extent - ctx->tls_deferred_extent;
+    if (growth > CONNECTION_PENDING_MAX - conn->tls_deferred_bytes) {
+      conn->transport->stats.resource_limit_errors++;
+      quicly_close(conn->quic, TRANSPORT_APP_ERROR_RESOURCE_LIMIT,
+                   "pending TLS connection bound exceeded");
+      return;
+    }
+    if (!ctx->tls_deferred) {
+      ctx->tls_deferred_next = conn->tls_deferred_head;
+      conn->tls_deferred_head = stream;
+    }
+    ctx->tls_deferred = conn->tls_deferred = true;
+    conn->tls_deferred_bytes += growth;
+    ctx->tls_deferred_extent = extent;
   }
+  if (transport_stream_ingress_receive(stream, off, src, len) != 0 || !allowed)
+    return;
+  dispatch_stream(conn, stream);
 }
 
 static void on_stop_sending(quicly_stream_t *stream, quicly_error_t err) {
@@ -723,6 +801,9 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
   transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
   ctx->owner = NULL;
   ctx->retained_frame_bytes = 0;
+  ctx->tls_deferred = false;
+  ctx->tls_deferred_next = NULL;
+  ctx->tls_deferred_extent = 0;
   ctx->is_control = (stream->stream_id == 0);
   ctx->alias_bound = false;
 
@@ -790,7 +871,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   transport_t *t = tconn->transport;
   t->stats.datagrams_received++;
   tconn->datagrams_received++;
-  if (!tconn->authenticated)
+  if (!transport_tls_application_allowed(tconn) || !tconn->authenticated)
     return;
 
   uint8_t datagram_type;

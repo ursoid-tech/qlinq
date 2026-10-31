@@ -279,6 +279,9 @@ bool transport_owner_ok(transport_t *t) {
 void transport_emit_event(transport_t *t, const transport_event_t *event) {
   if (!t || !event)
     return;
+  if (event->conn && event->type != TRANSPORT_EVENT_DISCONNECTED &&
+      !transport_tls_application_allowed(event->conn))
+    return;
   t->callback_depth++;
   t->stats.events_emitted++;
   t->callback(t->user_data, event);
@@ -1149,6 +1152,10 @@ static void schedule_client_reconnect(transport_t *t, int64_t now_ms) {
 }
 
 transport_t *transport_create(const transport_config_t *config) {
+  if (config && !qlinq_tls_group_policy_name(config->tls_group_policy)) {
+    fprintf(stderr, "transport: invalid TLS group policy\n");
+    return NULL;
+  }
   if (config &&
       config->initial_cwnd_packets > TRANSPORT_MAX_INITIAL_CWND_PACKETS)
     return NULL;
@@ -1293,7 +1300,8 @@ transport_t *transport_create(const transport_config_t *config) {
   /* setup cryptographic context */
   t->tls_ctx.random_bytes = ptls_openssl_random_bytes;
   t->tls_ctx.get_time = &ptls_get_time;
-  t->tls_ctx.key_exchanges = ptls_openssl_key_exchanges;
+  if (!transport_tls_configure_groups(t, config->tls_group_policy))
+    goto Fail;
   if (!transport_tls_configure_crypto_backend(t))
     goto Fail;
 
@@ -1686,6 +1694,7 @@ static bool service_interfaces(transport_t *t) {
 static void discard_connection(transport_conn_t *conn, quicly_error_t error,
                                const char *failure_reason) {
   transport_t *t = conn->transport;
+  transport_tls_note_failure(conn);
   size_t index = 0;
   if (t->is_server) {
     while (index < t->conn_count && t->conns[index] != conn)
@@ -1859,6 +1868,7 @@ transport_receive_datagram(transport_t *t, size_t fd_idx, const uint8_t *buf,
     if (target) {
       quicly_error_t ret = quicly_receive(
           target->quic, (struct sockaddr *)&effective_dest, psa, &decoded);
+      transport_tls_observe(target);
       if (ret != 0 && ret != QUICLY_ERROR_PACKET_IGNORED &&
           (ret != QUICLY_ERROR_STATE_EXHAUSTION ||
            quicly_close(target->quic, ret, "receive failure") != 0)) {
@@ -2027,6 +2037,8 @@ static void service_connections(transport_t *t, uint64_t now) {
     if (!conn->quic_ready && quicly_connection_is_ready(conn->quic)) {
       conn->quic_ready = true;
     }
+    transport_tls_observe(conn);
+    transport_protocol_resume_deferred(conn);
     abandon_removed_paths(conn);
     try_open_pending_paths(t, conn, now);
     if (conn->quic_ready)
@@ -2266,7 +2278,8 @@ void transport_tick(transport_t *t) {
 
 static bool subscribe_connection(transport_conn_t *conn,
                                  const moq_track_id_t *track_id) {
-  if (!conn || !conn->protocol_ready || !conn->authenticated || !conn->stream ||
+  if (!transport_tls_application_allowed(conn) || !conn->protocol_ready ||
+      !conn->authenticated || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
@@ -2334,7 +2347,8 @@ bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
 
 static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                    const moq_track_id_t *track_id) {
-  if (!conn || !conn->protocol_ready || !conn->authenticated || !conn->stream ||
+  if (!transport_tls_application_allowed(conn) || !conn->protocol_ready ||
+      !conn->authenticated || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
@@ -2394,7 +2408,8 @@ bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
   if (!transport_owner_ok(t) || size > t->limits.max_reliable_object_size ||
       (size > 0 && !data))
     return false;
-  if (!transport_has_connection(t, conn) || !conn->protocol_ready ||
+  if (!transport_has_connection(t, conn) ||
+      !transport_tls_application_allowed(conn) || !conn->protocol_ready ||
       !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
@@ -2474,7 +2489,8 @@ bool transport_send_auth(transport_t *t, transport_conn_t *conn,
                          const uint8_t *token, size_t token_len) {
   if (!transport_owner_ok(t))
     return false;
-  if (!transport_has_connection(t, conn) || !conn->protocol_ready ||
+  if (!transport_has_connection(t, conn) ||
+      !transport_tls_application_allowed(conn) || !conn->protocol_ready ||
       !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
   if (token_len > 65535 || (token_len > 0 && !token))
@@ -2488,7 +2504,8 @@ bool transport_respond_auth(transport_t *t, transport_conn_t *conn,
                             bool success) {
   if (!transport_owner_ok(t))
     return false;
-  if (!transport_has_connection(t, conn) || !conn->protocol_ready ||
+  if (!transport_has_connection(t, conn) ||
+      !transport_tls_application_allowed(conn) || !conn->protocol_ready ||
       !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
@@ -2595,6 +2612,7 @@ bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
   stats->quic_ready = conn->quic_ready;
   stats->protocol_ready = conn->protocol_ready;
   stats->authenticated = conn->authenticated;
+  transport_tls_get_info(conn, &stats->tls);
   stats->subscriptions =
       transport_subscriptions_count(&conn->receive_subscriptions) +
       transport_subscriptions_count(&conn->send_subscriptions);

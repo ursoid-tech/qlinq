@@ -25,6 +25,7 @@ static void help(void) {
        "  init NAME --listen IPV4[:PORT] --uplink IFACE [--uplink IFACE ...]\n"
        "  init NAME --invite FILE --uplink IFACE [--uplink IFACE ...]\n"
        "    [--interface NAME] [--local-ip IP] [--peer-ip IP]\n"
+       "    [--tls-group-policy classical|prefer-hybrid|require-hybrid]\n"
        "    [--run-as USER] [--route CIDR ...]\n"
        "  pair NAME PEER.json       Trust the client's public identity\n"
        "  up NAME [--mock]          Start in the background\n"
@@ -114,7 +115,12 @@ static bool parse(int argc, char **argv, tc_args *a) {
       a->local_ip = v;
     else if (!strcmp(option, "--peer-ip"))
       a->peer_ip = v;
-    else if (!strcmp(option, "--run-as"))
+    else if (!strcmp(option, "--tls-group-policy") && !a->tls_group_policy) {
+      qlinq_tls_group_policy_t policy;
+      if (!qlinq_tls_group_policy_parse(v, &policy))
+        return false;
+      a->tls_group_policy = v;
+    } else if (!strcmp(option, "--run-as"))
       a->run_as = v;
     else if (!strcmp(option, "--uplink") && a->uplink_count < 4)
       a->uplinks[a->uplink_count++] = v;
@@ -314,6 +320,7 @@ static int worker(const tc_args *a, const char *dir, const tc_config *c,
   OPT("--peer-ip", c->peer_ip);
   OPT("--track", track);
   OPT("--mode", c->mode);
+  OPT("--tls-group-policy", qlinq_tls_group_policy_name(c->tls_group_policy));
   OPT("--mtu", mtu);
   OPT("--queue-ms", queue);
   OPT("--stats-ms", "500");
@@ -423,7 +430,10 @@ static int serve(const tc_args *a, const char *dir, const tc_config *c) {
   bool signalled = false;
   uint64_t stopped_at = 0, updated = tc_now_ms(), tx = 0, rx = 0;
   double tx_rate = 0, rx_rate = 0;
-  char snapshot[16384] = "{\"state\":\"starting\",\"paths\":[]}";
+  char snapshot[16384];
+  snprintf(snapshot, sizeof(snapshot),
+           "{\"state\":\"starting\",\"tls_group_policy\":\"%s\",\"paths\":[]}",
+           qlinq_tls_group_policy_name(c->tls_group_policy));
   char pending[65536];
   size_t used = 0;
   for (;;) {
@@ -626,6 +636,13 @@ static void print_status(const char *name, const char *reply) {
   }
   const char *state = tj_string(d, &d->nodes[0], "state");
   printf("%s: %s\n", name, state ? state : "unknown");
+  const char *policy = tj_string(d, &d->nodes[0], "tls_group_policy");
+  if (policy)
+    printf("TLS group policy: %s\n", policy);
+  const tj_node *tls = tj_get(d, &d->nodes[0], "tls");
+  const char *group = tls ? tj_string(d, tls, "selected_group_name") : NULL;
+  if (group)
+    printf("Peer TLS group: %s\n", group);
   if (counter(d, "snapshot_age_ms") > 3000)
     puts("WARNING: transport health snapshot is stale");
   const tj_node *tx = tj_get(d, &d->nodes[0], "tx_mbps"),
@@ -697,7 +714,8 @@ int tun_control_main(int argc, char **argv) {
       return 1;
     }
     if (!status)
-      strcpy(reply, "{\"state\":\"stopped\"}");
+      sprintf(reply, "{\"state\":\"stopped\",\"tls_group_policy\":\"%s\"}",
+              qlinq_tls_group_policy_name(config.tls_group_policy));
     if (!strcmp(a.action, "pair")) {
       if (status) {
         tc_error("stop the tunnel before changing its trusted peer");
