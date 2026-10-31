@@ -441,7 +441,11 @@ t/00util/transport_quicly_clock.o: src/common/transport_quicly.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dclock_gettime=test_clock_gettime -c $< -o $@
 
-t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_quicly_clock.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
+t/00util/transport_publish_admission.o: src/common/transport_publish.c Makefile
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
+		-Dtransport_path_admission_rate=test_path_admission_rate -c $< -o $@
+
+t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_quicly_clock.o t/00util/transport_publish_admission.o $(filter-out src/common/transport_quicly.o src/common/transport_publish.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # The feedback fixture delegates native operations except during its explicit

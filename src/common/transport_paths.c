@@ -176,6 +176,22 @@ bool transport_path_measure(transport_path_measurement_t *m,
   return false;
 }
 
+bool transport_path_measure_on_path(transport_path_measurement_t *m,
+                                    quicly_conn_t *quic,
+                                    const quicly_path_stats_t *stats,
+                                    size_t quic_path, size_t queued_datagrams,
+                                    uint64_t now_ms) {
+  if (!stats)
+    return false;
+  quicly_path_stats_t measured = *stats;
+  quicly_path_health_t health;
+  if (!quic || quicly_get_path_health(quic, quic_path, &health) != 0 ||
+      !health.rtt_is_sampled)
+    measured.rtt_smoothed = 0;
+  return transport_path_measure(m, &measured, quic_path, queued_datagrams,
+                                now_ms);
+}
+
 fp_t transport_path_recent_loss(const transport_path_measurement_t *m) {
   return m && m->loss_sampled ? m->recent_loss : FP_FROM_FLOAT(0.01f);
 }
@@ -208,6 +224,13 @@ fp_t transport_path_probe_cap(const transport_path_measurement_t *m,
     return ceiling;
   fp_wide_t cap = (fp_wide_t)peak * FP_ONE / ((fp_wide_t)symbol_size + 80U);
   return cap > ceiling ? ceiling : (cap > 0 ? (fp_t)cap : 1);
+}
+
+fp_t transport_path_admission_rate(fp_t estimate, fp_t ceiling) {
+  if (estimate <= 0 || ceiling <= 0)
+    return 0;
+  fp_wide_t probe = (fp_wide_t)estimate * 5 / 4;
+  return probe >= ceiling ? ceiling : (fp_t)probe;
 }
 
 size_t transport_path_budget_burst(fp_t rate) {

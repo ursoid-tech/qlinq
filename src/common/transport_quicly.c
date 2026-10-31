@@ -1987,8 +1987,9 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
         }
         size_t queued =
             quicly_get_num_datagram_frames_path(target->quic, mapped);
-        if (transport_path_measure(&target->paths[i].measurement, &stats,
-                                   mapped, queued, now)) {
+        if (transport_path_measure_on_path(&target->paths[i].measurement,
+                                           target->quic, &stats, mapped, queued,
+                                           now)) {
           memset(&target->paths[i].state, 0, sizeof(target->paths[i].state));
           memset(&target->paths[i].budget, 0, sizeof(target->paths[i].budget));
         }

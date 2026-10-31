@@ -5,6 +5,42 @@
 #include <stdlib.h>
 
 static uint64_t group_timer_now;
+static fp_t admission_ceiling;
+
+/* isolate whole-group debt check from native capacity estimation */
+fp_t test_path_admission_rate(fp_t estimate, fp_t ceiling) {
+  if (admission_ceiling > 0 && ceiling > admission_ceiling)
+    ceiling = admission_ceiling;
+  return transport_path_admission_rate(estimate, ceiling);
+}
+
+/* stale ewma must not starve native cwnd with available capacity */
+static void test_native_window_admission(void) {
+  transport_fixture_t f;
+  fixture_create(&f, 19948, NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "native-window-admission"};
+  fixture_subscribe(&f, &f.client, track);
+  transport_conn_t *conn = f.server.conn;
+  quicly_path_stats_t stats;
+  size_t mapped = transport_path_get_eligible_by_local(
+      conn->quic, &f.server.transport->sockets[0].local_addr, &stats);
+  assert(mapped != SIZE_MAX);
+  (void)transport_path_measure(&conn->paths[0].measurement, &stats, mapped, 0,
+                               (uint64_t)transport_get_time_ms());
+  conn->paths[0].state.initialized = true;
+  conn->paths[0].state.b_ewma = FP_FROM_INT(1);
+  uint8_t payload[1000] = {17};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  assert(transport_publish_ex(f.server.transport, &object) ==
+         TRANSPORT_PUBLISH_BUFFERED);
+  assert(transport_publish_flush_grouped(f.server.transport));
+  assert(conn->paths[0].budget.rate > FP_FROM_INT(10));
+  fixture_receive(&f, &f.client, 1);
+  fixture_destroy(&f);
+}
 
 static void test_send_service_quantum(void) {
   transport_fixture_t f;
@@ -258,6 +294,7 @@ static void test_slow_group_admission(void) {
                                  (uint64_t)transport_get_time_ms());
     conn->paths[0].state.initialized = true;
     conn->paths[0].state.b_ewma = FP_FROM_INT(100);
+    admission_ceiling = FP_FROM_INT(100);
     uint8_t payload[8000] = {42};
     moq_object_t object = {
         .track_id = track, .data = payload, .size = sizeof(payload)};
@@ -282,6 +319,7 @@ static void test_slow_group_admission(void) {
     assert(transport_publish_flush_grouped(f.server.transport));
     assert(quicly_get_num_datagram_frames_path(conn->quic, 0) == 2 * queued);
     assert(f.server.transport->pending_group.size == 0);
+    admission_ceiling = 0;
     fixture_destroy(&f);
   }
 }
@@ -696,6 +734,7 @@ static void test_checkpoint_progress_under_datagram_pressure(bool drop_first) {
 int main(void) {
   test_checkpoint_progress_under_datagram_pressure(false);
   test_checkpoint_progress_under_datagram_pressure(true);
+  test_native_window_admission();
   test_send_service_quantum();
   test_queue_boundary();
   test_slow_group_admission();
