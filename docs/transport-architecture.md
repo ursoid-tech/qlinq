@@ -194,6 +194,13 @@ essential control. Exhausting essential-control capacity closes the connection
 with a resource-limit error. Configuration must accommodate one maximum-sized
 reliable object plus control space.
 
+New datagram admission also yields while the connection's control stream has
+unsent control bytes or control bytes pending retransmission. This lets the
+existing datagram queue drain so checkpoints and their acknowledgments can
+progress under continuous publishing. Admission resumes once control is emitted;
+it does not wait for acknowledgment. Application payload on the control stream
+does not extend this control watermark.
+
 Datagram publication checks the smallest negotiated FEC object limit among
 eligible receivers before accepting a record into a group or emitting data.
 Grouped records include their two-byte length prefixes in this limit. Short

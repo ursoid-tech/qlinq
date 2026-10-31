@@ -165,7 +165,18 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
          stats.records_sent == 1);
   qlinq_stream_close(sub);
   record.sequence++;
-  sent = qlinq_stream_send(pub, &record);
+  /* closing reverse subscription queues control; retry transient backpressure
+   */
+  for (size_t i = 0; i < 2000; i++) {
+    sent = qlinq_stream_send(pub, &record);
+    if (sent != QLINQ_SEND_WOULD_BLOCK)
+      break;
+    transport_tick(legacy.transport);
+    assert(qlinq_service(ctx, 1) >= QLINQ_STATUS_OK);
+    qlinq_event_t event;
+    while (qlinq_next_event(ctx, &event))
+      qlinq_event_release(&event);
+  }
   assert(sent == QLINQ_SEND_SENT || sent == QLINQ_SEND_BUFFERED);
   for (size_t i = 0; i < 2000 && legacy.received < 2; i++) {
     transport_tick(legacy.transport);

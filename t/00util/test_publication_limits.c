@@ -372,7 +372,13 @@ static void test_short_flush_recovery(void) {
    * remain contiguous with later rolling checkpoints. */
   for (unsigned i = 0; i < 128; i++)
     assert(transport_publish(f.server.transport, &object));
-  assert(transport_publish_flush(f.server.transport));
+  /* rolling checkpoint can pause grouped tail; retry without duplicating */
+  bool flushed = false;
+  for (unsigned i = 0; i < 2000 && !flushed; i++) {
+    flushed = transport_publish_flush(f.server.transport);
+    fixture_tick(&f);
+  }
+  assert(flushed);
   fixture_receive(&f, &f.client, 33);
   assert(f.server.transport->stats.recovery_checkpoints_sent == 3 &&
          f.client.transport->stats.recovery_checkpoints_received == 3);
@@ -520,7 +526,109 @@ static void test_group_timer_backpressure(void) {
   fixture_destroy(&f);
 }
 
+/* checkpoint acks must progress under continuous datagram pressure */
+static void test_checkpoint_progress_under_datagram_pressure(bool drop_first) {
+  transport_fixture_t f;
+  fixture_create(&f, (uint16_t)(19954 + drop_first), NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "checkpoint-under-load"};
+  fixture_subscribe(&f, &f.client, track);
+  quicly_stream_t *control = f.server.conn->stream;
+  transport_stream_ctx_t *ctx = control->data;
+  for (size_t i = 0; i < 1000 && control->sendstate.size_inflight <
+                                     ctx->streambuf.egress.bytes_written;
+       i++)
+    fixture_tick(&f);
+  assert(control->sendstate.size_inflight ==
+         ctx->streambuf.egress.bytes_written);
+  assert(transport_mock_path_state(f.server.transport, 0, 100000, 1, 0));
+  f.server.transport->limits.max_packets_per_tick = 1;
+  uint8_t payload[1024] = {77};
+  moq_object_t object = {.track_id = track,
+                         .data = payload,
+                         .size = sizeof(payload),
+                         .priority = 1};
+  size_t accepted = 0;
+  for (size_t i = 0; i < 32; i++) {
+    assert(transport_publish_ex(f.server.transport, &object) ==
+           TRANSPORT_PUBLISH_BUFFERED);
+    accepted++;
+    assert(transport_publish_flush_grouped(f.server.transport));
+  }
+  uint8_t alias;
+  assert(transport_subscriptions_find_alias(&f.server.conn->send_subscriptions,
+                                            &track, &alias) == 0);
+  transport_checkpoint_ack_state_t *ack =
+      transport_checkpoint_ack(f.server.conn, alias);
+  assert(ack->sent_initialized && ack->sent_object_id == 31);
+  uint64_t control_end = ctx->streambuf.egress.bytes_written;
+  bool progressed = false, resumed_before_ack = false, discarded = false;
+  size_t blocked = 0;
+  for (size_t turn = 0; turn < 600; turn++) {
+    for (size_t i = 0; i < 64; i++) {
+      transport_publish_result_t result =
+          transport_publish_ex(f.server.transport, &object);
+      if (result == TRANSPORT_PUBLISH_BACKPRESSURE) {
+        blocked++;
+        break;
+      }
+      assert(result == TRANSPORT_PUBLISH_BUFFERED ||
+             result == TRANSPORT_PUBLISH_DELIVERED);
+      accepted++;
+      if (!transport_publish_flush_grouped(f.server.transport))
+        break;
+    }
+    transport_tick(f.server.transport);
+    if (!resumed_before_ack &&
+        control->sendstate.size_inflight >= control_end) {
+      assert(!ack->acked_initialized || ack->acked_object_id < 31);
+      if (drop_first) {
+        /* drop initial checkpoint packet to verify control retransmission */
+        uint8_t packet[65536];
+        assert(recv(f.client.transport->sockets[0].fd, packet, sizeof(packet),
+                    MSG_DONTWAIT) > 0);
+        discarded = true;
+      }
+      transport_publish_result_t result =
+          transport_publish_ex(f.server.transport, &object);
+      assert(result == TRANSPORT_PUBLISH_BUFFERED ||
+             result == TRANSPORT_PUBLISH_DELIVERED);
+      accepted++;
+      assert(transport_publish_flush_grouped(f.server.transport));
+      resumed_before_ack = true;
+    }
+    transport_tick(f.client.transport);
+    assert(!f.server.failed && !f.client.failed);
+    usleep(1000);
+    if (ack->acked_initialized && ack->acked_group_id == 0 &&
+        ack->acked_object_id >= 31) {
+      progressed = true;
+      break;
+    }
+  }
+  fprintf(stderr,
+          "checkpoint pressure: ack=%d objects=%zu blocked=%zu "
+          "queued=%zu cache=%zu\n",
+          progressed, accepted, blocked,
+          quicly_get_num_datagram_frames_path(f.server.conn->quic, 0),
+          f.server.transport->sent_cache.count);
+  assert(progressed &&
+         "continuous DATAGRAM publication starved checkpoint ACK");
+  assert(resumed_before_ack && discarded == drop_first);
+  for (size_t i = 0; i < 4000 && f.client.objects < accepted; i++) {
+    (void)transport_publish_flush(f.server.transport);
+    fixture_tick(&f);
+  }
+  assert(f.client.objects == accepted);
+  assert(f.client.payload_size == sizeof(payload) + 2 &&
+         memcmp(f.client.payload + 2, payload, sizeof(payload)) == 0);
+  fixture_destroy(&f);
+}
+
 int main(void) {
+  test_checkpoint_progress_under_datagram_pressure(false);
+  test_checkpoint_progress_under_datagram_pressure(true);
   test_send_service_quantum();
   test_queue_boundary();
   test_slow_group_admission();

@@ -2872,6 +2872,8 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
                                        true))
         return false;
     } else {
+      if (transport_stream_control_pending(conn->stream))
+        return false;
       if (conn->admission_retry_at_ns > transport_get_monotonic_ns())
         return false;
       bool ready = false;

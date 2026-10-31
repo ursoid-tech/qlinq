@@ -243,6 +243,9 @@ static transport_publish_result_t
 plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                const transport_track_profile_t *profile,
                publication_plan_t *plan) {
+  /* yield new datagram admission until pending control can be emitted */
+  if (transport_stream_control_pending(conn->stream))
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
   uint64_t admission_now = transport_get_monotonic_ns();
   size_t symbol_size = plan->symbol_size;
   size_t estimate_symbol_size = plan->estimate_symbol_size;
