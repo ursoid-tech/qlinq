@@ -16,9 +16,11 @@ git submodule status --recursive | while IFS= read -r line; do
 done || bad_status=1
 [ "$bad_status" -eq 0 ] || exit 1
 
+python3 scripts/prepare_quicly.py --check
 python3 scripts/prepare_picotls.py --check
+export QLINQ_QUICLY_PATCH="$(pwd)/patches/quicly-gso.patch"
 export QLINQ_PICOTLS_PATCH="$(pwd)/patches/picotls-negotiated-group.patch"
 git submodule foreach --quiet --recursive \
-  'if ! git diff --quiet --ignore-submodules=all; then if [ "$displaypath" = "deps/quicly/deps/picotls" ] && git diff HEAD --binary | cmp -s - "$QLINQ_PICOTLS_PATCH"; then exit 0; fi; echo "tracked changes in submodule: $displaypath" >&2; exit 1; fi'
+  'if ! git diff --quiet --ignore-submodules=all; then if [ "$displaypath" = "deps/quicly" ] && git diff HEAD --binary --abbrev=8 --ignore-submodules=all | cmp -s - "$QLINQ_QUICLY_PATCH"; then exit 0; fi; if [ "$displaypath" = "deps/quicly/deps/picotls" ] && git diff HEAD --binary | cmp -s - "$QLINQ_PICOTLS_PATCH"; then exit 0; fi; echo "tracked changes in submodule: $displaypath" >&2; exit 1; fi'
 
-echo "submodule revisions are pinned and tracked contents match pins plus the recorded Picotls patch"
+echo "submodule revisions are pinned and tracked contents match pins plus the recorded Quicly and Picotls patches"

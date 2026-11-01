@@ -1,0 +1,68 @@
+diff --git a/include/quicly.h b/include/quicly.h
+index db91129c..32c00d2c 100644
+--- a/include/quicly.h
++++ b/include/quicly.h
+@@ -556,6 +556,12 @@ struct st_quicly_context_t {
+      * maximum number of DATAGRAM frame payloads that can be queued per path (0 uses default)
+      */
+     size_t max_datagram_frame_payloads;
++    /**
++     * Allow differently sized UDP datagrams in one send result instead of padding nonfinal datagrams solely for GSO.
++     * The caller must group compatible sizes for GSO or send them individually. Initial packets and explicit probes
++     * retain their required padding. Zero preserves the default uniform-size batching behavior.
++     */
++    uint8_t allow_variable_datagram_sizes : 1;
+ };
+ 
+ /**
+@@ -1620,7 +1626,8 @@ size_t quicly_send_retry(quicly_context_t *ctx, ptls_aead_context_t *token_encry
+  * @param buf                     buffer used for building UDP datagrams. It is guaranteed that the first datagram would be built
+  *                                from the address provided by `buf`, and that succeeding packets (if any) will be contiguously laid
+  *                                out. This constraint reduces the number of vectors that need to be passed to the kernel when using
+- *                                GSO.
++ *                                GSO. When allow_variable_datagram_sizes is set, the caller must split this output into compatible
++ *                                GSO groups; nonfinal datagrams need not have the same size.
+  * @return 0 if successful, otherwise one of the following:
+  *         * QUICLY_ERROR_FREE_CONNECTION - the connection has been closed (e.g., the closing period has ended, or the idle timeout
+  *           has fired). The caller must call `quicly_free` to discard the connection.
+diff --git a/lib/quicly.c b/lib/quicly.c
+index 1e70c601..8e0beb0a 100644
+--- a/lib/quicly.c
++++ b/lib/quicly.c
+@@ -6011,7 +6011,8 @@ static quicly_error_t commit_send_packet(quicly_conn_t *conn, quicly_send_contex
+         size_t full_size = s->datagram_capacity;
+         if (s->target.full_size_value != 0 && s->target.full_size_value < full_size)
+             full_size = s->target.full_size_value;
+-        assert(s->num_datagrams == 0 || s->datagrams[s->num_datagrams - 1].iov_len == full_size);
++        assert(conn->super.ctx->allow_variable_datagram_sizes || s->num_datagrams == 0 ||
++               s->datagrams[s->num_datagrams - 1].iov_len == full_size);
+         const size_t max_size = full_size - QUICLY_AEAD_TAG_SIZE;
+         assert(s->dst - s->payload_buf.datagram <= max_size);
+         memset(s->dst, QUICLY_FRAME_TYPE_PADDING, s->payload_buf.datagram + max_size - s->dst);
+@@ -6214,9 +6215,11 @@ static quicly_error_t do_allocate_frame(quicly_conn_t *conn, quicly_send_context
+             if (overhead + packet_min_space > s->dst_end - s->dst)
+                 coalescible = 0;
+         }
+-        /* Close the packet under construction. Datagrams being returned by `quicly_send` are padded to full-size (except for the
+-         * last one datagram) so that they can be sent at once using GSO. */
+-        if (!coalescible)
++        /* Uniform-size output permits a single GSO aggregate. Callers that can regroup varying lengths can avoid this
++         * padding; Initial datagrams must still be full-sized, including when a later packet closes them here. Explicit
++         * validation and PMTU probes retain target.full_size independently of this batching policy. */
++        if (!coalescible && (!conn->super.ctx->allow_variable_datagram_sizes ||
++                            QUICLY_PACKET_IS_INITIAL(s->payload_buf.datagram[0])))
+             s->target.full_size = 1;
+         if ((ret = commit_send_packet(conn, s, coalescible)) != 0)
+             return ret;
+@@ -6232,8 +6235,9 @@ static quicly_error_t do_allocate_frame(quicly_conn_t *conn, quicly_send_context
+         if (s->num_datagrams >= s->max_datagrams)
+             return QUICLY_ERROR_SENDBUF_FULL;
+         s->datagram_capacity = ps->max_udp_payload_size;
+-        /* a short validation datagram must be last in a GSO batch; ordinary sends still reserve configured size */
+-        if (s->num_datagrams != 0 && s->datagrams[s->num_datagrams - 1].iov_len != s->datagram_capacity)
++        /* Uniform-size callers require a short validation datagram to end the batch. Variable-size callers regroup the output. */
++        if (!conn->super.ctx->allow_variable_datagram_sizes && s->num_datagrams != 0 &&
++            s->datagrams[s->num_datagrams - 1].iov_len != s->datagram_capacity)
+             return QUICLY_ERROR_SENDBUF_FULL;
+         if (quicly_is_multipath(conn) || has_application_path_eligibility(conn)) {
+             uint64_t allowance = calc_amplification_limit_allowance(conn, path);

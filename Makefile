@@ -184,11 +184,14 @@ POLL_HOST_OBJS=$(POLL_HOST_OBJS)
 TRANSPORT_OBJS=$(TRANSPORT_OBJS)
 endef
 
-.PHONY: prepare-picotls
+.PHONY: prepare-picotls prepare-quicly
+prepare-quicly:
+	python3 scripts/prepare_quicly.py
+
 prepare-picotls:
 	python3 scripts/prepare_picotls.py
 
-.build-config: FORCE | prepare-picotls
+.build-config: FORCE | prepare-quicly prepare-picotls
 	$(file >$@.tmp,$(BUILD_CONFIG))
 	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
 
