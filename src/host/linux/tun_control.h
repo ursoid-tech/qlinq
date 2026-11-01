@@ -20,7 +20,7 @@ typedef struct {
   const char *tls_group_policy;
   const char *uplinks[4], *routes[16];
   unsigned uplink_count, route_count, metrics_interval;
-  bool mock, json;
+  bool mock, json, tx_gso, rx_gro;
 } tc_args;
 
 typedef struct {

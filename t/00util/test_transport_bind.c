@@ -125,8 +125,8 @@ static void recovery_event(void *data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
     state->conn = NULL;
-    state->disconnected = !event->disconnect.remote &&
-                          event->disconnect.error_code == 0x10;
+    state->disconnected =
+        !event->disconnect.remote && event->disconnect.error_code == 0x10;
     break;
   case TRANSPORT_EVENT_OBJECT:
     state->received = event->object.size == 8 &&
@@ -162,7 +162,8 @@ static int run_last_interface_recovery(void) {
     goto Exit;
   for (unsigned session = 1; session <= 3; session++) {
     int64_t deadline = transport_get_time_ms() + 3000;
-    while (client.authenticated < session && transport_get_time_ms() < deadline) {
+    while (client.authenticated < session &&
+           transport_get_time_ms() < deadline) {
       transport_tick(server.transport);
       transport_tick(client.transport);
       usleep(1000);
@@ -194,7 +195,8 @@ Exit:
   transport_destroy(client.transport);
   transport_destroy(server.transport);
   if (result)
-    fprintf(stderr, "last client interface did not reconnect and deliver data\n");
+    fprintf(stderr,
+            "last client interface did not reconnect and deliver data\n");
   return result;
 }
 

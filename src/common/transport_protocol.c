@@ -124,7 +124,7 @@ static void close_wire_error(transport_conn_t *conn,
 }
 
 static bool repair_request_allowed(transport_conn_t *conn) {
-  int64_t now = transport_get_time_ms();
+  int64_t now = transport_now_ms(conn->transport);
   conn->transport->stats.repair_requests_received++;
   if (!transport_repair_limiter_take(
           &conn->repair_request_limiter,
@@ -212,7 +212,7 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
   transport_policy_schedule_t schedule = {0};
   path_t planned_paths[TRANSPORT_POLICY_PATHS] = {0};
   size_t packet_len = QLINQ_WIRE_FEC_HEADER_SIZE + repair->symbol_size;
-  uint64_t admission_ns = transport_get_monotonic_ns();
+  uint64_t admission_ns = transport_now_ns(conn->transport);
   size_t path_count = transport_publish_collect_paths(
       conn->transport, conn, packet_len, admission_ns, native);
   if (path_count > TRANSPORT_POLICY_PATHS)
@@ -262,7 +262,8 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
                                       .data_symbols = cached->data_symbols,
                                       .symbol_size = repair->symbol_size,
                                       .original_size = (uint32_t)cached->size,
-                                      .send_time_ns = transport_get_time_ns()};
+                                      .send_time_ns =
+                                          transport_now_ns(conn->transport)};
     if (qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) !=
         QLINQ_WIRE_OK)
       break;
@@ -331,7 +332,7 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
     if (missing_count > TRANSPORT_REPAIR_MAX_SYMBOLS)
       missing_count = TRANSPORT_REPAIR_MAX_SYMBOLS;
   }
-  int64_t now = transport_get_time_ms();
+  int64_t now = transport_now_ms(t);
   if (!transport_repair_limiter_take(
           &t->aggregate_repair_limiter,
           t->limits.max_aggregate_repair_requests_per_second, now)) {
@@ -977,7 +978,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   /* The echoed ID belongs to the sender, never to our local path table.
    * Bound feedback per wire path, and reserve queue space for application data.
    */
-  uint64_t now_ns = transport_get_time_ns();
+  uint64_t now_ns = transport_now_ns(t);
   if (hdr.path_id < TRANSPORT_MAX_QUIC_PATHS &&
       now_ns >= tconn->telemetry_reply_at_ns[hdr.path_id]) {
     tconn->telemetry_reply_at_ns[hdr.path_id] = now_ns + 10000000U;
@@ -1017,7 +1018,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   }
 
   if (rateless_data)
-    transport_recovery_observe(object_state, group_id, object_id);
+    transport_recovery_observe_at(object_state, transport_now_ms(t), group_id,
+                                  object_id);
 
   frame_assembler_t *asm_slot =
       transport_find_assembler(tconn, track_id, group_id, object_id);
@@ -1098,7 +1100,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot->priority = hdr.priority;
     asm_slot->received_count = 0;
     asm_slot->nack_sent = false;
-    asm_slot->first_symbol_time_ms = transport_get_time_ms();
+    asm_slot->first_symbol_time_ms = transport_now_ms(t);
     asm_slot->last_activity_time_ms = asm_slot->first_symbol_time_ms;
     transport_index_assembler(tconn, asm_slot);
   }
@@ -1123,7 +1125,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
            payload.base + QLINQ_WIRE_FEC_HEADER_SIZE, symbol_size);
     asm_slot->received_mask[symbol_index] = true;
     asm_slot->received_count++;
-    asm_slot->last_activity_time_ms = transport_get_time_ms();
+    asm_slot->last_activity_time_ms = transport_now_ms(t);
   }
 
   if (asm_slot->received_count >= data_symbols) {

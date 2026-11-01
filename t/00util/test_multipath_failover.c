@@ -1,3 +1,4 @@
+#include "transport_poll_host.h"
 #include "transport_internal.h"
 #include "transport_paths.h"
 #include "transport_udp.h"
@@ -55,11 +56,11 @@ ssize_t transport_udp_send_batch_ecn(int fd, const struct sockaddr *destination,
     quicly_stats_t stats;
     assert(quicly_get_stats(quic, &stats) == 0);
     bool confirmed = stats.handshake_confirmed_msec != UINT64_MAX;
-    if (fd == startup_client->sockets[1].fd && !confirmed)
+    if (fd == transport_poll_host(startup_client)->sockets[1].fd && !confirmed)
       startup_early_secondary += count;
     if (startup_delay && !startup_released &&
-        fd == startup_client->sockets[0].fd && !confirmed &&
-        quicly_connection_is_ready(quic)) {
+        fd == transport_poll_host(startup_client)->sockets[0].fd &&
+        !confirmed && quicly_connection_is_ready(quic)) {
       if (startup_hold_at == 0)
         startup_hold_at = transport_get_time_ms();
       for (size_t i = 0; i < count; i++) {
@@ -154,10 +155,10 @@ static void release_startup_flight(void) {
   for (size_t i = 0; i < startup_held_count; i++) {
     struct iovec datagram = {.iov_base = startup_held[i].data,
                              .iov_len = startup_held[i].size};
-    assert(real_udp_send_batch(startup_client->sockets[0].fd,
-                               (struct sockaddr *)&startup_held[i].destination,
-                               startup_held[i].destination_len, &datagram, 1,
-                               0) == 1);
+    assert(real_udp_send_batch(
+               transport_poll_host(startup_client)->sockets[0].fd,
+               (struct sockaddr *)&startup_held[i].destination,
+               startup_held[i].destination_len, &datagram, 1, 0) == 1);
     startup_delivered++;
   }
 }
@@ -360,9 +361,12 @@ static void run(size_t failed_path, bool bidirectional) {
   }
   client.transport->quic_ctx.multipath_failover_pto_threshold = 2;
   server.transport->quic_ctx.multipath_failover_pto_threshold = 2;
-  dropped_fds[0] = client.transport->sockets[failed_path].fd;
+  dropped_fds[0] =
+      transport_poll_host(client.transport)->sockets[failed_path].fd;
   dropped_fds[1] =
-      bidirectional ? server.transport->sockets[failed_path].fd : -1;
+      bidirectional
+          ? transport_poll_host(server.transport)->sockets[failed_path].fd
+          : -1;
   dropped_packets = 0;
   quicly_path_stats_t stats;
   forced_path = transport_path_get_stats_by_local(

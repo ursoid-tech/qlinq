@@ -1,3 +1,4 @@
+#include "transport_poll_host.h"
 /* Exercise the real queue and public ownership operations without socket I/O.
  * Including the implementation exposes allocation charges for this audit. */
 #include "../../src/common/qlinq.c"
@@ -353,8 +354,9 @@ static int service_progress(void) {
     usleep(1000);
   } while (transport_get_time_ms() < deadline);
   CHECK(!quicly_has_pending_stream_data(reverse_conn->quic));
-  struct pollfd input = {.fd = fixture.endpoints[0]->transport->sockets[0].fd,
-                         .events = POLLIN};
+  struct pollfd input = {
+      .fd = transport_poll_host(fixture.endpoints[0]->transport)->sockets[0].fd,
+      .events = POLLIN};
   CHECK(poll(&input, 1, 1000) == 1 && (input.revents & POLLIN));
   fixture.contexts[0]->max_queued_events = 1;
   CHECK(qlinq_service(fixture.contexts[0], -1) == QLINQ_STATUS_RESOURCE_LIMIT);

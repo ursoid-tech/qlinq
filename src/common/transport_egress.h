@@ -18,7 +18,15 @@ typedef struct {
   size_t size;
 } transport_egress_packet_t;
 
+typedef ssize_t (*transport_egress_sender_t)(void *, int,
+                                             const struct sockaddr *, socklen_t,
+                                             const struct sockaddr *, uint32_t,
+                                             const struct iovec *, size_t,
+                                             size_t, uint8_t);
+
 typedef struct {
+  transport_egress_sender_t sender;
+  void *sender_context;
   transport_egress_packet_t *packets;
   size_t capacity;
   size_t max_bytes;
@@ -43,21 +51,24 @@ bool transport_egress_can_accept(const transport_egress_t *egress,
                                  size_t packets, size_t bytes);
 /* Preserve the UDP grouping limit (0=default, 1..64=bounded) with retained
  * packets, including across partial sends and later submissions. */
-bool transport_egress_submit(transport_egress_t *egress, int fd,
+bool transport_egress_submit(transport_egress_t *egress, int path_token,
                              const struct sockaddr *destination,
                              socklen_t destination_len,
                              const struct iovec *datagrams, size_t count,
                              size_t max_gso_segments);
-bool transport_egress_submit_ecn(transport_egress_t *egress, int fd,
+bool transport_egress_submit_ecn(transport_egress_t *egress, int path_token,
                                  const struct sockaddr *destination,
                                  socklen_t destination_len,
                                  const struct iovec *datagrams, size_t count,
                                  size_t max_gso_segments, uint8_t ecn);
-bool transport_egress_submit_pktinfo(
-    transport_egress_t *egress, int fd, const struct sockaddr *destination,
-    socklen_t destination_len, const struct sockaddr *source, uint32_t ifindex,
-    const struct iovec *datagrams, size_t count, size_t max_gso_segments,
-    uint8_t ecn);
-bool transport_egress_flush(transport_egress_t *egress, int fd);
+bool transport_egress_submit_pktinfo(transport_egress_t *egress, int path_token,
+                                     const struct sockaddr *destination,
+                                     socklen_t destination_len,
+                                     const struct sockaddr *source,
+                                     uint32_t ifindex,
+                                     const struct iovec *datagrams,
+                                     size_t count, size_t max_gso_segments,
+                                     uint8_t ecn);
+bool transport_egress_flush(transport_egress_t *egress, int path_token);
 
 #endif

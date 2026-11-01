@@ -1,7 +1,6 @@
 /* transport_quicly.c */
 
 #include "fec.h"
-#include "ifmon.h"
 #include "pathflow.h"
 #include "portable_sockets.h"
 #include "transport.h"
@@ -20,10 +19,8 @@
 #include "transport_subscriptions.h"
 #include "transport_tls.h"
 #include "transport_tracks.h"
-#include "transport_udp.h"
 #include "transport_wire.h"
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -31,9 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#ifndef _WIN32
-#include <net/if.h>
-#endif
+
 #include "picotls.h"
 #include "picotls/openssl.h"
 #include "quicly.h"
@@ -47,24 +42,6 @@
 #define QLINQ_PATHFLOW_UPDATE_MS 25U
 #define QLINQ_GROUP_FLUSH_MS 3U
 #define QLINQ_GROUP_FLUSH_RETRY_MS 1U
-
-uint64_t transport_get_time_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
-uint64_t transport_get_monotonic_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
-static void monotonic_now_cb(quicly_now_t *self, double *now) {
-  (void)self;
-  *now = (double)transport_get_monotonic_ns() / 1000000.0;
-}
-static quicly_now_t transport_monotonic_now = {monotonic_now_cb};
 
 /* Exact identities share hash buckets; collisions never replace live objects.
  * Slot references are offset by one so calloc initializes empty indexes. */
@@ -186,7 +163,7 @@ void transport_assembler_observe_receive(transport_conn_t *conn,
                                          size_t payload_bytes) {
   if (!conn || payload_bytes == 0)
     return;
-  uint64_t now_ms = (uint64_t)transport_get_time_ms();
+  uint64_t now_ms = (uint64_t)transport_now_ms(conn->transport);
   if (conn->assembler_rx_window_started_ms == 0 ||
       now_ms < conn->assembler_rx_window_started_ms) {
     conn->assembler_rx_window_started_ms = now_ms;
@@ -270,7 +247,7 @@ bool transport_owner_ok(transport_t *t) {
   if (!t)
     return false;
   if (pthread_equal(t->owner_thread, pthread_self()))
-    return !t->log_callback_active;
+    return !t->log_callback_active && !t->host_callback_active;
   atomic_fetch_add_explicit(&t->cross_thread_violations, 1,
                             memory_order_relaxed);
   return false;
@@ -388,14 +365,6 @@ bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
   size_t after = quicly_get_num_datagram_frames_path(conn->quic, path_index);
   return after == before + 1U;
 }
-
-typedef struct {
-  uint32_t index;
-  char name[64];
-  struct sockaddr_storage addr;
-  socklen_t addr_len;
-  int is_added;
-} ifmon_pipe_msg_t;
 
 static void copy_interface_name(char destination[64], const char *name) {
   if (!destination || !name)
@@ -627,257 +596,6 @@ static quicly_path_scheduler_t qlinq_path_scheduler = {
     .do_send = qlinq_path_scheduler_send,
     .is_path_eligible = qlinq_path_is_eligible};
 
-static socklen_t ifmon_socket_address(struct sockaddr_storage *out,
-                                      const ifmon_addr_t *address,
-                                      uint32_t interface_index) {
-  memset(out, 0, sizeof(*out));
-  if (address->family == AF_INET) {
-    struct sockaddr_in *v4 = (struct sockaddr_in *)out;
-    v4->sin_family = AF_INET;
-    v4->sin_addr = address->ip.v4;
-    return sizeof(*v4);
-  }
-  struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)out;
-  v6->sin6_family = AF_INET6;
-  v6->sin6_addr = address->ip.v6;
-  if (IN6_IS_ADDR_LINKLOCAL(&v6->sin6_addr))
-    v6->sin6_scope_id = interface_index;
-  return sizeof(*v6);
-}
-
-static void resolve_configured_interfaces(transport_t *t) {
-  ifmon_list_t interfaces = {0};
-  uint8_t scratchpad[IFMON_SCRATCHPAD_SIZE];
-  if (!t || ifmon_list_get(&interfaces, scratchpad, sizeof(scratchpad)) != 0)
-    return;
-  for (size_t path = 0; path < t->socket_count; path++) {
-    for (int i = 0; i < interfaces.count; i++) {
-      const ifmon_iface_t *iface = &interfaces.ifaces[i];
-      for (int a = 0; a < iface->addr_count; a++) {
-        struct sockaddr_storage address;
-        ifmon_socket_address(&address, &iface->addrs[a], iface->index);
-        if (!transport_address_equal(
-                (const struct sockaddr *)&address,
-                (const struct sockaddr *)&t->sockets[path].local_addr))
-          continue;
-        t->sockets[path].interface_index = iface->index;
-        copy_interface_name(t->sockets[path].interface_name, iface->name);
-        break;
-      }
-      if (t->sockets[path].interface_index != 0)
-        break;
-    }
-  }
-}
-
-static void bind_to_device(int fd, uint32_t index) {
-  if (index == 0)
-    return;
-#if defined(__linux__)
-  char ifname[IF_NAMESIZE];
-  if (if_indextoname(index, ifname)) {
-    setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname));
-  }
-#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) ||    \
-    defined(__NetBSD__)
-#ifndef IP_BOUND_IF
-#define IP_BOUND_IF 25
-#endif
-#ifndef IPV6_BOUND_IF
-#define IPV6_BOUND_IF 125
-#endif
-  unsigned int idx = index;
-  setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof(idx));
-  setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &idx, sizeof(idx));
-#elif defined(_WIN32)
-  DWORD idx = index;
-  setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, (const char *)&idx, sizeof(idx));
-  setsockopt(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, (const char *)&idx,
-             sizeof(idx));
-#endif
-}
-
-static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
-  transport_t *t = userdata;
-
-  if (update->is_initial) {
-    if (!t->multihome)
-      return;
-    for (int j = 0; j < update->interfaces->count; j++) {
-      const ifmon_iface_t *iface = &update->interfaces->ifaces[j];
-      if (!iface->is_up)
-        continue;
-      if (strncmp(iface->name, "lo", 2) == 0 && update->interfaces->count > 1)
-        continue;
-      for (int k = 0; k < iface->addr_count; k++) {
-        const ifmon_addr_t *a = &iface->addrs[k];
-        ifmon_pipe_msg_t msg = {0};
-        msg.index = iface->index;
-        copy_interface_name(msg.name, iface->name);
-        msg.is_added = 1;
-        msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-        ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-        (void)w;
-      }
-    }
-    return;
-  }
-
-  for (int i = 0; i < update->added_count; i++) {
-    uint32_t idx = update->added[i];
-    for (int j = 0; j < update->interfaces->count; j++) {
-      if (update->interfaces->ifaces[j].index == idx) {
-        const ifmon_iface_t *iface = &update->interfaces->ifaces[j];
-        for (int k = 0; k < iface->addr_count; k++) {
-          const ifmon_addr_t *a = &iface->addrs[k];
-          ifmon_pipe_msg_t msg = {0};
-          msg.index = idx;
-          copy_interface_name(msg.name, iface->name);
-          msg.is_added = 1;
-          msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-          ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-          (void)w;
-        }
-        break;
-      }
-    }
-  }
-
-  for (int i = 0; i < update->removed_count; i++) {
-    ifmon_pipe_msg_t msg = {0};
-    msg.index = update->removed[i];
-    msg.is_added = 0;
-    msg.addr.ss_family = AF_UNSPEC;
-    ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-    (void)w;
-  }
-
-  for (int i = 0; i < update->modified_count; i++) {
-    const ifmon_iface_diff_t *diff = &update->modified[i];
-
-    if (diff->link_state_changed) {
-      for (int k = 0; k < update->interfaces->count; k++) {
-        const ifmon_iface_t *iface = &update->interfaces->ifaces[k];
-        if (iface->index == diff->index) {
-          for (int a_idx = 0; a_idx < iface->addr_count; a_idx++) {
-            const ifmon_addr_t *a = &iface->addrs[a_idx];
-            ifmon_pipe_msg_t msg = {0};
-            msg.index = diff->index;
-            copy_interface_name(msg.name, iface->name);
-            msg.is_added = diff->is_up ? 1 : 0;
-            msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-            ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-            (void)w;
-          }
-          break;
-        }
-      }
-    }
-
-    for (int j = 0; j < diff->addrs_added_count; j++) {
-      const ifmon_addr_t *a = &diff->addrs_added[j];
-      ifmon_pipe_msg_t msg = {0};
-      msg.index = diff->index;
-      msg.is_added = 1;
-      for (int k = 0; k < update->interfaces->count; k++) {
-        if (update->interfaces->ifaces[k].index == diff->index) {
-          copy_interface_name(msg.name, update->interfaces->ifaces[k].name);
-          break;
-        }
-      }
-      msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-      ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-      (void)w;
-    }
-
-    for (int j = 0; j < diff->addrs_removed_count; j++) {
-      const ifmon_addr_t *a = &diff->addrs_removed[j];
-      ifmon_pipe_msg_t msg = {0};
-      msg.index = diff->index;
-      msg.is_added = 0;
-      for (int k = 0; k < update->interfaces->count; k++) {
-        if (update->interfaces->ifaces[k].index == diff->index) {
-          copy_interface_name(msg.name, update->interfaces->ifaces[k].name);
-          break;
-        }
-      }
-      msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-      ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-      (void)w;
-    }
-  }
-}
-
-static bool set_fd_nonblocking(int fd) {
-  int flags = fcntl(fd, F_GETFL, 0);
-  return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
-}
-
-static int open_unicast_socket(int family) {
-  int fd = socket(family, SOCK_DGRAM, 0);
-  if (fd >= 0 && family == AF_INET6) {
-    /* A wildcard IPv6 path must not claim a separately configured IPv4 path's
-     * port. Each physical socket and its address matching stay family-specific.
-     */
-    int v6_only = 1;
-    if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6_only, sizeof(v6_only)) !=
-        0) {
-      CLOSE_SOCKET(fd);
-      return -1;
-    }
-  }
-  if (fd >= 0) {
-    (void)transport_udp_enable_recv_ecn(fd, family);
-    (void)transport_udp_enable_recv_pktinfo(fd, family);
-  }
-  return fd;
-}
-
-static void configure_socket_buffers(transport_t *t, int fd) {
-  int buf_size = 32 * 1024 * 1024; /* 32mb buffer size for multi-gigabit bdp */
-#ifdef SO_SNDBUFFORCE
-  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &buf_size, sizeof(buf_size)) !=
-          0 &&
-      setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) != 0)
-#else
-  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) != 0)
-#endif
-    transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, SIZE_MAX,
-                  "unable to enlarge send buffer: %s", strerror(errno));
-#ifdef SO_RCVBUFFORCE
-  if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &buf_size, sizeof(buf_size)) !=
-          0 &&
-      setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) != 0)
-#else
-  if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) != 0)
-#endif
-    transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, SIZE_MAX,
-                  "unable to enlarge receive buffer: %s", strerror(errno));
-  int send_size = 0, receive_size = 0;
-  socklen_t size_len = sizeof(send_size);
-  bool sizes_known =
-      getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_size, &size_len) == 0;
-  size_len = sizeof(receive_size);
-  sizes_known =
-      getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receive_size, &size_len) == 0 &&
-      sizes_known;
-  if (sizes_known) {
-    int expected_size = buf_size;
-#ifdef __linux__
-    /* Linux reports twice the requested value, including kernel overhead.
-     * SO_*BUF can succeed while silently clamping to net.core.*mem_max. */
-    expected_size *= 2;
-#endif
-    bool clamped = send_size < expected_size || receive_size < expected_size;
-    transport_log(
-        t, clamped ? TRANSPORT_LOG_WARNING : TRANSPORT_LOG_INFO, "udp", 0,
-        SIZE_MAX,
-        "socket buffers requested=%d send=%d receive=%d expected=%d%s",
-        buf_size, send_size, receive_size, expected_size,
-        clamped ? "; clamped by host socket buffer limits" : "");
-  }
-}
-
 static void set_address_port(struct sockaddr_storage *address, uint16_t port) {
   if (address->ss_family == AF_INET)
     ((struct sockaddr_in *)address)->sin_port = htons(port);
@@ -902,52 +620,85 @@ static bool parse_address(const char *host, uint16_t port,
   return inet_pton(address->ss_family, host, ip) == 1;
 }
 
-static void destroy_socket(transport_socket_t *socket) {
-  transport_udp_gro_destroy(socket->gro);
-  if (socket->fd >= 0)
-    CLOSE_SOCKET(socket->fd);
+static void close_local_path(transport_local_path_t *socket) {
+  if (socket->owner && socket->drive_id) {
+    transport_t *t = socket->owner;
+    transport_drive_path_t path = transport_local_path_info(socket);
+    t->host_callback_active = true;
+    t->drive_host.close(t->drive_host.context, &path);
+    t->host_callback_active = false;
+  }
   transport_egress_destroy(&socket->egress);
-  *socket = (transport_socket_t){.fd = -1, .remote_index = SIZE_MAX};
+  *socket = (transport_local_path_t){.egress_id = -1, .remote_index = SIZE_MAX};
 }
 
-/* Install a socket only when its descriptor and egress queue are both ready.
- * Unicast tuples stay exclusive: SO_REUSEADDR can let a later endpoint steal
- * an earlier endpoint's QUIC replies, even for bind(port=0) on Linux. */
-static const char *open_local_socket(transport_t *t,
-                                     transport_socket_t *socket) {
-  const char *error = "socket creation failed";
-  int saved_errno;
-  socket->fd = open_unicast_socket(socket->local_addr.ss_family);
-  if (socket->fd < 0)
-    goto Fail;
-  error = "socket bind failed";
-  if (bind(socket->fd, (struct sockaddr *)&socket->local_addr,
-           socket->local_addr_len) != 0)
-    goto Fail;
-  socklen_t actual_len = sizeof(socket->local_addr);
-  if (getsockname(socket->fd, (struct sockaddr *)&socket->local_addr,
-                  &actual_len) == 0) {
-    socket->local_addr_len = actual_len;
+static ssize_t submit_to_host(void *context, int fd,
+                              const struct sockaddr *destination,
+                              socklen_t destination_len,
+                              const struct sockaddr *source, uint32_t ifindex,
+                              const struct iovec *datagrams, size_t count,
+                              size_t gso, uint8_t ecn) {
+  transport_t *t = context;
+  for (size_t i = 0; i < t->socket_count; i++)
+    if (t->sockets[i].egress_id == fd) {
+      const transport_local_path_t *socket = &t->sockets[i];
+      transport_drive_path_t path = transport_local_path_info(socket);
+      if (!source || source->sa_family == AF_UNSPEC)
+        source = (const struct sockaddr *)&path.local;
+      t->host_callback_active = true;
+      ssize_t n = t->drive_host.send(t->drive_host.context, &path, source,
+                                     destination, destination_len, ifindex, ecn,
+                                     gso, datagrams, count);
+      t->host_callback_active = false;
+      return n;
+    }
+  return -1;
+}
+
+/* install logical path after host open and egress allocation succeed */
+const char *transport_engine_open_path(transport_t *t,
+                                       transport_local_path_t *socket) {
+  const char *error = "host path creation failed";
+  socket->owner = t;
+  if (t->next_drive_id >= INT_MAX)
+    return "path identity space exhausted";
+  transport_drive_path_t path = {.id = ++t->next_drive_id,
+                                 .local = socket->local_addr,
+                                 .local_len = socket->local_addr_len,
+                                 .interface_index = socket->interface_index};
+  copy_interface_name(path.interface_name, socket->interface_name);
+  t->host_callback_active = true;
+  uint64_t identity = path.id;
+  sa_family_t family = path.local.ss_family;
+  bool opened = t->drive_host.open(t->drive_host.context, &path);
+  t->host_callback_active = false;
+  if (!opened)
+    return error;
+  if (path.id != identity || path.local.ss_family != family ||
+      path.local_len != (family == AF_INET ? sizeof(struct sockaddr_in)
+                                           : sizeof(struct sockaddr_in6)) ||
+      !memchr(path.interface_name, 0, sizeof(path.interface_name))) {
+    t->host_callback_active = true;
+    t->drive_host.close(t->drive_host.context, &path);
+    t->host_callback_active = false;
+    return "invalid host path metadata";
   }
-  configure_socket_buffers(t, socket->fd);
-  error = "failed to make socket nonblocking";
-  if (!set_fd_nonblocking(socket->fd))
-    goto Fail;
-  error = "failed to allocate socket egress queue";
+  socket->drive_id = identity;
+  socket->egress_id =
+      (int)path.id; /* opaque incarnation; never a real descriptor */
+  socket->local_addr = path.local;
+  socket->local_addr_len = path.local_len;
+  socket->interface_index = path.interface_index;
+  copy_interface_name(socket->interface_name, path.interface_name);
   if (!transport_egress_init(&socket->egress,
                              t->limits.max_egress_packets_per_socket,
-                             t->limits.max_egress_bytes_per_socket))
-    goto Fail;
-  /* Optional per-socket storage is allocated before enabling UDP_GRO. An
-   * unsupported socket or allocation failure retains the stateless path. */
-  socket->gro = transport_udp_gro_create(socket->fd);
+                             t->limits.max_egress_bytes_per_socket)) {
+    close_local_path(socket);
+    return "failed to allocate path egress queue";
+  }
+  socket->egress.sender = submit_to_host;
+  socket->egress.sender_context = t;
   return NULL;
-
-Fail:
-  saved_errno = errno;
-  destroy_socket(socket);
-  errno = saved_errno;
-  return error;
 }
 
 #define QLINQ_PATH_OPEN_RETRY_MS 100U
@@ -1151,7 +902,7 @@ static void schedule_client_reconnect(transport_t *t, int64_t now_ms) {
   }
 }
 
-transport_t *transport_create(const transport_config_t *config) {
+transport_t *transport_drive_create(const transport_config_t *config) {
   if (config && !qlinq_tls_group_policy_name(config->tls_group_policy)) {
     fprintf(stderr, "transport: invalid TLS group policy\n");
     return NULL;
@@ -1159,8 +910,8 @@ transport_t *transport_create(const transport_config_t *config) {
   if (config &&
       config->initial_cwnd_packets > TRANSPORT_MAX_INITIAL_CWND_PACKETS)
     return NULL;
-  if (!config || !config->callback || config->port == 0 ||
-      config->num_bind_hosts == 0 ||
+  if (!config || !config->drive_host || !config->callback ||
+      config->port == 0 || config->num_bind_hosts == 0 ||
       config->num_bind_hosts > TRANSPORT_MAX_PATHS ||
       config->num_path_interface_names > TRANSPORT_MAX_PATHS ||
       config->num_remote_hosts > TRANSPORT_MAX_PATHS ||
@@ -1216,14 +967,22 @@ transport_t *transport_create(const transport_config_t *config) {
   }
 
   for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++) {
-    t->sockets[i].fd = -1;
+    t->sockets[i].egress_id = -1;
     t->sockets[i].remote_index = SIZE_MAX;
   }
   t->owner_thread = pthread_self();
+  if (config->drive_host) {
+    if (!config->drive_host->open || !config->drive_host->close ||
+        !config->drive_host->send ||
+        config->drive_host->initial_time_ns < 1000000U) {
+      free(t);
+      return NULL;
+    }
+    t->drive_host = *config->drive_host;
+    t->drive_now_ns = t->drive_host.initial_time_ns;
+  }
   atomic_init(&t->cross_thread_violations, 0);
   t->limits = limits;
-  t->ifmon_pipe[0] = -1;
-  t->ifmon_pipe[1] = -1;
   t->fec_cache.memory.limit = limits.max_codec_memory_bytes;
   size_t recovery_object_bytes =
       limits.max_fec_object_size < TRANSPORT_MAX_FEC_GROUP_SIZE
@@ -1255,7 +1014,6 @@ transport_t *transport_create(const transport_config_t *config) {
   t->log_user_data = config->log_user_data;
   t->is_server = (config->num_remote_hosts == 0);
   t->bind_port = t->is_server ? config->port : 0;
-  t->multihome = config->multihome;
   t->reconnect_enabled = !t->is_server && config->reconnect_enabled;
   t->reconnect_initial_delay_ms =
       config->reconnect_initial_delay_ms != 0
@@ -1280,22 +1038,7 @@ transport_t *transport_create(const transport_config_t *config) {
     transport_log(t, TRANSPORT_LOG_WARNING, "simulation", 0, SIZE_MAX,
                   "simulated packet loss is enabled");
 
-  t->last_pathflow_update = transport_get_time_ms();
-
-  if (pipe(t->ifmon_pipe) == 0) {
-    if (set_fd_nonblocking(t->ifmon_pipe[0]) &&
-        set_fd_nonblocking(t->ifmon_pipe[1])) {
-      (void)ifmon_watch_start(&t->ifmon_w, on_ifmon_update, t);
-    } else {
-      CLOSE_SOCKET(t->ifmon_pipe[0]);
-      CLOSE_SOCKET(t->ifmon_pipe[1]);
-      t->ifmon_pipe[0] = -1;
-      t->ifmon_pipe[1] = -1;
-    }
-  } else {
-    t->ifmon_pipe[0] = -1;
-    t->ifmon_pipe[1] = -1;
-  }
+  t->last_pathflow_update = transport_now_ms(t);
 
   /* setup cryptographic context */
   t->tls_ctx.random_bytes = ptls_openssl_random_bytes;
@@ -1309,7 +1052,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->verifier_initialized = false;
 
   t->quic_ctx = quicly_spec_context;
-  t->quic_ctx.now = &transport_monotonic_now;
+  transport_drive_setup_clocks(t);
   /* Use Quicly's native adaptive requester and its supported receive delay. */
   t->quic_ctx.transport_params.min_ack_delay_usec =
       QUICLY_LOCAL_MAX_ACK_DELAY * 1000u;
@@ -1342,7 +1085,7 @@ transport_t *transport_create(const transport_config_t *config) {
 
   /* Setup CID encryptor to support active connection migration */
   char cid_key[16];
-  ptls_openssl_random_bytes(cid_key, sizeof(cid_key));
+  t->tls_ctx.random_bytes(cid_key, sizeof(cid_key));
   t->quic_ctx.cid_encryptor = transport_tls_new_cid_encryptor(
       t, ptls_iovec_init(cid_key, sizeof(cid_key)));
   ptls_clear_memory(cid_key, sizeof(cid_key));
@@ -1398,7 +1141,7 @@ transport_t *transport_create(const transport_config_t *config) {
 
   t->num_remote_addrs = config->num_remote_hosts;
   for (size_t i = 0; i < config->num_bind_hosts; i++) {
-    transport_socket_t *socket = &t->sockets[i];
+    transport_local_path_t *socket = &t->sockets[i];
     if (!parse_address(config->bind_hosts[i], t->bind_port, &socket->local_addr,
                        &socket->local_addr_len)) {
       transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
@@ -1407,7 +1150,7 @@ transport_t *transport_create(const transport_config_t *config) {
                     config->bind_hosts[i]);
       goto Fail;
     }
-    const char *error = open_local_socket(t, socket);
+    const char *error = transport_engine_open_path(t, socket);
     if (error) {
       transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i, "%s for %s:%u: %s",
                     error, config->bind_hosts[i], config->port,
@@ -1416,7 +1159,6 @@ transport_t *transport_create(const transport_config_t *config) {
     }
     t->socket_count++;
   }
-  resolve_configured_interfaces(t);
 
   if (t->is_server || (config->cert_file && config->key_file)) {
     if (transport_tls_load_certificate_and_key(&t->tls_ctx, &t->sign_cert,
@@ -1546,21 +1288,13 @@ void transport_destroy(transport_t *t) {
     return;
   if (!transport_owner_ok(t))
     return;
-  if (t->callback_depth != 0) {
+  if (t->callback_depth != 0 || t->turn_active) {
     t->stats.callback_destroy_rejections++;
     return;
   }
 
-  if (t->ifmon_pipe[0] >= 0) {
-    ifmon_watch_stop(&t->ifmon_w);
-  }
-  if (t->ifmon_pipe[0] >= 0) {
-    CLOSE_SOCKET(t->ifmon_pipe[0]);
-    CLOSE_SOCKET(t->ifmon_pipe[1]);
-  }
-
   for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
-    destroy_socket(&t->sockets[i]);
+    close_local_path(&t->sockets[i]);
   t->socket_count = 0;
 
   while (transport_connection_count(t) != 0) {
@@ -1598,10 +1332,13 @@ void transport_destroy(transport_t *t) {
   dispose_tls_identity(&t->tls_ctx, &t->sign_cert);
 
   free(t->conns);
+  if (t->host_dispose)
+    t->host_dispose(t->host_context);
   free(t);
 }
 
-static void add_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
+static void add_interface(transport_t *t,
+                          const transport_interface_event_t *msg) {
   if (!path_interface_allowed(t, msg->name) ||
       t->socket_count >= TRANSPORT_MAX_PATHS)
     return;
@@ -1612,21 +1349,20 @@ static void add_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
       return;
 
   size_t local_index = t->socket_count;
-  transport_socket_t *socket = &t->sockets[local_index];
+  transport_local_path_t *socket = &t->sockets[local_index];
   socket->local_addr = msg->addr;
   socket->local_addr_len = msg->addr_len;
   socket->interface_index = msg->index;
   copy_interface_name(socket->interface_name, msg->name);
   set_address_port(&socket->local_addr, t->bind_port);
-  if (open_local_socket(t, socket))
+  if (transport_engine_open_path(t, socket))
     return;
-  bind_to_device(socket->fd, msg->index);
   t->socket_count++;
 
   if (!t->is_server) {
     socket->remote_index = select_remote_for_added_local(t, local_index);
     if (socket->remote_index == SIZE_MAX) {
-      destroy_socket(socket);
+      close_local_path(socket);
       t->socket_count--;
       return;
     }
@@ -1646,7 +1382,8 @@ static void add_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
 static void discard_connection(transport_conn_t *conn, quicly_error_t error,
                                const char *failure_reason);
 
-static void remove_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
+static void remove_interface(transport_t *t,
+                             const transport_interface_event_t *msg) {
   for (size_t i = 0; i < t->socket_count; i++) {
     bool match = msg->addr.ss_family == AF_UNSPEC
                      ? t->sockets[i].interface_index == msg->index
@@ -1656,12 +1393,12 @@ static void remove_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
     if (!match)
       continue;
     accumulate_egress_stats(&t->stats, &t->sockets[i].egress, true);
-    destroy_socket(&t->sockets[i]);
+    close_local_path(&t->sockets[i]);
     remove_connection_physical_slot(t, i);
     for (size_t j = i; j + 1 < t->socket_count; j++)
       t->sockets[j] = t->sockets[j + 1];
     t->sockets[--t->socket_count] =
-        (transport_socket_t){.fd = -1, .remote_index = SIZE_MAX};
+        (transport_local_path_t){.egress_id = -1, .remote_index = SIZE_MAX};
     transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, i,
                   "removed socket for local IP");
     /* A returning client socket gets a new ephemeral port. With no surviving
@@ -1675,19 +1412,19 @@ static void remove_interface(transport_t *t, const ifmon_pipe_msg_t *msg) {
   }
 }
 
-static bool service_interfaces(transport_t *t) {
-  if (t->ifmon_pipe[0] < 0)
-    return false;
-  bool consumed = false;
-  ifmon_pipe_msg_t msg;
-  while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
-    consumed = true;
-    if (msg.is_added)
-      add_interface(t, &msg);
-    else
-      remove_interface(t, &msg);
-  }
-  return consumed;
+void transport_drive_interface_event(transport_t *t, bool added,
+                                     const struct sockaddr_storage *address,
+                                     uint32_t index, const char *name) {
+  transport_interface_event_t msg = {
+      .addr = *address, .index = index, .is_added = added};
+  msg.addr_len = address->ss_family == AF_INET    ? sizeof(struct sockaddr_in)
+                 : address->ss_family == AF_INET6 ? sizeof(struct sockaddr_in6)
+                                                  : 0;
+  copy_interface_name(msg.name, name);
+  if (added)
+    add_interface(t, &msg);
+  else
+    remove_interface(t, &msg);
 }
 
 /* discard connection without CONNECTION_CLOSE on fatal error */
@@ -1746,15 +1483,14 @@ static void discard_connection(transport_conn_t *conn, quicly_error_t error,
     t->conns[--t->conn_count] = NULL;
   } else {
     t->client_conn = NULL;
-    schedule_client_reconnect(t, transport_get_time_ms());
+    schedule_client_reconnect(t, transport_now_ms(t));
   }
 }
 
-static void
-transport_receive_datagram(transport_t *t, size_t fd_idx, const uint8_t *buf,
-                           size_t len, struct sockaddr_storage *source,
-                           const struct sockaddr_storage *destination,
-                           uint32_t ifindex, uint8_t ecn) {
+void transport_drive_dispatch(transport_t *t, size_t fd_idx, const uint8_t *buf,
+                              size_t len, struct sockaddr_storage *source,
+                              const struct sockaddr_storage *destination,
+                              uint32_t ifindex, uint8_t ecn) {
   t->sockets[fd_idx].bytes_received += len;
 
   struct sockaddr *psa = (struct sockaddr *)source;
@@ -1859,10 +1595,11 @@ transport_receive_datagram(transport_t *t, size_t fd_idx, const uint8_t *buf,
       }
     }
 
-    if (target && target->authenticated && t->simulated_loss_rate > 0 &&
-        (rand() % 100) < t->simulated_loss_rate) {
-      continue; /* simulate packet loss on wire after connection is
-                   established */
+    if (target && target->authenticated && t->simulated_loss_rate > 0) {
+      uint32_t sample;
+      t->tls_ctx.random_bytes(&sample, sizeof(sample));
+      if (sample % 100 < t->simulated_loss_rate)
+        continue;
     }
 
     if (target) {
@@ -1875,94 +1612,6 @@ transport_receive_datagram(transport_t *t, size_t fd_idx, const uint8_t *buf,
         discard_connection(target, ret, "receive failure");
         break;
       }
-    }
-  }
-}
-
-static bool socket_receive_ready(int fd, const struct pollfd *fds,
-                                 size_t count) {
-  if (!fds)
-    return true;
-  for (size_t i = 0; i < count; i++)
-    if (fds[i].fd == fd &&
-        (fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL)) != 0)
-      return true;
-  return false;
-}
-
-static void receive_packets(transport_t *t, const struct pollfd *fds,
-                            size_t count) {
-  size_t receive_budget = t->limits.max_packets_per_tick;
-  size_t receive_start =
-      t->socket_count ? t->receive_cursor % t->socket_count : 0;
-  t->receive_cursor =
-      t->socket_count ? (receive_start + 1U) % t->socket_count : 0;
-  size_t quantum = t->socket_count ? (receive_budget + t->socket_count - 1U) /
-                                         t->socket_count
-                                   : 0;
-  for (size_t visited = 0; visited < t->socket_count; visited++) {
-    size_t fd_idx = (receive_start + visited) % t->socket_count;
-    transport_socket_t *socket = &t->sockets[fd_idx];
-    if (!transport_udp_gro_pending(socket->gro) &&
-        !socket_receive_ready(socket->fd, fds, count))
-      continue;
-    if (receive_budget == 0) {
-      /* The earlier sockets consumed this tick's budget. Remember every
-       * remaining ready socket even when the last serviced socket drained. */
-      socket->receive_backlog = true;
-      continue;
-    }
-    size_t serviced = 0;
-    while (receive_budget > 0 && serviced < quantum) {
-      size_t batch = quantum - serviced;
-      if (batch > receive_budget)
-        batch = receive_budget;
-      if (batch > TRANSPORT_UDP_RECEIVE_BATCH)
-        batch = TRANSPORT_UDP_RECEIVE_BATCH;
-      ssize_t received;
-      bool more;
-      if (socket->gro) {
-        transport_udp_view_t views[TRANSPORT_UDP_RECEIVE_BATCH];
-        received = transport_udp_gro_receive(socket->gro, socket->fd, views,
-                                             batch, &more);
-        for (ssize_t i = 0; i < received; i++)
-          if (!views[i].dropped)
-            transport_receive_datagram(t, fd_idx, views[i].data, views[i].size,
-                                       &views[i].source, &views[i].destination,
-                                       views[i].ifindex, views[i].ecn);
-      } else {
-        transport_udp_datagram_t datagrams[TRANSPORT_UDP_RECEIVE_BATCH];
-        received = transport_udp_receive_batch(socket->fd, datagrams, batch);
-        for (ssize_t i = 0; i < received; i++) {
-          /* Preserve recvfrom/recvmmsg's original copied-prefix dispatch. The
-           * decoder validates each complete QUIC packet in that prefix. */
-          transport_receive_datagram(t, fd_idx, datagrams[i].data,
-                                     datagrams[i].size, &datagrams[i].source,
-                                     &datagrams[i].destination,
-                                     datagrams[i].ifindex, datagrams[i].ecn);
-        }
-        more = received == (ssize_t)batch;
-      }
-      if (received <= 0) {
-        /* Only an actual empty read proves this socket drained. A timer-only
-         * tick or a receive error must not erase an earlier exhausted budget.
-         */
-        if (received == 0)
-          socket->receive_backlog = false;
-        break; /* Empty or persistently failing sockets cannot spin the owner.
-                */
-      }
-      receive_budget -= (size_t)received;
-      serviced += (size_t)received;
-      if (!more)
-        socket->receive_backlog = false;
-      else if (receive_budget == 0 || serviced >= quantum)
-        socket->receive_backlog = true;
-      /* GRO may fill its raw batch yet return fewer logical views than asked
-       * for. Its explicit continuation flag preserves the packet quantum and
-       * avoids stranding input after a short logical batch. */
-      if (!more)
-        break;
     }
   }
 }
@@ -2166,9 +1815,10 @@ static void service_connections(transport_t *t, uint64_t now) {
         }
 
         if (!transport_egress_submit_pktinfo(
-                &t->sockets[out_fd_index].egress, t->sockets[out_fd_index].fd,
-                &dest.sa, quicly_get_socklen(&dest.sa), egress_source,
-                egress_ifindex, dgrams, num_dgrams, gso_segments,
+                &t->sockets[out_fd_index].egress,
+                t->sockets[out_fd_index].egress_id, &dest.sa,
+                quicly_get_socklen(&dest.sa), egress_source, egress_ifindex,
+                dgrams, num_dgrams, gso_segments,
                 quicly_send_get_ecn_bits(conn->quic)))
           transport_log(t, TRANSPORT_LOG_WARNING, "udp", conn->id, out_fd_index,
                         "egress queue exhausted");
@@ -2210,12 +1860,12 @@ static void flush_group_on_timer(transport_t *t) {
   int64_t deadline = group_flush_deadline(t);
   if (deadline == INT64_MAX)
     return;
-  int64_t now = transport_get_time_ms();
+  int64_t now = transport_now_ms(t);
   if (now < deadline || transport_publish_flush_grouped(t))
     return;
   /* preserve the group's original age and frozen identity after failure;
    * explicit publish/flush/finish calls do not consult this timer deadline */
-  now = transport_get_time_ms();
+  now = transport_now_ms(t);
   t->pending_group.flush_retry_at_ms =
       now > INT64_MAX - QLINQ_GROUP_FLUSH_RETRY_MS
           ? INT64_MAX
@@ -2224,20 +1874,19 @@ static void flush_group_on_timer(transport_t *t) {
       t->stats.recovery_cache_releases;
 }
 
-void transport_tick_ready(transport_t *t, const struct pollfd *fds,
-                          size_t count) {
+bool transport_engine_begin_turn(transport_t *t) {
   if (!transport_owner_ok(t))
-    return;
-  if (t->tick_active) {
+    return false;
+  if (t->tick_active || t->turn_active || t->callback_depth) {
     t->stats.recursive_tick_rejections++;
-    return;
+    return false;
   }
-  t->tick_active = true;
-
+  t->turn_active = t->tick_active = true;
   for (size_t i = 0; i < t->socket_count; i++)
-    (void)transport_egress_flush(&t->sockets[i].egress, t->sockets[i].fd);
+    (void)transport_egress_flush(&t->sockets[i].egress,
+                                 t->sockets[i].egress_id);
 
-  int64_t now_nack_ms = transport_get_time_ms();
+  int64_t now_nack_ms = transport_now_ms(t);
   if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
       !t->shutting_down && now_nack_ms >= t->reconnect_at_ms) {
     t->stats.reconnect_attempts++;
@@ -2255,25 +1904,22 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
 
   flush_group_on_timer(t);
 
-  /* Messages arriving after the snapshot remain readable for the next poll.
-   * Consumed updates can compact slots and recycle descriptors; even a no-op
-   * update invalidates UDP readiness. Direct ticks retain the full scan. */
-  if (socket_receive_ready(t->ifmon_pipe[0], fds, count) &&
-      service_interfaces(t))
-    fds = NULL;
-  receive_packets(t, fds, count);
+  t->tick_active = false;
+  return true;
+}
+void transport_engine_end_turn(transport_t *t) {
+  if (!transport_owner_ok(t) || !t->turn_active || t->tick_active)
+    return;
+  t->tick_active = true;
   if (t->pending_group.size != 0 && t->pending_group.flush_retry_at_ms != 0 &&
       t->pending_group.flush_retry_cache_releases !=
           t->stats.recovery_cache_releases)
     flush_group_on_timer(t);
-  uint64_t now = transport_get_time_ms();
+  uint64_t now = transport_now_ms(t);
   update_path_measurements(t, now);
   service_connections(t, now);
   t->tick_active = false;
-}
-
-void transport_tick(transport_t *t) {
-  transport_tick_ready(t, NULL, 0);
+  t->turn_active = false;
 }
 
 static bool subscribe_connection(transport_conn_t *conn,
@@ -2567,7 +2213,7 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
       atomic_load_explicit(&t->cross_thread_violations, memory_order_relaxed);
   stats->active_connections = transport_connection_count(t);
   stats->assembler_memory_bytes = t->assembler_memory_bytes;
-  int64_t now_ms = transport_get_time_ms();
+  int64_t now_ms = transport_now_ms(t);
   size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
     const transport_conn_t *conn = transport_connection_at(t, i);
@@ -2681,35 +2327,6 @@ transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
              : TRANSPORT_REPAIR_MODE_INDEXED;
 }
 
-int transport_enable_qlog(const char *socket_path) {
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd < 0)
-    return -1;
-
-  struct sockaddr_un addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
-
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-    CLOSE_SOCKET(fd);
-    return -1;
-  }
-
-  /* Set non-blocking to prevent logging from hanging the main transport thread
-   */
-  if (!set_fd_nonblocking(fd)) {
-    CLOSE_SOCKET(fd);
-    return -1;
-  }
-
-  /* enable picotls and quicly tracing, sample ratio 1.0 (all logs), write to fd
-   */
-  ptls_log_add_fd(fd, 1.0, NULL, NULL, NULL, 0);
-  ptls_log_add_fd(fd, 1.0, NULL, NULL, NULL, 1);
-  return 0;
-}
-
 bool transport_get_path_stats(transport_t *t, size_t path_idx,
                               transport_path_stats_t *stats) {
   if (!transport_owner_ok(t) || !stats || path_idx >= t->socket_count)
@@ -2777,32 +2394,7 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
   return true;
 }
 
-static void transport_mock_iface_change(transport_t *t, const char *ip_addr,
-                                        bool added) {
-  if (!transport_owner_ok(t) || t->ifmon_pipe[1] < 0)
-    return;
-
-  ifmon_pipe_msg_t msg = {0};
-  msg.is_added = added ? 1 : 0;
-  msg.index = 1; /* loopback interface index */
-  struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
-  sin->sin_family = AF_INET;
-  if (!ip_addr || inet_pton(AF_INET, ip_addr, &sin->sin_addr) != 1)
-    return;
-  msg.addr_len = sizeof(*sin);
-
-  ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-  (void)w;
-}
-
 /* deterministic interface changes for integration tests */
-void transport_mock_iface_add(transport_t *t, const char *ip_addr) {
-  transport_mock_iface_change(t, ip_addr, true);
-}
-
-void transport_mock_iface_remove(transport_t *t, const char *ip_addr) {
-  transport_mock_iface_change(t, ip_addr, false);
-}
 
 bool transport_mock_path_state(transport_t *t, size_t path_idx,
                                uint32_t packets_per_second, double latency_ms,
@@ -2893,7 +2485,7 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
     } else {
       if (transport_stream_control_pending(conn->stream))
         return false;
-      if (conn->admission_retry_at_ns > transport_get_monotonic_ns())
+      if (conn->admission_retry_at_ns > transport_now_ns(t))
         return false;
       bool ready = false;
       for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
@@ -2924,21 +2516,14 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
   return true;
 }
 
-int64_t transport_get_time_ms(void) {
-  return (int64_t)(transport_get_monotonic_ns() / 1000000U);
-}
-
 int64_t transport_get_first_timeout(transport_t *t) {
   if (!transport_owner_ok(t))
     return INT64_MAX;
   if (t->send_backlog)
     return 0;
 
-  /* A GRO read can empty the kernel socket while leaving logical datagrams
-   * in userspace. Poll readiness alone cannot schedule the remaining work. */
-  for (size_t i = 0; i < t->socket_count; i++)
-    if (transport_udp_gro_pending(t->sockets[i].gro))
-      return 0;
+  if (transport_drive_input_pending(t))
+    return 0;
 
   int64_t first_timeout = t->aggregate_nack_retry_at_ms > 0
                               ? t->aggregate_nack_retry_at_ms
@@ -2950,13 +2535,13 @@ int64_t transport_get_first_timeout(transport_t *t) {
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
     if (conn->admission_retry_at_ns) {
-      uint64_t monotonic_now = transport_get_monotonic_ns();
+      uint64_t monotonic_now = transport_now_ns(t);
       if (conn->admission_retry_at_ns <= monotonic_now) {
         conn->admission_retry_at_ns = 0;
       } else {
         uint64_t delta = conn->admission_retry_at_ns - monotonic_now;
         uint64_t delay_ms = delta / 1000000U + (delta % 1000000U != 0);
-        int64_t timer_now = transport_get_time_ms();
+        int64_t timer_now = transport_now_ms(t);
         int64_t retry_at = delay_ms > (uint64_t)(INT64_MAX - timer_now)
                                ? INT64_MAX
                                : timer_now + (int64_t)delay_ms;
@@ -2992,81 +2577,6 @@ int64_t transport_get_first_timeout(transport_t *t) {
   }
 
   return first_timeout;
-}
-
-size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
-                              size_t max_fds) {
-  if (!transport_owner_ok(t) || !fds)
-    return 0;
-
-  size_t count = 0;
-  for (size_t i = 0; i < t->socket_count && count < max_fds; i++) {
-    if (t->sockets[i].fd >= 0) {
-      fds[count].fd = t->sockets[i].fd;
-      fds[count].events = POLLIN;
-      if (t->sockets[i].egress.count > 0)
-        fds[count].events |= POLLOUT;
-      fds[count].revents = 0;
-      count++;
-    }
-  }
-  if (t->ifmon_pipe[0] >= 0 && count < max_fds) {
-    fds[count++] = (struct pollfd){.fd = t->ifmon_pipe[0], .events = POLLIN};
-  }
-  return count;
-}
-
-bool transport_rx_cadence_mask(transport_t *t, struct pollfd *fds,
-                               size_t count) {
-  if (!transport_owner_ok(t) || !fds || t->tick_active || t->shutting_down ||
-      t->reconnect_in_progress || t->pending_group.size ||
-      t->socket_count == 0 || transport_connection_count(t) != 1)
-    return false;
-  transport_conn_t *conn = transport_connection_at(t, 0);
-  if (!conn || !conn->quic || !conn->authenticated || !conn->protocol_ready ||
-      !conn->quic_ready || !quicly_connection_is_ready(conn->quic) ||
-      quicly_has_pending_stream_data(conn->quic) ||
-      quicly_has_datagram_frames(conn->quic) ||
-      quicly_get_state(conn->quic) != QUICLY_STATE_CONNECTED ||
-      transport_subscriptions_count(&conn->send_subscriptions) != 0 ||
-      transport_subscriptions_count(&conn->receive_subscriptions) == 0)
-    return false;
-
-  if (!conn->rx_cadence_handshake_confirmed) {
-    quicly_stats_t stats;
-    if (quicly_get_stats(conn->quic, &stats) != 0 ||
-        stats.handshake_confirmed_msec == UINT64_MAX)
-      return false;
-    conn->rx_cadence_handshake_confirmed = true;
-  }
-
-  /* Validate before mutating any mask. This also rejects stale/recycled fd
-   * snapshots and leaves egress and interface wakeups on the ordinary path. */
-  size_t slot = 0;
-  for (size_t i = 0; i < t->socket_count; i++) {
-    transport_socket_t *socket = &t->sockets[i];
-    if (socket->egress.count || socket->open_pending ||
-        socket->receive_backlog || transport_udp_gro_pending(socket->gro))
-      return false;
-    if (socket->fd < 0)
-      continue;
-    if (slot >= count || fds[slot].fd != socket->fd ||
-        fds[slot].events != POLLIN || fds[slot].revents != 0)
-      return false;
-    slot++;
-  }
-  size_t udp_count = slot;
-  if (t->ifmon_pipe[0] >= 0) {
-    if (slot >= count || fds[slot].fd != t->ifmon_pipe[0] ||
-        fds[slot].events != POLLIN || fds[slot].revents != 0)
-      return false;
-    slot++;
-  }
-  if (!udp_count || slot != count)
-    return false;
-  for (size_t i = 0; i < udp_count; i++)
-    fds[i].events &= (short)~POLLIN;
-  return true;
 }
 
 bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,

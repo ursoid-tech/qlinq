@@ -1,3 +1,4 @@
+#include "transport_poll_host.h"
 #include <arpa/inet.h>
 #include "cli_parse.h"
 #include "transport_config.h"
@@ -176,14 +177,14 @@ static void telemetry_and_wakeup(transport_t *t, transport_conn_t *conn) {
   size_t n = transport_get_poll_fds(t, fds, TRANSPORT_MAX_POLL_FDS);
   bool found = false;
   for (size_t i = 0; i < n; i++) {
-    if (fds[i].fd != t->ifmon_pipe[0])
+    if (fds[i].fd != transport_poll_host(t)->ifmon_pipe[0])
       continue;
     found = true;
     /* Waking this descriptor needs no packet on any UDP socket. */
-    assert(write(t->ifmon_pipe[1], "x", 1) == 1);
+    assert(write(transport_poll_host(t)->ifmon_pipe[1], "x", 1) == 1);
     assert(poll(&fds[i], 1, 100) == 1 && (fds[i].revents & POLLIN));
     char byte;
-    assert(read(t->ifmon_pipe[0], &byte, 1) == 1);
+    assert(read(transport_poll_host(t)->ifmon_pipe[0], &byte, 1) == 1);
   }
   assert(found && n == t->socket_count + 1);
 }

@@ -138,7 +138,7 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
                                        uint64_t admission_now,
                                        transport_publication_path_t *paths) {
   size_t active_paths = 0;
-  uint64_t measure_now = transport_get_time_ms();
+  uint64_t measure_now = transport_now_ms(t);
   for (size_t physical = 0; physical < t->socket_count; physical++) {
     quicly_path_stats_t stats;
     size_t mapped = SIZE_MAX, queued = 0;
@@ -250,7 +250,7 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
   /* yield new datagram admission until pending control can be emitted */
   if (transport_stream_control_pending(conn->stream))
     return TRANSPORT_PUBLISH_BACKPRESSURE;
-  uint64_t admission_now = transport_get_monotonic_ns();
+  uint64_t admission_now = transport_now_ns(t);
   size_t symbol_size = plan->symbol_size;
   size_t estimate_symbol_size = plan->estimate_symbol_size;
   size_t data_symbols = plan->data_symbols;
@@ -495,7 +495,7 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                                       .data_symbols = (uint16_t)data_symbols,
                                       .symbol_size = (uint16_t)symbol_size,
                                       .original_size = (uint32_t)obj->size,
-                                      .send_time_ns = transport_get_time_ns()};
+                                      .send_time_ns = transport_now_ns(t)};
     if (qlinq_wire_encode_fec_header(pkt_buf, pkt_len, &header) !=
         QLINQ_WIRE_OK)
       return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
@@ -566,14 +566,15 @@ checkpoint_ack_pending(const transport_checkpoint_ack_state_t *state) {
           state->acked_object_id < state->sent_object_id);
 }
 
-static void checkpoint_mark_sent(transport_checkpoint_ack_state_t *state,
+static void checkpoint_mark_sent(transport_t *t,
+                                 transport_checkpoint_ack_state_t *state,
                                  uint64_t group_id, uint64_t object_id) {
   bool already_pending = checkpoint_ack_pending(state);
   state->sent_initialized = true;
   state->sent_group_id = group_id;
   state->sent_object_id = object_id;
   if (!already_pending || state->oldest_unacked_sent_at_ms <= 0)
-    state->oldest_unacked_sent_at_ms = transport_get_time_ms();
+    state->oldest_unacked_sent_at_ms = transport_now_ms(t);
 }
 
 static void release_acked_checkpoints(transport_t *t,
@@ -727,7 +728,7 @@ bool transport_publish_checkpoint_acked(
   if (!checkpoint_ack_pending(state))
     state->oldest_unacked_sent_at_ms = 0;
   else if (advanced)
-    state->oldest_unacked_sent_at_ms = transport_get_time_ms();
+    state->oldest_unacked_sent_at_ms = transport_now_ms(t);
   release_acked_checkpoints(t, track_id);
   return true;
 }
@@ -830,7 +831,7 @@ static bool emit_rolling_checkpoint(transport_t *t,
       succeeded = false;
       continue;
     }
-    checkpoint_mark_sent(ack, group_id, final_object_id);
+    checkpoint_mark_sent(t, ack, group_id, final_object_id);
     t->stats.recovery_checkpoints_sent++;
   }
   if (succeeded) {
@@ -980,7 +981,7 @@ group_record(transport_t *t, const moq_object_t *obj, size_t fec_limit) {
       return TRANSPORT_PUBLISH_ERROR;
   }
 
-  uint64_t now = transport_get_time_ms();
+  uint64_t now = transport_now_ms(t);
   if (group->size == 0) {
     size_t count = transport_connection_count(t);
     for (size_t i = 0; i < count; i++) {
@@ -1261,7 +1262,7 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
             transport_checkpoint_ack(conn, alias);
         if (!ack->participating)
           transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
-        checkpoint_mark_sent(ack, 0, final_object_id);
+        checkpoint_mark_sent(t, ack, 0, final_object_id);
       }
     } else {
       succeeded = false;

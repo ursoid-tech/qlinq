@@ -1,7 +1,5 @@
 #include "transport_egress.h"
 
-#include "transport_udp.h"
-
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,12 +98,32 @@ queue_remaining(transport_egress_t *egress, const struct sockaddr *destination,
   return true;
 }
 
-bool transport_egress_submit_pktinfo(
-    transport_egress_t *egress, int fd, const struct sockaddr *destination,
-    socklen_t destination_len, const struct sockaddr *source, uint32_t ifindex,
-    const struct iovec *datagrams, size_t count, size_t max_gso_segments,
-    uint8_t ecn) {
-  if (!egress || fd < 0 || !destination || (!datagrams && count > 0) ||
+static ssize_t send_batch(transport_egress_t *egress, int path_token,
+                          const struct sockaddr *destination,
+                          socklen_t destination_len,
+                          const struct sockaddr *source, uint32_t ifindex,
+                          const struct iovec *datagrams, size_t count,
+                          size_t gso, uint8_t ecn) {
+  ssize_t sent;
+  if (egress->sender)
+    sent = egress->sender(egress->sender_context, path_token, destination,
+                          destination_len, source, ifindex, datagrams, count,
+                          gso, ecn);
+  else
+    sent = -1; /* every host must supply its output effect explicitly */
+  /* broken host must not read past the vector or consume unaccepted data */
+  return sent > (ssize_t)count ? -1 : sent;
+}
+
+bool transport_egress_submit_pktinfo(transport_egress_t *egress, int path_token,
+                                     const struct sockaddr *destination,
+                                     socklen_t destination_len,
+                                     const struct sockaddr *source,
+                                     uint32_t ifindex,
+                                     const struct iovec *datagrams,
+                                     size_t count, size_t max_gso_segments,
+                                     uint8_t ecn) {
+  if (!egress || path_token < 0 || !destination || (!datagrams && count > 0) ||
       destination_len > sizeof(struct sockaddr_storage) ||
       max_gso_segments > TRANSPORT_EGRESS_BATCH || ecn > 3)
     return false;
@@ -114,16 +132,9 @@ bool transport_egress_submit_pktinfo(
 
   size_t first = 0;
   if (egress->count == 0) {
-    ssize_t sent;
-    if (source && source->sa_family != AF_UNSPEC) {
-      sent = transport_udp_send_batch_pktinfo(fd, destination, destination_len,
-                                              source, ifindex, datagrams, count,
-                                              max_gso_segments, ecn);
-    } else {
-      sent =
-          transport_udp_send_batch_ecn(fd, destination, destination_len,
-                                       datagrams, count, max_gso_segments, ecn);
-    }
+    ssize_t sent =
+        send_batch(egress, path_token, destination, destination_len, source,
+                   ifindex, datagrams, count, max_gso_segments, ecn);
     if (sent < 0) {
       egress->send_errors++;
       return false;
@@ -143,27 +154,28 @@ bool transport_egress_submit_pktinfo(
                          ecn);
 }
 
-bool transport_egress_submit_ecn(transport_egress_t *egress, int fd,
+bool transport_egress_submit_ecn(transport_egress_t *egress, int path_token,
                                  const struct sockaddr *destination,
                                  socklen_t destination_len,
                                  const struct iovec *datagrams, size_t count,
                                  size_t max_gso_segments, uint8_t ecn) {
-  return transport_egress_submit_pktinfo(egress, fd, destination,
+  return transport_egress_submit_pktinfo(egress, path_token, destination,
                                          destination_len, NULL, 0, datagrams,
                                          count, max_gso_segments, ecn);
 }
 
-bool transport_egress_submit(transport_egress_t *egress, int fd,
+bool transport_egress_submit(transport_egress_t *egress, int path_token,
                              const struct sockaddr *destination,
                              socklen_t destination_len,
                              const struct iovec *datagrams, size_t count,
                              size_t max_gso_segments) {
-  return transport_egress_submit_ecn(egress, fd, destination, destination_len,
-                                     datagrams, count, max_gso_segments, 0);
+  return transport_egress_submit_ecn(egress, path_token, destination,
+                                     destination_len, datagrams, count,
+                                     max_gso_segments, 0);
 }
 
-bool transport_egress_flush(transport_egress_t *egress, int fd) {
-  if (!egress || fd < 0)
+bool transport_egress_flush(transport_egress_t *egress, int path_token) {
+  if (!egress || path_token < 0)
     return false;
   bool success = true;
   size_t budget = TRANSPORT_EGRESS_BATCH;
@@ -189,19 +201,11 @@ bool transport_egress_flush(transport_egress_t *egress, int fd) {
       compatible++;
     }
 
-    ssize_t sent;
-    if (first->source.ss_family != AF_UNSPEC) {
-      sent = transport_udp_send_batch_pktinfo(
-          fd, (const struct sockaddr *)&first->destination,
-          first->destination_len, (const struct sockaddr *)&first->source,
-          first->ifindex, datagrams, compatible, first->max_gso_segments,
-          first->ecn);
-    } else {
-      sent = transport_udp_send_batch_ecn(
-          fd, (const struct sockaddr *)&first->destination,
-          first->destination_len, datagrams, compatible,
-          first->max_gso_segments, first->ecn);
-    }
+    ssize_t sent = send_batch(
+        egress, path_token, (const struct sockaddr *)&first->destination,
+        first->destination_len, (const struct sockaddr *)&first->source,
+        first->ifindex, datagrams, compatible, first->max_gso_segments,
+        first->ecn);
     if (sent < 0) {
       egress->send_errors++;
       /* A hard error applies to the first unsent datagram. Retaining it

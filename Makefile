@@ -107,8 +107,9 @@ NANORQ_CODEC_OBJS = $(NANORQ_OBJS) deps/nanors/deps/obl/oblas_common.o \
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
-TRANSPORT_OBJS = src/common/qlinq.o \
-              src/common/transport_repair_policy.o \
+# The protocol engine has an independent positive object list. Native network
+# I/O and the application polling loop are composed only into the public host.
+ENGINE_OBJS = src/common/transport_repair_policy.o \
               src/common/transport_policy_scheduler.o \
               src/common/cli_parse.o \
               src/common/transport_config.o \
@@ -127,17 +128,20 @@ TRANSPORT_OBJS = src/common/qlinq.o \
               src/common/transport_tls_groups.o \
               src/common/transport_tls_state.o \
               src/common/transport_tracks.o \
-              src/common/transport_udp.o \
               src/common/transport_wire.o \
-              src/common/transport_quicly.o \
+              src/common/transport_drive.o src/common/transport_quicly.o \
+              src/common/transport_time.o \
               src/common/fec.o \
               deps/nanors/rs.o \
               deps/nanors/deps/obl/oblas_common.o \
               deps/nanors/deps/obl/oblas_lite.o \
               $(QUICLY_OBJS) \
               $(NANORQ_OBJS) \
-              $(PATHFLOW_OBJS) \
-              $(IFMON_OBJS)
+              $(PATHFLOW_OBJS)
+
+
+POLL_HOST_OBJS = src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
+TRANSPORT_OBJS = src/common/qlinq.o $(ENGINE_OBJS) $(POLL_HOST_OBJS)
 
 COMMON_OBJS = src/common/data_uds.o \
               $(TRANSPORT_OBJS)
@@ -171,6 +175,8 @@ NANORQ_NATIVE_CFLAGS=$(NANORQ_NATIVE_CFLAGS)
 WITH_FUSION=$(WITH_FUSION)
 FUSION_CFLAGS=$(FUSION_CFLAGS)
 LDFLAGS=$(LDFLAGS)
+ENGINE_OBJS=$(ENGINE_OBJS)
+POLL_HOST_OBJS=$(POLL_HOST_OBJS)
 TRANSPORT_OBJS=$(TRANSPORT_OBJS)
 endef
 
@@ -233,7 +239,7 @@ qlinq-app: $(APP_OBJS) libqlinq.a
 qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o libqlinq.a
+qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 PREFIX ?= /usr/local
@@ -244,10 +250,55 @@ install-tun: qlinq-tun
 	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
 	install -m 644 packaging/qlinq.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/qlinq.conf
 
-t/00util/test_tun_queue: t/00util/test_tun_queue.o src/host/linux/tun_device.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write
+t/00util/test_tun_queue.o: src/host/linux/tun_direct.c
 
-check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue
+t/00util/test_tun_queue: t/00util/test_tun_queue.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write,--wrap=tun_read_vnet,--wrap=tun_write_vnet,--wrap=tun_write_offload
+
+t/00util/test_tun_segment: t/00util/test_tun_segment.o src/common/tun_segment.o src/common/tun_packet.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_tun_coalesce: t/00util/test_tun_coalesce.o src/common/tun_coalesce.o src/common/tun_segment.o src/common/tun_packet.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+ifeq ($(UNAME_S),Linux)
+TUN_VNET_TEST = t/00util/test_tun_vnet
+t/00util/test_tun_vnet: t/00util/test_tun_vnet.o src/host/linux/tun_device.o
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=open,--wrap=close,--wrap=ioctl,--wrap=readv,--wrap=writev
+endif
+
+t/00util/test_tun_tx_kernel.o: src/host/linux/tun_direct.c
+
+t/00util/test_tun_tx_kernel: t/00util/test_tun_tx_kernel.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_tun_rx_kernel.o: src/host/linux/tun_direct.c
+
+t/00util/test_tun_rx_kernel: t/00util/test_tun_rx_kernel.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+check-tun-offloads: qlinq-tun t/00util/test_tun_tx_kernel t/00util/test_tun_rx_kernel
+	unshare --net ./t/00util/test_tun_tx_kernel 4 on
+	unshare --net ./t/00util/test_tun_tx_kernel 6 on
+	unshare --net ./t/00util/test_tun_tx_kernel 4 off
+	unshare --net ./t/00util/test_tun_tx_kernel 6 off
+	unshare --net ./t/00util/test_tun_rx_kernel 4 on
+	unshare --net ./t/00util/test_tun_rx_kernel 6 on
+	unshare --net ./t/00util/test_tun_rx_kernel 4 off
+	unshare --net ./t/00util/test_tun_rx_kernel 6 off
+
+t/00util/test_tun_packet: t/00util/test_tun_packet.o src/common/tun_packet.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_tun_receive_batch: t/00util/test_tun_receive_batch.o src/common/tun_receive_batch.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST)
+	./t/00util/test_tun_packet
+	./t/00util/test_tun_segment
+	./t/00util/test_tun_coalesce
+	$(if $(TUN_VNET_TEST),./$(TUN_VNET_TEST),true)
+	./t/00util/test_tun_receive_batch
 	./t/00util/test_tun_queue
 	./t/00util/test_tun_names
 	python3 t/test_tun_tool.py
@@ -428,7 +479,19 @@ ifeq ($(UNAME_S),Linux)
 TLS_BARRIER_TEST = t/00util/test_tls_barrier
 endif
 
-CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue \
+t/00util/test_transport_drive: t/00util/test_transport_drive.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=socket,--wrap=pipe,--wrap=clock_gettime
+
+t/00util/test_transport_engine.o: t/00util/test_transport_drive.c .build-config
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -DTRANSPORT_ENGINE_ONLY=1 -c $< -o $@
+
+t/00util/test_transport_engine: t/00util/test_transport_engine.o $(ENGINE_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=clock_gettime,-Map,$@.map
+
+t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=clock_gettime,-Map,$@.map
+
+CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
@@ -451,7 +514,7 @@ CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups $(QUICLY_INTEGRATI
 t/00util/test_multipath_failover: t/00util/test_multipath_failover.o $(filter-out src/common/transport_udp.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/transport_quicly_clock.o: src/common/transport_quicly.c Makefile
+t/00util/transport_time_clock.o: src/common/transport_time.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dclock_gettime=test_clock_gettime -c $< -o $@
 
@@ -459,7 +522,7 @@ t/00util/transport_publish_admission.o: src/common/transport_publish.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dtransport_path_admission_rate=test_path_admission_rate -c $< -o $@
 
-t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_quicly_clock.o t/00util/transport_publish_admission.o $(filter-out src/common/transport_quicly.o src/common/transport_publish.o,$(COMMON_OBJS))
+t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/transport_time_clock.o t/00util/transport_publish_admission.o $(filter-out src/common/transport_time.o src/common/transport_publish.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 # The feedback fixture delegates native operations except during its explicit
@@ -485,17 +548,18 @@ t/00util/test_rx_cadence: t/00util/test_rx_cadence.o $(filter-out src/common/qli
 t/00util/test_rx_cadence_backlog: t/00util/test_rx_cadence_backlog.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/transport_egress_cadence.o: src/common/transport_egress.c Makefile
+t/00util/transport_poll_host_cadence.o: src/common/transport_poll_host.c Makefile
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dtransport_udp_send_batch_ecn=test_cadence_udp_send_batch -c $< -o $@
 
-t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_egress_cadence.o $(filter-out src/common/qlinq.o src/common/transport_egress.o,$(COMMON_OBJS))
+t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_poll_host_cadence.o $(filter-out src/common/qlinq.o src/common/transport_poll_host.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
+	rm -f t/00util/test_transport_engine t/00util/test_transport_engine.map t/00util/test_recovery_latency t/00util/test_recovery_latency.map
 	rm -f $(QUICLY_INTEGRATION_TEST)
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
@@ -561,3 +625,4 @@ t/00util/test_tls_groups: t/00util/test_tls_groups.o t/00util/transport_tls_grou
 
 t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=ptls_handshake_is_complete,--wrap=ptls_get_negotiated_group,--wrap=ptls_is_psk_handshake,--wrap=transport_stream_write_frame,--wrap=quicly_receive
+.PHONY: check-tun-offloads

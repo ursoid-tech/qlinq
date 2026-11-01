@@ -9,7 +9,10 @@ recovery, path scheduling, and bounded storage.
 | Module | Responsibility |
 | --- | --- |
 | `qlinq.c` | Application contexts, endpoints, named streams and owned event queues |
-| `transport_quicly.c` | Connection lifecycle, socket event loop, and public control/query API |
+| `transport_quicly.c` | Protocol engine, logical local paths, connection lifecycle, and control/query API |
+| `transport_poll_host.c` | Default socket host, UDP receive/GRO, interface watching and readiness integration |
+| `transport_drive.c` | Explicit host input, time and engine turn boundary |
+| `transport_time.c` | Standalone platform clock helpers for compatibility APIs |
 | `transport_internal.h` | Private shared transport and connection state |
 | `cli_parse.c` | Shared bounded numeric and endpoint parsing for app and daemon |
 | `transport_config.c` | Default resolution and validation of resource limits |
@@ -27,11 +30,12 @@ recovery, path scheduling, and bounded storage.
 | `transport_repair.c` | Bounded NACK symbol reconstruction |
 | `transport_scheduler.c` | Per-connection path and redundancy planning |
 | `transport_tls.c` | Certificate loading and verifier initialization |
-| `transport_egress.c` | Owned, bounded queues for packets awaiting socket writability |
+| `transport_egress.c` | Owned, bounded queues for packets awaiting host acceptance |
 | `transport_udp.c` | Portable UDP batch system calls and Linux GSO acceleration |
 
 The protocol and publication engines operate on private state but do not own the
-socket event loop. `transport_quicly.c` coordinates lifecycle and polling while
+socket event loop. `transport_poll_host.c` supplies native input and effects;
+`transport_quicly.c` coordinates protocol lifecycle while
 each module owns its invariants. The public header continues to expose opaque
 handles.
 
@@ -47,10 +51,12 @@ delivery directly and retains its bytes and identity across partial retries.
 Recipients are evaluated on every retry, including new subscriptions, while
 peers that already accepted the group are skipped.
 
-Physical socket records own addresses, interface identity, egress queues, and
-path-open retries. Each connection keeps separate path measurements, telemetry,
-and admission budgets indexed by that socket slot. QUIC path IDs are resolved
-separately. Removing an interface moves complete records together.
+Engine local-path records own addresses, interface identity, egress queues, and
+path-open retries. The polling host owns the matching native descriptors, GRO
+state and receive-backlog flags. Each connection keeps separate path measurements,
+telemetry, and admission budgets indexed by the local-path slot. QUIC path IDs
+are resolved separately. Removing an interface compacts both views together;
+monotonic path incarnation IDs reject deferred input for retired paths.
 Several remote QUIC paths may share one local socket. The send loop snapshots
 their socket ownership once per connection service pass, then scores every
 owned QUIC path using live congestion and health information. Physical-path

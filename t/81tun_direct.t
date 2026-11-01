@@ -42,7 +42,8 @@ for my $index (0 .. $#cases) {
         "--track tun-direct-test --mode $mode --mock --run-ms 3500");
     my $waited = waitpid($server_pid, 0);
     is($waited, $server_pid, "$label listener exited");
-    is($? >> 8, 0, "$label listener succeeded");
+    is($?, 0, "$label listener succeeded");
+    cmp_ok(-s $server_log, '<', 64 * 1024, "$label listener log stays bounded after peer close");
     open my $log, '<', $server_log or die "open $server_log: $!";
     local $/;
     my $server_output = <$log>;

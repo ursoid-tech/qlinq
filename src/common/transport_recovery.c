@@ -214,7 +214,7 @@ static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
   window->group_id = group_id;
   window->first_object_id = first_object_id;
   window->final_object_id = final_object_id;
-  window->last_request_ms = transport_get_time_ms();
+  window->last_request_ms = transport_now_ms(conn->transport);
   uint32_t count = (uint32_t)(final_object_id - first_object_id + 1U);
   for (uint32_t bit = 0; bit < count; bit++)
     if (!object_is_recently_delivered(state, first_object_id + bit))
@@ -248,7 +248,8 @@ void transport_recovery_delivered(transport_conn_t *conn, uint8_t alias,
 }
 
 static bool queue_missing_objects(transport_object_gap_state_t *state,
-                                  uint64_t group_id, uint64_t first_missing,
+                                  int64_t now_ms, uint64_t group_id,
+                                  uint64_t first_missing,
                                   uint64_t missing_count) {
   if (!state || missing_count == 0)
     return true;
@@ -256,7 +257,7 @@ static bool queue_missing_objects(transport_object_gap_state_t *state,
     return false;
   if (state->pending_mask == 0) {
     state->pending_base = first_missing;
-    state->detected_at_ms = transport_get_time_ms();
+    state->detected_at_ms = now_ms;
     state->group_id = group_id;
   }
   if (first_missing < state->pending_base ||
@@ -271,8 +272,9 @@ static bool queue_missing_objects(transport_object_gap_state_t *state,
   return count == missing_count;
 }
 
-void transport_recovery_observe(transport_object_gap_state_t *gap,
-                                uint64_t group_id, uint64_t object_id) {
+void transport_recovery_observe_at(transport_object_gap_state_t *gap,
+                                   int64_t now_ms, uint64_t group_id,
+                                   uint64_t object_id) {
   if (!gap->seen_initialized) {
     gap->seen_initialized = true;
     gap->last_seen = object_id;
@@ -280,7 +282,8 @@ void transport_recovery_observe(transport_object_gap_state_t *gap,
     if (object_id - gap->last_seen > 1) {
       uint64_t first_missing = gap->last_seen + 1;
       uint64_t missing_count = object_id - first_missing;
-      (void)queue_missing_objects(gap, group_id, first_missing, missing_count);
+      (void)queue_missing_objects(gap, now_ms, group_id, first_missing,
+                                  missing_count);
     }
     gap->last_seen = object_id;
   } else if (gap->pending_mask != 0 && object_id >= gap->pending_base &&
@@ -389,16 +392,16 @@ bool transport_recovery_send_nack(transport_conn_t *conn, uint8_t alias,
     } else if (transport_repair_limiter_wait_ms(
                    &conn->nack_request_limiter,
                    conn->transport->limits.max_repair_requests_per_second,
-                   transport_get_time_ms()) != 0 ||
+                   transport_now_ms(conn->transport)) != 0 ||
                transport_repair_limiter_wait_ms(
                    &conn->transport->aggregate_nack_limiter,
                    conn->transport->limits
                        .max_aggregate_nack_requests_per_second,
-                   transport_get_time_ms()) != 0) {
+                   transport_now_ms(conn->transport)) != 0) {
       conn->transport->stats.repair_requests_deferred++;
     } else if (transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
                                             written)) {
-      int64_t admitted_at_ms = transport_get_time_ms();
+      int64_t admitted_at_ms = transport_now_ms(conn->transport);
       (void)transport_repair_limiter_take(
           &conn->nack_request_limiter,
           conn->transport->limits.max_repair_requests_per_second,
