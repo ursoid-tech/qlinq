@@ -2,12 +2,12 @@
 
 This document describes qlinq's private peer protocol. All multibyte integers
 are unsigned and encoded in network byte order. The current protocol version is
-1. A peer must reject an unsupported stream-frame version. Invalid datagrams
+2. A peer must reject an unsupported stream-frame version. Invalid datagrams
 are discarded.
 
-Version 1 is the initial versioned layout. It uses 64-bit object identifiers
-and preserves object metadata on reliable streams. The legacy unversioned
-format is not supported.
+Version 2 omits implicit zero tails from systematic datagram symbols. It
+retains the existing 44-byte symbol header and FEC geometry. Versions 1 and
+the legacy unversioned format are not supported.
 
 ## Stream frame envelope
 
@@ -16,7 +16,7 @@ Control messages and reliable track objects use one common envelope:
 | Offset | Size | Field |
 | ---: | ---: | --- |
 | 0 | 2 | Magic bytes `QL` (`0x51 0x4c`) |
-| 2 | 1 | Protocol version (`1`) |
+| 2 | 1 | Protocol version (`2`) |
 | 3 | 1 | Frame type |
 | 4 | 4 | Payload length |
 | 8 | variable | Frame payload |
@@ -45,8 +45,8 @@ a 20-byte metadata header followed by application data.
 
 `HELLO` is the first frame on the bidirectional control stream in each
 direction. Application control frames and the public connected event are gated
-until both peers have exchanged valid HELLO frames. This is still protocol
-version 1: the handshake was added before version 1 had external users.
+until both peers have exchanged valid HELLO frames. Both peers must use
+protocol version 2.
 
 The HELLO payload is 20 bytes:
 
@@ -131,7 +131,20 @@ The FEC header is 44 bytes:
 | 30 | 2 | Symbol size |
 | 32 | 4 | Original object size |
 | 36 | 8 | Send timestamp in nanoseconds |
-| 44 | variable | Exactly one symbol |
+| 44 | variable | One symbol, excluding an implicit source zero tail |
+
+Let `K` be data symbols, `S` symbol size, `N` original object size, and `i`
+symbol index. Valid geometry requires `(K - 1) * S < N <= K * S`. A source
+symbol (`i < K`) carries exactly `min(S, N - i * S)` bytes; a repair symbol
+carries exactly `S` bytes. Receivers restore omitted source tails as zeros
+before FEC decoding, including when reusing assembly buffers. Padded source
+tails, truncated payloads, extra bytes and empty source symbols are invalid.
+The same rule applies to retained systematic retransmissions. Encoder geometry,
+repair equations and source-cache strides remain unchanged.
+
+Ordinary QUIC packets retain their actual lengths in mixed-size UDP batches;
+required Initial, validation and PMTU probe padding is preserved. Hosts group
+compatible lengths for GSO and handle other lengths as separate datagrams.
 
 The telemetry datagram is exactly 24 bytes: the four-byte envelope, path ID,
 three reserved zero bytes, an eight-byte send timestamp, and an eight-byte

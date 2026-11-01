@@ -139,6 +139,8 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
       total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
       object->data_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
       object->symbol_size > QLINQ_FEC_MAX_SYMBOL_SIZE ||
+      object->size <=
+          (size_t)(object->data_symbols - 1U) * object->symbol_size ||
       object->size > (size_t)object->data_symbols * object->symbol_size)
     return false;
   for (size_t i = 0; i < batch->count; i++) {

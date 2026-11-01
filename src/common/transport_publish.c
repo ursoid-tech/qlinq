@@ -477,10 +477,6 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
 
   size_t queued = 0;
   for (size_t s = 0; s < total_symbols; s++) {
-    size_t pkt_len = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size;
-    uint8_t *pkt_buf = transport_arena_alloc(&t->arena, pkt_len);
-    if (!pkt_buf)
-      return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
     size_t scheduled =
         transport_path_select_physical(plan->schedule.paths, active_paths, s);
     if (scheduled >= active_paths)
@@ -500,12 +496,17 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                                       .symbol_size = (uint16_t)symbol_size,
                                       .original_size = (uint32_t)obj->size,
                                       .send_time_ns = transport_now_ns(t)};
-    if (qlinq_wire_encode_fec_header(pkt_buf, pkt_len, &header) !=
-        QLINQ_WIRE_OK)
+    size_t payload_size = qlinq_wire_fec_payload_size(&header);
+    if (payload_size == 0)
+      return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
+    size_t pkt_len = QLINQ_WIRE_FEC_HEADER_SIZE + payload_size;
+    uint8_t *pkt_buf = transport_arena_alloc(&t->arena, pkt_len);
+    if (!pkt_buf || qlinq_wire_encode_fec_header(pkt_buf, pkt_len, &header) !=
+                        QLINQ_WIRE_OK)
       return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
     const uint8_t *symbol =
         s < data_symbols ? symbols->data[s] : symbols->parity[s - data_symbols];
-    memcpy(pkt_buf + QLINQ_WIRE_FEC_HEADER_SIZE, symbol, symbol_size);
+    memcpy(pkt_buf + QLINQ_WIRE_FEC_HEADER_SIZE, symbol, payload_size);
     ptls_iovec_t datagram = ptls_iovec_init(pkt_buf, pkt_len);
     if (!transport_queue_datagram(conn, mapped, datagram))
       return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL

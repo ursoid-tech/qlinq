@@ -22,7 +22,8 @@ typedef struct transport_drive_host {
    */
   bool (*open)(void *context, transport_drive_path_t *path);
   void (*close)(void *context, const transport_drive_path_t *path);
-  /* accepted contiguous prefix: 0=would block, -1=hard failure */
+  /* each iovec is a UDP datagram; group equal-size runs for GSO or send
+   * individually, returning accepted prefix length (0=would block, -1=error) */
   ssize_t (*send)(void *context, const transport_drive_path_t *path,
                   const struct sockaddr *source,
                   const struct sockaddr *destination, socklen_t destination_len,

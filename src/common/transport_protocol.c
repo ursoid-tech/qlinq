@@ -270,13 +270,16 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
                                       .original_size = (uint32_t)cached->size,
                                       .send_time_ns =
                                           transport_now_ns(conn->transport)};
-    if (qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) !=
-        QLINQ_WIRE_OK)
+    size_t payload_size = qlinq_wire_fec_payload_size(&header);
+    size_t wire_len = QLINQ_WIRE_FEC_HEADER_SIZE + payload_size;
+    if (payload_size == 0 || wire_len > sizeof(packet) ||
+        qlinq_wire_encode_fec_header(packet, wire_len, &header) !=
+            QLINQ_WIRE_OK)
       break;
     memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE,
-           repair->symbols + i * repair->symbol_size, repair->symbol_size);
+           repair->symbols + i * repair->symbol_size, payload_size);
     if (!transport_queue_datagram(conn, path,
-                                  ptls_iovec_init(packet, packet_len)))
+                                  ptls_iovec_init(packet, wire_len)))
       break;
     queued++;
   }
@@ -968,18 +971,11 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   uint16_t symbol_size = hdr.symbol_size;
   uint32_t original_size = hdr.original_size;
 
-  if (total_symbols == 0 || total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
-      symbol_size == 0 || symbol_size > QLINQ_FEC_MAX_SYMBOL_SIZE ||
-      data_symbols == 0 || data_symbols > total_symbols ||
-      symbol_index >= total_symbols)
-    goto malformed_datagram;
-
-  if (original_size > tconn->negotiated_limits.max_fec_object_size ||
-      original_size > (uint32_t)data_symbols * symbol_size ||
-      original_size == 0)
-    goto malformed_datagram;
-
-  if (payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size)
+  size_t payload_size = qlinq_wire_fec_payload_size(&hdr);
+  if (payload_size == 0 || total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+      symbol_size > QLINQ_FEC_MAX_SYMBOL_SIZE ||
+      original_size > tconn->negotiated_limits.max_fec_object_size ||
+      payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + payload_size)
     goto malformed_datagram;
 
   /* The echoed ID belongs to the sender, never to our local path table.
@@ -1130,7 +1126,10 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
   if (!asm_slot->received_mask[symbol_index]) {
     memcpy(asm_slot->buffers[symbol_index],
-           payload.base + QLINQ_WIRE_FEC_HEADER_SIZE, symbol_size);
+           payload.base + QLINQ_WIRE_FEC_HEADER_SIZE, payload_size);
+    /* zero any omitted source tail before FEC decoding */
+    memset(asm_slot->buffers[symbol_index] + payload_size, 0,
+           symbol_size - payload_size);
     asm_slot->received_mask[symbol_index] = true;
     asm_slot->received_count++;
     asm_slot->last_activity_time_ms = transport_now_ms(t);

@@ -211,8 +211,12 @@ Datagram publication checks the smallest negotiated FEC object limit among
 eligible receivers before accepting a record into a group or emitting data.
 Grouped records include their two-byte length prefixes in this limit. Short
 objects use smaller FEC symbols instead of padding every symbol to the maximum
-UDP payload. Received objects preserve the subscribed track flags; applications
-recognize grouped FEC data when either FEC flag is present.
+UDP payload. Source symbols omit their implicit zero tail on the wire while
+keeping capacity-sized codec and repair-cache strides. Receivers reconstruct
+those zeros before decoding. Ordinary QUIC batches permit mixed UDP lengths,
+so compact source payloads are not expanded by GSO padding. Received objects
+preserve the subscribed track flags; applications recognize grouped FEC data
+when either FEC flag is present.
 
 Finite rateless publishers call `transport_finish_track` after their final
 application record. Publication assigns internal FEC object IDs, emits a

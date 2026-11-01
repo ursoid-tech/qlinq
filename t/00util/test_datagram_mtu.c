@@ -27,7 +27,7 @@ struct mtu_endpoint {
   capture_t capture;
   size_t symbols, largest_symbol;
   uint64_t observe_group;
-  size_t observed_symbols, observed_symbol_size;
+  size_t observed_symbols, observed_symbol_size, observed_source_bytes;
 };
 
 typedef struct {
@@ -59,6 +59,8 @@ static ssize_t send_mtu(void *context, const transport_drive_path_t *path,
   }
   size_t accepted = 0;
   for (size_t i = 0; i < count; i++) {
+    if (QUICLY_PACKET_IS_INITIAL(*(const uint8_t *)datagrams[i].iov_base))
+      assert(datagrams[i].iov_len >= 1200);
     if (datagrams[i].iov_len > host->largest[physical])
       host->largest[physical] = datagrams[i].iov_len;
     if (datagrams[i].iov_len > mtu) {
@@ -82,12 +84,16 @@ static void capture_datagram(quicly_receive_datagram_frame_t *self,
   qlinq_wire_fec_header_t header;
   if (qlinq_wire_decode_fec_header(payload.base, payload.len, &header) ==
       QLINQ_WIRE_OK) {
-    assert(payload.len == QLINQ_WIRE_FEC_HEADER_SIZE + header.symbol_size);
+    assert(payload.len ==
+           QLINQ_WIRE_FEC_HEADER_SIZE + qlinq_wire_fec_payload_size(&header));
     endpoint->symbols++;
     if (header.symbol_size > endpoint->largest_symbol)
       endpoint->largest_symbol = header.symbol_size;
     if (header.group_id == endpoint->observe_group) {
       endpoint->observed_symbols++;
+      if (header.symbol_index < header.data_symbols)
+        endpoint->observed_source_bytes +=
+            payload.len - QLINQ_WIRE_FEC_HEADER_SIZE;
       if (endpoint->observed_symbol_size)
         assert(endpoint->observed_symbol_size == header.symbol_size);
       endpoint->observed_symbol_size = header.symbol_size;
@@ -210,9 +216,8 @@ static void receive_object(mtu_fixture_t *f, size_t expected,
 }
 
 static void inject_nack(quicly_stream_t *stream, uint8_t alias, uint64_t group,
-                        uint64_t object) {
+                        uint64_t object, uint16_t missing) {
   uint8_t nack[64], frame[128];
-  uint16_t missing = 0;
   size_t nack_len;
   assert(qlinq_wire_encode_nack(nack, sizeof(nack), alias, 0, group, object,
                                 &missing, 1, &nack_len) == QLINQ_WIRE_OK);
@@ -278,7 +283,7 @@ static void differing_path_mtu(void) {
       quicly_get_num_datagram_frames_path(conn->quic, paths[0]),
       quicly_get_num_datagram_frames_path(conn->quic, paths[1])};
   f->endpoints[1].observe_group = 900;
-  inject_nack(conn->stream, alias, 900, 0);
+  inject_nack(conn->stream, alias, 900, 0, 0);
   assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0]) ==
          before[0]);
   assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1]) ==
@@ -376,7 +381,7 @@ static void mtu_blackhole_fallback(void) {
                                             &alias) == 0);
   size_t queued = quicly_get_num_datagram_frames_path(conn->quic, path);
   uint64_t failures = t->stats.repair_queue_failures;
-  inject_nack(conn->stream, alias, 54, 0);
+  inject_nack(conn->stream, alias, 54, 0, 0);
   assert(quicly_get_num_datagram_frames_path(conn->quic, path) == queued &&
          t->stats.repair_queue_failures > failures &&
          cached->symbol_size == original_symbol);
@@ -491,7 +496,7 @@ static void shared_socket_mtu(void) {
       quicly_get_num_datagram_frames_path(conn->quic, paths[0]),
       quicly_get_num_datagram_frames_path(conn->quic, paths[1])};
   f->endpoints[1].observe_group = 903;
-  inject_nack(conn->stream, alias, 903, 0);
+  inject_nack(conn->stream, alias, 903, 0, 0);
   assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0]) ==
          before[0]);
   assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1]) ==
@@ -503,7 +508,188 @@ static void shared_socket_mtu(void) {
   destroy(f);
 }
 
+/* keep capacity-sized FEC/cache strides, but send only actual source bytes */
+static void implicit_source_tails(void) {
+  const uint8_t flags[] = {0, MOQ_TRACK_FLAG_FEC_ENABLED,
+                           MOQ_TRACK_FLAG_FEC_RATELESS};
+  for (size_t mode = 0; mode < sizeof(flags) / sizeof(flags[0]); mode++) {
+    mtu_fixture_t *f = create(1, 1280, 0);
+    moq_track_id_t track = {
+        .type = MOQ_TRACK_VIDEO, .flags = flags[mode], .name = "compact"};
+    subscribe(f, track);
+    step(f, 5000);
+    transport_t *t = f->endpoints[0].base.transport;
+    transport_conn_t *conn = f->endpoints[0].base.conn;
+    assert(transport_mock_path_state(t, 0, 100000, 10, 0));
+    size_t capacity = transport_get_datagram_symbol_size(t);
+    const size_t sizes[] = {1,    capacity,     capacity + 1,
+                            1400, capacity * 2, capacity * 2 + 17};
+    uint8_t data[4096];
+    for (size_t i = 0; i < sizeof(data); i++)
+      data[i] = (uint8_t)(i * 37U + i / 700U);
+    mtu_endpoint_t *receiver = &f->endpoints[1];
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+      assert(sizes[i] <= sizeof(data));
+      receiver->observe_group = 1000 + i;
+      receiver->observed_symbols = receiver->observed_symbol_size = 0;
+      receiver->observed_source_bytes = 0;
+      moq_object_t object = {.track_id = track,
+                             .group_id = 1000 + i,
+                             .data = data,
+                             .size = sizes[i]};
+      assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_DELIVERED);
+      receive_object(f, i + 1, data, sizes[i]);
+      step(f, 100);
+      assert(receiver->observed_source_bytes == sizes[i]);
+      assert(receiver->observed_symbol_size ==
+             (sizes[i] < capacity ? sizes[i] : capacity));
+    }
+    if (flags[mode] == MOQ_TRACK_FLAG_FEC_ENABLED) {
+      /* NACK for the final systematic symbol trims its zero tail */
+      uint8_t alias;
+      assert(transport_subscriptions_find_alias(&conn->send_subscriptions,
+                                                &track, &alias) == 0);
+      moq_object_t retained = {.track_id = track,
+                               .group_id = receiver->observe_group,
+                               .data = data,
+                               .size = capacity * 2 + 17};
+      assert(transport_sent_cache_store(&t->sent_cache, &retained, 3, 3,
+                                        (uint16_t)capacity, true));
+      size_t before = receiver->observed_symbols;
+      receiver->observed_source_bytes = 0;
+      inject_nack(conn->stream, alias, receiver->observe_group, 0, 2);
+      step(f, 100);
+      assert(receiver->observed_symbols == before + 1);
+      assert(receiver->observed_source_bytes == 17);
+    }
+    assert(f->endpoints[1].base.transport->stats.malformed_datagrams == 0);
+    destroy(f);
+  }
+}
+
+static void implicit_tail_recovery(void) {
+  for (size_t rateless = 0; rateless < 2; rateless++) {
+    mtu_fixture_t *f = create(1, 1280, 0);
+    moq_track_id_t track = {.type = MOQ_TRACK_VIDEO,
+                            .flags = rateless ? MOQ_TRACK_FLAG_FEC_RATELESS
+                                              : MOQ_TRACK_FLAG_FEC_ENABLED,
+                            .name = "tail-recovery"};
+    subscribe(f, track);
+    transport_t *t = f->endpoints[1].base.transport;
+    transport_conn_t *conn = f->endpoints[1].base.conn;
+    uint8_t alias;
+    assert(transport_subscriptions_find_alias(&conn->receive_subscriptions,
+                                              &track, &alias) == 0);
+    uint8_t source[3][700] = {{0}}, parity[8][700];
+    const uint8_t *sources[] = {source[0], source[1], source[2]};
+    uint8_t *repairs[8];
+    uint8_t expected[1401];
+    for (size_t i = 0; i < sizeof(expected); i++) {
+      expected[i] = (uint8_t)(i * 37U + i / 700U);
+      source[i / 700][i % 700] = expected[i];
+    }
+    for (size_t i = 0; i < 8; i++)
+      repairs[i] = parity[i];
+    fec_t *fec =
+        fec_create_ex(rateless ? FEC_RAPTORQ : FEC_REED_SOLOMON, 3, 8, 700);
+    assert(fec && fec_encode(fec, sources, repairs));
+    fec_destroy(fec);
+    /* model a reused slot whose old tail must not reach the decoder */
+    assert(transport_grow_assembler(t, &conn->assemblers[0], 11, 700));
+    for (size_t i = 0; i < 11; i++)
+      memset(conn->assemblers[0].buffers[i], 0xa5, 700);
+    conn->assembler_index = 0;
+    uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + 701] = {0};
+    qlinq_wire_fec_header_t header = {.alias = alias,
+                                      .group_id = 2000,
+                                      .data_symbols = 3,
+                                      .total_symbols = 11,
+                                      .symbol_size = 700,
+                                      .original_size = 1401,
+                                      .symbol_index = 2};
+    assert(qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) ==
+           QLINQ_WIRE_OK);
+    const size_t invalid_sizes[] = {0, 2, 700, 701};
+    for (size_t i = 0; i < sizeof(invalid_sizes) / sizeof(invalid_sizes[0]);
+         i++) {
+      uint64_t before = t->stats.malformed_datagrams;
+      t->receive_datagram.cb(
+          &t->receive_datagram, conn->quic,
+          ptls_iovec_init(packet,
+                          QLINQ_WIRE_FEC_HEADER_SIZE + invalid_sizes[i]));
+      assert(t->stats.malformed_datagrams == before + 1);
+      assert(f->endpoints[1].base.objects == 0);
+    }
+    /* lose source zero; keep the compact tail and enough repair equations */
+    for (uint16_t i = 1; i < 11 && !f->endpoints[1].base.objects; i++) {
+      header.symbol_index = i;
+      assert(qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) ==
+             QLINQ_WIRE_OK);
+      size_t bytes = i == 2 ? 1 : 700;
+      memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE,
+             i < 3 ? source[i] : parity[i - 3], bytes);
+      t->receive_datagram.cb(
+          &t->receive_datagram, conn->quic,
+          ptls_iovec_init(packet, QLINQ_WIRE_FEC_HEADER_SIZE + bytes));
+    }
+    receive_object(f, 1, expected, sizeof(expected));
+    assert(t->stats.fec_objects_decoded > 0);
+    destroy(f);
+  }
+}
+
+static void variable_udp_batches(void) {
+  mtu_fixture_t *f = create(1, 1280, 0);
+  step(f, 5000); /* finish PMTU probes before measuring ordinary traffic */
+  transport_t *t = f->endpoints[0].base.transport;
+  transport_conn_t *conn = f->endpoints[0].base.conn;
+  size_t path = native_path(f, 0);
+  assert(path != SIZE_MAX && t->quic_ctx.allow_variable_datagram_sizes);
+  /* equal payloads form GSO runs; mixed sizes still share one send batch */
+  const size_t sizes[] = {744, 744, 744, 744, 144, 844, 844, 844, 844};
+  uint8_t payload[844];
+  memset(payload, 0x5a, sizeof(payload));
+  for (unsigned variable = 0; variable < 2; variable++) {
+    t->quic_ctx.allow_variable_datagram_sizes = variable;
+    size_t payload_bytes = 0;
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+      assert(transport_queue_datagram(conn, path,
+                                      ptls_iovec_init(payload, sizes[i])));
+      payload_bytes += sizes[i];
+    }
+    uint8_t buffer[32 * 1500];
+    struct iovec datagrams[32];
+    size_t count = 32;
+    quicly_address_t destination, source;
+    assert(quicly_send(conn->quic, &destination, &source, datagrams, &count,
+                       buffer, sizeof(buffer)) == 0);
+    assert(count >= 8 && count <= 10 &&
+           quicly_get_num_datagram_frames_path(conn->quic, path) == 0);
+    size_t bytes = 0, equal_pairs = 0;
+    for (size_t i = 0; i < count; i++) {
+      bytes += datagrams[i].iov_len;
+      if (i != 0) {
+        assert((uint8_t *)datagrams[i - 1].iov_base +
+                   datagrams[i - 1].iov_len ==
+               datagrams[i].iov_base);
+        equal_pairs += datagrams[i - 1].iov_len == datagrams[i].iov_len;
+      }
+      if (!variable && i + 1 < count)
+        assert(datagrams[i].iov_len == datagrams[0].iov_len);
+    }
+    assert(equal_pairs >= 2);
+    if (variable)
+      assert(bytes <= payload_bytes + count * 100);
+    else
+      assert(bytes > payload_bytes + count * 100);
+  }
+  destroy(f);
+}
+
 int main(void) {
+  implicit_source_tails();
+  implicit_tail_recovery();
+  variable_udp_batches();
   differing_path_mtu();
   admission_limits();
   mtu_blackhole_fallback();

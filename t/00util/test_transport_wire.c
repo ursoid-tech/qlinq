@@ -268,6 +268,24 @@ int main(void) {
   CHECK(qlinq_wire_decode_fec_header(payload, QLINQ_WIRE_FEC_HEADER_SIZE,
                                      &decoded_fec) == QLINQ_WIRE_INVALID,
         "FEC keyframe validation");
+  CHECK(qlinq_wire_fec_payload_size(NULL) == 0 &&
+            qlinq_wire_fec_payload_size(&fec) == 1200,
+        "FEC full source payload size");
+  fec.symbol_index = 15;
+  CHECK(qlinq_wire_fec_payload_size(&fec) == 1000,
+        "FEC trimmed final source payload size");
+  fec.symbol_index = 16;
+  CHECK(qlinq_wire_fec_payload_size(&fec) == 1200, "FEC parity payload size");
+  fec.original_size = 18000;
+  CHECK(qlinq_wire_fec_payload_size(&fec) == 0,
+        "FEC rejects empty tail symbol");
+  fec.original_size = 19201;
+  CHECK(qlinq_wire_fec_payload_size(&fec) == 0,
+        "FEC rejects oversized object geometry");
+  fec.original_size = 19000;
+  fec.symbol_index = 20;
+  CHECK(qlinq_wire_fec_payload_size(&fec) == 0,
+        "FEC rejects out-of-range symbol index");
 
   qlinq_wire_telemetry_t telemetry = {.path_id = 2,
                                       .send_time_ns = UINT64_C(987654321),

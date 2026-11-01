@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define QLINQ_WIRE_VERSION 1U
+#define QLINQ_WIRE_VERSION 2U
 #define QLINQ_WIRE_FRAME_HEADER_SIZE 8U
 #define QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE 20U
 #define QLINQ_WIRE_FEC_HEADER_SIZE 44U
@@ -116,6 +116,9 @@ typedef struct {
   uint32_t original_size;
   uint64_t send_time_ns;
 } qlinq_wire_fec_header_t;
+
+/* wire payload bytes for a symbol, or 0 for invalid geometry */
+size_t qlinq_wire_fec_payload_size(const qlinq_wire_fec_header_t *header);
 
 typedef struct {
   uint8_t path_id;

@@ -296,6 +296,24 @@ qlinq_wire_decode_track_object(const uint8_t *src, size_t len,
   return QLINQ_WIRE_OK;
 }
 
+size_t qlinq_wire_fec_payload_size(const qlinq_wire_fec_header_t *header) {
+  if (!header || header->symbol_size == 0 || header->data_symbols == 0 ||
+      header->data_symbols > header->total_symbols ||
+      header->symbol_index >= header->total_symbols ||
+      header->original_size <=
+          (uint32_t)(header->data_symbols - 1U) * header->symbol_size ||
+      header->original_size >
+          (uint32_t)header->data_symbols * header->symbol_size)
+    return 0;
+  if (header->symbol_index < header->data_symbols) {
+    size_t remaining = header->original_size -
+                       (uint32_t)header->symbol_index * header->symbol_size;
+    if (remaining < header->symbol_size)
+      return remaining;
+  }
+  return header->symbol_size;
+}
+
 qlinq_wire_result_t
 qlinq_wire_encode_fec_header(uint8_t *dst, size_t capacity,
                              const qlinq_wire_fec_header_t *header) {

@@ -31,7 +31,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                                        &payload_len);
 
   qlinq_wire_fec_header_t fec;
-  (void)qlinq_wire_decode_fec_header(data, size, &fec);
+  if (qlinq_wire_decode_fec_header(data, size, &fec) == QLINQ_WIRE_OK)
+    (void)qlinq_wire_fec_payload_size(&fec);
 
   qlinq_wire_telemetry_t telemetry;
   (void)qlinq_wire_decode_telemetry(data, size, &telemetry);

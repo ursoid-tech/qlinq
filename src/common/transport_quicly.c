@@ -1153,6 +1153,8 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   t->quic_ctx.transport_params.max_datagram_frame_size =
       t->limits.max_udp_payload_size;
   t->quic_ctx.max_datagram_frame_payloads = QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY;
+  /* avoid padding variable-size datagrams solely for GSO */
+  t->quic_ctx.allow_variable_datagram_sizes = 1;
   if (config->quic_idle_timeout_ms != 0)
     t->quic_ctx.transport_params.max_idle_timeout =
         config->quic_idle_timeout_ms;
