@@ -11,6 +11,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "qlinq-tun"
+LEGACY_PEER = Path(os.environ.get("QLINQ_TUN_LEGACY_PEER", str(CLI)))
 
 
 def run(*args, prefix=(), **kwargs):
@@ -25,7 +26,7 @@ def main():
     if os.geteuid() != 0:
         raise RuntimeError("run as root; this test creates isolated network namespaces")
     if "--isolated" not in sys.argv:
-        os.execvp("unshare", ["unshare", "--net", sys.executable, __file__, "--isolated"])
+        os.execvp("unshare", ["unshare", "--net", sys.executable, __file__, "--isolated", *sys.argv[1:]])
     run("ip", "link", "set", "lo", "up")
     peer = subprocess.Popen(["unshare", "--net", "sleep", "300"])
     processes = []
@@ -46,7 +47,14 @@ def main():
             directory = Path(temporary)
 
             def cli(*args, client=False):
-                return run(CLI, "--config-dir", directory, *args, prefix=ns if client else ())
+                if args[0] == "up" and ("--tx-gso-both" in sys.argv or
+                                          ("--tx-gso" in sys.argv and not client)):
+                    args = (*args, "--tx-gso")
+                if args[0] == "up" and ("--rx-gro-both" in sys.argv or
+                                          ("--rx-gro" in sys.argv and not client)):
+                    args = (*args, "--rx-gro")
+                return run(LEGACY_PEER if client else CLI, "--config-dir", directory,
+                           *args, prefix=ns if client else ())
 
             def wait_connected(name, client=False):
                 for _ in range(100):
@@ -82,8 +90,19 @@ def main():
             try:
                 cli("up", "server")
                 cli("up", "client", client=True)
-                wait_connected("server")
-                wait_connected("client", True)
+                server_status = wait_connected("server")
+                client_status = wait_connected("client", True)
+                if "--tx-gso" in sys.argv or "--tx-gso-both" in sys.argv:
+                    assert server_status["tx_gso_active"], "server did not enable offloads"
+                    assert client_status.get("tx_gso_active", False) == ("--tx-gso-both" in sys.argv)
+                if "--rx-gro" in sys.argv or "--rx-gro-both" in sys.argv:
+                    assert server_status["rx_gro_active"]
+                    assert client_status.get("rx_gro_active",False) == ("--rx-gro-both" in sys.argv)
+                # Ordinary IPv6 records share the same unchanged transport wire format.
+                run("ip", "-6", "addr", "add", "fd88::1/64", "dev", "qt_a", "nodad")
+                run("ip", "-6", "addr", "add", "fd88::2/64", "dev", "qt_b", "nodad", prefix=ns)
+                run("ping", "-6", "-c", "2", "-W", "2", "-M", "do", "-s", "1352",
+                    "fd88::1", prefix=ns)
                 run("ping", "-c", "3", "-W", "2", "10.88.0.1", prefix=ns)
                 # Full MTU packet: IPv4 + ICMP headers consume 28 bytes.
                 run("ping", "-c", "2", "-W", "2", "-M", "do", "-s", "1372",
@@ -102,6 +121,23 @@ def main():
                         "'http://10.88.0.1:18088/payload.bin',timeout=15).read()).hexdigest())")
                 actual = run(sys.executable, "-c", code, prefix=ns).strip()
                 assert actual == hashlib.sha256(payload).hexdigest(), "TCP payload corrupted"
+                http6 = subprocess.Popen([sys.executable, "-m", "http.server", "18090",
+                                          "--bind", "fd88::1", "--directory", temporary],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                processes.append(http6)
+                time.sleep(0.2)
+                code6 = ("import urllib.request,hashlib; "
+                         "o=urllib.request.build_opener(urllib.request.ProxyHandler({})); "
+                         "print(hashlib.sha256(o.open("
+                         "'http://[fd88::1]:18090/payload.bin',timeout=15).read()).hexdigest())")
+                actual6 = run(sys.executable, "-c", code6, prefix=ns).strip()
+                assert actual6 == hashlib.sha256(payload).hexdigest(), "IPv6 TCP payload corrupted"
+                udp6_code = "import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.bind(('fd88::1',18091)); exec('while True:\\n d,a=s.recvfrom(2048); s.sendto(d,a)')"
+                udp6 = subprocess.Popen([sys.executable, "-c", udp6_code])
+                processes.append(udp6)
+                time.sleep(0.1)
+                probe6 = 'import socket; s=socket.socket(socket.AF_INET6,socket.SOCK_DGRAM); s.settimeout(3); exec(\'for i in range(20):\\n d=bytes([i])*(511 if i%2 else 1352); s.sendto(d,("fd88::1",18091)); assert s.recv(2048)==d\')'
+                run(sys.executable, "-c", probe6, prefix=ns)
                 # UDP echo verifies record boundaries with ordinary application sockets.
                 udp_code = ("import socket; s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); "
                             "s.bind(('10.88.0.1',18089)); "
@@ -172,7 +208,7 @@ def main():
             assert "qt_b" not in {r["ifname"] for r in json.loads(run("ip", "-j", "link", prefix=ns))}
             assert not any(r.get("dst") == "10.99.0.0/24" for r in
                            json.loads(run("ip", "-j", "route", prefix=ns)))
-            print("REAL TUN OK: mTLS, ping/MTU, subnet route, TCP integrity, UDP, restart, multipath hot-add/failover/removal, uplink recovery, cleanup")
+            print("REAL TUN OK: mTLS, IPv4/IPv6 ping/MTU, subnet route, TCP integrity, UDP, restart, multipath hot-add/failover/removal, uplink recovery, cleanup")
     finally:
         for process in processes:
             process.terminate()

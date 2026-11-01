@@ -273,6 +273,8 @@ typedef struct {
   uint32_t max_jumpstart_packets;
   /* automatically detect and bind non-loopback network interfaces */
   bool multihome;
+  /* optional externally driven internal host; NULL keeps the polling host */
+  const struct transport_drive_host *drive_host;
 } transport_config_t;
 
 /* create and destroy transport instances */

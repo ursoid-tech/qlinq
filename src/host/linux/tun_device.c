@@ -137,7 +137,11 @@ static int tun_create_by_id(char if_name[IFNAMSIZ], unsigned int id) {
 }
 #endif
 
-static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name) {
+static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name,
+                      bool vnet) {
+#if !defined(__linux__)
+  (void)vnet;
+#endif
 #if defined(__linux__)
   struct ifreq ifr = {0};
   int fd;
@@ -148,14 +152,24 @@ static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name) {
     perror("opening /dev/net/tun");
     return -1;
   }
-  ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+  if (vnet) {
+    unsigned features = 0;
+    if (ioctl(fd, TUNGETFEATURES, &features) < 0 ||
+        !(features & IFF_VNET_HDR)) {
+      (void)close(fd);
+      errno = EOPNOTSUPP;
+      return -1;
+    }
+  }
+  ifr.ifr_flags = IFF_TUN | IFF_NO_PI | (vnet ? IFF_VNET_HDR : 0);
   snprintf(ifr.ifr_name, IFNAMSIZ, "%s",
            wanted_name == NULL ? "" : wanted_name);
   if (ioctl(fd, TUNSETIFF, &ifr) != 0) {
     err = errno;
     (void)close(fd);
     errno = err;
-    perror("ioctl(TUNSETIFF)");
+    if (!vnet)
+      perror("ioctl(TUNSETIFF)");
     return -1;
   }
   snprintf(if_name, IFNAMSIZ, "%s", ifr.ifr_name);
@@ -216,7 +230,84 @@ int tun_alloc(char *dev) {
   char wanted_name[IFNAMSIZ];
   strncpy(wanted_name, dev, IFNAMSIZ - 1);
   wanted_name[IFNAMSIZ - 1] = '\0';
-  return tun_create(dev, wanted_name[0] ? wanted_name : NULL);
+  return tun_create(dev, wanted_name[0] ? wanted_name : NULL, false);
+}
+
+int tun_alloc_vnet(char *dev, bool transmit, bool *active) {
+  *active = false;
+#ifndef __linux__
+  (void)transmit;
+#endif
+#ifdef __linux__
+  char wanted[IFNAMSIZ];
+  snprintf(wanted, sizeof(wanted), "%s", dev);
+  int fd = tun_create(dev, wanted[0] ? wanted : NULL, true);
+  if (fd >= 0) {
+    int size = TUN_VNET_HEADER_SIZE, little = 1;
+    unsigned base = transmit ? TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6 : 0;
+    const uint16_t native = 1;
+    bool endian_ok =
+        ioctl(fd, TUNSETVNETLE, &little) == 0 || *(const uint8_t *)&native == 1;
+    if (endian_ok && ioctl(fd, TUNSETVNETHDRSZ, &size) == 0 &&
+        (ioctl(fd, TUNSETOFFLOAD, base | (transmit ? TUN_F_TSO_ECN : 0)) == 0 ||
+         ioctl(fd, TUNSETOFFLOAD, base) == 0)) {
+      *active = true;
+      return fd;
+    }
+    (void)close(fd);
+  }
+  snprintf(dev, IFNAMSIZ, "%s", wanted);
+#endif
+  return tun_alloc(dev);
+}
+
+int tun_alloc_tx_offload(char *dev, bool *active) {
+  return tun_alloc_vnet(dev, true, active);
+}
+
+static unsigned vnet16(const uint8_t *p) {
+  return (unsigned)p[1] << 8 | p[0];
+}
+
+ssize_t tun_read_vnet(int fd, void *data, size_t capacity,
+                      tun_offload_t *metadata) {
+  uint8_t header[TUN_VNET_HEADER_SIZE];
+  struct iovec vectors[2] = {{header, sizeof(header)}, {data, capacity}};
+  ssize_t size = readv(fd, vectors, 2);
+  if (size <= 0)
+    return size;
+  if (size <= (ssize_t)sizeof(header)) {
+    errno = EBADMSG;
+    return -1;
+  }
+  *metadata = (tun_offload_t){.flags = header[0],
+                              .gso_type = header[1],
+                              .header_length = vnet16(header + 2),
+                              .gso_size = vnet16(header + 4),
+                              .checksum_start = vnet16(header + 6),
+                              .checksum_offset = vnet16(header + 8)};
+  return size - sizeof(header);
+}
+
+ssize_t tun_write_offload(int fd, const void *data, size_t size,
+                          const tun_offload_t *m) {
+  uint8_t header[TUN_VNET_HEADER_SIZE] = {m->flags, m->gso_type};
+  const uint16_t fields[] = {m->header_length, m->gso_size, m->checksum_start,
+                             m->checksum_offset};
+  for (size_t i = 0; i < 4; i++) {
+    header[2 + 2 * i] = fields[i];
+    header[3 + 2 * i] = fields[i] >> 8;
+  }
+  struct iovec vectors[2] = {{header, sizeof(header)}, {(void *)data, size}};
+  ssize_t written = writev(fd, vectors, 2);
+  if (written <= 0)
+    return written;
+  return written <= (ssize_t)sizeof(header) ? 0 : written - sizeof(header);
+}
+
+ssize_t tun_write_vnet(int fd, const void *data, size_t size) {
+  const tun_offload_t metadata = {0};
+  return tun_write_offload(fd, data, size, &metadata);
 }
 
 int tun_set_mtu(const char *if_name, int mtu) {

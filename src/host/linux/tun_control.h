@@ -17,7 +17,7 @@ typedef struct {
   const char *interface, *local_ip, *peer_ip, *run_as, *metrics_output;
   const char *uplinks[4], *routes[16];
   unsigned uplink_count, route_count, metrics_interval;
-  bool mock, json;
+  bool mock, json, tx_gso, rx_gro;
 } tc_args;
 
 typedef struct {

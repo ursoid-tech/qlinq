@@ -1,3 +1,4 @@
+#include "transport_poll_host.h"
 #include "transport_fixture.h"
 #include "transport_publish.h"
 #include "transport_stream.h"
@@ -390,8 +391,8 @@ static void test_short_flush_recovery(void) {
   for (unsigned i = 0; i < 100; i++) {
     transport_tick(f.server.transport);
     uint8_t packet[65536];
-    while (recv(f.client.transport->sockets[0].fd, packet, sizeof(packet),
-                MSG_DONTWAIT) > 0)
+    while (recv(transport_poll_host(f.client.transport)->sockets[0].fd, packet,
+                sizeof(packet), MSG_DONTWAIT) > 0)
       discarded++;
     usleep(1000);
   }
@@ -691,8 +692,8 @@ static void test_checkpoint_progress_under_datagram_pressure(bool drop_first) {
       if (drop_first) {
         /* drop initial checkpoint packet to verify control retransmission */
         uint8_t packet[65536];
-        assert(recv(f.client.transport->sockets[0].fd, packet, sizeof(packet),
-                    MSG_DONTWAIT) > 0);
+        assert(recv(transport_poll_host(f.client.transport)->sockets[0].fd,
+                    packet, sizeof(packet), MSG_DONTWAIT) > 0);
         discarded = true;
       }
       transport_publish_result_t result =

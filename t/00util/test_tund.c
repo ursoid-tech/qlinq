@@ -166,13 +166,21 @@ int main(void) {
   }
 
   /* 5. fork and run mock tund hosts */
-  unlink("/tmp/tund_host.log");
-  unlink("/tmp/tund_client.log");
+  char log_dir[] = "/tmp/qlinq-tund-XXXXXX";
+  if (!mkdtemp(log_dir)) {
+    perror("mkdtemp");
+    return 1;
+  }
+  char host_log_path[sizeof(log_dir) + sizeof("/host.log")];
+  char client_log_path[sizeof(log_dir) + sizeof("/client.log")];
+  snprintf(host_log_path, sizeof(host_log_path), "%s/host.log", log_dir);
+  snprintf(client_log_path, sizeof(client_log_path), "%s/client.log", log_dir);
 
   pid_t pid_host = fork();
   if (pid_host == 0) {
-    int log_fd = open("/tmp/tund_host.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    dup2(log_fd, STDOUT_FILENO);
+    int log_fd = open(host_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log_fd < 0 || dup2(log_fd, STDOUT_FILENO) < 0)
+      _exit(1);
     close(log_fd);
 
     char *args[] = {
@@ -185,9 +193,9 @@ int main(void) {
 
   pid_t pid_client = fork();
   if (pid_client == 0) {
-    int log_fd =
-        open("/tmp/tund_client.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    dup2(log_fd, STDOUT_FILENO);
+    int log_fd = open(client_log_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (log_fd < 0 || dup2(log_fd, STDOUT_FILENO) < 0)
+      _exit(1);
     close(log_fd);
 
     char *args[] = {
@@ -221,14 +229,17 @@ int main(void) {
   transport_destroy(server_ctx.transport);
 
   /* 9. verify log files contain cross-transmitted packets */
-  FILE *h_log = fopen("/tmp/tund_host.log", "r");
-  FILE *c_log = fopen("/tmp/tund_client.log", "r");
+  FILE *h_log = fopen(host_log_path, "r");
+  FILE *c_log = fopen(client_log_path, "r");
   if (!h_log || !c_log) {
     fprintf(stderr, "failed to open mock tund logs\n");
     if (h_log)
       fclose(h_log);
     if (c_log)
       fclose(c_log);
+    unlink(host_log_path);
+    unlink(client_log_path);
+    rmdir(log_dir);
     return 1;
   }
 
@@ -251,6 +262,9 @@ int main(void) {
 
   fclose(h_log);
   fclose(c_log);
+  unlink(host_log_path);
+  unlink(client_log_path);
+  rmdir(log_dir);
 
   if (!host_got_packet || !client_got_packet ||
       server_ctx.subscription_failed || client_ctx.subscription_failed) {

@@ -317,7 +317,8 @@ fec_t *transport_fec_cache_get(transport_fec_cache_t *cache, fec_type_t type,
     return NULL;
   cache->memory.reclaim = reclaim_codecs;
   cache->memory.context = cache;
-  uint64_t now = get_time_ns();
+  uint64_t now =
+      cache->now_ns ? cache->now_ns(cache->clock_context) : get_time_ns();
   size_t lru_index = 0;
   uint64_t oldest = UINT64_MAX;
 

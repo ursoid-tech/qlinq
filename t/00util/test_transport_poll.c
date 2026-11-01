@@ -1,4 +1,4 @@
-#include "transport_internal.h"
+#include "transport_poll_host.h"
 #include "portable_sockets.h"
 
 #include <assert.h>
@@ -12,6 +12,7 @@
  * timers for handshake completion. No production operation is intercepted. */
 typedef struct {
   transport_t transport;
+  transport_poll_host_t host;
   int sender;
   bool inject_added_socket;
   size_t added_socket_injections;
@@ -20,7 +21,7 @@ typedef struct {
 static void enqueue(fixture_t *f, size_t socket_index, size_t count) {
   struct sockaddr_storage address;
   socklen_t length = sizeof(address);
-  assert(getsockname(f->transport.sockets[socket_index].fd,
+  assert(getsockname(f->host.sockets[socket_index].fd,
                      (struct sockaddr *)&address, &length) == 0);
   const uint8_t truncated_header = 0xc0;
   for (size_t i = 0; i < count; i++)
@@ -52,37 +53,38 @@ static void init_fixture(fixture_t *f) {
   t->limits.max_aggregate_nack_requests_per_second = 16;
   t->log_callback = log_event;
   t->log_user_data = f;
+  f->host.transport = t;
+  f->host.ifmon_pipe[0] = f->host.ifmon_pipe[1] = -1;
+  t->drive_host = transport_poll_host_adapter(&f->host);
+  t->drive_now_ns = t->drive_host.initial_time_ns;
+  t->host_context = &f->host;
   f->sender = socket(AF_INET, SOCK_DGRAM, 0);
   assert(f->sender >= 0);
   for (size_t i = 0; i < 2; i++) {
-    transport_socket_t *bound = &t->sockets[i];
-    bound->fd = socket(AF_INET, SOCK_DGRAM, 0);
-    assert(bound->fd >= 0);
+    transport_local_path_t *bound = &t->sockets[i];
     struct sockaddr_in address = {.sin_family = AF_INET};
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    assert(bind(bound->fd, (struct sockaddr *)&address, sizeof(address)) == 0);
-    bound->local_addr_len = sizeof(bound->local_addr);
-    assert(getsockname(bound->fd, (struct sockaddr *)&bound->local_addr,
-                       &bound->local_addr_len) == 0);
-    int flags = fcntl(bound->fd, F_GETFL, 0);
-    assert(flags >= 0 && fcntl(bound->fd, F_SETFL, flags | O_NONBLOCK) == 0);
-    assert(transport_egress_init(&bound->egress, 64, 65536));
+    memcpy(&bound->local_addr, &address, sizeof(address));
+    bound->local_addr_len = sizeof(address);
+    assert(!transport_engine_open_path(t, bound));
+    transport_udp_gro_destroy(f->host.sockets[i].gro);
+    f->host.sockets[i].gro = NULL;
     t->socket_count++;
   }
-  assert(pipe(t->ifmon_pipe) == 0);
-  int flags = fcntl(t->ifmon_pipe[0], F_GETFL, 0);
+  assert(pipe(f->host.ifmon_pipe) == 0);
+  int flags = fcntl(f->host.ifmon_pipe[0], F_GETFL, 0);
   assert(flags >= 0 &&
-         fcntl(t->ifmon_pipe[0], F_SETFL, flags | O_NONBLOCK) == 0);
+         fcntl(f->host.ifmon_pipe[0], F_SETFL, flags | O_NONBLOCK) == 0);
 }
 
 static void destroy_fixture(fixture_t *f) {
   for (size_t i = 0; i < f->transport.socket_count; i++) {
-    transport_udp_gro_destroy(f->transport.sockets[i].gro);
-    close(f->transport.sockets[i].fd);
+    transport_udp_gro_destroy(f->host.sockets[i].gro);
+    close(f->host.sockets[i].fd);
     transport_egress_destroy(&f->transport.sockets[i].egress);
   }
-  close(f->transport.ifmon_pipe[0]);
-  close(f->transport.ifmon_pipe[1]);
+  close(f->host.ifmon_pipe[0]);
+  close(f->host.ifmon_pipe[1]);
   close(f->sender);
 }
 
@@ -95,11 +97,12 @@ static void ready_filter(void) {
   assert(count == 3);
   enqueue(&f, 0, 1);
   enqueue(&f, 1, 1);
-  size_t cursor = t->receive_cursor;
+  size_t cursor = transport_poll_host(t)->receive_cursor;
   transport_tick_ready(t, fds, count); /* A timeout snapshot has no revents. */
   assert(t->sockets[0].bytes_received == 0 &&
          t->sockets[1].bytes_received == 0);
-  assert(t->receive_cursor == (cursor + 1U) % t->socket_count);
+  assert(transport_poll_host(t)->receive_cursor ==
+         (cursor + 1U) % t->socket_count);
   assert(t->last_pathflow_update != 0); /* Maintenance still ran. */
 
   fds[0].revents = POLLIN;
@@ -153,8 +156,9 @@ static void ready_filter(void) {
 
 static bool enable_gro(fixture_t *f) {
   for (size_t i = 0; i < f->transport.socket_count; i++) {
-    transport_socket_t *socket = &f->transport.sockets[i];
-    socket->gro = transport_udp_gro_create(socket->fd);
+    transport_poll_socket_t *socket = &f->host.sockets[i];
+    if (!socket->gro)
+      socket->gro = transport_udp_gro_create(socket->fd);
     if (!socket->gro) {
       puts("UDP_GRO unavailable; buffered receive integration skipped");
       return false;
@@ -171,7 +175,7 @@ static void enqueue_gso(fixture_t *f, size_t socket_index) {
     struct cmsghdr alignment;
     uint8_t bytes[CMSG_SPACE(sizeof(uint16_t))];
   } control = {0};
-  transport_socket_t *socket = &f->transport.sockets[socket_index];
+  transport_local_path_t *socket = &f->transport.sockets[socket_index];
   struct msghdr message = {.msg_name = &socket->local_addr,
                            .msg_namelen = socket->local_addr_len,
                            .msg_iov = &iov,
@@ -201,8 +205,8 @@ static void gro_buffered_input(void) {
   transport_tick(t);
   assert(t->sockets[0].bytes_received == 1280 &&
          t->sockets[1].bytes_received == 1280);
-  assert(transport_udp_gro_pending(t->sockets[0].gro) &&
-         transport_udp_gro_pending(t->sockets[1].gro));
+  assert(transport_udp_gro_pending(transport_poll_host(t)->sockets[0].gro) &&
+         transport_udp_gro_pending(transport_poll_host(t)->sockets[1].gro));
   assert(transport_get_first_timeout(t) == 0);
   struct pollfd fds[TRANSPORT_MAX_POLL_FDS];
   size_t count = transport_get_poll_fds(t, fds, TRANSPORT_MAX_POLL_FDS);
@@ -225,8 +229,8 @@ static void gro_buffered_input(void) {
   }
   assert(t->sockets[0].bytes_received == 6 * 1280 &&
          t->sockets[1].bytes_received == 6 * 1280);
-  assert(!transport_udp_gro_pending(t->sockets[0].gro) &&
-         !transport_udp_gro_pending(t->sockets[1].gro));
+  assert(!transport_udp_gro_pending(transport_poll_host(t)->sockets[0].gro) &&
+         !transport_udp_gro_pending(transport_poll_host(t)->sockets[1].gro));
   assert(transport_get_first_timeout(t) == INT64_MAX);
 
   /* Four ordinary messages fill the raw receive batch but are fewer than
@@ -252,9 +256,9 @@ static void gro_interface_compaction(void) {
   enqueue_gso(&f, 0);
   enqueue_gso(&f, 1);
   transport_tick(t);
-  transport_udp_gro_t *retained = t->sockets[1].gro;
-  int retained_fd = t->sockets[1].fd;
-  int removed_fd = t->sockets[0].fd;
+  transport_udp_gro_t *retained = transport_poll_host(t)->sockets[1].gro;
+  int retained_fd = transport_poll_host(t)->sockets[1].fd;
+  int removed_fd = transport_poll_host(t)->sockets[0].fd;
   struct pollfd stale[TRANSPORT_MAX_POLL_FDS];
   size_t count = transport_get_poll_fds(t, stale, TRANSPORT_MAX_POLL_FDS);
   assert(poll(stale, count, 0) == 0);
@@ -265,23 +269,27 @@ static void gro_interface_compaction(void) {
   transport_tick_ready(t, stale, count);
   /* The new pipe input was absent from this snapshot. Buffered GRO remains
    * serviceable on both original sockets while interface handling waits. */
-  assert(t->socket_count == 2 && t->sockets[0].fd == removed_fd &&
-         t->sockets[1].fd == retained_fd && t->sockets[1].gro == retained);
+  assert(t->socket_count == 2 &&
+         transport_poll_host(t)->sockets[0].fd == removed_fd &&
+         transport_poll_host(t)->sockets[1].fd == retained_fd &&
+         transport_poll_host(t)->sockets[1].gro == retained);
   assert(t->sockets[0].bytes_received == 2 * 1280 &&
          t->sockets[1].bytes_received == 2 * 1280 &&
          f.added_socket_injections == 0);
   count = transport_get_poll_fds(t, stale, TRANSPORT_MAX_POLL_FDS);
   assert(poll(stale, count, 0) == 1 && (stale[count - 1].revents & POLLIN));
   transport_tick_ready(t, stale, count);
-  assert(t->socket_count == 2 && t->sockets[0].fd == retained_fd &&
-         t->sockets[0].gro == retained && t->sockets[1].fd == removed_fd);
+  assert(t->socket_count == 2 &&
+         transport_poll_host(t)->sockets[0].fd == retained_fd &&
+         transport_poll_host(t)->sockets[0].gro == retained &&
+         transport_poll_host(t)->sockets[1].fd == removed_fd);
   assert(t->sockets[0].bytes_received == 3 * 1280 &&
          t->sockets[1].bytes_received == 1 && f.added_socket_injections == 1);
   t->limits.max_packets_per_tick = 32;
   transport_tick(t);
   assert(t->sockets[0].bytes_received == 6 * 1280 &&
          t->sockets[1].bytes_received == 1);
-  assert(!transport_udp_gro_pending(t->sockets[0].gro));
+  assert(!transport_udp_gro_pending(transport_poll_host(t)->sockets[0].gro));
   destroy_fixture(&f);
 }
 
@@ -293,8 +301,8 @@ static void interface_invalidation(void) {
   transport_t *t = &f.transport;
   struct pollfd stale[TRANSPORT_MAX_POLL_FDS];
   size_t count = transport_get_poll_fds(t, stale, TRANSPORT_MAX_POLL_FDS);
-  int removed_fd = t->sockets[0].fd;
-  int retained_fd = t->sockets[1].fd;
+  int removed_fd = transport_poll_host(t)->sockets[0].fd;
+  int retained_fd = transport_poll_host(t)->sockets[1].fd;
   enqueue(&f, 1, 1);
   /* These messages arrive after the poll snapshot. Removal compacts slots;
    * the new socket can reuse the old descriptor, whose snapshot is not ready.
@@ -303,17 +311,20 @@ static void interface_invalidation(void) {
   transport_mock_iface_add(t, "127.0.0.3");
   f.inject_added_socket = true;
   transport_tick_ready(t, stale, count);
-  assert(t->socket_count == 2 && t->sockets[0].fd == removed_fd &&
-         t->sockets[1].fd == retained_fd && f.added_socket_injections == 0);
+  assert(t->socket_count == 2 &&
+         transport_poll_host(t)->sockets[0].fd == removed_fd &&
+         transport_poll_host(t)->sockets[1].fd == retained_fd &&
+         f.added_socket_injections == 0);
   assert(t->sockets[0].bytes_received == 0 &&
          t->sockets[1].bytes_received == 0);
   count = transport_get_poll_fds(t, stale, TRANSPORT_MAX_POLL_FDS);
   assert(poll(stale, count, 0) == 2 && (stale[count - 1].revents & POLLIN));
   transport_tick_ready(t, stale, count);
-  assert(t->socket_count == 2 && t->sockets[0].fd == retained_fd);
+  assert(t->socket_count == 2 &&
+         transport_poll_host(t)->sockets[0].fd == retained_fd);
   assert(f.added_socket_injections == 1 && t->sockets[0].bytes_received == 1 &&
          t->sockets[1].bytes_received == 1);
-  assert(t->sockets[1].fd == removed_fd);
+  assert(transport_poll_host(t)->sockets[1].fd == removed_fd);
   /* A deferred no-op message also remains pollable. Once consumed, it forces
    * a full scan that finds UDP input arriving after that second snapshot. */
   count = transport_get_poll_fds(t, stale, TRANSPORT_MAX_POLL_FDS);
@@ -333,7 +344,8 @@ static void interface_invalidation(void) {
   enqueue(&f, 0, 1);
   transport_tick(t);
   assert(t->socket_count == 2 && f.added_socket_injections == 2 &&
-         t->sockets[0].fd == retained_fd && t->sockets[1].fd == removed_fd);
+         transport_poll_host(t)->sockets[0].fd == retained_fd &&
+         transport_poll_host(t)->sockets[1].fd == removed_fd);
   assert(t->sockets[0].bytes_received == 3 &&
          t->sockets[1].bytes_received == 1);
 

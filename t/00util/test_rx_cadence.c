@@ -15,6 +15,7 @@ static int fake_ppoll(struct pollfd *, nfds_t, const struct timespec *,
 static size_t fake_fds(transport_t *, struct pollfd *, size_t);
 static int64_t fake_deadline(transport_t *);
 static int64_t fake_ms(void);
+int64_t fake_transport_ms(const transport_t *);
 static void fake_tick(transport_t *, const struct pollfd *, size_t);
 static bool fake_mask(transport_t *, struct pollfd *, size_t);
 static bool fake_writable(transport_t *, const moq_track_id_t *);
@@ -24,6 +25,7 @@ static bool fake_writable(transport_t *, const moq_track_id_t *);
 #define transport_get_poll_fds fake_fds
 #define transport_get_first_timeout fake_deadline
 #define transport_get_time_ms fake_ms
+#define transport_now_ms fake_transport_ms
 #define transport_tick_ready fake_tick
 #define transport_rx_cadence_mask fake_mask
 #define transport_is_track_ready fake_writable
@@ -31,6 +33,7 @@ static bool fake_writable(transport_t *, const moq_track_id_t *);
 #undef clock_gettime
 #undef poll
 #undef ppoll
+#undef transport_now_ms
 
 static uint64_t mono, wall, clock_step, mask_cost, requested, tick_cost;
 static int64_t deadline;
@@ -52,6 +55,10 @@ static int fake_clock(clockid_t clock, struct timespec *ts) {
 }
 static int64_t fake_ms(void) {
   return (int64_t)(mono / 1000000U);
+}
+int64_t fake_transport_ms(const transport_t *t) {
+  (void)t;
+  return fake_ms();
 }
 static size_t fake_fds(transport_t *t, struct pollfd *fds, size_t cap) {
   (void)t;

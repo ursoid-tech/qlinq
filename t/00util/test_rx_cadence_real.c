@@ -1,3 +1,4 @@
+#include "transport_poll_host.h"
 /* Separate contexts exercise the eligible public API, including actual QUIC
  * recovery. A test-only egress wrapper reorders and loses one data burst. */
 #include "qlinq.h"
@@ -113,8 +114,8 @@ static void eligibility_guards(qlinq_endpoint_t *endpoint) {
     assert(memcmp(fds, saved, count * sizeof(*fds)) == 0);                     \
     restore;                                                                   \
   } while (0)
-  REJECT(t->sockets[0].receive_backlog = true,
-         t->sockets[0].receive_backlog = false);
+  REJECT(transport_poll_host(t)->sockets[0].receive_backlog = true,
+         transport_poll_host(t)->sockets[0].receive_backlog = false);
   REJECT(t->shutting_down = true, t->shutting_down = false);
   REJECT(t->reconnect_in_progress = true, t->reconnect_in_progress = false);
   REJECT(conn->authenticated = false, conn->authenticated = true);
@@ -186,7 +187,7 @@ static void run(unsigned window_usec, bool use_callback) {
   }
   assert(joined && eligible(client));
   eligibility_guards(client);
-  impaired_fd = server->transport->sockets[0].fd;
+  impaired_fd = transport_poll_host(server->transport)->sockets[0].fd;
   inject_loss = true;
   uint8_t payload[BYTES];
   unsigned sent = 0;
@@ -256,7 +257,7 @@ static void run(unsigned window_usec, bool use_callback) {
       assert(fd >= 0);
       struct sockaddr_storage address;
       socklen_t length = sizeof(address);
-      assert(getsockname(client->transport->sockets[0].fd,
+      assert(getsockname(transport_poll_host(client->transport)->sockets[0].fd,
                          (struct sockaddr *)&address, &length) == 0);
       const uint8_t invalid = 0xc0;
       assert(sendto(fd, &invalid, 1, 0, (struct sockaddr *)&address, length) ==

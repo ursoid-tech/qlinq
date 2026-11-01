@@ -2,6 +2,7 @@
 
 #include "portable_sockets.h"
 #include "transport.h"
+#include "transport_internal.h"
 #include "transport_tracks.h"
 #include "transport_wire.h"
 
@@ -1274,7 +1275,6 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
   size_t count = 0;
   size_t poll_count = 0;
   int wait_ms = timeout_ms;
-  int64_t now = transport_get_time_ms();
   for (qlinq_endpoint_t *endpoint = context->endpoints; endpoint;
        endpoint = endpoint->next) {
     if (!endpoint->active || !endpoint->transport)
@@ -1297,6 +1297,7 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
     int64_t deadline = transport_get_first_timeout(endpoint->transport);
     entry->deadline = deadline;
     if (deadline >= 0) {
+      int64_t now = transport_now_ms(endpoint->transport);
       int64_t remaining = deadline <= now ? 0 : deadline - now;
       int timer_wait = remaining > INT_MAX ? INT_MAX : (int)remaining;
       if (wait_ms < 0 || timer_wait < wait_ms)
@@ -1360,7 +1361,8 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
               uint64_t now_ns = rx_monotonic_now();
               int64_t native_at = polls[0].deadline;
               bool native_due =
-                  native_at >= 0 && native_at <= transport_get_time_ms();
+                  native_at >= 0 &&
+                  native_at <= transport_now_ms(polls[0].endpoint->transport);
               /* return on shorter caller timeout without sliding cadence;
                * native timers still trigger a full readiness check */
               if (now_ns && started && now_ns >= started &&
@@ -1402,12 +1404,12 @@ static qlinq_status_t poll_endpoints(qlinq_context_t *context,
     set_status(context, QLINQ_STATUS_AGAIN);
     return QLINQ_STATUS_AGAIN;
   }
-  now = transport_get_time_ms();
   /* One radio packet should not make every unrelated endpoint perform a
    * second complete service sweep. After poll, service ready sockets, due
    * timers, and timeout wakes that drive periodic maintenance. */
   for (size_t i = 0; i < poll_count; i++) {
     qlinq_endpoint_poll_t *entry = &polls[i];
+    int64_t now = transport_now_ms(entry->endpoint->transport);
     bool ready = entry->endpoint->service_pending ||
                  (!used_rx_wait && result == 0) ||
                  (entry->deadline >= 0 && entry->deadline <= now);
