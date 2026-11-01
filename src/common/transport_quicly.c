@@ -322,7 +322,28 @@ static void accumulate_egress_stats(transport_stats_t *stats,
 
 /* Resolve local ownership independently of peer wire IDs. Prefer an empty
  * queue, then the lower RTT; reselect for every repair symbol in a batch. */
-size_t transport_select_datagram_path(transport_conn_t *conn) {
+size_t transport_datagram_payload_limit(transport_conn_t *conn,
+                                        size_t path_index) {
+  if (!conn || !conn->quic || path_index >= TRANSPORT_MAX_QUIC_PATHS ||
+      !quicly_is_path_available(conn->quic, path_index))
+    return 0;
+  quicly_path_stats_t stats;
+  quicly_path_health_t health;
+  if (quicly_get_path_stats(conn->quic, path_index, &stats) != 0 ||
+      (quicly_get_path_health(conn->quic, path_index, &health) == 0 &&
+       health.state == QUICLY_PATH_SUSPECT))
+    return 0;
+  for (size_t p = 0; p < conn->transport->socket_count; p++)
+    if (transport_path_matches_local(&stats,
+                                     &conn->transport->sockets[p].local_addr))
+      return quicly_get_datagram_payload_limit(conn->quic, path_index);
+  return 0;
+}
+
+size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
+                                               size_t payload_size) {
+  if (!conn || !conn->quic)
+    return SIZE_MAX;
   size_t best = SIZE_MAX, best_queued = SIZE_MAX;
   uint32_t best_rtt = UINT32_MAX;
   transport_t *t = conn->transport;
@@ -341,7 +362,8 @@ size_t transport_select_datagram_path(transport_conn_t *conn) {
     if (!owned)
       continue;
     size_t queued = quicly_get_num_datagram_frames_path(conn->quic, path);
-    if (queued < QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY &&
+    size_t limit = transport_datagram_payload_limit(conn, path);
+    if (limit != 0 && payload_size <= limit &&
         (queued < best_queued ||
          (queued == best_queued && stats.rtt_smoothed < best_rtt))) {
       best = path;
@@ -352,13 +374,14 @@ size_t transport_select_datagram_path(transport_conn_t *conn) {
   return best;
 }
 
+size_t transport_select_datagram_path(transport_conn_t *conn) {
+  return transport_select_datagram_path_for_size(conn, 1);
+}
+
 bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
                               ptls_iovec_t datagram) {
-  quicly_path_stats_t path_stats;
-  if (!conn || !conn->quic || path_index >= TRANSPORT_MAX_QUIC_PATHS ||
-      quicly_get_path_stats(conn->quic, path_index, &path_stats) != 0 ||
-      quicly_get_num_datagram_frames_path(conn->quic, path_index) >=
-          QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY)
+  size_t limit = transport_datagram_payload_limit(conn, path_index);
+  if (limit == 0 || datagram.len > limit)
     return false;
   size_t before = quicly_get_num_datagram_frames_path(conn->quic, path_index);
   quicly_send_datagram_frames_path(conn->quic, path_index, &datagram, 1);
@@ -491,7 +514,7 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
   bool feedback_only = !quicly_has_pending_stream_data(quic) && !has_datagrams;
   size_t symbol_size = 0;
   if (!feedback_only) {
-    symbol_size = transport_get_datagram_symbol_size(t);
+    symbol_size = transport_connection_datagram_symbol_size(conn);
     if (symbol_size == 0)
       symbol_size = 1200;
   }
@@ -910,13 +933,18 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   if (config &&
       config->initial_cwnd_packets > TRANSPORT_MAX_INITIAL_CWND_PACKETS)
     return NULL;
+  if (config && config->congestion_control == TRANSPORT_CC_BBR &&
+      config->pacing == TRANSPORT_PACING_DISABLED) {
+    fprintf(stderr, "transport: BBR requires pacing\n");
+    return NULL;
+  }
   if (!config || !config->drive_host || !config->callback ||
       config->port == 0 || config->num_bind_hosts == 0 ||
       config->num_bind_hosts > TRANSPORT_MAX_PATHS ||
       config->num_path_interface_names > TRANSPORT_MAX_PATHS ||
       config->num_remote_hosts > TRANSPORT_MAX_PATHS ||
       config->simulated_loss_rate > 100 ||
-      config->congestion_control > TRANSPORT_CC_CUBACK ||
+      config->congestion_control > TRANSPORT_CC_BBR ||
       config->pacing > TRANSPORT_PACING_ENABLED ||
       (config->num_remote_hosts != 0 &&
        (config->reconnect_initial_delay_ms != 0
@@ -1065,8 +1093,16 @@ transport_t *transport_drive_create(const transport_config_t *config) {
     t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_cubic_init;
   else if (config->congestion_control == TRANSPORT_CC_CUBACK)
     t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_cuback_init;
+  else if (config->congestion_control == TRANSPORT_CC_BBR)
+    t->quic_ctx.egress[0].cc.init_cc = &quicly_cc_bbr_init;
   if (config->pacing != TRANSPORT_PACING_DEFAULT)
     t->quic_ctx.egress[0].pacing = config->pacing == TRANSPORT_PACING_ENABLED;
+  if (config->congestion_control == TRANSPORT_CC_BBR) {
+    /* Native BBR owns its pacing rate and supports classic ECN, not L4S. */
+    if (t->quic_ctx.egress[0].ecn == QUICLY_ECN_MODE_L4S)
+      goto Fail;
+    t->quic_ctx.egress[0].pacing = 1;
+  }
   if (config->default_jumpstart_packets != 0 ||
       config->max_jumpstart_packets != 0) {
     t->quic_ctx.egress[0].default_jumpstart_packets =
@@ -1103,13 +1139,20 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   /* QLINQ selects the failover policy; Quicly owns the sent ranges, PTOs and
    * fresh-ACK recovery. Zero remains the native library's opt-out default. */
   t->quic_ctx.multipath_failover_pto_threshold = 2;
+  t->path_probe_interval_ms = config->path_probe_interval_ms;
 
   t->quic_ctx.egress[0].cc.initcwnd_packets =
       config->initial_cwnd_packets != 0 ? config->initial_cwnd_packets : 100;
-  t->quic_ctx.initial_egress_max_udp_payload_size =
+  /* Start at QUIC's minimum and let native per-path probes grow or reduce
+   * packet sizes. The configured ceiling applies to probes as well as data. */
+  t->quic_ctx.egress[0].enable_pmtud = 1;
+  t->quic_ctx.egress[0].max_udp_payload_size = t->limits.max_udp_payload_size;
+  t->quic_ctx.initial_egress_max_udp_payload_size = 1200;
+  t->quic_ctx.transport_params.max_udp_payload_size =
       t->limits.max_udp_payload_size;
   t->quic_ctx.transport_params.max_datagram_frame_size =
       t->limits.max_udp_payload_size;
+  t->quic_ctx.max_datagram_frame_payloads = QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY;
   if (config->quic_idle_timeout_ms != 0)
     t->quic_ctx.transport_params.max_idle_timeout =
         config->quic_idle_timeout_ms;
@@ -1623,6 +1666,9 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
      * their common symbol size once, instead of scanning the cohort again
      * for each connection. */
     size_t symbol_size = transport_get_datagram_symbol_size(t);
+    if (symbol_size == 0)
+      symbol_size =
+          1200; /* measurement units while every native queue is full */
 
     size_t update_count = transport_connection_count(t);
     for (size_t c = 0; c < update_count; c++) {
@@ -1694,6 +1740,7 @@ static void service_connections(transport_t *t, uint64_t now) {
       (void)transport_protocol_send_hello(conn);
     transport_protocol_maybe_emit_connected(conn);
     refresh_scheduler_paths(conn);
+    transport_probe_tick(conn, (int64_t)now);
 
     /* Return to ACK reception and the application after a bounded send turn.
      * A fast path must not drain an entire stream window in this loop. */
@@ -2424,19 +2471,35 @@ bool transport_mock_path_state(transport_t *t, size_t path_idx,
   return true;
 }
 
+size_t transport_connection_datagram_symbol_size(transport_conn_t *conn) {
+  size_t symbol_size = 0;
+  for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
+    size_t limit = transport_datagram_payload_limit(conn, path);
+    if (limit <= QLINQ_WIRE_FEC_HEADER_SIZE)
+      continue;
+    size_t size = limit - QLINQ_WIRE_FEC_HEADER_SIZE;
+    if (size > QLINQ_FEC_MAX_SYMBOL_SIZE)
+      size = QLINQ_FEC_MAX_SYMBOL_SIZE;
+    if (symbol_size == 0 || size < symbol_size)
+      symbol_size = size;
+  }
+  return symbol_size;
+}
+
 size_t transport_get_datagram_symbol_size(const transport_t *t) {
   if (!t || !transport_owner_ok((transport_t *)t))
     return 0;
-  size_t udp_payload_size = t->limits.max_udp_payload_size;
+  size_t symbol_size = 0;
   size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
-    const transport_conn_t *conn = transport_connection_at(t, i);
-    if (conn && conn->protocol_ready &&
-        conn->negotiated_limits.max_udp_payload_size < udp_payload_size)
-      udp_payload_size = conn->negotiated_limits.max_udp_payload_size;
+    transport_conn_t *conn = transport_connection_at(t, i);
+    if (!conn || !conn->protocol_ready)
+      continue;
+    size_t size = transport_connection_datagram_symbol_size(conn);
+    if (size != 0 && (symbol_size == 0 || size < symbol_size))
+      symbol_size = size;
   }
-  size_t symbol_size = udp_payload_size > 80U ? udp_payload_size - 80U : 0U;
-  return symbol_size < 1000 ? 1000 : symbol_size;
+  return symbol_size;
 }
 
 bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
@@ -2454,6 +2517,23 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
   }
 
   transport_track_profile_t profile = transport_track_profile(track_id);
+
+  /* A partially published group keeps its encoding on retries and blocks new
+   * grouped data tracks until its remaining recipients accept it. */
+  const transport_pending_group_t *group = &t->pending_group;
+  if (track_id->type == MOQ_TRACK_DATA && !profile.reliable &&
+      (profile.fec_enabled || profile.fec_rateless) && group->size != 0 &&
+      group->symbol_size != 0) {
+    for (size_t c = 0; c < transport_connection_count(t); c++) {
+      transport_conn_t *conn = transport_connection_at(t, c);
+      if (transport_publish_recipient_eligible(t, conn, &group->track_id) &&
+          !conn->fec_group_delivered &&
+          transport_select_datagram_path_for_size(
+              conn, QLINQ_WIRE_FEC_HEADER_SIZE + group->symbol_size) ==
+              SIZE_MAX)
+        return false;
+    }
+  }
 
   size_t active_count = transport_connection_count(t);
   if (active_count == 0)
@@ -2500,9 +2580,12 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
         for (size_t physical = 0; physical < t->socket_count; physical++)
           owned |= transport_path_matches_local(
               &stats, &t->sockets[physical].local_addr);
+        size_t capacity = quicly_get_max_datagram_frames_path(conn->quic, path);
         if (owned &&
+            transport_datagram_payload_limit(conn, path) >
+                QLINQ_WIRE_FEC_HEADER_SIZE &&
             quicly_get_num_datagram_frames_path(conn->quic, path) <
-                QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4 &&
+                capacity - capacity / 4 &&
             stats.cwnd != 0 && stats.bytes_in_flight / 2 < stats.cwnd) {
           ready = true;
           break;
@@ -2552,6 +2635,9 @@ int64_t transport_get_first_timeout(transport_t *t) {
     int64_t recovery_at = transport_recovery_deadline(conn);
     if (recovery_at < first_timeout)
       first_timeout = recovery_at;
+    int64_t probe_at = transport_probe_deadline(conn, transport_now_ms(t));
+    if (probe_at < first_timeout)
+      first_timeout = probe_at;
   }
 
   if (active_conns != 0 &&

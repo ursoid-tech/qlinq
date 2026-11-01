@@ -42,6 +42,25 @@ bool cli_parse_track_mode(const char *text, uint8_t *flags) {
   return true;
 }
 
+bool cli_parse_congestion_control(const char *text,
+                                  qlinq_congestion_control_t *controller) {
+  if (!text || !controller)
+    return false;
+  if (strcmp(text, "default") == 0)
+    *controller = QLINQ_CC_DEFAULT;
+  else if (strcmp(text, "reno") == 0)
+    *controller = QLINQ_CC_RENO;
+  else if (strcmp(text, "pico") == 0)
+    *controller = QLINQ_CC_PICO;
+  else if (strcmp(text, "cubic") == 0)
+    *controller = QLINQ_CC_CUBIC;
+  else if (strcmp(text, "bbr") == 0)
+    *controller = QLINQ_CC_BBR;
+  else
+    return false;
+  return true;
+}
+
 bool cli_parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
   char *end = NULL;
   if (!text || !text[0] || text[0] < '0' || text[0] > '9' || !value)

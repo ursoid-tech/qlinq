@@ -36,7 +36,8 @@ static bool receive_callback(void *user_data, const qlinq_event_t *event) {
 /* Exercise the public event boundary: transport-only tests cannot detect a
  * received object's descriptor no longer matching its application stream. */
 static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
-                        bool callback_delivery) {
+                        bool callback_delivery,
+                        qlinq_congestion_control_t congestion_control) {
   callback_state_t callback = {
       .delivery = delivery, .content = content, .valid = true};
   qlinq_context_config_t context_config = {
@@ -51,6 +52,7 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
       .bind_addresses = {"127.0.0.1"},
       .bind_address_count = 1,
       .port = 19762,
+      .congestion_control = congestion_control,
       .security = {.shared_secret = "delivery",
                    .shared_secret_size = 8,
                    .certificate_file = "t/assets/server.crt",
@@ -62,6 +64,7 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
       .remote_addresses = {"127.0.0.1"},
       .remote_address_count = 1,
       .port = 19762,
+      .congestion_control = congestion_control,
       .security = {.shared_secret = "delivery",
                    .shared_secret_size = 8,
                    .allow_insecure_peer = true}};
@@ -217,8 +220,8 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
 Exit:
   qlinq_context_destroy(context);
   if (failed)
-    fprintf(stderr, "delivery failed: mode=%d content=%d callback=%d\n",
-            delivery, content, callback_delivery);
+    fprintf(stderr, "delivery failed: mode=%d content=%d callback=%d cc=%d\n",
+            delivery, content, callback_delivery, congestion_control);
   return failed;
 }
 
@@ -329,8 +332,15 @@ int main(void) {
   for (size_t c = 0; c < sizeof(content) / sizeof(content[0]); c++)
     for (size_t m = 0; m < sizeof(modes) / sizeof(modes[0]); m++)
       for (size_t callback = 0; callback < 2; callback++)
-        if (run_delivery(modes[m], content[c], callback != 0))
+        if (run_delivery(modes[m], content[c], callback != 0, QLINQ_CC_DEFAULT))
           return 1;
+  /* BBR must carry both QUIC stream and DATAGRAM traffic through the same
+   * public API, including its automatic pacing policy. */
+  if (run_delivery(QLINQ_DELIVERY_RELIABLE, QLINQ_CONTENT_DATA, false,
+                   QLINQ_CC_BBR) ||
+      run_delivery(QLINQ_DELIVERY_DATAGRAM, QLINQ_CONTENT_DATA, false,
+                   QLINQ_CC_BBR))
+    return 1;
   puts("===QLINQ DELIVERY MATRIX OK===");
   return 0;
 }

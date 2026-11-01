@@ -8,6 +8,7 @@
 #include "transport_fec_state.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
+#include "transport_probe.h"
 #include "transport_repair.h"
 #include "transport_subscriptions.h"
 
@@ -24,8 +25,7 @@
 #define QLINQ_FEC_NACK_DELAY_MS 25
 #define QLINQ_FEC_COMPLETION_RETRY_MS 500
 #define QLINQ_CONNECTION_CACHE_SLOTS 256U
-/* Quicly's per-path queue, not its legacy connection-wide 256-frame queue.
- * The publication boundary test verifies this against the linked backend. */
+/* Explicit native queue policy; read actual capacity through Quicly's API. */
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 64U
 #define QLINQ_COMPLETED_OBJECTS (2U * TRANSPORT_HARD_MAX_ASSEMBLERS)
 #define QLINQ_ASSEMBLER_BUCKETS 2048U
@@ -50,6 +50,7 @@ typedef struct {
   uint64_t flush_retry_cache_releases;
   moq_track_id_t track_id;
   uint32_t record_count;
+  size_t symbol_size; /* frozen once any recipient accepts this group */
   uint8_t priority;
   bool pending; /* Attempted bytes and identity stay fixed until completion. */
 } transport_pending_group_t;
@@ -140,6 +141,7 @@ struct transport_t {
   quicly_cid_plaintext_t next_cid;
 
   uint64_t last_pathflow_update;
+  uint32_t path_probe_interval_ms;
   transport_conn_t **conns;
   size_t conn_count;
   uint32_t next_conn_id;
@@ -177,6 +179,7 @@ struct transport_conn_t {
   transport_subscription_table_t receive_subscriptions;
   bool quic_ready;
   bool rx_cadence_handshake_confirmed;
+  bool path_probe_handshake_confirmed;
   bool hello_sent;
   bool hello_received;
   bool protocol_ready;
@@ -214,6 +217,7 @@ struct transport_conn_t {
   size_t completed_cursor;
   uint16_t completed_buckets[QLINQ_ASSEMBLER_BUCKETS];
   transport_conn_path_t paths[TRANSPORT_MAX_PATHS];
+  transport_probe_state_t path_probes[TRANSPORT_MAX_QUIC_PATHS];
   uint64_t admission_retry_at_ns;
   pathflow_context_t scheduler_context;
   size_t round_robin_path;
@@ -323,6 +327,12 @@ void transport_release_assembler(transport_t *t, frame_assembler_t *assembler);
 bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
                               uint16_t symbols, uint16_t symbol_size);
 size_t transport_select_datagram_path(transport_conn_t *conn);
+size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
+                                               size_t payload_size);
+/* Zero means unavailable (including a full queue), not a zero path MTU. */
+size_t transport_datagram_payload_limit(transport_conn_t *conn,
+                                        size_t path_index);
+size_t transport_connection_datagram_symbol_size(transport_conn_t *conn);
 bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
                               ptls_iovec_t datagram);
 

@@ -84,6 +84,7 @@ typedef struct {
   const char *stats_path;
   uint16_t listen_port;
   uint64_t idle_timeout_ms;
+  uint32_t path_probe_interval_ms;
   uint8_t simulated_loss;
   size_t message_size;
   size_t max_connections;
@@ -158,7 +159,7 @@ static void show_help(FILE *out, const char *program) {
       "  --stripes N                 multi-socket striping paths (1..4)\n"
       "  --multihome                 auto-bind all active non-loopback "
       "interfaces\n"
-      "  --cc cubic|cuback       congestion controller (default: cubic)\n"
+      "  --cc cubic|cuback|bbr   congestion controller (default: cubic)\n"
       "  --initial-cwnd N            initial window packets (default: 4096)\n"
       "  --udp-payload N             maximum UDP payload, 1200..1500 bytes "
       "(default: 1280; must fit the path MTU)\n"
@@ -172,6 +173,8 @@ static void show_help(FILE *out, const char *program) {
       "require-hybrid\n"
       "  --insecure-no-verify        test-only certificate bypass\n"
       "  --idle-timeout-ms MS        QUIC session idle timeout\n"
+      "  --path-probe-ms MS          idle path probe interval (default: "
+      "0/off)\n"
       "  --max-connections N         listener connection capacity\n"
       "  --max-repair-requests N     per-peer repair requests/second\n"
       "  --max-aggregate-repairs N   source-wide repair requests/second\n"
@@ -772,6 +775,8 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         options->congestion_control = TRANSPORT_CC_CUBIC;
       else if (strcmp(value, "cuback") == 0)
         options->congestion_control = TRANSPORT_CC_CUBACK;
+      else if (strcmp(value, "bbr") == 0)
+        options->congestion_control = TRANSPORT_CC_BBR;
       else
         goto invalid;
     } else if (strcmp(arg, "--initial-cwnd") == 0) {
@@ -803,6 +808,10 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       if (!cli_parse_u64(value, UINT64_MAX, &options->idle_timeout_ms) ||
           options->idle_timeout_ms == 0)
         goto invalid;
+    } else if (strcmp(arg, "--path-probe-ms") == 0) {
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed))
+        goto invalid;
+      options->path_probe_interval_ms = (uint32_t)parsed;
     } else if (strcmp(arg, "--max-connections") == 0) {
       if (!cli_parse_u64(value, TRANSPORT_HARD_MAX_CONNECTIONS, &parsed) ||
           parsed == 0)
@@ -1288,6 +1297,7 @@ static int run_app(const options_t *options) {
   }
   config.port = port;
   config.quic_idle_timeout_ms = options->idle_timeout_ms;
+  config.path_probe_interval_ms = options->path_probe_interval_ms;
   config.cert_file = options->cert_file;
   config.key_file = options->key_file;
   config.tls_group_policy = options->tls_group_policy;

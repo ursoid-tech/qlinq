@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define CHECK(test)                                                            \
   do {                                                                         \
@@ -31,6 +32,37 @@ static transport_t *fixture(void) {
                                .allow_insecure_peer = true,
                                .callback = ignore_event};
   return transport_create(&config);
+}
+
+/* Repair queues now enforce native DATAGRAM negotiation and its path MTU.
+ * Establish real application keys for these tests, then stop all socket
+ * service while inspecting queue occupancy and encoding/accounting outcomes. */
+static transport_t *repair_fixture(transport_t **server) {
+  transport_config_t config = {.bind_hosts = {"127.0.0.1"},
+                               .num_bind_hosts = 1,
+                               .port = 19869,
+                               .cert_file = "t/assets/server.crt",
+                               .key_file = "t/assets/server.key",
+                               .allow_insecure_peer = true,
+                               .callback = ignore_event};
+  *server = transport_create(&config);
+  if (!*server)
+    return NULL;
+  transport_t *client = fixture();
+  if (!client)
+    return NULL;
+  for (size_t i = 0; i < 2000; i++) {
+    transport_tick(client);
+    transport_tick(*server);
+    transport_conn_t *conn = client->client_conn;
+    if (conn && conn->hello_received &&
+        quicly_get_datagram_payload_limit(conn->quic, 0) >=
+            QLINQ_WIRE_FEC_HEADER_SIZE + 1024)
+      return client;
+    usleep(1000);
+  }
+  transport_destroy(client);
+  return NULL;
 }
 
 /* Invoke the actual QUIC stream destruction callbacks while the transport's
@@ -655,15 +687,16 @@ static bool receive_bytes(quicly_stream_t *stream, const uint8_t *data,
   return true;
 }
 
-static bool receive_ingress_range(quicly_stream_t *stream, uint64_t off,
+static bool receive_ingress_range(quicly_stream_t *stream, size_t off,
                                   const uint8_t *data, size_t size, bool fin) {
   size_t received = size;
+  uint64_t absolute_offset = off;
   uint64_t max_committed =
       stream->stream_id >= 0
           ? (uint64_t)stream->_send_aux.max_stream_data_sender.committed
           : UINT64_MAX;
-  return quicly_recvstate_update(&stream->recvstate, &off, &received, fin,
-                                 max_committed) == 0 &&
+  return quicly_recvstate_update(&stream->recvstate, &absolute_offset,
+                                 &received, fin, max_committed) == 0 &&
          received == size &&
          transport_stream_ingress_receive(
              stream, off - stream->recvstate.data_off, data, size) == 0;
@@ -767,7 +800,8 @@ static bool receive_control(quicly_stream_t *stream, uint8_t type,
 
 static int repair_response_outcomes(void) {
   int failed = 0;
-  transport_t *t = fixture();
+  transport_t *server = NULL;
+  transport_t *t = repair_fixture(&server);
   CHECK(t && t->client_conn && t->client_conn->stream);
   transport_conn_t *conn = t->client_conn;
   conn->authenticated = conn->protocol_ready = conn->hello_received = true;
@@ -826,13 +860,15 @@ static int repair_response_outcomes(void) {
 cleanup:
   if (!dispose(t))
     failed = 1;
+  transport_destroy(server);
   return failed;
 }
 
 /* repair queue preflight when datagram queue is full */
 static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
   int failed = 0;
-  transport_t *t = fixture();
+  transport_t *server = NULL;
+  transport_t *t = repair_fixture(&server);
   CHECK(t && t->client_conn && t->client_conn->stream);
   transport_conn_t *conn = t->client_conn;
   conn->authenticated = conn->protocol_ready = conn->hello_received = true;
@@ -841,7 +877,7 @@ static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
   CHECK(transport_subscriptions_add(&conn->send_subscriptions, MOQ_TRACK_DATA,
                                     MOQ_TRACK_FLAG_FEC_RATELESS, "repair", 7));
 
-  uint8_t data[32008] = {0};
+  uint8_t data[24008] = {0};
   moq_object_t object = {.track_id = {.type = MOQ_TRACK_DATA,
                                       .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
                                       .name = "repair"},
@@ -850,7 +886,7 @@ static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
                          .data = data,
                          .size = sizeof(data)};
   CHECK(
-      transport_sent_cache_store(&t->sent_cache, &object, 24, 24, 1372, false));
+      transport_sent_cache_store(&t->sent_cache, &object, 24, 24, 1024, false));
   sent_object_cache_t *cached =
       transport_sent_cache_find(&t->sent_cache, &object.track_id, 3, 9);
   CHECK(cached);
@@ -904,7 +940,7 @@ static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
         fec_contexts++;
         CHECK(!fallback && admitted == 1 && entry->type == FEC_RAPTORQ &&
               entry->data_symbols == 24 && entry->parity_symbols == 24 &&
-              entry->symbol_size == 1372);
+              entry->symbol_size == 1024);
       }
     }
     /* second request after partial admission does not re-encode */
@@ -913,6 +949,7 @@ static int repair_queue_preflight(size_t queued, uint16_t first_esi) {
 cleanup:
   if (!dispose(t))
     failed = 1;
+  transport_destroy(server);
   return failed;
 }
 

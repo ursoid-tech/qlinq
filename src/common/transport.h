@@ -142,7 +142,8 @@ enum {
   TRANSPORT_CC_RENO,
   TRANSPORT_CC_PICO,
   TRANSPORT_CC_CUBIC,
-  TRANSPORT_CC_CUBACK
+  TRANSPORT_CC_CUBACK,
+  TRANSPORT_CC_BBR
 };
 enum {
   TRANSPORT_PACING_DEFAULT,
@@ -202,6 +203,7 @@ typedef struct {
   size_t max_total_stream_egress_bytes; /* shared across all connections */
   size_t max_reliable_object_size;
   size_t max_fec_object_size;
+  /* UDP ceiling including native MTU probes; default 1280, range 1200..1500. */
   size_t max_udp_payload_size;
   size_t max_packets_per_tick;
 } transport_limits_t;
@@ -238,6 +240,8 @@ typedef struct {
   /* QUIC control-session idle timeout in milliseconds. Zero keeps Quicly's
    * default. */
   uint64_t quic_idle_timeout_ms;
+  /* Optional ACK-eliciting probes on idle usable paths; zero disables. */
+  uint32_t path_probe_interval_ms;
   /* FEC assembler inactivity timeout. Zero selects 2000 ms. */
   uint32_t fec_assembler_timeout_ms;
   /* Zero keeps the corresponding Quicly default. */
@@ -539,6 +543,8 @@ bool transport_mock_path_state(transport_t *t, size_t path_idx,
                                uint32_t packets_per_second, double latency_ms,
                                double loss_rate);
 
+/* Current common FEC symbol capacity of usable native paths. Zero means no
+ * path can presently accept a DATAGRAM (including queue backpressure). */
 size_t transport_get_datagram_symbol_size(const transport_t *t);
 
 /* check if a track is ready for more data (application-layer backpressure) */

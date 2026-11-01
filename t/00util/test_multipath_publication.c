@@ -56,8 +56,8 @@ static void check_constrained_multipath(void) {
     fixture_tick(&f);
     if (f.server.authenticated && f.client.authenticated) {
       path_count = transport_publish_collect_paths(
-          f.server.transport, f.server.conn, 1200, transport_get_monotonic_ns(),
-          paths);
+          f.server.transport, f.server.conn, 1200, 0,
+          transport_get_monotonic_ns(), paths);
       if (path_count == 2)
         break;
     }

@@ -38,6 +38,40 @@ int main(void) {
       qlinq_endpoint_close(endpoint);
     }
   }
+  const uint32_t probe_intervals[] = {0, 250, UINT32_MAX};
+  for (size_t i = 0; i < sizeof(probe_intervals) / sizeof(probe_intervals[0]);
+       i++) {
+    config.path_probe_interval_ms = probe_intervals[i];
+    qlinq_endpoint_t *endpoint = qlinq_connect(context, &config);
+    assert(endpoint &&
+           endpoint->transport->path_probe_interval_ms == probe_intervals[i]);
+    qlinq_endpoint_close(endpoint);
+  }
+  config.path_probe_interval_ms = 0;
+  /* Exercise the actual native connection: BBR cannot allocate a path unless
+   * the public policy enabled its required pacer. */
+  config.congestion_control = QLINQ_CC_BBR;
+  for (unsigned pacing = QLINQ_PACING_DEFAULT; pacing <= QLINQ_PACING_ENABLED;
+       pacing++) {
+    config.pacing = (qlinq_pacing_t)pacing;
+    qlinq_endpoint_t *endpoint = qlinq_connect(context, &config);
+    if (pacing == QLINQ_PACING_DISABLED) {
+      assert(!endpoint);
+      assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
+      continue;
+    }
+    assert(endpoint && endpoint->transport->client_conn);
+    assert(endpoint->transport->quic_ctx.egress[0].pacing == 1);
+    assert(endpoint->transport->quic_ctx.egress[0].ecn ==
+           QUICLY_ECN_MODE_CLASSIC);
+    quicly_stats_t stats;
+    assert(quicly_get_stats(endpoint->transport->client_conn->quic, &stats) ==
+           0);
+    assert(stats.cc.type == &quicly_cc_type_bbr);
+    assert(stats.cc.state.bbr.stats.pacing_interval_m != 0);
+    qlinq_endpoint_close(endpoint);
+  }
+  config.congestion_control = QLINQ_CC_CUBIC;
   const uint32_t initial_windows[] = {0, 1, 10, 100,
                                       QLINQ_MAX_INITIAL_CWND_PACKETS};
   for (size_t i = 0; i < sizeof(initial_windows) / sizeof(initial_windows[0]);
@@ -101,11 +135,32 @@ int main(void) {
     native_config.initial_cwnd_packets = invalid_windows[i];
     assert(!transport_create(&native_config));
   }
+  native_config.initial_cwnd_packets = 0;
+  native_config.congestion_control = TRANSPORT_CC_BBR;
+  native = transport_create(&native_config);
+  assert(native && native->client_conn);
+  quicly_stats_t native_stats;
+  assert(quicly_get_stats(native->client_conn->quic, &native_stats) == 0);
+  assert(native_stats.cc.type == &quicly_cc_type_bbr);
+  assert(native->quic_ctx.egress[0].pacing == 1);
+  transport_destroy(native);
+  native_config.pacing = TRANSPORT_PACING_DISABLED;
+  native_config.default_jumpstart_packets = 256;
+  assert(!transport_create(&native_config));
   config.congestion_control = (qlinq_congestion_control_t)-1;
   assert(!qlinq_connect(context, &config));
   assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
   config.congestion_control = (qlinq_congestion_control_t)(QLINQ_CC_CUBIC + 1);
   assert(!qlinq_connect(context, &config));
+  assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
+  config.congestion_control = (qlinq_congestion_control_t)(QLINQ_CC_BBR + 1);
+  assert(!qlinq_connect(context, &config));
+  config.congestion_control = QLINQ_CC_BBR;
+  config.pacing = QLINQ_PACING_DISABLED;
+  config.default_jumpstart_packets = 256;
+  assert(!qlinq_connect(context, &config));
+  assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
+  config.default_jumpstart_packets = 0;
   config.congestion_control = QLINQ_CC_DEFAULT;
   config.pacing = (qlinq_pacing_t)-1;
   assert(!qlinq_connect(context, &config));

@@ -31,4 +31,18 @@ subtest "coded publication retains native path measurement identity" => sub {
 		"a healthy alternate does not inherit another remote path's loss or delay";
 };
 
+subtest "optional native idle path probes" => sub {
+	my ($stderr, $stdout) = run_prog("./t/00util/test_path_probe");
+	diag "STDERR:\n$stderr" if $stderr;
+	like $stdout, qr/===PATH PROBE OK===/,
+		"idle paths probe independently while active and recovering paths retain native timers";
+};
+
+subtest "native DATAGRAM limits and path MTU discovery" => sub {
+	my ($stderr, $stdout) = run_prog("./t/00util/test_datagram_mtu");
+	diag "STDERR:\n$stderr" if $stderr;
+	like $stdout, qr/===DATAGRAM MTU OK===/,
+		"FEC publication and repairs respect per-path capacity and changing MTUs";
+};
+
 done_testing();

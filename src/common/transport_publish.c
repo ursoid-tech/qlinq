@@ -135,6 +135,7 @@ typedef struct {
 
 size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
                                        size_t estimate_symbol_size,
+                                       size_t payload_bytes,
                                        uint64_t admission_now,
                                        transport_publication_path_t *paths) {
   size_t active_paths = 0;
@@ -152,7 +153,8 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
            health.state == QUICLY_PATH_SUSPECT))
         continue;
       queued = quicly_get_num_datagram_frames_path(conn->quic, native);
-      if (queued >= QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY)
+      size_t limit = transport_datagram_payload_limit(conn, native);
+      if (limit == 0 || limit < payload_bytes)
         continue;
       mapped = native;
       break;
@@ -175,7 +177,8 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
                             ? path->latest_owd_fp
                             : 0;
     candidate->quic = mapped;
-    candidate->available = QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - queued;
+    candidate->available =
+        quicly_get_max_datagram_frames_path(conn->quic, mapped) - queued;
     candidate->sample = transport_path_estimate_on_path(
         conn->quic, mapped, &stats, queued, t->sockets[physical].egress.bytes,
         estimate_symbol_size, relative_owd);
@@ -257,7 +260,8 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
   transport_publication_path_t *paths = plan->paths;
   conn->admission_retry_at_ns = 0;
   size_t active_paths = transport_publish_collect_paths(
-      t, conn, estimate_symbol_size, admission_now, paths);
+      t, conn, estimate_symbol_size, QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size,
+      admission_now, paths);
   if (active_paths == 0)
     return TRANSPORT_PUBLISH_BACKPRESSURE;
 
@@ -895,6 +899,7 @@ static transport_publish_result_t flush_group(transport_t *t) {
   group->flush_retry_at_ms = 0;
   group->flush_retry_cache_releases = 0;
   group->record_count = 0;
+  group->symbol_size = 0;
   group->pending = false;
   if ((track_state->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
       track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
@@ -993,6 +998,7 @@ group_record(transport_t *t, const moq_object_t *obj, size_t fec_limit) {
     group->flush_retry_cache_releases = 0;
     group->track_id = obj->track_id;
     group->priority = obj->priority;
+    group->symbol_size = 0;
   }
 
   if (obj->size > SIZE_MAX - 2 - group->size)
@@ -1097,17 +1103,6 @@ static transport_publish_result_t publish_object(transport_t *t,
   size_t data_size = obj->size;
   if (data_size == 0 || data_size > fec_limit)
     return TRANSPORT_PUBLISH_INVALID;
-  /* Stored rates use full-sized symbols even when a small object shrinks its
-   * payload. Resolve the cohort-wide size only once for all recipients. */
-  size_t estimate_symbol_size = transport_get_datagram_symbol_size(t);
-  size_t symbol_size = estimate_symbol_size;
-  /* The object envelope and repair cache retain this exact symbol size. */
-  if (symbol_size > data_size)
-    symbol_size = data_size;
-  size_t data_symbols = (data_size + symbol_size - 1) / symbol_size;
-  if (data_symbols == 0)
-    data_symbols = 1;
-
   bool protect_repair_cache = obj->track_id.type == MOQ_TRACK_DATA &&
                               profile.fec_rateless &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
@@ -1117,6 +1112,39 @@ static transport_publish_result_t publish_object(transport_t *t,
     t->stats.recovery_cache_backpressure++;
     return TRANSPORT_PUBLISH_BACKPRESSURE;
   }
+  /* Stored rates use full-sized symbols even when a small object shrinks its
+   * payload. Resolve the cohort-wide size only once for all recipients. */
+  size_t estimate_symbol_size = 0;
+  size_t recipients = 0;
+  for (size_t c = 0; c < transport_connection_count(t); c++) {
+    transport_conn_t *conn = transport_connection_at(t, c);
+    if (!transport_publish_recipient_eligible(t, conn, &obj->track_id))
+      continue;
+    recipients++;
+    size_t limit = transport_connection_datagram_symbol_size(conn);
+    if (limit == 0 && !(grouped && conn->fec_group_delivered))
+      return TRANSPORT_PUBLISH_BACKPRESSURE;
+    if (limit != 0 &&
+        (estimate_symbol_size == 0 || limit < estimate_symbol_size))
+      estimate_symbol_size = limit;
+  }
+  if (recipients == 0) {
+    publish_log_no_recipients(t, &obj->track_id);
+    return TRANSPORT_PUBLISH_NO_RECIPIENTS;
+  }
+  /* A partial grouped publication must keep its encoding across MTU changes
+   * and retries. Newly joined recipients must accept that same geometry. */
+  if (grouped && t->pending_group.symbol_size != 0)
+    estimate_symbol_size = t->pending_group.symbol_size;
+  if (estimate_symbol_size == 0)
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
+  size_t symbol_size = estimate_symbol_size;
+  /* The object envelope and repair cache retain this exact symbol size. */
+  if (symbol_size > data_size)
+    symbol_size = data_size;
+  size_t data_symbols = (data_size + symbol_size - 1) / symbol_size;
+  if (data_symbols == 0)
+    data_symbols = 1;
 
   size_t active_count = transport_connection_count(t);
   size_t eligible = 0;
@@ -1157,6 +1185,9 @@ static transport_publish_result_t publish_object(transport_t *t,
         failure = TRANSPORT_PUBLISH_BACKPRESSURE;
     }
   }
+
+  if ((delivered > 0 || partially_queued) && grouped)
+    t->pending_group.symbol_size = symbol_size;
 
   if ((delivered > 0 || partially_queued) &&
       obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&

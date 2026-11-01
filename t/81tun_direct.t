@@ -7,11 +7,13 @@ use t::Util;
 
 my $directory = tempdir(CLEANUP => 1);
 my @cases = (['fixedrate', 0], ['rateless', 0], ['reliable', 0],
-             ['datagram', 0], ['fixedrate', 1]);
+             ['datagram', 0], ['fixedrate', 1],
+             ['reliable', 0, 'bbr'], ['datagram', 0, 'bbr']);
 
 for my $index (0 .. $#cases) {
-    my ($mode, $verified) = @{$cases[$index]};
+    my ($mode, $verified, $cc) = @{$cases[$index]};
     my $label = $verified ? "$mode verified" : $mode;
+    $label .= " $cc" if defined $cc;
     my $port = 19940 + $index;
     my $server_log = "$directory/server-$index.log";
     my @security = $verified
@@ -28,6 +30,7 @@ for my $index (0 .. $#cases) {
             ($verified ? () : ('--cert', 't/assets/server.crt',
                                 '--key', 't/assets/server.key')),
             '--track', 'tun-direct-test', '--mode', $mode, '--mock',
+            (defined $cc ? ('--cc', $cc) : ()),
             '--run-ms', '5000';
         die "exec server: $!";
     }
@@ -39,7 +42,8 @@ for my $index (0 .. $#cases) {
     my ($stderr, $stdout) = run_prog(
         "./qlinq-tun --peer 127.0.0.1:$port --bind 127.0.0.1 " .
         "--auth-token direct-test $client_security " .
-        "--track tun-direct-test --mode $mode --mock --run-ms 3500");
+        "--track tun-direct-test --mode $mode --mock --run-ms 3500" .
+        (defined $cc ? " --cc $cc" : ""));
     my $waited = waitpid($server_pid, 0);
     is($waited, $server_pid, "$label listener exited");
     is($?, 0, "$label listener succeeded");

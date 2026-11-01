@@ -10,6 +10,8 @@
 /* fixedrate and fec name the same delivery mode. */
 bool cli_parse_delivery(const char *text, qlinq_delivery_t *delivery);
 bool cli_parse_track_mode(const char *text, uint8_t *flags);
+bool cli_parse_congestion_control(const char *text,
+                                  qlinq_congestion_control_t *controller);
 
 bool cli_parse_u64(const char *text, uint64_t maximum, uint64_t *value);
 

@@ -14,7 +14,8 @@ typedef struct {
 } transport_publication_path_t;
 
 size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
-                                       size_t symbol_bytes, uint64_t now_ns,
+                                       size_t symbol_bytes,
+                                       size_t payload_bytes, uint64_t now_ns,
                                        transport_publication_path_t *paths);
 size_t transport_publish_path_capacity(transport_conn_t *conn,
                                        const transport_publication_path_t *path,

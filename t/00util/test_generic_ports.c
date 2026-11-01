@@ -110,6 +110,27 @@ static void parsers_and_limits(void) {
   assert(!cli_parse_delivery("fec", NULL));
   assert(!cli_parse_track_mode("fec", NULL));
 
+  const struct {
+    const char *name;
+    qlinq_congestion_control_t controller;
+  } controllers[] = {{"default", QLINQ_CC_DEFAULT},
+                     {"reno", QLINQ_CC_RENO},
+                     {"pico", QLINQ_CC_PICO},
+                     {"cubic", QLINQ_CC_CUBIC},
+                     {"bbr", QLINQ_CC_BBR}};
+  for (size_t i = 0; i < sizeof(controllers) / sizeof(controllers[0]); i++) {
+    qlinq_congestion_control_t controller = QLINQ_CC_DEFAULT;
+    assert(cli_parse_congestion_control(controllers[i].name, &controller));
+    assert(controller == controllers[i].controller);
+  }
+  qlinq_congestion_control_t controller = QLINQ_CC_CUBIC;
+  assert(!cli_parse_congestion_control("BBR", &controller));
+  assert(!cli_parse_congestion_control("cuback", &controller));
+  assert(!cli_parse_congestion_control("", &controller));
+  assert(!cli_parse_congestion_control(NULL, &controller));
+  assert(!cli_parse_congestion_control("bbr", NULL));
+  assert(controller == QLINQ_CC_CUBIC);
+
   transport_repair_limiter_t limiter = {0};
   assert(transport_repair_limiter_wait_ms(&limiter, 2, 1000) == 0);
   assert(transport_repair_limiter_take(&limiter, 2, 1000));

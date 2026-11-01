@@ -58,12 +58,14 @@ typedef struct {
   size_t route_count;
   uint64_t mtu;
   uint64_t stats_ms;
+  uint32_t path_probe_interval_ms;
   uint64_t queue_ms;
   uint64_t parent_pid;
   char peer[256];
   uint16_t port;
   uint64_t run_ms;
   qlinq_delivery_t delivery;
+  qlinq_congestion_control_t congestion_control;
   qlinq_tls_group_policy_t tls_group_policy;
 } options_t;
 
@@ -95,10 +97,12 @@ static void usage(FILE *out, const char *program) {
       "  --route CIDR            Add a subnet route (repeatable, no default)\n"
       "  --uplink NAME           Allow discovered paths on this interface\n"
       "  --stats-ms N            Emit JSON health snapshots periodically\n"
+      "  --path-probe-ms N       Idle path probe interval (default: 0/off)\n"
       "  --queue-ms N            Local queue age limit (default: 100 ms)\n"
       "  --track NAME            Packet stream (default: tund/tun0)\n"
       "  --mode MODE             fixedrate/fec (default), rateless, reliable, "
       "datagram\n"
+      "  --cc default|reno|pico|cubic|bbr (default: Reno; BBR enables pacing)\n"
       "  --cert FILE --key FILE  TLS identity (required on listener)\n"
       "  --tls-group-policy POLICY classical (default), prefer-hybrid, "
       "require-hybrid\n"
@@ -181,6 +185,11 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         if (!cli_parse_u64(value, 60000, &options->queue_ms) ||
             options->queue_ms == 0)
           return false;
+      } else if (strcmp(arg, "--path-probe-ms") == 0) {
+        uint64_t parsed;
+        if (!cli_parse_u64(value, UINT32_MAX, &parsed))
+          return false;
+        options->path_probe_interval_ms = (uint32_t)parsed;
       } else if (strcmp(arg, "--parent-pid") == 0) {
         if (!cli_parse_u64(value, INT32_MAX, &options->parent_pid) ||
             options->parent_pid == 0)
@@ -210,6 +219,9 @@ static bool parse_options(int argc, char **argv, options_t *options) {
           return false;
       } else if (strcmp(arg, "--mode") == 0) {
         if (!cli_parse_delivery(value, &options->delivery))
+          return false;
+      } else if (strcmp(arg, "--cc") == 0) {
+        if (!cli_parse_congestion_control(value, &options->congestion_control))
           return false;
       } else {
         return false;
@@ -746,8 +758,10 @@ static int run_tunnel(const options_t *options) {
       .bind_addresses = {bind},
       .bind_address_count = 1,
       .port = options->port,
+      .congestion_control = options->congestion_control,
       .reconnect_enabled = !options->listen,
       .idle_timeout_ms = 10000,
+      .path_probe_interval_ms = options->path_probe_interval_ms,
       .limits = {.max_connections = 1},
       .security = {.shared_secret = options->token,
                    .shared_secret_size = strlen(options->token),

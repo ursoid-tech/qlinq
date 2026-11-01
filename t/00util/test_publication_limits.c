@@ -161,10 +161,34 @@ static void test_partial_group_retry(void) {
     transport_tick(second.transport);
   }
   assert(f.server.subscriptions == 2);
+  moq_track_id_t other_track = {.type = MOQ_TRACK_DATA,
+                                .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                                .name = "after-frozen-group"};
+  fixture_subscribe(&f, &f.client, other_track);
+  moq_track_id_t independent_track = {.type = MOQ_TRACK_VIDEO,
+                                      .name = "independent-datagram"};
+  fixture_subscribe(&f, &f.client, independent_track);
   transport_t *t = f.server.transport;
   transport_conn_t *first_conn = t->conns[0], *blocked_conn = t->conns[1];
-  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
-  uint8_t original[1000], next[1000];
+  /* Leave headroom for native binary probing when the smaller cap is later
+   * removed; a search may stop just below its configured upper bound. */
+  assert(quicly_set_max_udp_payload_size(first_conn->quic, 1270) == 0);
+  assert(quicly_set_max_udp_payload_size(blocked_conn->quic, 1270) == 0);
+  for (size_t i = 0;
+       i < 2000 &&
+       (quicly_get_datagram_payload_limit(first_conn->quic, 0) <= 1200 ||
+        quicly_get_datagram_payload_limit(blocked_conn->quic, 0) <= 1200);
+       i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(quicly_get_datagram_payload_limit(first_conn->quic, 0) > 1200 &&
+         quicly_get_datagram_payload_limit(blocked_conn->quic, 0) > 1200);
+  /* Keep the native size query available, but leave too little room for the
+   * whole FEC allocation. A completely full queue now backpressures the cohort
+   * before encoding because its native payload limit is unavailable. */
+  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1);
+  uint8_t original[2000], next[2000];
   memset(original, 17, sizeof(original));
   memset(next, 23, sizeof(next));
   moq_object_t object = {
@@ -175,20 +199,48 @@ static void test_partial_group_retry(void) {
   sent_object_cache_t *cached =
       transport_sent_cache_find(&t->sent_cache, &track, 0, 0);
   assert(cached == NULL); /* Fixed-rate FEC never retains repair obligations. */
-  assert(t->pending_group.size == 1002 &&
-         memcmp(t->pending_group.data + 2, original, 1000) == 0);
+  assert(t->pending_group.size == 2002 &&
+         memcmp(t->pending_group.data + 2, original, 2000) == 0);
   size_t first_queued =
       quicly_get_num_datagram_frames_path(first_conn->quic, 0);
   assert(first_queued > 0);
+  size_t frozen_symbol_size = t->pending_group.symbol_size;
+  assert(frozen_symbol_size > 0 && frozen_symbol_size < sizeof(original));
   object.data = next;
   for (size_t i = 0; i < 3; i++) {
     assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BACKPRESSURE);
-    assert(t->pending_group.size == 1002 &&
-           memcmp(t->pending_group.data + 2, original, 1000) == 0);
+    assert(t->pending_group.size == 2002 &&
+           memcmp(t->pending_group.data + 2, original, 2000) == 0);
     assert(quicly_get_num_datagram_frames_path(first_conn->quic, 0) ==
            first_queued);
     assert(t->stats.recovery_cache_backpressure == 0);
+    assert(t->pending_group.symbol_size == frozen_symbol_size);
   }
+  /* Once another recipient accepted these symbols, lowering this peer's MTU
+   * cannot re-encode the group. An empty native queue must not advertise
+   * writable, even on a different grouped track subscribed only by the first
+   * peer: the transport-wide pending group must flush before it can start. */
+  assert(quicly_set_max_udp_payload_size(blocked_conn->quic, 1200) == 0);
+  quicly_discard_datagram_frames(blocked_conn->quic, 0);
+  size_t smaller_limit =
+      quicly_get_datagram_payload_limit(blocked_conn->quic, 0);
+  assert(smaller_limit > QLINQ_WIRE_FEC_HEADER_SIZE &&
+         smaller_limit < QLINQ_WIRE_FEC_HEADER_SIZE + frozen_symbol_size);
+  assert(!transport_is_track_ready(t, &track));
+  assert(!transport_is_track_ready(t, &other_track));
+  assert(transport_is_track_ready(t, &independent_track));
+  moq_object_t other_object = object;
+  other_object.track_id = other_track;
+  assert(transport_publish_ex(t, &other_object) ==
+         TRANSPORT_PUBLISH_BACKPRESSURE);
+  assert(t->pending_group.symbol_size == frozen_symbol_size &&
+         t->pending_group.size == 2002);
+  assert(quicly_get_num_datagram_frames_path(blocked_conn->quic, 0) == 0 &&
+         quicly_get_num_datagram_frames_path(first_conn->quic, 0) ==
+             first_queued);
+  /* Restoring the cap permits native probes to grow the path again. The
+   * original frozen group must then reach both recipients exactly once. */
+  assert(quicly_set_max_udp_payload_size(blocked_conn->quic, 1280) == 0);
   for (size_t i = 0; i < 2000 && (t->pending_group.size ||
                                   f.client.objects < 1 || second.objects < 1);
        i++) {
@@ -197,8 +249,8 @@ static void test_partial_group_retry(void) {
   }
   assert(!t->pending_group.size && f.client.objects == 1 &&
          second.objects == 1);
-  assert(memcmp(f.client.payload + 2, original, 1000) == 0 &&
-         memcmp(second.payload + 2, original, 1000) == 0);
+  assert(memcmp(f.client.payload + 2, original, 2000) == 0 &&
+         memcmp(second.payload + 2, original, 2000) == 0);
   assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
   assert(transport_publish_flush_grouped(t));
   for (size_t i = 0; i < 2000 && (f.client.objects < 2 || second.objects < 2);
@@ -207,13 +259,15 @@ static void test_partial_group_retry(void) {
     transport_tick(second.transport);
   }
   assert(f.client.objects == 2 && second.objects == 2 && !second.failed);
-  assert(memcmp(f.client.payload + 2, next, 1000) == 0 &&
-         memcmp(second.payload + 2, next, 1000) == 0);
+  assert(memcmp(f.client.payload + 2, next, 2000) == 0 &&
+         memcmp(second.payload + 2, next, 2000) == 0);
   assert(t->stats.recovery_cache_backpressure == 0);
   /* The record triggering a partial flush is itself retained, so it must be
    * reported as BUFFERED rather than failed or rejected. */
-  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
+  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1);
   object.data = original;
+  object.size =
+      1000; /* Four framed records fit the fixture's receive buffer. */
   for (size_t i = 0; i < 4; i++)
     assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
   assert(t->pending_group.size == 4008 && t->pending_group.pending);
@@ -232,14 +286,15 @@ static void test_partial_group_retry(void) {
   }
   /* Membership stays live while a group is pending. Change subscriptions
    * directly so no event-loop tick drains the deliberately blocked queue. */
-  assert(transport_mock_path_state(t, 0, 100000, 1, 0));
+  assert(transport_mock_path_state(t, 0, 200000, 1, 0));
   uint8_t alias;
   assert(transport_subscriptions_find_alias(&first_conn->send_subscriptions,
                                             &track, &alias) == 0);
   transport_subscriptions_remove(&first_conn->send_subscriptions, track.type,
                                  track.name);
   transport_publish_checkpoint_member_removed(t, first_conn, &track, alias);
-  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
+  fill_queue(blocked_conn, QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1);
+  object.size = sizeof(original);
   assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
   assert(!transport_publish_flush_grouped(t));
   uint64_t pending_object_id = t->fec_tracks[0].next_object_id;
@@ -266,8 +321,8 @@ static void test_partial_group_retry(void) {
   assert(!first_conn->fec_group_delivered);
   assert(!transport_publish_flush_grouped(t));
   assert(quicly_get_num_datagram_frames_path(first_conn->quic, 0) > after_join);
-  assert(t->pending_group.size == 1002 &&
-         memcmp(t->pending_group.data + 2, original, 1000) == 0);
+  assert(t->pending_group.size == 2002 &&
+         memcmp(t->pending_group.data + 2, original, 2000) == 0);
   assert(t->fec_tracks[0].next_object_id == pending_object_id);
   transport_destroy(second.transport);
   fixture_destroy(&f);

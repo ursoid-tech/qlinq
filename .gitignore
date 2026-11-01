@@ -135,3 +135,5 @@ qlinq-tun-engine
 /t/00util/test_transport_engine.map
 /t/00util/test_recovery_latency
 /t/00util/test_recovery_latency.map
+/t/00util/test_datagram_mtu
+/t/00util/test_path_probe

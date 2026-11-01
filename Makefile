@@ -120,6 +120,7 @@ ENGINE_OBJS = src/common/transport_repair_policy.o \
               src/common/transport_fec_state.o \
               src/common/transport_memory.o \
               src/common/transport_paths.o \
+              src/common/transport_probe.o \
               src/common/transport_protocol.o \
               src/common/transport_publish.o \
               src/common/transport_recovery.o \
@@ -371,6 +372,8 @@ TRANSPORT_TESTS = t/00util/test_transport_bind \
 	t/00util/test_tc_benchmark \
 	t/00util/test_multipath t/00util/test_multipath_failover \
 	t/00util/test_multipath_feedback \
+	t/00util/test_path_probe \
+	t/00util/test_datagram_mtu \
 	t/00util/test_multipath_publication \
 	t/00util/test_multipath_nack \
 	t/00util/test_operational \
@@ -495,6 +498,8 @@ t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=clock_gettime,-Map,$@.map
 
 CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
+	t/00util/test_datagram_mtu \
+	t/00util/test_path_probe \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
@@ -517,11 +522,11 @@ CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_reco
 t/00util/test_multipath_failover: t/00util/test_multipath_failover.o $(filter-out src/common/transport_udp.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/transport_time_clock.o: src/common/transport_time.c Makefile
+t/00util/transport_time_clock.o: src/common/transport_time.c Makefile .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dclock_gettime=test_clock_gettime -c $< -o $@
 
-t/00util/transport_publish_admission.o: src/common/transport_publish.c Makefile
+t/00util/transport_publish_admission.o: src/common/transport_publish.c Makefile .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dtransport_path_admission_rate=test_path_admission_rate -c $< -o $@
 
@@ -530,7 +535,7 @@ t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/tr
 
 # The feedback fixture delegates native operations except during its explicit
 # scheduler checks. Keep the production library and native dependency intact.
-t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile
+t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dquicly_get_path_stats=test_quicly_get_path_stats \
 		-Dquicly_get_path_health=test_quicly_get_path_health \
@@ -551,7 +556,7 @@ t/00util/test_rx_cadence: t/00util/test_rx_cadence.o $(filter-out src/common/qli
 t/00util/test_rx_cadence_backlog: t/00util/test_rx_cadence_backlog.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/transport_poll_host_cadence.o: src/common/transport_poll_host.c Makefile
+t/00util/transport_poll_host_cadence.o: src/common/transport_poll_host.c Makefile .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dtransport_udp_send_batch_ecn=test_cadence_udp_send_batch -c $< -o $@
 

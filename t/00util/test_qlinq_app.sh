@@ -54,7 +54,7 @@ server_pid=$!
 
 timeout 4 "$app_bin" \
     --peer 127.0.0.1:10093 \
-    --idle-timeout-ms 60000 --udp-payload 1200 --cc cuback \
+    --idle-timeout-ms 60000 --udp-payload 1200 --cc bbr \
     --auth-token app-test --insecure-no-verify \
     --output "$tmp_dir/output.bin" --mode rateless \
     --receive-count 1 --drain-ms 200 \
@@ -79,7 +79,7 @@ client_pid=
 
 test "$(wc -c < "$tmp_dir/output.bin")" -eq 512
 grep -q 'cc=cuback' "$tmp_dir/server.log"
-grep -q 'cc=cuback' "$tmp_dir/client.log"
+grep -q 'cc=bbr' "$tmp_dir/client.log"
 cmp -n 512 README.md "$tmp_dir/output.bin"
 awk -F '\t' 'NR == 1 { exit !($1 == "elapsed_ms" && $2 == "node" &&
                                   $3 == "tx_records" && $4 == "rx_records" &&

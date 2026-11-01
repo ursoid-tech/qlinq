@@ -128,6 +128,8 @@ _Static_assert((int)QLINQ_CC_PICO == TRANSPORT_CC_PICO,
                "public and transport policy values must match");
 _Static_assert((int)QLINQ_CC_CUBIC == TRANSPORT_CC_CUBIC,
                "public and transport policy values must match");
+_Static_assert((int)QLINQ_CC_BBR == TRANSPORT_CC_BBR,
+               "public and transport policy values must match");
 _Static_assert((int)QLINQ_PACING_DEFAULT == TRANSPORT_PACING_DEFAULT,
                "public and transport policy values must match");
 _Static_assert((int)QLINQ_PACING_DISABLED == TRANSPORT_PACING_DISABLED,
@@ -669,8 +671,11 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
        !config->security.shared_secret) ||
       config->security.shared_secret_size > UINT16_MAX ||
       !qlinq_tls_group_policy_name(config->security.tls_group_policy) ||
-      (unsigned)config->congestion_control > QLINQ_CC_CUBIC ||
+      ((unsigned)config->congestion_control > QLINQ_CC_CUBIC &&
+       config->congestion_control != QLINQ_CC_BBR) ||
       (unsigned)config->pacing > QLINQ_PACING_ENABLED ||
+      (config->congestion_control == QLINQ_CC_BBR &&
+       config->pacing == QLINQ_PACING_DISABLED) ||
       config->initial_cwnd_packets > QLINQ_MAX_INITIAL_CWND_PACKETS ||
       (config->repair_mode != QLINQ_REPAIR_AUTO &&
        config->repair_mode != QLINQ_REPAIR_INDEXED &&
@@ -732,6 +737,7 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
         .path_interface_names[transport_config.num_path_interface_names++] =
         config->path_interface_names[i];
   transport_config.quic_idle_timeout_ms = config->idle_timeout_ms;
+  transport_config.path_probe_interval_ms = config->path_probe_interval_ms;
   transport_config.fec_assembler_timeout_ms = config->receive_object_timeout_ms;
   transport_config.handshake_timeout_rtt_multiplier =
       config->handshake_timeout_rtt_multiplier;

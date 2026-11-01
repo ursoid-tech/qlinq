@@ -55,6 +55,9 @@ static void show_help(FILE *out, const char *program) {
       "  --socket NAME               Unix data socket name\n"
       "  --track NAME                subscribe to a track (repeatable)\n"
       "  --stats-ms MS               periodically print transport counters\n"
+      "  --path-probe-ms MS          idle path probe interval (default: "
+      "0/off)\n"
+      "  --cc default|reno|pico|cubic|bbr (default: Reno; BBR enables pacing)\n"
       "  --mode datagram|fixedrate|rateless|reliable (default fixedrate)\n"
       "                              fec is an alias for fixedrate\n"
       "  --reliable                  alias for --mode reliable\n"
@@ -112,6 +115,8 @@ typedef struct {
   size_t num_subscribe_tracks;
   uint8_t track_flags;
   uint32_t stats_ms;
+  uint32_t path_probe_interval_ms;
+  qlinq_congestion_control_t congestion_control;
   bool verbose;
   bool help;
 } options_t;
@@ -472,6 +477,14 @@ static bool parse_options(int argc, char **argv, options_t *options) {
     } else if (strcmp(arg, "--stats-ms") == 0) {
       if (!parse_u32(value, &options->stats_ms))
         goto invalid;
+    } else if (strcmp(arg, "--path-probe-ms") == 0) {
+      uint64_t parsed;
+      if (!cli_parse_u64(value, UINT32_MAX, &parsed))
+        goto invalid;
+      options->path_probe_interval_ms = (uint32_t)parsed;
+    } else if (strcmp(arg, "--cc") == 0) {
+      if (!cli_parse_congestion_control(value, &options->congestion_control))
+        goto invalid;
     } else if (strcmp(arg, "--mode") == 0) {
       uint8_t flags;
       if (!cli_parse_track_mode(value, &flags) ||
@@ -525,18 +538,20 @@ static bool add_transport(daemon_ctx_t *ctx, const peer_options_t *peer) {
   daemon_transport_ctx_t *tctx = &ctx->transports[ctx->num_transports];
   tctx->daemon = ctx;
   tctx->is_server = peer == NULL;
-  transport_config_t config = {.port = peer ? peer->port : options->listen_port,
-                               .num_bind_hosts = 1,
-                               .cert_file = options->cert_file,
-                               .key_file = options->key_file,
-                               .ca_file = options->ca_file,
-                               .tls_group_policy = options->tls_group_policy,
-                               .verify_peer = options->verify_peer,
-                               .allow_insecure_peer =
-                                   options->allow_insecure_peer,
-                               .reconnect_enabled = peer != NULL,
-                               .callback = on_transport_event,
-                               .user_data = tctx};
+  transport_config_t config = {
+      .port = peer ? peer->port : options->listen_port,
+      .num_bind_hosts = 1,
+      .congestion_control = options->congestion_control,
+      .path_probe_interval_ms = options->path_probe_interval_ms,
+      .cert_file = options->cert_file,
+      .key_file = options->key_file,
+      .ca_file = options->ca_file,
+      .tls_group_policy = options->tls_group_policy,
+      .verify_peer = options->verify_peer,
+      .allow_insecure_peer = options->allow_insecure_peer,
+      .reconnect_enabled = peer != NULL,
+      .callback = on_transport_event,
+      .user_data = tctx};
   fprintf(stderr, "daemon: transport=%zu tls-group-policy=%s\n",
           ctx->num_transports,
           qlinq_tls_group_policy_name(options->tls_group_policy));

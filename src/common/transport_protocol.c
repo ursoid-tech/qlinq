@@ -101,6 +101,12 @@ static bool receive_hello(transport_conn_t *conn, const uint8_t *payload,
         hello.max_subscriptions;
   if (conn->negotiated_limits.max_udp_payload_size > hello.max_datagram_size)
     conn->negotiated_limits.max_udp_payload_size = hello.max_datagram_size;
+  /* Older peers advertised this ceiling only in HELLO. Keep native probes
+   * and packets inside that bound without rewriting their QUIC parameters. */
+  if (quicly_set_max_udp_payload_size(
+          conn->quic, (uint16_t)conn->negotiated_limits.max_udp_payload_size) !=
+      0)
+    return false;
   conn->hello_received = true;
   if (!transport_protocol_send_hello(conn))
     return false;
@@ -214,7 +220,7 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
   size_t packet_len = QLINQ_WIRE_FEC_HEADER_SIZE + repair->symbol_size;
   uint64_t admission_ns = transport_now_ns(conn->transport);
   size_t path_count = transport_publish_collect_paths(
-      conn->transport, conn, packet_len, admission_ns, native);
+      conn->transport, conn, packet_len, packet_len, admission_ns, native);
   if (path_count > TRANSPORT_POLICY_PATHS)
     path_count = TRANSPORT_POLICY_PATHS;
   for (size_t i = 0; i < path_count; i++) {
@@ -247,7 +253,7 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
         path = native[slot].quic;
     }
     if (path == SIZE_MAX)
-      path = transport_select_datagram_path(conn);
+      path = transport_select_datagram_path_for_size(conn, packet_len);
     if (path == SIZE_MAX)
       break;
     uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + QLINQ_FEC_MAX_SYMBOL_SIZE];
@@ -341,7 +347,8 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
   }
   /* Charge the request, but avoid encoding when no eligible queue has room. */
   if (indices_valid && missing_count != 0 &&
-      transport_select_datagram_path(conn) == SIZE_MAX) {
+      transport_select_datagram_path_for_size(
+          conn, QLINQ_WIRE_FEC_HEADER_SIZE + cached->symbol_size) == SIZE_MAX) {
     if (rateless && cached->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS)
       t->stats.repair_rateless_exhausted++;
     t->stats.repair_queue_failures++;
@@ -982,10 +989,11 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (hdr.path_id < TRANSPORT_MAX_QUIC_PATHS &&
       now_ns >= tconn->telemetry_reply_at_ns[hdr.path_id]) {
     tconn->telemetry_reply_at_ns[hdr.path_id] = now_ns + 10000000U;
-    size_t reply_path = transport_select_datagram_path(tconn);
+    size_t reply_path = transport_select_datagram_path_for_size(
+        tconn, QLINQ_WIRE_TELEMETRY_SIZE);
     if (reply_path != SIZE_MAX &&
         quicly_get_num_datagram_frames_path(conn, reply_path) <
-            QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY / 2) {
+            quicly_get_max_datagram_frames_path(conn, reply_path) / 2) {
       uint8_t reply[QLINQ_WIRE_TELEMETRY_SIZE];
       qlinq_wire_telemetry_t telemetry = {.path_id = hdr.path_id,
                                           .send_time_ns = hdr.send_time_ns,

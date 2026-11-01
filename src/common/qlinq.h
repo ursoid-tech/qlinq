@@ -72,7 +72,9 @@ typedef enum {
   QLINQ_CC_DEFAULT = 0,
   QLINQ_CC_RENO,
   QLINQ_CC_PICO,
-  QLINQ_CC_CUBIC
+  QLINQ_CC_CUBIC,
+  /* Value 4 is reserved for the transport's internal Cuback policy. */
+  QLINQ_CC_BBR = 5
 } qlinq_congestion_control_t;
 typedef enum {
   QLINQ_PACING_DEFAULT = 0,
@@ -127,6 +129,8 @@ typedef struct {
   size_t max_total_stream_egress_bytes;
   size_t max_reliable_record_bytes;
   size_t max_fec_record_bytes;
+  /* UDP send/receive ceiling (default 1280, range 1200..1500); native path
+   * discovery starts at 1200 and currently probes up to at most 1472 bytes. */
   size_t max_udp_payload_bytes;
   size_t max_packets_per_service;
 } qlinq_limits_t;
@@ -194,6 +198,9 @@ typedef struct {
   size_t remote_address_count;
   uint16_t port;
   uint64_t idle_timeout_ms;
+  /* Probe idle usable QUIC paths after this interval; zero disables. Native
+   * traffic and PTO recovery suppress extra probes. */
+  uint32_t path_probe_interval_ms;
   /* Incomplete FEC object idle timeout; zero selects 2,000 ms. Increase for
    * slow TDMA links so repair traffic can arrive before assembly expires. */
   uint32_t receive_object_timeout_ms;
@@ -208,6 +215,7 @@ typedef struct {
   qlinq_security_config_t security;
   qlinq_repair_mode_t repair_mode;
   qlinq_congestion_control_t congestion_control;
+  /* BBR enables pacing by default and rejects QLINQ_PACING_DISABLED. */
   qlinq_pacing_t pacing;
   qlinq_limits_t limits;
   /* exact interface allowlist for paths discovered after startup. initial
