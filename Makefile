@@ -75,6 +75,9 @@ QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/streambuf.c \
               deps/quicly/lib/cc-cubic.c \
               deps/quicly/lib/cc-pico.c \
+              deps/quicly/lib/cc-bbr.c \
+              deps/quicly/lib/cc-bbr-engine.c \
+              deps/quicly/lib/cc-bbr-sampler.c \
               deps/quicly/deps/picotls/lib/picotls.c \
               deps/quicly/deps/picotls/lib/openssl.c \
               deps/quicly/deps/picotls/lib/pembase64.c \
