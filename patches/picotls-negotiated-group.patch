@@ -1,5 +1,5 @@
 diff --git a/include/picotls.h b/include/picotls.h
-index fb81a2d..c3017a3 100644
+index fb81a2d..56551cd 100644
 --- a/include/picotls.h
 +++ b/include/picotls.h
 @@ -1756,6 +1756,13 @@ int ptls_handshake_is_complete(ptls_t *tls);
@@ -7,10 +7,10 @@ index fb81a2d..c3017a3 100644
   */
  int ptls_is_psk_handshake(ptls_t *tls);
 +/**
-+ * Returns the TLS NamedGroup used for key exchange in this handshake after local handshake completion.
-+ * Returns zero while the handshake is incomplete, for PSK-only handshakes, or when the group is unavailable (imported
-+ * connections). A ClientHello offer, an HRR request, or a group cached in a session ticket is not a negotiated result.
-+ * Applications must still check the handshake result for errors before using the connection.
++ * Returns the TLS NamedGroup used for key exchange in this handshake, once the key exchange has succeeded.
++ * Returns zero before key exchange, for PSK-only handshakes, or when the group is unavailable (imported connections).
++ * A ClientHello offer, an HRR request, or a group cached in a session ticket is not a negotiated result.
++ * The value can be available before handshake completion; applications must still check the handshake result for errors.
 + */
 +uint16_t ptls_get_negotiated_group(ptls_t *tls);
  /**
@@ -29,7 +29,7 @@ index 9a4304c..d464149 100644
      if (evpctx == NULL) {
          ret = PTLS_ERROR_LIBRARY;
 diff --git a/lib/picotls.c b/lib/picotls.c
-index e4a463d..3ebcf4c 100644
+index e4a463d..63e8189 100644
 --- a/lib/picotls.c
 +++ b/lib/picotls.c
 @@ -262,9 +262,13 @@ struct st_ptls_t {
@@ -69,7 +69,7 @@ index e4a463d..3ebcf4c 100644
  
 +uint16_t ptls_get_negotiated_group(ptls_t *tls)
 +{
-+    return ptls_handshake_is_complete(tls) ? tls->negotiated_group : 0;
++    return tls->negotiated_group;
 +}
 +
  int ptls_is_ech_handshake(ptls_t *tls, uint8_t *config_id, ptls_hpke_kem_t **kem, ptls_hpke_cipher_suite_t **cipher)
