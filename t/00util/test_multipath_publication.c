@@ -21,9 +21,9 @@ static void inject_nack(quicly_stream_t *stream, uint8_t alias,
   size_t size = QLINQ_WIRE_FRAME_HEADER_SIZE + nack_len;
   size_t offset = transport_stream_ingress_get(stream).len;
   size_t received = size;
-  assert(quicly_recvstate_update(&stream->recvstate,
-                                 stream->recvstate.data_off + offset, &received,
-                                 0, UINT64_MAX) == 0 &&
+  uint64_t absolute_offset = stream->recvstate.data_off + offset;
+  assert(quicly_recvstate_update(&stream->recvstate, &absolute_offset,
+                                 &received, 0, UINT64_MAX) == 0 &&
          received == size);
   stream->callbacks->on_receive(stream, offset, frame, size);
 }

@@ -641,28 +641,28 @@ cleanup:
 static bool receive_bytes(quicly_stream_t *stream, const uint8_t *data,
                           size_t size) {
   size_t offset = transport_stream_ingress_get(stream).len;
+  uint64_t absolute_offset = stream->recvstate.data_off + offset;
   size_t received = size;
   uint64_t max_committed =
       stream->stream_id >= 0
           ? (uint64_t)stream->_send_aux.max_stream_data_sender.committed
           : UINT64_MAX;
-  if (quicly_recvstate_update(&stream->recvstate,
-                              stream->recvstate.data_off + offset, &received, 0,
-                              max_committed) != 0 ||
+  if (quicly_recvstate_update(&stream->recvstate, &absolute_offset, &received,
+                              0, max_committed) != 0 ||
       received != size)
     return false;
   stream->callbacks->on_receive(stream, offset, data, size);
   return true;
 }
 
-static bool receive_ingress_range(quicly_stream_t *stream, size_t off,
+static bool receive_ingress_range(quicly_stream_t *stream, uint64_t off,
                                   const uint8_t *data, size_t size, bool fin) {
   size_t received = size;
   uint64_t max_committed =
       stream->stream_id >= 0
           ? (uint64_t)stream->_send_aux.max_stream_data_sender.committed
           : UINT64_MAX;
-  return quicly_recvstate_update(&stream->recvstate, off, &received, fin,
+  return quicly_recvstate_update(&stream->recvstate, &off, &received, fin,
                                  max_committed) == 0 &&
          received == size &&
          transport_stream_ingress_receive(

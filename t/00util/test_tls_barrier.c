@@ -75,7 +75,7 @@ quicly_error_t __wrap_quicly_receive(quicly_conn_t *q, struct sockaddr *dst,
   uint64_t off = inject_stream->recvstate.data_off +
                  transport_stream_ingress_get(inject_stream).len;
   assert(quicly_recvstate_update(
-             &inject_stream->recvstate, off, &count, 0,
+             &inject_stream->recvstate, &off, &count, 0,
              inject_stream->_send_aux.max_stream_data_sender.committed) == 0);
   assert(count == inject_size);
   inject_stream->callbacks->on_receive(inject_stream,
