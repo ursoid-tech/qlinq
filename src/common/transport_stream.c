@@ -1,6 +1,7 @@
 #include "transport_stream.h"
 
 #include "transport_internal.h"
+#include "transport_tls.h"
 #include "transport_wire.h"
 
 #include "quicly/streambuf.h"
@@ -331,6 +332,8 @@ bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,
   if (!stream || !stream->conn || !stream->data ||
       prefix_len > SIZE_MAX - payload_len || (prefix_len > 0 && !prefix) ||
       (payload_len > 0 && !payload))
+    return false;
+  if (!transport_tls_application_allowed(*quicly_get_data(stream->conn)))
     return false;
   size_t wire_payload_len = prefix_len + payload_len;
   if (wire_payload_len > TRANSPORT_WIRE_MAX_STREAM_PAYLOAD ||

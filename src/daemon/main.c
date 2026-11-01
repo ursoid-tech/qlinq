@@ -49,6 +49,8 @@ static void show_help(FILE *out, const char *program) {
       "  --cert FILE --key FILE      TLS identity\n"
       "  --ca FILE                   peer CA bundle\n"
       "  --auth-token TOKEN          application authentication token\n"
+      "  --tls-group-policy POLICY   classical (default), prefer-hybrid, "
+      "require-hybrid\n"
       "  --insecure-no-verify        test-only certificate bypass\n"
       "  --socket NAME               Unix data socket name\n"
       "  --track NAME                subscribe to a track (repeatable)\n"
@@ -100,6 +102,7 @@ typedef struct {
   const char *cert_file;
   const char *key_file;
   const char *ca_file;
+  qlinq_tls_group_policy_t tls_group_policy;
   bool verify_peer;
   bool allow_insecure_peer;
   const char *socket_name;
@@ -442,6 +445,9 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       options->cert_file = value;
     } else if (strcmp(arg, "--key") == 0) {
       options->key_file = value;
+    } else if (strcmp(arg, "--tls-group-policy") == 0) {
+      if (!qlinq_tls_group_policy_parse(value, &options->tls_group_policy))
+        goto invalid;
     } else if (strcmp(arg, "--ca") == 0) {
       options->ca_file = value;
     } else if (strcmp(arg, "--auth-token") == 0) {
@@ -524,12 +530,16 @@ static bool add_transport(daemon_ctx_t *ctx, const peer_options_t *peer) {
                                .cert_file = options->cert_file,
                                .key_file = options->key_file,
                                .ca_file = options->ca_file,
+                               .tls_group_policy = options->tls_group_policy,
                                .verify_peer = options->verify_peer,
                                .allow_insecure_peer =
                                    options->allow_insecure_peer,
                                .reconnect_enabled = peer != NULL,
                                .callback = on_transport_event,
                                .user_data = tctx};
+  fprintf(stderr, "daemon: transport=%zu tls-group-policy=%s\n",
+          ctx->num_transports,
+          qlinq_tls_group_policy_name(options->tls_group_policy));
   config.bind_hosts[0] = peer ? (strchr(peer->host, ':') ? "::" : "0.0.0.0")
                               : options->listen_host;
   if (peer) {

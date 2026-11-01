@@ -126,6 +126,8 @@ static bool hex_string(const char *s, size_t n) {
 
 bool tc_validate(const tc_config *c) {
   uint32_t endpoint, local, peer;
+  if (!qlinq_tls_group_policy_name(c->tls_group_policy))
+    return tc_error("invalid TLS group policy");
   if (!hex_string(c->id, 32) || !hex_string(c->token, 64) ||
       (strcmp(c->role, "listen") && strcmp(c->role, "connect")) ||
       !ipv4(c->endpoint, &endpoint) || !ipv4(c->local_ip, &local) ||
@@ -178,8 +180,14 @@ bool tc_decode(const tj_doc *d, const tj_node *obj, tc_config *c) {
   for (int i = obj->child; i >= 0; i = d->nodes[d->nodes[i].next].next)
     fields++;
   uint64_t v;
-  if (fields != 15 || !tj_u64(tj_get(d, obj, "schema"), &v) || v != 1)
+  const tj_node *policy = tj_get(d, obj, "tls_group_policy");
+  if (fields != (policy ? 16U : 15U) || !tj_u64(tj_get(d, obj, "schema"), &v) ||
+      v != 1)
     return tc_error("unsupported or incomplete profile schema");
+  if (policy &&
+      (policy->type != TJ_STRING ||
+       !qlinq_tls_group_policy_parse(policy->text, &c->tls_group_policy)))
+    return tc_error("invalid stored TLS group policy");
 #define FIELD(key)                                                             \
   if (!copy_string(c->key, sizeof(c->key), tj_string(d, obj, #key)))           \
   return tc_error("invalid field: " #key)
@@ -244,6 +252,8 @@ void tc_write(FILE *f, const tc_config *c, bool redacted) {
   FIELD(peer_ip);
   FIELD(interface);
   FIELD(mode);
+  fputs(",\"tls_group_policy\":", f);
+  tj_quote(f, qlinq_tls_group_policy_name(c->tls_group_policy));
   if (!redacted) {
     FIELD(id);
     FIELD(run_as);
@@ -443,6 +453,9 @@ int tc_init(const tc_args *a, const char *dir) {
     for (unsigned i = 0; i < 5; i++)
       sprintf(c.interface + 2 + i * 2, "%02x", digest[i]);
   }
+  if (a->tls_group_policy &&
+      !qlinq_tls_group_policy_parse(a->tls_group_policy, &c.tls_group_policy))
+    goto invalid;
   if (!copy_string(c.run_as, sizeof(c.run_as), a->run_as))
     goto invalid;
   c.uplink_count = a->uplink_count;

@@ -78,6 +78,7 @@ typedef struct {
   const char *cert_file;
   const char *key_file;
   const char *ca_file;
+  qlinq_tls_group_policy_t tls_group_policy;
   const char *input_path;
   const char *output_path;
   const char *stats_path;
@@ -167,6 +168,8 @@ static void show_help(FILE *out, const char *program) {
       "and verified peers\n"
       "  --ca FILE                   peer CA bundle\n"
       "  --auth-token TOKEN          application authentication token\n"
+      "  --tls-group-policy POLICY   classical (default), prefer-hybrid, "
+      "require-hybrid\n"
       "  --insecure-no-verify        test-only certificate bypass\n"
       "  --idle-timeout-ms MS        QUIC session idle timeout\n"
       "  --max-connections N         listener connection capacity\n"
@@ -789,6 +792,9 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       options->cert_file = value;
     } else if (strcmp(arg, "--key") == 0) {
       options->key_file = value;
+    } else if (strcmp(arg, "--tls-group-policy") == 0) {
+      if (!qlinq_tls_group_policy_parse(value, &options->tls_group_policy))
+        goto invalid;
     } else if (strcmp(arg, "--ca") == 0) {
       options->ca_file = value;
     } else if (strcmp(arg, "--auth-token") == 0) {
@@ -1284,6 +1290,7 @@ static int run_app(const options_t *options) {
   config.quic_idle_timeout_ms = options->idle_timeout_ms;
   config.cert_file = options->cert_file;
   config.key_file = options->key_file;
+  config.tls_group_policy = options->tls_group_policy;
   config.ca_file = options->ca_file;
   config.verify_peer = options->verify_peer;
   config.allow_insecure_peer = options->allow_insecure;
@@ -1318,6 +1325,8 @@ static int run_app(const options_t *options) {
     config.default_jumpstart_packets = 256;
     config.max_jumpstart_packets = 4096;
   }
+  fprintf(stderr, "qlinq-app: tls-group-policy=%s\n",
+          qlinq_tls_group_policy_name(options->tls_group_policy));
   app.transport = transport_create(&config);
   if (!app.transport) {
     fprintf(stderr, "qlinq-app: unable to create transport\n");

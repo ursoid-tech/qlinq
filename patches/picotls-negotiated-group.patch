@@ -1,0 +1,77 @@
+diff --git a/include/picotls.h b/include/picotls.h
+index fb81a2d..c3017a3 100644
+--- a/include/picotls.h
++++ b/include/picotls.h
+@@ -1756,6 +1756,13 @@ int ptls_handshake_is_complete(ptls_t *tls);
+  * returns if a PSK (or PSK-DHE) handshake was performed
+  */
+ int ptls_is_psk_handshake(ptls_t *tls);
++/**
++ * Returns the TLS NamedGroup used for key exchange in this handshake after local handshake completion.
++ * Returns zero while the handshake is incomplete, for PSK-only handshakes, or when the group is unavailable (imported
++ * connections). A ClientHello offer, an HRR request, or a group cached in a session ticket is not a negotiated result.
++ * Applications must still check the handshake result for errors before using the connection.
++ */
++uint16_t ptls_get_negotiated_group(ptls_t *tls);
+ /**
+  * return if a ECH handshake was performed, as well as optionally the kem and cipher-suite being used
+  * FIXME: this function always return false when the TLS session is exported and imported
+diff --git a/lib/openssl.c b/lib/openssl.c
+index 9a4304c..d464149 100644
+--- a/lib/openssl.c
++++ b/lib/openssl.c
+@@ -964,6 +964,7 @@ static int evp_kem_exchange(ptls_key_exchange_algorithm_t *algo, ptls_iovec_t *c
+         goto Exit;
+     }
+ 
++    EVP_PKEY_CTX_free(evpctx);
+     evpctx = EVP_PKEY_CTX_new_from_pkey(NULL, key, NULL);
+     if (evpctx == NULL) {
+         ret = PTLS_ERROR_LIBRARY;
+diff --git a/lib/picotls.c b/lib/picotls.c
+index e4a463d..3ebcf4c 100644
+--- a/lib/picotls.c
++++ b/lib/picotls.c
+@@ -262,9 +262,13 @@ struct st_ptls_t {
+      */
+     char *negotiated_protocol;
+     /**
+-     * selected key-exchange
++     * offered or selected key-exchange, also retained for session tickets
+      */
+     ptls_key_exchange_algorithm_t *key_share;
++    /**
++     * group used for key exchange in this handshake (zero for PSK-only or imported connections)
++     */
++    uint16_t negotiated_group;
+     /**
+      * selected cipher-suite
+      */
+@@ -2955,6 +2959,7 @@ static int client_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
+             assert(ecdh_secret.base == NULL);
+             goto Exit;
+         }
++        tls->negotiated_group = tls->key_share->id;
+     }
+ 
+     if ((ret = key_schedule_extract(tls->key_schedule, ecdh_secret)) != 0)
+@@ -4841,6 +4846,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
+             goto Exit;
+         }
+         tls->key_share = key_share.algorithm;
++        tls->negotiated_group = key_share.algorithm->id;
+     }
+ 
+     { /* send ServerHello */
+@@ -5706,6 +5712,11 @@ int ptls_is_psk_handshake(ptls_t *tls)
+     return tls->is_psk_handshake;
+ }
+ 
++uint16_t ptls_get_negotiated_group(ptls_t *tls)
++{
++    return ptls_handshake_is_complete(tls) ? tls->negotiated_group : 0;
++}
++
+ int ptls_is_ech_handshake(ptls_t *tls, uint8_t *config_id, ptls_hpke_kem_t **kem, ptls_hpke_cipher_suite_t **cipher)
+ {
+     if (tls->ech.state == PTLS_ECH_STATE_ACCEPTED) {

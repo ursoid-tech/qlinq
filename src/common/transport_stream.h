@@ -33,6 +33,9 @@ typedef struct {
   size_t emit_index, emit_prefix; /* vector index and bytes before it */
   size_t ingress_prefix;          /* consumed bytes awaiting compaction */
   uint64_t control_end;           /* absolute end of last control frame */
+  quicly_stream_t *tls_deferred_next;
+  bool tls_deferred;
+  size_t tls_deferred_extent;
   bool is_control;
   bool alias_bound;
   uint8_t alias;
