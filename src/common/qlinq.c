@@ -78,7 +78,6 @@ struct qlinq_context {
   pthread_t owner_thread;
   bool in_log;
   bool in_record_callback;
-  bool record_callback_delivered;
   qlinq_endpoint_t *endpoints;
   qlinq_event_node_t *event_head;
   qlinq_event_node_t *event_tail;
@@ -399,7 +398,6 @@ static bool deliver_record(qlinq_endpoint_t *endpoint, transport_conn_t *conn,
     context->in_record_callback = true;
     bool accepted = context->record_callback(context->record_user_data, &event);
     context->in_record_callback = false;
-    context->record_callback_delivered = true;
     if (!accepted) {
       increment_counter(&endpoint->record_callbacks_rejected);
       return false;
@@ -1450,7 +1448,6 @@ qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
   if (context->event_head)
     return context->last_status < 0 ? context->last_status : QLINQ_STATUS_OK;
   set_status(context, QLINQ_STATUS_OK);
-  context->record_callback_delivered = false;
 
   size_t endpoint_count = count_active_endpoints(context);
   if (endpoint_count == 0) {

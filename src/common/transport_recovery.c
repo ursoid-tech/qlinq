@@ -104,7 +104,9 @@ static void retire_recovery_through(transport_conn_t *conn, uint8_t alias,
                            : (UINT32_C(1) << (uint32_t)(distance + 1U)) - 1U;
     gap->pending_mask &= ~covered;
   }
-  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+  for (size_t i = transport_next_assembler(conn, 0);
+       i < t->limits.max_assemblers_per_connection;
+       i = transport_next_assembler(conn, i + 1)) {
     frame_assembler_t *assembler = &conn->assemblers[i];
     if (assembler->total_symbols > 0 && assembler->track_id == alias &&
         assembler->group_id == group_id &&

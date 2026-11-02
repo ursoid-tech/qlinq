@@ -212,9 +212,13 @@ static void on_transport_event(void *user_data,
         (event->track_id.flags &
          (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS))) {
       qlinq_wire_cursor_t cursor = {event->object.data, event->object.size};
-      const uint8_t *record;
-      size_t size;
-      while (qlinq_wire_next_record(&cursor, &record, &size)) {
+      while (cursor.remaining != 0) {
+        const uint8_t *record;
+        size_t size;
+        if (!qlinq_wire_next_record(&cursor, &record, &size) || size == 0) {
+          fprintf(stderr, "daemon: malformed grouped record payload\n");
+          break;
+        }
         if (!data_uds_send(ctx->data_pipe, &event->track_id, record, size,
                            event->object.priority) &&
             options->verbose)
@@ -522,7 +526,6 @@ static bool parse_options(int argc, char **argv, options_t *options) {
            "bishnc/default");
     strcpy(options->subscribe_tracks[options->num_subscribe_tracks++],
            "tund/tun0");
-    strcpy(options->subscribe_tracks[options->num_subscribe_tracks++], "");
   }
 
   return true;

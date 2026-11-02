@@ -425,19 +425,25 @@ static bool receive_packet(void *data, const qlinq_event_t *event) {
   if (receiver->fd < 0)
     return true;
   uint64_t now_ms = monotonic_ms();
-  if (receiver->coalesce &&
-      (receiver->queue->count || tun_coalesce_candidate(packet))) {
+  bool candidate = receiver->coalesce && tun_coalesce_candidate(packet);
+  if (receiver->coalesce && (receiver->queue->count || candidate)) {
     /* copy before callback returns; flush on pressure or incompatible prefix */
     if (receiver->queue->count && !flush_packets(receiver, now_ms))
       return false;
     bool incompatible = false;
+    size_t head_size = packet->size;
     if (receiver->queue->count) {
+      const tun_rx_slot_t *head =
+          &receiver->queue
+               ->slots[receiver->queue->head % TUN_RX_BATCH_CAPACITY];
       const tun_rx_slot_t *tail =
           &receiver->queue
                ->slots[(receiver->queue->head + receiver->queue->count - 1) %
                        TUN_RX_BATCH_CAPACITY];
       tun_packet_view_t previous = {.data = tail->bytes, .size = tail->size};
-      incompatible = !tun_coalesce_pair(&previous, packet);
+      head_size = head->size;
+      incompatible =
+          tail->size < head_size || !tun_coalesce_pair(&previous, packet);
     }
     if (incompatible ||
         receiver->queue->count == receiver->queue->limits.packets ||
@@ -446,8 +452,16 @@ static bool receive_packet(void *data, const qlinq_event_t *event) {
       if (!flush_packets(receiver, now_ms))
         return false;
       (void)tun_rx_batch_begin(receiver->queue);
+      head_size = packet->size;
     }
     (void)tun_rx_batch_push(receiver->queue, packet, now_ms);
+    if (!candidate || packet->size < head_size) {
+      tun_rx_batch_end(receiver->queue);
+      if (!flush_packets(receiver, now_ms))
+        return false;
+      (void)tun_rx_batch_begin(receiver->queue);
+      return true;
+    }
     return flush_packets(receiver, now_ms);
   }
   if (!flush_packets(receiver, now_ms))
@@ -546,14 +560,16 @@ static ssize_t read_transmit(tunnel_transmitter_t *tx, int fd, uint8_t *frame,
     if (tx->plan.segmented)
       tx->gso_reads++;
   }
+  bool segmented = tx->plan.segmented;
   tun_packet_result_t result =
-      tun_segment_next(&tx->plan, packet->bytes, sizeof(packet->bytes), output);
+      tun_segment_next(&tx->plan, segmented ? packet->bytes : frame,
+                       sizeof(packet->bytes), output);
   if (result.status != TUN_PACKET_OK) {
     tx->dropped += tun_segment_cancel(&tx->plan);
     errno = EBADMSG;
     return -1;
   }
-  if (tx->plan.segmented)
+  if (segmented)
     tx->gso_packets++;
   if (tx->plan.partial)
     tx->checksums++;
@@ -872,8 +888,15 @@ static int run_tunnel(const options_t *options) {
         state = "connected";
         peer_id = event.peer_id;
         fprintf(stderr, "peer %u ready\n", event.peer_id);
+      } else if (event.type == QLINQ_EVENT_SUBSCRIBER_JOINED) {
+        if (peer_id != 0 && event.peer_id == peer_id)
+          state = "connected";
       } else if (event.type == QLINQ_EVENT_PEER_DISCONNECTED ||
                  event.type == QLINQ_EVENT_SUBSCRIBER_LEFT) {
+        if (peer_id != 0 && event.peer_id != peer_id) {
+          qlinq_event_release(&event);
+          continue;
+        }
         /* do not replay an old IP packet after reconnect */
         if (event.type == QLINQ_EVENT_PEER_DISCONNECTED)
           peer_id = 0;
@@ -883,9 +906,16 @@ static int run_tunnel(const options_t *options) {
         tx.dropped += tun_segment_cancel(&tx.plan);
         tun_rx_batch_cancel(&queue);
         state = options->listen ? "listening" : "reconnecting";
-      } else if (event.type == QLINQ_EVENT_PEER_REJECTED ||
-                 event.type == QLINQ_EVENT_ERROR) {
-        state = "error";
+      } else if (event.type == QLINQ_EVENT_PEER_REJECTED) {
+        if (peer_id == 0 || event.peer_id == peer_id) {
+          peer_id = 0;
+          state = "error";
+        }
+        fprintf(stderr, "peer error: %s (status=%d)\n",
+                event.message ? event.message : "unknown", event.status);
+      } else if (event.type == QLINQ_EVENT_ERROR) {
+        if (peer_id == 0)
+          state = "error";
         fprintf(stderr, "peer error: %s (status=%d)\n",
                 event.message ? event.message : "unknown", event.status);
       }

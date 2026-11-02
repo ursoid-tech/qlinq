@@ -65,7 +65,6 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,
                                                uint64_t group_id,
                                                uint64_t object_id);
-bool transport_sent_cache_has_space(const transport_sent_cache_t *cache);
 bool transport_sent_cache_store(transport_sent_cache_t *cache,
                                 const moq_object_t *object,
                                 uint16_t total_symbols, uint16_t data_symbols,

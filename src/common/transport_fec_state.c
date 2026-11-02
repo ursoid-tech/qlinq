@@ -4,13 +4,8 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
-static uint64_t get_time_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
-}
+uint64_t transport_get_monotonic_ns(void);
 
 static size_t cache_capacity(const transport_sent_cache_t *cache) {
   return cache && cache->capacity ? cache->capacity : TRANSPORT_SENT_CACHE_SIZE;
@@ -71,10 +66,6 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
   }
   assert(remaining == 0);
   return NULL;
-}
-
-bool transport_sent_cache_has_space(const transport_sent_cache_t *cache) {
-  return cache && cache->count < cache_capacity(cache);
 }
 
 static bool source_overlaps_entry(const moq_object_t *object,
@@ -317,8 +308,8 @@ fec_t *transport_fec_cache_get(transport_fec_cache_t *cache, fec_type_t type,
     return NULL;
   cache->memory.reclaim = reclaim_codecs;
   cache->memory.context = cache;
-  uint64_t now =
-      cache->now_ns ? cache->now_ns(cache->clock_context) : get_time_ns();
+  uint64_t now = cache->now_ns ? cache->now_ns(cache->clock_context)
+                               : transport_get_monotonic_ns();
   size_t lru_index = 0;
   uint64_t oldest = UINT64_MAX;
 
@@ -326,8 +317,11 @@ fec_t *transport_fec_cache_get(transport_fec_cache_t *cache, fec_type_t type,
     transport_fec_cache_entry_t *entry = &cache->entries[i];
     if (entry->fec && entry->type == type &&
         entry->data_symbols == data_symbols &&
-        entry->parity_symbols == parity_symbols &&
-        entry->symbol_size == symbol_size) {
+        entry->symbol_size == symbol_size &&
+        (entry->parity_symbols == parity_symbols ||
+         (type == FEC_RAPTORQ &&
+          fec_set_parity_symbols(entry->fec, parity_symbols)))) {
+      entry->parity_symbols = parity_symbols;
       entry->last_used_ns = now;
       return entry->fec;
     }

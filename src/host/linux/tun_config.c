@@ -659,15 +659,20 @@ static bool route_check(const tc_config *c) {
     }
   }
   close(pipes[0]);
-  if (waitpid(pid, &status, WNOHANG) == 0) {
+  pid_t waited = waitpid(pid, &status, WNOHANG);
+  if (waited != pid) {
     /* bounded wait even when an external ip executable misbehaves */
     for (unsigned i = 0; i < 20; i++) {
-      if (waitpid(pid, &status, WNOHANG) == pid)
+      waited = waitpid(pid, &status, WNOHANG);
+      if (waited == pid)
         goto collected;
+      if (waited < 0 && errno != EINTR)
+        return false;
       usleep(10000);
     }
     kill(pid, SIGKILL);
-    waitpid(pid, &status, 0);
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
     return false;
   }
 collected:

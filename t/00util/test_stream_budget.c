@@ -1177,6 +1177,7 @@ static int checkpoint_retires_redundant_recovery(void) {
     a->group_id = i == 3 ? 4 : 3;
     a->object_id = i == 1 ? 13 : 11;
     a->total_symbols = 2;
+    transport_index_assembler(conn, a);
   }
   size_t memory = t->assembler_memory_bytes;
   uint8_t payload[QLINQ_WIRE_TRACK_CHECKPOINT_SIZE];
@@ -1199,6 +1200,7 @@ static int checkpoint_retires_redundant_recovery(void) {
   conn->assemblers[0].group_id = 3;
   conn->assemblers[0].object_id = 11;
   conn->assemblers[0].total_symbols = 2;
+  transport_index_assembler(conn, &conn->assemblers[0]);
   uint8_t end_payload[QLINQ_WIRE_TRACK_END_SIZE];
   qlinq_wire_track_end_t end = {
       .alias = 7, .group_id = 3, .final_object_id = 11};

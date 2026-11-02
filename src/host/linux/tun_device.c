@@ -261,10 +261,6 @@ int tun_alloc_vnet(char *dev, bool transmit, bool *active) {
   return tun_alloc(dev);
 }
 
-int tun_alloc_tx_offload(char *dev, bool *active) {
-  return tun_alloc_vnet(dev, true, active);
-}
-
 static unsigned vnet16(const uint8_t *p) {
   return (unsigned)p[1] << 8 | p[0];
 }

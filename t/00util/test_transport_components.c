@@ -999,12 +999,9 @@ int main(void) {
             strcmp(resolved.name, track.name) == 0,
         "subscription track lookup");
   quicly_stream_t *fake_stream = (quicly_stream_t *)(uintptr_t)1;
-  CHECK(transport_subscriptions_bind_stream(&subscriptions, 8, fake_stream),
-        "subscription stream binding");
+  transport_subscriptions_find(&subscriptions, &track)->stream = fake_stream;
   transport_subscriptions_clear_stream(&subscriptions, fake_stream);
-  CHECK(transport_subscriptions_find(&subscriptions, &track)->stream == NULL &&
-            transport_subscriptions_find(&subscriptions, &track)
-                    ->ingress_stream == NULL,
+  CHECK(transport_subscriptions_find(&subscriptions, &track)->stream == NULL,
         "subscription stream clearing");
   CHECK(transport_subscriptions_next_alias(&subscriptions, 8) == 9,
         "subscription next alias");
@@ -1135,6 +1132,13 @@ int main(void) {
             fec_decode(rateless_decoder, decode_blocks, decode_missing) &&
             decode_data_1[0] == 3 && decode_data_1[1] == 4,
         "fresh rateless repair recovers a missing source symbol");
+  CHECK(transport_fec_cache_get(&repair_fec_cache, FEC_RAPTORQ, 2, 5, 2) ==
+                rateless_decoder &&
+            repair_fec_cache.entries[1].parity_symbols == 5 &&
+            transport_fec_cache_get(&repair_fec_cache, FEC_RAPTORQ, 2, 1, 2) ==
+                rateless_decoder &&
+            repair_fec_cache.entries[1].parity_symbols == 1,
+        "raptorq cache reuses codec across parity symbol counts");
   CHECK(transport_repair_commit_rateless(rateless_cached, &repair, 2) &&
             rateless_cached->next_repair_symbol == 4,
         "rateless repair consumes only admitted ESIs");
@@ -1231,12 +1235,12 @@ int main(void) {
   }
   object.object_id = TRANSPORT_SENT_CACHE_SIZE;
   CHECK(
-      !transport_sent_cache_has_space(&bounded_cache) &&
+      !transport_sent_cache_can_store(&bounded_cache, &object, false) &&
           !transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2, false),
       "unacknowledged cache refuses overwrite");
   CHECK(transport_sent_cache_release_through(&bounded_cache, &track, 10, 127) ==
                 128 &&
-            transport_sent_cache_has_space(&bounded_cache) &&
+            transport_sent_cache_can_store(&bounded_cache, &object, false) &&
             transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2, false),
         "checkpoint release restores bounded cache capacity");
   transport_sent_cache_destroy(&bounded_cache);

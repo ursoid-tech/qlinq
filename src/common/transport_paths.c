@@ -280,22 +280,19 @@ uint64_t transport_path_budget_wait(const transport_path_budget_t *budget,
 
 bool transport_path_matches_local(const quicly_path_stats_t *stats,
                                   const struct sockaddr_storage *local) {
-  if (!stats || !local)
+  if (!stats || !local || local->ss_family != stats->local.sa.sa_family)
     return false;
   uint16_t port = local->ss_family == AF_INET
                       ? ((const struct sockaddr_in *)local)->sin_port
                       : ((const struct sockaddr_in6 *)local)->sin6_port;
-  if (transport_address_is_wildcard((const struct sockaddr *)local)) {
-    uint16_t stats_port =
-        stats->local.sa.sa_family == AF_INET
-            ? ((const struct sockaddr_in *)&stats->local.sa)->sin_port
-            : ((const struct sockaddr_in6 *)&stats->local.sa)->sin6_port;
-    return (port == 0 || port == stats_port) &&
-           (local->ss_family == stats->local.sa.sa_family);
-  }
-  if (port != 0)
-    return transport_endpoint_equal(&stats->local.sa,
-                                    (const struct sockaddr *)local);
+  uint16_t stats_port =
+      stats->local.sa.sa_family == AF_INET
+          ? ((const struct sockaddr_in *)&stats->local.sa)->sin_port
+          : ((const struct sockaddr_in6 *)&stats->local.sa)->sin6_port;
+  if (port != 0 && stats_port != 0 && port != stats_port)
+    return false;
+  if (transport_address_is_wildcard((const struct sockaddr *)local))
+    return true;
   return transport_address_equal(&stats->local.sa,
                                  (const struct sockaddr *)local);
 }

@@ -187,7 +187,8 @@ bool tj_parse(tj_doc *d, const char *text) {
   size_t length = strnlen(text, TJ_MAX_BYTES + 1);
   if (length > TJ_MAX_BYTES)
     return false;
-  memmove(d->input, text, length + 1);
+  if (d->input != text)
+    memmove(d->input, text, length + 1);
   d->pos = d->count = d->used = 0;
   if (value(d, 0) != 0)
     return false;

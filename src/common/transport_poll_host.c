@@ -541,14 +541,17 @@ void transport_tick(transport_t *t) {
   transport_tick_ready(t, NULL, 0);
 }
 int transport_enable_qlog(const char *socket_path) {
+  struct sockaddr_un addr;
+  if (!socket_path || strlen(socket_path) >= sizeof(addr.sun_path))
+    return -1;
+
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0)
     return -1;
 
-  struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
-  strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+  memcpy(addr.sun_path, socket_path, strlen(socket_path) + 1);
 
   if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
     CLOSE_SOCKET(fd);
@@ -562,10 +565,25 @@ int transport_enable_qlog(const char *socket_path) {
     return -1;
   }
 
+  int quicly_fd = dup(fd);
+  if (quicly_fd < 0 || !set_fd_nonblocking(quicly_fd)) {
+    if (quicly_fd >= 0)
+      CLOSE_SOCKET(quicly_fd);
+    CLOSE_SOCKET(fd);
+    return -1;
+  }
+
   /* enable picotls and quicly tracing, sample ratio 1.0 (all logs), write to fd
    */
-  ptls_log_add_fd(fd, 1.0, NULL, NULL, NULL, 0);
-  ptls_log_add_fd(fd, 1.0, NULL, NULL, NULL, 1);
+  if (ptls_log_add_fd(fd, 1.0, NULL, NULL, NULL, 0) != 0) {
+    CLOSE_SOCKET(quicly_fd);
+    CLOSE_SOCKET(fd);
+    return -1;
+  }
+  if (ptls_log_add_fd(quicly_fd, 1.0, NULL, NULL, NULL, 1) != 0) {
+    CLOSE_SOCKET(quicly_fd);
+    return -1;
+  }
   return 0;
 }
 size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,

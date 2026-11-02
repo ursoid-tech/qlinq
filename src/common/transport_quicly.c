@@ -362,7 +362,7 @@ size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
     if (!owned)
       continue;
     size_t queued = quicly_get_num_datagram_frames_path(conn->quic, path);
-    size_t limit = transport_datagram_payload_limit(conn, path);
+    size_t limit = quicly_get_datagram_payload_limit(conn->quic, path);
     if (limit != 0 && payload_size <= limit &&
         (queued < best_queued ||
          (queued == best_queued && stats.rtt_smoothed < best_rtt))) {
@@ -404,17 +404,9 @@ static int qlinq_path_is_eligible(quicly_path_scheduler_t *scheduler,
       quicly_get_path_tuple(quic, path_index, &tuple) != 0)
     return 0;
   transport_t *t = conn->transport;
+  quicly_path_stats_t stats = {.local = tuple.address.local};
   for (size_t i = 0; i < t->socket_count; i++)
-    if (transport_endpoint_equal(
-            (const struct sockaddr *)&t->sockets[i].local_addr,
-            &tuple.address.local.sa) ||
-        transport_address_equal(
-            (const struct sockaddr *)&t->sockets[i].local_addr,
-            &tuple.address.local.sa) ||
-        (t->sockets[i].local_addr.ss_family ==
-             tuple.address.local.sa.sa_family &&
-         transport_address_is_wildcard(
-             (const struct sockaddr *)&t->sockets[i].local_addr)))
+    if (transport_path_matches_local(&stats, &t->sockets[i].local_addr))
       return 1;
   return 0;
 }
@@ -448,17 +440,6 @@ static void refresh_scheduler_paths(transport_conn_t *conn) {
                                        &t->sockets[physical].local_addr)) {
         matched = physical;
         break;
-      }
-    }
-    if (matched == SIZE_MAX) {
-      for (size_t physical = 0; physical < t->socket_count; physical++) {
-        if (t->sockets[physical].local_addr.ss_family ==
-                stats.local.sa.sa_family &&
-            transport_address_is_wildcard(
-                (const struct sockaddr *)&t->sockets[physical].local_addr)) {
-          matched = physical;
-          break;
-        }
       }
     }
     if (matched != SIZE_MAX) {
@@ -1809,27 +1790,6 @@ static void service_connections(transport_t *t, uint64_t now) {
             }
           }
         }
-        if (out_fd_index == SIZE_MAX) {
-          for (size_t k = 0; k < t->socket_count; k++) {
-            if (transport_address_equal(
-                    (const struct sockaddr *)&t->sockets[k].local_addr,
-                    &src.sa)) {
-              out_fd_index = k;
-              break;
-            }
-          }
-        }
-
-        if (out_fd_index == SIZE_MAX) {
-          for (size_t k = 0; k < t->socket_count; k++) {
-            if (t->sockets[k].local_addr.ss_family == src.sa.sa_family &&
-                transport_address_is_wildcard(
-                    (const struct sockaddr *)&t->sockets[k].local_addr)) {
-              out_fd_index = k;
-              break;
-            }
-          }
-        }
 
         if (out_fd_index == SIZE_MAX) {
           t->stats.udp_send_errors += num_dgrams;
@@ -2057,7 +2017,9 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
                                           alias, &subscribed_track))
     return false;
 
-  for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++)
+  for (size_t i = transport_next_assembler(conn, 0);
+       i < t->limits.max_assemblers_per_connection;
+       i = transport_next_assembler(conn, i + 1))
     if (conn->assemblers[i].total_symbols &&
         conn->assemblers[i].track_id == alias)
       transport_release_assembler(t, &conn->assemblers[i]);
@@ -2541,6 +2503,8 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
   if (active_count == 0)
     return true; /* no peers means data is dropped anyway, so it's "ready" */
 
+  bool matched_subscription = false;
+  bool mismatched_subscription = false;
   for (size_t c = 0; c < active_count; c++) {
     transport_conn_t *conn = transport_connection_at(t, c);
     if (!conn || !conn->quic ||
@@ -2549,12 +2513,15 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
 
     if (!t->is_server && (!conn->authenticated || !conn->protocol_ready))
       return false;
-    if (!transport_publish_recipient_eligible(t, conn, track_id))
-      continue;
     const track_subscription_t *subscription =
         transport_subscriptions_find_const(&conn->send_subscriptions, track_id);
-    if (subscription && subscription->track_id.flags != track_id->flags)
-      return false;
+    if (subscription && subscription->track_id.flags != track_id->flags) {
+      mismatched_subscription = true;
+      continue;
+    }
+    if (!transport_publish_recipient_eligible(t, conn, track_id))
+      continue;
+    matched_subscription = true;
 
     if (profile.reliable) {
       quicly_stream_t *stream = subscription ? subscription->stream : NULL;
@@ -2584,7 +2551,7 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
               &stats, &t->sockets[physical].local_addr);
         size_t capacity = quicly_get_max_datagram_frames_path(conn->quic, path);
         if (owned &&
-            transport_datagram_payload_limit(conn, path) >
+            quicly_get_datagram_payload_limit(conn->quic, path) >
                 QLINQ_WIRE_FEC_HEADER_SIZE &&
             quicly_get_num_datagram_frames_path(conn->quic, path) <
                 capacity - capacity / 4 &&
@@ -2598,7 +2565,7 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
     }
   }
 
-  return true;
+  return !(mismatched_subscription && !matched_subscription);
 }
 
 int64_t transport_get_first_timeout(transport_t *t) {
@@ -2675,12 +2642,13 @@ bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
   size_t count = transport_connection_count(t);
   for (size_t i = 0; i < count; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
-    uint8_t alias;
     if (conn && conn->authenticated && conn->quic &&
-        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
-        transport_subscriptions_find_alias(&conn->send_subscriptions, track,
-                                           &alias) == 0)
-      stats->subscribers++;
+        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING) {
+      const track_subscription_t *sub =
+          transport_subscriptions_find_const(&conn->send_subscriptions, track);
+      if (sub && sub->track_id.flags == track->flags)
+        stats->subscribers++;
+    }
   }
   return true;
 }

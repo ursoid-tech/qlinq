@@ -170,7 +170,6 @@ void transport_subscriptions_remove(transport_subscription_table_t *table,
       if (entry->stream)
         quicly_streambuf_egress_shutdown(entry->stream);
       entry->stream = NULL;
-      entry->ingress_stream = NULL;
       return;
     }
   }
@@ -182,28 +181,9 @@ void transport_subscriptions_clear_stream(transport_subscription_table_t *table,
     return;
   for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
-    if (entry->active) {
-      if (entry->stream == stream)
-        entry->stream = NULL;
-      if (entry->ingress_stream == stream)
-        entry->ingress_stream = NULL;
-    }
+    if (entry->active && entry->stream == stream)
+      entry->stream = NULL;
   }
-}
-
-bool transport_subscriptions_bind_stream(transport_subscription_table_t *table,
-                                         uint8_t alias,
-                                         quicly_stream_t *stream) {
-  if (!table || !stream)
-    return false;
-  for (size_t i = 0; i < table->capacity; i++) {
-    track_subscription_t *entry = &table->entries[i];
-    if (entry->active && entry->alias == alias) {
-      entry->ingress_stream = stream;
-      return true;
-    }
-  }
-  return false;
 }
 
 int transport_subscriptions_next_alias(

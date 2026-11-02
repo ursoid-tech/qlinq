@@ -21,16 +21,28 @@ static transport_publish_result_t publish_object(transport_t *t,
                                                  size_t fec_limit,
                                                  bool grouped);
 
+/* Recovery membership must match the publication mode even while a peer is
+ * closing and still owes acknowledgements for retained objects. */
+static const track_subscription_t *
+matching_send_subscription(const transport_conn_t *conn,
+                           const moq_track_id_t *track) {
+  if (!conn || !track)
+    return NULL;
+  const track_subscription_t *sub =
+      transport_subscriptions_find_const(&conn->send_subscriptions, track);
+  return sub && sub->track_id.flags == track->flags ? sub : NULL;
+}
+
 bool transport_publish_recipient_eligible(const transport_t *t,
                                           const transport_conn_t *conn,
                                           const moq_track_id_t *track) {
-  return t && conn && track && conn->quic && conn->protocol_ready &&
-         conn->authenticated &&
-         (t->tls_group_policy == QLINQ_TLS_GROUP_CLASSICAL ||
-          conn->tls.policy_accepted) &&
-         quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING &&
-         (!t->is_server ||
-          transport_subscriptions_contains(&conn->send_subscriptions, track));
+  if (!t || !conn || !track || !conn->quic || !conn->protocol_ready ||
+      !conn->authenticated ||
+      (t->tls_group_policy != QLINQ_TLS_GROUP_CLASSICAL &&
+       !conn->tls.policy_accepted) ||
+      quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+    return false;
+  return matching_send_subscription(conn, track) != NULL;
 }
 
 /* A publication can become ineligible between grouped flushes. Preserve the
@@ -84,17 +96,24 @@ static bool publication_valid(transport_t *t, const moq_object_t *obj) {
       (obj->size > 0 && !obj->data))
     return false;
 
+  bool matched = false;
+  bool mismatched = false;
   size_t recipients = transport_connection_count(t);
   for (size_t i = 0; i < recipients; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
-    if (!transport_publish_recipient_eligible(t, conn, &obj->track_id))
+    if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
     const track_subscription_t *sub = transport_subscriptions_find_const(
         &conn->send_subscriptions, &obj->track_id);
-    if (sub && sub->track_id.flags != obj->track_id.flags)
-      return false;
+    if (!sub)
+      continue;
+    if (sub->track_id.flags == obj->track_id.flags)
+      matched = true;
+    else
+      mismatched = true;
   }
-  return true;
+  return !(mismatched && !matched);
 }
 
 static size_t publication_fec_limit(const transport_t *t,
@@ -153,7 +172,7 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
            health.state == QUICLY_PATH_SUSPECT))
         continue;
       queued = quicly_get_num_datagram_frames_path(conn->quic, native);
-      size_t limit = transport_datagram_payload_limit(conn, native);
+      size_t limit = quicly_get_datagram_payload_limit(conn->quic, native);
       if (limit == 0 || limit < payload_bytes)
         continue;
       mapped = native;
@@ -436,9 +455,9 @@ static bool encode_symbols(transport_t *t, const moq_object_t *obj,
       data_blocks[i] = transport_arena_alloc(&t->arena, symbol_size);
       if (!data_blocks[i])
         return false;
-      memset(data_blocks[i], 0, symbol_size);
       if (chunk > 0)
         memcpy(data_blocks[i], obj->data + offset, chunk);
+      memset(data_blocks[i] + chunk, 0, symbol_size - chunk);
     }
   }
 
@@ -475,6 +494,11 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                                          &obj->track_id, &alias) != 0)
     return TRANSPORT_PUBLISH_NO_RECIPIENTS;
 
+  uint8_t *pkt_buf = transport_arena_alloc(
+      &t->arena, QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size);
+  if (!pkt_buf)
+    return TRANSPORT_PUBLISH_ERROR;
+
   size_t queued = 0;
   for (size_t s = 0; s < total_symbols; s++) {
     size_t scheduled =
@@ -500,9 +524,8 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     if (payload_size == 0)
       return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
     size_t pkt_len = QLINQ_WIRE_FEC_HEADER_SIZE + payload_size;
-    uint8_t *pkt_buf = transport_arena_alloc(&t->arena, pkt_len);
-    if (!pkt_buf || qlinq_wire_encode_fec_header(pkt_buf, pkt_len, &header) !=
-                        QLINQ_WIRE_OK)
+    if (qlinq_wire_encode_fec_header(pkt_buf, pkt_len, &header) !=
+        QLINQ_WIRE_OK)
       return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
     const uint8_t *symbol =
         s < data_symbols ? symbols->data[s] : symbols->parity[s - data_symbols];
@@ -519,12 +542,12 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
   return TRANSPORT_PUBLISH_DELIVERED;
 }
 
-static transport_publish_result_t
-publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
-                         const moq_object_t *obj,
-                         const transport_track_profile_t *profile,
-                         size_t symbol_size, size_t estimate_symbol_size,
-                         size_t data_symbols, uint16_t *sent_total_symbols) {
+static transport_publish_result_t publish_datagram_to_conn(
+    transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
+    const transport_track_profile_t *profile, size_t symbol_size,
+    size_t estimate_symbol_size, size_t data_symbols,
+    publication_symbols_t *cached, size_t *cached_total_symbols,
+    uint16_t *sent_total_symbols) {
   publication_plan_t plan = {.symbol_size = symbol_size,
                              .estimate_symbol_size = estimate_symbol_size,
                              .data_symbols = data_symbols};
@@ -535,11 +558,19 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
   if (sent_total_symbols)
     *sent_total_symbols = (uint16_t)plan.total_symbols;
 
-  publication_symbols_t symbols;
-  result = encode_symbols(t, obj, profile, &plan, &symbols)
-               ? enqueue_symbols(t, conn, obj, &plan, &symbols)
-               : TRANSPORT_PUBLISH_ERROR;
-  transport_arena_reset(&t->arena);
+  bool can_reuse =
+      *cached_total_symbols != 0 &&
+      (*cached_total_symbols == plan.total_symbols ||
+       (profile->fec_rateless && *cached_total_symbols >= plan.total_symbols));
+  if (!can_reuse) {
+    transport_arena_reset(&t->arena);
+    if (!encode_symbols(t, obj, profile, &plan, cached)) {
+      *cached_total_symbols = 0;
+      return TRANSPORT_PUBLISH_ERROR;
+    }
+    *cached_total_symbols = plan.total_symbols;
+  }
+  result = enqueue_symbols(t, conn, obj, &plan, cached);
   if (result == TRANSPORT_PUBLISH_DELIVERED)
     conn->admission_retry_at_ns = 0;
   return result;
@@ -592,16 +623,16 @@ static void release_acked_checkpoints(transport_t *t,
   size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
-    uint8_t alias = 0;
-    if (!conn || transport_subscriptions_find_alias(&conn->send_subscriptions,
-                                                    track_id, &alias) != 0)
+    const track_subscription_t *sub =
+        matching_send_subscription(conn, track_id);
+    if (!sub)
       continue;
     if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0) {
       found_legacy_member = true;
       continue;
     }
     transport_checkpoint_ack_state_t *state =
-        transport_checkpoint_ack(conn, alias);
+        transport_checkpoint_ack(conn, sub->alias);
     if (!state->participating)
       continue;
     found_capable_member = true;
@@ -744,14 +775,14 @@ static bool checkpoint_cache_is_protected(transport_t *t,
   size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
-    uint8_t alias = 0;
-    if (!conn || transport_subscriptions_find_alias(&conn->send_subscriptions,
-                                                    track_id, &alias) != 0)
+    const track_subscription_t *sub =
+        matching_send_subscription(conn, track_id);
+    if (!sub)
       continue;
     if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0)
       return false;
     const transport_checkpoint_ack_state_t *ack =
-        transport_checkpoint_ack(conn, alias);
+        transport_checkpoint_ack(conn, sub->alias);
     if (ack->participating)
       found = true;
   }
@@ -802,14 +833,14 @@ static bool emit_rolling_checkpoint(transport_t *t,
   size_t active_count = transport_connection_count(t);
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
-    uint8_t alias = 0;
-    if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
+    const track_subscription_t *sub =
+        matching_send_subscription(conn, &track->track_id);
+    if (!sub || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
         !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING ||
-        (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
-        transport_subscriptions_find_alias(&conn->send_subscriptions,
-                                           &track->track_id, &alias) != 0)
+        (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0)
       continue;
+    uint8_t alias = sub->alias;
     transport_checkpoint_ack_state_t *ack =
         transport_checkpoint_ack(conn, alias);
     if (!ack->participating)
@@ -945,18 +976,8 @@ static bool publication_needs_group(transport_t *t, const moq_object_t *obj) {
   size_t count = transport_connection_count(t);
   for (size_t i = 0; i < count; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
-    if (!conn || !conn->protocol_ready || !conn->authenticated ||
-        (t->is_server &&
-         !transport_publish_recipient_eligible(t, conn, &obj->track_id)))
-      continue;
-    const track_subscription_t *sub = transport_subscriptions_find_const(
-        &conn->send_subscriptions, &obj->track_id);
-    if (sub) {
-      transport_track_profile_t profile =
-          transport_track_profile(&sub->track_id);
-      if (profile.fec_enabled || profile.fec_rateless)
-        return true;
-    }
+    if (transport_publish_recipient_eligible(t, conn, &obj->track_id))
+      return true;
   }
   return false;
 }
@@ -1153,6 +1174,8 @@ static transport_publish_result_t publish_object(transport_t *t,
   uint16_t maximum_sent_symbols = (uint16_t)data_symbols;
   bool partially_queued = false;
   transport_publish_result_t failure = TRANSPORT_PUBLISH_ERROR;
+  publication_symbols_t cached_symbols = {0};
+  size_t cached_total_symbols = 0;
 
   for (size_t c = 0; c < active_count; c++) {
     transport_conn_t *conn = transport_connection_at(t, c);
@@ -1170,7 +1193,7 @@ static transport_publish_result_t publish_object(transport_t *t,
     uint16_t sent_symbols = 0;
     transport_publish_result_t result = publish_datagram_to_conn(
         t, conn, obj, &profile, symbol_size, estimate_symbol_size, data_symbols,
-        &sent_symbols);
+        &cached_symbols, &cached_total_symbols, &sent_symbols);
     if (sent_symbols > maximum_sent_symbols)
       maximum_sent_symbols = sent_symbols;
     if (result == TRANSPORT_PUBLISH_DELIVERED) {
@@ -1186,6 +1209,7 @@ static transport_publish_result_t publish_object(transport_t *t,
         failure = TRANSPORT_PUBLISH_BACKPRESSURE;
     }
   }
+  transport_arena_reset(&t->arena);
 
   if ((delivered > 0 || partially_queued) && grouped)
     t->pending_group.symbol_size = symbol_size;
@@ -1214,8 +1238,15 @@ static transport_publish_result_t publish_record(transport_t *t,
   if (!publication_valid(t, obj))
     return TRANSPORT_PUBLISH_INVALID;
   size_t fec_limit = publication_fec_limit(t, &obj->track_id);
-  if (obj->track_id.type == MOQ_TRACK_DATA && publication_needs_group(t, obj))
-    return group_record(t, obj, fec_limit);
+  transport_track_profile_t profile = transport_track_profile(&obj->track_id);
+  if (obj->track_id.type == MOQ_TRACK_DATA && !profile.reliable &&
+      (profile.fec_enabled || profile.fec_rateless)) {
+    if (obj->size == 0 || obj->size > TRANSPORT_MAX_FEC_RECORD_SIZE ||
+        fec_limit < 2U || obj->size > fec_limit - 2U)
+      return TRANSPORT_PUBLISH_INVALID;
+    if (publication_needs_group(t, obj))
+      return group_record(t, obj, fec_limit);
+  }
   return publish_object(t, obj, fec_limit, false);
 }
 
@@ -1276,14 +1307,13 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
   bool succeeded = true;
   for (size_t i = 0; i < active_count; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);
-    if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
+    const track_subscription_t *sub =
+        matching_send_subscription(conn, &track_id);
+    if (!sub || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
         !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
-    uint8_t alias = 0;
-    if (transport_subscriptions_find_alias(&conn->send_subscriptions, &track_id,
-                                           &alias) != 0)
-      continue;
+    uint8_t alias = sub->alias;
     found = true;
     if (transport_stream_write_track_end_frame(conn->stream, alias, 0,
                                                final_object_id)) {

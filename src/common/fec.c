@@ -29,6 +29,7 @@ struct fec_t {
   uint8_t *rq_D;
   uint32_t *rq_dropped_esi;
   uint32_t *rq_repair_esi;
+  size_t rq_repair_capacity;
   struct nanorq_core_mem_reqs rq_capacity;
 };
 
@@ -213,6 +214,7 @@ fec_t *fec_create_bounded(fec_type_t type, size_t data_symbols,
     }
     f->rq_dropped_esi = malloc(data_symbols * sizeof(uint32_t));
     f->rq_repair_esi = malloc(parity_symbols * sizeof(uint32_t));
+    f->rq_repair_capacity = parity_symbols;
 
     if (!f->rq_dropped_esi || !f->rq_repair_esi) {
       if (budget)
@@ -225,16 +227,44 @@ fec_t *fec_create_bounded(fec_type_t type, size_t data_symbols,
   return f;
 }
 
+bool fec_set_parity_symbols(fec_t *f, size_t parity_symbols) {
+  if (!f || f->type != FEC_RAPTORQ || parity_symbols == 0 ||
+      f->data_symbols > SIZE_MAX - parity_symbols ||
+      f->data_symbols + parity_symbols > UINT32_MAX ||
+      parity_symbols > SIZE_MAX / f->symbol_size ||
+      parity_symbols > SIZE_MAX / sizeof(uint32_t) ||
+      parity_symbols > UINT32_MAX)
+    return false;
+  if (parity_symbols <= f->rq_repair_capacity) {
+    f->parity_symbols = parity_symbols;
+    return true;
+  }
+  size_t previous_bytes = f->rq_repair_capacity * sizeof(uint32_t);
+  size_t replacement_bytes = parity_symbols * sizeof(uint32_t);
+  /* Keep the old geometry usable if growth fails, while accounting for both
+   * repair arrays during replacement. */
+  if (!memory_take(f->budget, replacement_bytes, f))
+    return false;
+  uint32_t *repairs = malloc(replacement_bytes);
+  if (!repairs) {
+    if (f->budget)
+      f->budget->refusals++;
+    memory_return(f->budget, replacement_bytes);
+    return false;
+  }
+  free(f->rq_repair_esi);
+  memory_return(f->budget, previous_bytes);
+  f->rq_repair_esi = repairs;
+  f->rq_repair_capacity = parity_symbols;
+  f->parity_symbols = parity_symbols;
+  f->memory_bytes += replacement_bytes - previous_bytes;
+  return true;
+}
+
 fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
                      size_t parity_symbols, size_t symbol_size) {
   return fec_create_bounded(type, data_symbols, parity_symbols, symbol_size,
                             NULL);
-}
-
-fec_t *fec_create(size_t data_symbols, size_t parity_symbols,
-                  size_t symbol_size) {
-  return fec_create_ex(FEC_REED_SOLOMON, data_symbols, parity_symbols,
-                       symbol_size);
 }
 
 void fec_destroy(fec_t *f) {

@@ -494,21 +494,22 @@ bool app_xfer_receive(app_xfer_t *x, const void *data, size_t size) {
     pthread_mutex_unlock(&x->mutex);
     return true;
   }
-  while (x->connected && !x->failed && !x->done &&
+  bool valid = p != NULL && size >= X_HEADER && size <= X_HEADER + X_PAYLOAD &&
+               memcmp(p, "QXF1", 4) == 0 && p[5] == 0 && p[6] == 0 && p[7] == 0;
+  /* bypass queue for progress updates during large file hashing */
+  if (valid && x->connected && !x->failed && p[4] == X_PROGRESS &&
+      size == X_HEADER) {
+    pthread_mutex_unlock(&x->mutex);
+    return true;
+  }
+  while (valid && x->connected && !x->failed && !x->done && !x->stopping &&
          (size > X_QUEUE_BYTES - x->input.bytes ||
           x->input.count >= X_QUEUE_RECORDS))
     pthread_cond_wait(&x->changed, &x->mutex);
 
-  bool ok = x->connected && !x->failed && size >= X_HEADER &&
-            size <= X_HEADER + X_PAYLOAD && memcmp(p, "QXF1", 4) == 0 &&
-            p[5] == 0 && p[6] == 0 && p[7] == 0 &&
+  bool ok = valid && x->connected && !x->failed && !x->stopping &&
             size <= X_QUEUE_BYTES - x->input.bytes &&
             x->input.count < X_QUEUE_RECORDS;
-  /* bypass queue for progress updates during large file hashing */
-  if (ok && p[4] == X_PROGRESS && size == X_HEADER) {
-    pthread_mutex_unlock(&x->mutex);
-    return true;
-  }
   if (ok) {
     message_t *m = malloc(sizeof(*m) + size);
     if (m) {

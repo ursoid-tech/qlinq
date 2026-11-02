@@ -108,19 +108,16 @@ bool tun_segment_prepare(tun_segment_t *plan, const tun_packet_config_t *config,
         (offload->checksum_start != decoded.tcp ||
          offload->checksum_offset != (protocol == 6 ? 16U : 6U)))
       return false;
-    if (decoded.segmented) {
-      unsigned kind = offload->gso_type & ~TUN_GSO_ECN;
-      if (protocol != 6 || !decoded.partial ||
-          (kind != TUN_GSO_TCP4 && kind != TUN_GSO_TCP6) ||
-          packet.version != (kind == TUN_GSO_TCP4 ? 4 : 6) ||
-          (packet.data[decoded.tcp + 13] & 6U) ||
-          decoded.header >= packet.size ||
-          (offload->header_length && offload->header_length < decoded.header) ||
-          offload->header_length > packet.size || !offload->gso_size ||
-          decoded.header > limit || offload->gso_size > limit - decoded.header)
-        return false;
-      decoded.segment = offload->gso_size;
-    }
+    unsigned kind = offload->gso_type & ~TUN_GSO_ECN;
+    if (protocol != 6 || !decoded.partial ||
+        (kind != TUN_GSO_TCP4 && kind != TUN_GSO_TCP6) ||
+        packet.version != (kind == TUN_GSO_TCP4 ? 4 : 6) ||
+        (packet.data[decoded.tcp + 13] & 6U) || decoded.header >= packet.size ||
+        (offload->header_length && offload->header_length < decoded.header) ||
+        offload->header_length > packet.size || !offload->gso_size ||
+        decoded.header > limit || offload->gso_size > limit - decoded.header)
+      return false;
+    decoded.segment = offload->gso_size;
   }
   *plan = decoded;
   return true;
@@ -156,7 +153,8 @@ tun_packet_result_t tun_segment_next(tun_segment_t *plan, void *storage,
   uint8_t *out = storage;
   const uint8_t *p = plan->data;
   if (!plan->segmented) {
-    memcpy(out, p, size);
+    if (out != p)
+      memcpy(out, p, size);
     if (plan->partial) {
       unsigned check = (~fold(sum(out + plan->tcp, size - plan->tcp))) & 65535U;
       if ((plan->checksum_field - plan->tcp) & 1U)

@@ -90,7 +90,7 @@ static int is_iface_allowed(const char *name) {
   /* Linux / Generic */
   if (strcmp(name, "lo") == 0 || strncmp(name, "lo:", 3) == 0)
     return 0;
-  if (strncmp(name, "tun", 3) == 0)
+  if (strncmp(name, "tun", 3) == 0 || strncmp(name, "ql", 2) == 0)
     return 0;
   if (strncmp(name, "tap", 3) == 0)
     return 0;

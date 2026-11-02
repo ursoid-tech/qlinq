@@ -36,13 +36,12 @@ typedef struct fec_memory_budget_t {
 fec_t *fec_create_bounded(fec_type_t type, size_t data_symbols,
                           size_t parity_symbols, size_t symbol_size,
                           fec_memory_budget_t *budget);
+bool fec_set_parity_symbols(fec_t *fec, size_t parity_symbols);
 size_t fec_memory_usage(const fec_t *fec);
 
 /* create a forward error correction instance */
 fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
                      size_t parity_symbols, size_t symbol_size);
-fec_t *fec_create(size_t data_symbols, size_t parity_symbols,
-                  size_t symbol_size);
 void fec_destroy(fec_t *f);
 
 /* encode data symbols and output parity symbols */

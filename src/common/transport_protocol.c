@@ -177,6 +177,16 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
       return close_protocol_error(conn,
                                   "protocol error: track alias collision");
     }
+    const track_subscription_t *existing = transport_subscriptions_find_const(
+        &conn->send_subscriptions, &parsed_track);
+    bool already_same_alias = existing && existing->active &&
+                              existing->track_id.flags == flags &&
+                              existing->alias == alias;
+    if (existing && existing->active && existing->track_id.flags == flags &&
+        existing->alias != alias) {
+      transport_publish_checkpoint_member_removed(t, conn, &parsed_track,
+                                                  existing->alias);
+    }
     quicly_debug_printf(
         conn->quic,
         "Subscription mapping: track '%s' (type %d) mapped to alias %d",
@@ -189,7 +199,8 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
                    "protocol error: too many tracks");
       return false;
     }
-    transport_publish_checkpoint_member_added(t, conn, &parsed_track, alias);
+    if (!already_same_alias)
+      transport_publish_checkpoint_member_added(t, conn, &parsed_track, alias);
   } else if (type == QLINQ_WIRE_UNSUBSCRIBE) {
     transport_publish_checkpoint_member_removed(t, conn, &parsed_track, alias);
     transport_subscriptions_remove(&conn->send_subscriptions,
@@ -608,7 +619,6 @@ static void on_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
     transport_stream_ctx_t *ctx = stream->data;
     if (ctx)
       release_deferred(conn, stream);
-    transport_subscriptions_clear_stream(&conn->receive_subscriptions, stream);
     transport_subscriptions_clear_stream(&conn->send_subscriptions, stream);
   }
   transport_stream_destroy(stream, err);
@@ -670,12 +680,6 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
     if (!ctx->alias_bound) {
       ctx->alias = alias;
       ctx->alias_bound = true;
-      if (transport_subscriptions_bind_stream(&conn->receive_subscriptions,
-                                              alias, stream))
-        quicly_debug_printf(conn->quic,
-                            "Mapped incoming QUIC Stream %" PRIu64
-                            " to MoQ track alias %d",
-                            stream->stream_id, alias);
     }
 
     moq_track_id_t resolved_track = {0};
@@ -1029,7 +1033,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       transport_find_assembler(tconn, track_id, group_id, object_id);
   if (asm_slot && (asm_slot->symbol_size != symbol_size ||
                    asm_slot->data_symbols != data_symbols ||
-                   asm_slot->original_size != original_size))
+                   asm_slot->original_size != original_size ||
+                   (!rateless && asm_slot->total_symbols != total_symbols)))
     goto malformed_datagram;
 
   if (!asm_slot) {
@@ -1057,17 +1062,22 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot = &tconn->assemblers[tconn->assembler_index];
     tconn->assembler_index = (tconn->assembler_index + 1) % assembler_limit;
 
+    transport_unindex_assembler(asm_slot);
     if (asm_slot->total_symbols > 0) {
-      moq_track_id_t resolved_track;
+      uint8_t evicted_alias = asm_slot->track_id;
+      uint64_t evicted_group = asm_slot->group_id;
+      uint64_t evicted_object = asm_slot->object_id;
+      asm_slot->total_symbols = 0;
+      moq_track_id_t evicted_track;
       if (transport_subscriptions_find_by_alias(&tconn->receive_subscriptions,
-                                                asm_slot->track_id,
-                                                &resolved_track) == 0) {
+                                                evicted_alias,
+                                                &evicted_track) == 0) {
         transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
                                 .conn = tconn,
-                                .track_id = resolved_track,
-                                .object = {.track_id = resolved_track,
-                                           .group_id = asm_slot->group_id,
-                                           .object_id = asm_slot->object_id}};
+                                .track_id = evicted_track,
+                                .object = {.track_id = evicted_track,
+                                           .group_id = evicted_group,
+                                           .object_id = evicted_object}};
         t->stats.fec_objects_lost++;
         transport_emit_event(tconn->transport, &ev);
         /* A loss callback may unsubscribe and reuse this alias. Never retain
@@ -1076,13 +1086,14 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
             &tconn->receive_subscriptions, track_id);
         if (!subscription_state ||
             subscription_state->generation != generation ||
-            quicly_get_state(conn) >= QUICLY_STATE_CLOSING)
+            quicly_get_state(conn) >= QUICLY_STATE_CLOSING) {
+          transport_release_assembler(t, asm_slot);
           return;
+        }
         object_state = &subscription_state->object_gap;
       }
     }
 
-    transport_unindex_assembler(asm_slot);
     if (!asm_slot->buffers || asm_slot->capacity_symbols < total_symbols ||
         asm_slot->capacity_symbol_size < symbol_size) {
       transport_release_assembler(t, asm_slot);
@@ -1109,7 +1120,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     transport_index_assembler(tconn, asm_slot);
   }
 
-  if (total_symbols > asm_slot->total_symbols) {
+  if (rateless && total_symbols > asm_slot->total_symbols) {
     if (!transport_grow_assembler(t, asm_slot, total_symbols, symbol_size)) {
       return;
     }

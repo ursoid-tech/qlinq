@@ -369,9 +369,53 @@ static int test_memory_budget(void) {
   return 0;
 }
 
+static int test_parity_resize_budget(void) {
+  fec_memory_budget_t budget = {0};
+  fec_t *f = fec_create_bounded(FEC_RAPTORQ, 2, 2, 4, &budget);
+  assert(f);
+  const uint8_t source[2][4] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+  const uint8_t *blocks[] = {source[0], source[1]};
+  uint8_t expected[4], actual[4];
+  uint8_t *outputs[] = {expected};
+  uint32_t old_id = 3, new_id = 4;
+  assert(fec_encode_symbols(f, blocks, &old_id, 1, outputs));
+  size_t prepared = budget.current;
+  size_t previous_bytes = 2U * sizeof(uint32_t);
+  size_t replacement_bytes = 3U * sizeof(uint32_t);
+
+  /* The final allocation would fit, but keeping the old array until success
+   * requires enough room for the entire replacement at the same time. */
+  budget.limit = prepared + replacement_bytes - previous_bytes;
+  uint64_t refused = budget.refusals;
+  assert(!fec_set_parity_symbols(f, 3));
+  assert(budget.current == prepared && fec_memory_usage(f) == prepared &&
+         budget.refusals == refused + 1 && budget.peak <= budget.limit);
+  outputs[0] = actual;
+  assert(!fec_encode_symbols(f, blocks, &new_id, 1, outputs));
+  assert(fec_encode_symbols(f, blocks, &old_id, 1, outputs) &&
+         memcmp(actual, expected, sizeof(actual)) == 0);
+
+  budget.limit = prepared + replacement_bytes;
+  assert(fec_set_parity_symbols(f, 3));
+  assert(budget.current == prepared + replacement_bytes - previous_bytes &&
+         fec_memory_usage(f) == budget.current && budget.peak == budget.limit);
+  assert(fec_encode_symbols(f, blocks, &new_id, 1, outputs));
+  size_t grown = budget.current;
+  budget.limit = grown;
+  assert(fec_set_parity_symbols(f, 2) && fec_set_parity_symbols(f, 3) &&
+         budget.current == grown);
+  assert(fec_encode_symbols(f, blocks, &old_id, 1, outputs) &&
+         memcmp(actual, expected, sizeof(actual)) == 0);
+  fec_destroy(f);
+  assert(!budget.current);
+  puts("Parity growth reserves temporary memory and preserves failed geometry "
+       "OK");
+  return 0;
+}
+
 int main(void) {
   printf("running FEC test suite...\n");
-  if (test_memory_budget() != 0)
+  if (test_memory_budget() != 0 || test_parity_resize_budget() != 0)
     return 1;
   if (test_selective_symbols() != 0)
     return 1;

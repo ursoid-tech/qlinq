@@ -105,7 +105,7 @@ int main(void) {
     opened = closed = offload_calls = 0;
     char name[16] = "testtun0";
     bool active = false;
-    int fd = tun_alloc_tx_offload(name, &active);
+    int fd = tun_alloc_vnet(name, true, &active);
     assert(fd > 100 && !strcmp(name, "testtun0"));
     bool supported = mode == 0 || mode == 3;
     assert(active == supported && framing == supported);

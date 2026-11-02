@@ -16,7 +16,6 @@ int tun_alloc(char *dev);
 int tun_alloc_vnet(char *dev, bool transmit, bool *active);
 ssize_t tun_write_offload(int fd, const void *data, size_t size,
                           const tun_offload_t *metadata);
-int tun_alloc_tx_offload(char *dev, bool *active);
 ssize_t tun_read_vnet(int fd, void *data, size_t capacity,
                       tun_offload_t *metadata);
 ssize_t tun_write_vnet(int fd, const void *data, size_t size);

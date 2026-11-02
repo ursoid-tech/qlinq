@@ -546,6 +546,112 @@ static void test_rateless_late_join_tail(void) {
   }
 }
 
+/* Same-name subscribers with another mode neither receive recovery control
+ * nor participate in the rateless cohort's cache protection and release. */
+static void test_mixed_mode_recovery(uint8_t other_flags, bool legacy) {
+  transport_fixture_t f;
+  fixture_create(&f, 19956, NULL, NULL);
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                          .name = "mixed-mode-recovery"};
+  fixture_subscribe(&f, &f.client, track);
+  transport_conn_t *matching = f.server.conn;
+  fixture_endpoint_t second = {0};
+  transport_config_t config = {.bind_hosts = {"127.0.0.1"},
+                               .num_bind_hosts = 1,
+                               .remote_hosts = {"127.0.0.1"},
+                               .num_remote_hosts = 1,
+                               .port = 19956,
+                               .allow_insecure_peer = true,
+                               .callback = fixture_event,
+                               .user_data = &second};
+  second.transport = transport_create(&config);
+  assert(second.transport);
+  for (unsigned i = 0; i < 2000 && !second.authenticated; i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(second.authenticated);
+  moq_track_id_t other = track;
+  other.flags = other_flags;
+  assert(transport_subscribe_conn(second.transport, second.conn, other));
+  for (unsigned i = 0; i < 2000 && f.server.subscriptions < 2; i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(f.server.subscriptions == 2 && f.server.conn != matching);
+  if (legacy)
+    f.server.conn->peer_capabilities &= ~QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS;
+
+  transport_t *t = f.server.transport;
+  transport_track_stats_t stats;
+  assert(transport_get_track_stats(t, &track, &stats) &&
+         stats.subscribers == 1);
+  assert(transport_get_track_stats(t, &other, &stats) &&
+         stats.subscribers == 1);
+  moq_track_id_t absent = track;
+  absent.flags = 0;
+  assert(transport_get_track_stats(t, &absent, &stats) &&
+         stats.subscribers == 0);
+
+  uint8_t payload[48] = {42};
+  moq_object_t object = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  for (unsigned round = 0; round < 2; round++) {
+    assert(transport_publish_ex(t, &object) == TRANSPORT_PUBLISH_BUFFERED);
+    assert(transport_publish_flush_grouped(t));
+    sent_object_cache_t *cached =
+        transport_sent_cache_find(&t->sent_cache, &track, 0, round);
+    assert(cached && cached->recovery_protected && t->sent_cache.count == 1);
+    if (round == 0) {
+      assert(transport_publish_flush(t));
+      assert(t->stats.recovery_checkpoints_sent == 1);
+    } else {
+      assert(transport_finish_track(t, track));
+      assert(t->stats.track_ends_sent == 1);
+    }
+    for (unsigned i = 0;
+         i < 2000 && (f.client.objects < round + 1 || t->sent_cache.count);
+         i++) {
+      fixture_tick(&f);
+      transport_tick(second.transport);
+    }
+    assert(f.client.objects == round + 1 && t->sent_cache.count == 0);
+    assert(f.client.payload_size == sizeof(payload) + 2 &&
+           memcmp(f.client.payload + 2, payload, sizeof(payload)) == 0);
+    assert(!second.failed && second.objects == 0 &&
+           second.transport->stats.protocol_errors == 0 &&
+           second.transport->stats.recovery_checkpoints_received == 0 &&
+           second.transport->stats.track_ends_received == 0);
+  }
+  assert(f.client.transport->stats.recovery_checkpoints_received == 1 &&
+         f.client.transport->stats.track_ends_received == 1);
+
+  /* The other mode remains usable after the rateless track ends. */
+  object.track_id = other;
+  assert(transport_publish(t, &object));
+  for (unsigned i = 0; i < 2000 && second.objects == 0; i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(!second.failed && second.objects == 1 && f.client.objects == 2);
+  assert(second.last_track.flags == other_flags);
+
+  assert(transport_unsubscribe(f.client.transport, track));
+  for (unsigned i = 0; i < 2000 && transport_subscriptions_contains(
+                                       &matching->send_subscriptions, &track);
+       i++) {
+    fixture_tick(&f);
+    transport_tick(second.transport);
+  }
+  assert(transport_get_track_stats(t, &track, &stats) &&
+         stats.subscribers == 0);
+  assert(transport_get_track_stats(t, &other, &stats) &&
+         stats.subscribers == 1);
+  transport_destroy(second.transport);
+  fixture_destroy(&f);
+}
+
 /* Small objects used to derive 16384 cache slots, exceeding the receiver's
  * 4096-object history. A missing prefix must stop new admission before the
  * sender can produce a checkpoint that the receiver cannot retain. */
@@ -799,6 +905,10 @@ int main(void) {
   test_xfer_recovery_protection();
   test_short_flush_recovery();
   test_rateless_late_join_tail();
+  test_mixed_mode_recovery(MOQ_TRACK_FLAG_RELIABLE, false);
+  test_mixed_mode_recovery(MOQ_TRACK_FLAG_RELIABLE, true);
+  test_mixed_mode_recovery(MOQ_TRACK_FLAG_FEC_ENABLED, false);
+  test_mixed_mode_recovery(MOQ_TRACK_FLAG_FEC_ENABLED, true);
   test_group_timer_backpressure();
   test_partial_group_retry();
   transport_fixture_t fixture;

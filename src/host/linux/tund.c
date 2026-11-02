@@ -162,36 +162,38 @@ int main(int argc, char **argv) {
     /* self-healing connection to qlinq UDS data socket */
     if (uds_fd == -1) {
       uds_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-      if (uds_fd >= 0) {
-        struct sockaddr_un addr;
-        socklen_t addr_len;
-        if (!setup_uds_addr(&addr, &addr_len, socket_name)) {
-          fprintf(stderr, "invalid UDS socket name\n");
-          close(uds_fd);
-          if (!mock_mode && tun_fd != -1)
-            close(tun_fd);
-          return 1;
-        }
-        if (connect(uds_fd, (struct sockaddr *)&addr, addr_len) != 0) {
-          close(uds_fd);
-          uds_fd = -1;
-          usleep(500 * 1000);
-          continue;
-        }
-        uint8_t reg_hdr[3];
-        reg_hdr[0] = MOQ_TRACK_DATA;
-        reg_hdr[1] =
-            use_reliable ? MOQ_TRACK_FLAG_RELIABLE : MOQ_TRACK_FLAG_FEC_ENABLED;
-        reg_hdr[2] = (uint8_t)strlen(track_name);
-        if (!write_exact(uds_fd, reg_hdr, 3) ||
-            !write_exact(uds_fd, track_name, reg_hdr[2])) {
-          close(uds_fd);
-          uds_fd = -1;
-          usleep(500 * 1000);
-          continue;
-        }
-        printf("connected to qlinq data socket\n");
+      if (uds_fd < 0) {
+        usleep(500 * 1000);
+        continue;
       }
+      struct sockaddr_un addr;
+      socklen_t addr_len;
+      if (!setup_uds_addr(&addr, &addr_len, socket_name)) {
+        fprintf(stderr, "invalid UDS socket name\n");
+        close(uds_fd);
+        if (!mock_mode && tun_fd != -1)
+          close(tun_fd);
+        return 1;
+      }
+      if (connect(uds_fd, (struct sockaddr *)&addr, addr_len) != 0) {
+        close(uds_fd);
+        uds_fd = -1;
+        usleep(500 * 1000);
+        continue;
+      }
+      uint8_t reg_hdr[3];
+      reg_hdr[0] = MOQ_TRACK_DATA;
+      reg_hdr[1] =
+          use_reliable ? MOQ_TRACK_FLAG_RELIABLE : MOQ_TRACK_FLAG_FEC_ENABLED;
+      reg_hdr[2] = (uint8_t)strlen(track_name);
+      if (!write_exact(uds_fd, reg_hdr, 3) ||
+          !write_exact(uds_fd, track_name, reg_hdr[2])) {
+        close(uds_fd);
+        uds_fd = -1;
+        usleep(500 * 1000);
+        continue;
+      }
+      printf("connected to qlinq data socket\n");
     }
 
     /* asynchronous polling event loop */

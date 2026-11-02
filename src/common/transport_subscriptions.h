@@ -10,8 +10,7 @@ typedef struct {
   moq_track_id_t track_id;
   uint8_t alias;
   bool active;
-  quicly_stream_t *stream;         /* egress stream for publishing */
-  quicly_stream_t *ingress_stream; /* ingress stream received from peer */
+  quicly_stream_t *stream; /* egress stream for publishing */
 } track_subscription_t;
 
 typedef struct {
@@ -55,9 +54,6 @@ void transport_subscriptions_remove(transport_subscription_table_t *table,
                                     moq_track_type_t type, const char *name);
 void transport_subscriptions_clear_stream(transport_subscription_table_t *table,
                                           quicly_stream_t *stream);
-bool transport_subscriptions_bind_stream(transport_subscription_table_t *table,
-                                         uint8_t alias,
-                                         quicly_stream_t *stream);
 int transport_subscriptions_next_alias(
     const transport_subscription_table_t *table, int first_dynamic_alias);
 
