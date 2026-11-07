@@ -542,6 +542,173 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
   return TRANSPORT_PUBLISH_DELIVERED;
 }
 
+static transport_publish_result_t publish_datagram_to_flexicast(
+    transport_t *t, transport_flexicast_flow_t *flow, const moq_object_t *obj,
+    const transport_track_profile_t *profile, size_t symbol_size,
+    size_t data_symbols, uint16_t *sent_total_symbols) {
+  size_t parity_symbols = 0;
+  bool scheduled = false;
+  for (size_t i = 0; i < flow->member_count; i++) {
+    transport_conn_t *member = flow->members[i].conn;
+    if (!member || !flow->members[i].listening || !member->quic)
+      continue;
+    path_state_t active_states[TRANSPORT_MAX_PATHS];
+    size_t active_paths = 0;
+    for (size_t physical = 0; physical < t->socket_count; physical++) {
+      quicly_path_stats_t stats;
+      size_t mapped = transport_path_get_eligible_by_local(
+          member->quic, &t->sockets[physical].local_addr, &stats);
+      if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
+          !quicly_is_path_available(member->quic, mapped))
+        continue;
+      transport_conn_path_t *live = &member->paths[physical];
+      if (!live->state_overridden) {
+        path_t sample = transport_path_estimate_on_path(
+            member->quic, mapped, &stats,
+            quicly_get_num_datagram_frames_path(member->quic, mapped),
+            t->sockets[physical].egress.bytes, symbol_size,
+            live->owd_initialized && live->telemetry_path == mapped
+                ? live->latest_owd_fp
+                : 0);
+        transport_path_update_state(&live->state, &sample, false);
+      }
+      active_states[active_paths] = live->state;
+      quicly_flexicast_member_stats_t shared;
+      if (quicly_flexicast_get_member_stats(flow->crypto, member->id,
+                                            &shared) == QUICLY_FLEXICAST_OK &&
+          (shared.delivered_packets || shared.lost_packets)) {
+        fp_wide_t total =
+            (fp_wide_t)shared.delivered_packets + shared.lost_packets;
+        fp_t loss = (fp_t)((fp_wide_t)shared.lost_packets * FP_ONE / total);
+        if (loss > active_states[active_paths].p_ewma)
+          active_states[active_paths].p_ewma = loss;
+      }
+      active_paths++;
+    }
+    if (active_paths == 0)
+      continue;
+    /* rateless source packets are systematic; defer repair until requested */
+    if (profile->fec_rateless) {
+      scheduled = true;
+      continue;
+    }
+    transport_schedule_t member_schedule;
+    size_t scratch_round_robin = member->round_robin_path;
+    bool use_fec = profile->fec_enabled || profile->fec_rateless;
+    if (!transport_schedule_build(&member->scheduler_context, active_states,
+                                  active_paths, data_symbols, symbol_size,
+                                  use_fec, obj->priority, &scratch_round_robin,
+                                  &member_schedule))
+      return TRANSPORT_PUBLISH_ERROR;
+    if (member_schedule.parity_symbols > parity_symbols)
+      parity_symbols = member_schedule.parity_symbols;
+    scheduled = true;
+  }
+  if (!scheduled)
+    return TRANSPORT_PUBLISH_NO_RECIPIENTS;
+
+  size_t total_symbols = data_symbols + parity_symbols;
+  if (total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS || total_symbols > UINT16_MAX)
+    return TRANSPORT_PUBLISH_INVALID;
+  if (sent_total_symbols)
+    *sent_total_symbols = (uint16_t)total_symbols;
+  /* preserve per-publication backpressure bound */
+  if (total_symbols > QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY) {
+    t->stats.flexicast_pacing_backpressure++;
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
+  }
+  size_t packet_size = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size;
+  if (packet_size > SIZE_MAX / total_symbols ||
+      !transport_flexicast_can_queue(t, flow, total_symbols,
+                                     packet_size * total_symbols)) {
+    t->stats.flexicast_pacing_backpressure++;
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
+  }
+
+  uint8_t **data_blocks =
+      transport_arena_alloc(&t->arena, data_symbols * sizeof(*data_blocks));
+  uint8_t **parity_blocks =
+      transport_arena_alloc(&t->arena, parity_symbols * sizeof(*parity_blocks));
+  if (!data_blocks || (parity_symbols > 0 && !parity_blocks)) {
+    transport_arena_reset(&t->arena);
+    return TRANSPORT_PUBLISH_ERROR;
+  }
+  for (size_t i = 0; i < data_symbols; i++) {
+    size_t offset = i * symbol_size;
+    size_t chunk = offset < obj->size ? obj->size - offset : 0;
+    if (chunk >= symbol_size) {
+      data_blocks[i] = (uint8_t *)obj->data + offset;
+    } else {
+      data_blocks[i] = transport_arena_alloc(&t->arena, symbol_size);
+      if (!data_blocks[i]) {
+        transport_arena_reset(&t->arena);
+        return TRANSPORT_PUBLISH_ERROR;
+      }
+      memset(data_blocks[i], 0, symbol_size);
+      if (chunk > 0)
+        memcpy(data_blocks[i], obj->data + offset, chunk);
+    }
+  }
+  for (size_t i = 0; i < parity_symbols; i++) {
+    parity_blocks[i] = transport_arena_alloc(&t->arena, symbol_size);
+    if (!parity_blocks[i]) {
+      transport_arena_reset(&t->arena);
+      return TRANSPORT_PUBLISH_ERROR;
+    }
+  }
+  if (parity_symbols > 0) {
+    fec_type_t fec_type = profile->fec_rateless || total_symbols > 255
+                              ? FEC_RAPTORQ
+                              : FEC_REED_SOLOMON;
+    fec_t *fec = transport_fec_cache_get(&t->fec_cache, fec_type, data_symbols,
+                                         parity_symbols, symbol_size);
+    if (!fec ||
+        !fec_encode(fec, (const uint8_t *const *)data_blocks, parity_blocks)) {
+      transport_arena_reset(&t->arena);
+      return TRANSPORT_PUBLISH_ERROR;
+    }
+  }
+
+  size_t sent = 0;
+  for (size_t s = 0; s < total_symbols; s++) {
+    uint8_t *packet = transport_arena_alloc(&t->arena, packet_size);
+    if (!packet)
+      break;
+    qlinq_wire_fec_header_t header = {.alias = flow->alias,
+                                      .is_keyframe = obj->is_keyframe,
+                                      .priority = obj->priority,
+                                      .path_id = 0,
+                                      .group_id = obj->group_id,
+                                      .object_id = obj->object_id,
+                                      .symbol_index = (uint16_t)s,
+                                      .total_symbols = (uint16_t)total_symbols,
+                                      .data_symbols = (uint16_t)data_symbols,
+                                      .symbol_size = (uint16_t)symbol_size,
+                                      .original_size = (uint32_t)obj->size,
+                                      .send_time_ns = transport_now_ns(t)};
+    if (qlinq_wire_encode_fec_header(packet, packet_size, &header) !=
+        QLINQ_WIRE_OK)
+      break;
+    const uint8_t *symbol =
+        s < data_symbols ? data_blocks[s] : parity_blocks[s - data_symbols];
+    size_t payload_size = qlinq_wire_fec_payload_size(&header);
+    memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE, symbol, payload_size);
+    size_t encoded_size = QLINQ_WIRE_FEC_HEADER_SIZE + payload_size;
+    if (!tf_enqueue_payload(t, flow, ptls_iovec_init(packet, encoded_size)))
+      break;
+    sent++;
+  }
+  /* drain once after enqueuing all symbols of the object */
+  tf_drain_paced_payloads(t, flow);
+  if (flow->data_queue.count != 0)
+    t->stats.flexicast_pacing_delays++;
+  transport_arena_reset(&t->arena);
+  if (sent == total_symbols) {
+    return TRANSPORT_PUBLISH_DELIVERED;
+  }
+  return sent > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
+}
+
 static transport_publish_result_t publish_datagram_to_conn(
     transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     const transport_track_profile_t *profile, size_t symbol_size,
@@ -1177,6 +1344,32 @@ static transport_publish_result_t publish_object(transport_t *t,
   publication_symbols_t cached_symbols = {0};
   size_t cached_total_symbols = 0;
 
+  transport_flexicast_flow_t *delivered_flows[TRANSPORT_FLEXICAST_MAX_FLOWS];
+  size_t delivered_flow_count = 0;
+  if (t->flexicast_enabled && t->is_server) {
+    for (size_t f = 0; f < t->flexicast.capacity; f++) {
+      transport_flexicast_flow_t *flow = &t->flexicast.flows[f];
+      if (!flow->active || !flow->source ||
+          !transport_track_id_equal(&flow->track_id, &obj->track_id) ||
+          transport_flexicast_listening_members(flow) == 0)
+        continue;
+      uint16_t sent_symbols = 0;
+      transport_publish_result_t result = publish_datagram_to_flexicast(
+          t, flow, obj, &profile, symbol_size, data_symbols, &sent_symbols);
+      if (sent_symbols > maximum_sent_symbols)
+        maximum_sent_symbols = sent_symbols;
+      if (result == TRANSPORT_PUBLISH_DELIVERED) {
+        delivered_flows[delivered_flow_count++] = flow;
+        delivered += transport_flexicast_listening_members(flow);
+      } else if (result == TRANSPORT_PUBLISH_PARTIAL) {
+        partially_queued = true;
+      } else if (result == TRANSPORT_PUBLISH_BACKPRESSURE) {
+        return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL
+                             : TRANSPORT_PUBLISH_BACKPRESSURE;
+      }
+    }
+  }
+
   for (size_t c = 0; c < active_count; c++) {
     transport_conn_t *conn = transport_connection_at(t, c);
     if (!transport_publish_recipient_eligible(t, conn, &obj->track_id))
@@ -1184,6 +1377,18 @@ static transport_publish_result_t publish_object(transport_t *t,
     eligible++;
     if (grouped && conn->fec_group_delivered) {
       delivered++;
+      continue;
+    }
+    bool flexicast_delivered = false;
+    for (size_t f = 0; f < delivered_flow_count; f++) {
+      if (transport_flexicast_member_is_listening(delivered_flows[f], conn)) {
+        flexicast_delivered = true;
+        break;
+      }
+    }
+    if (flexicast_delivered) {
+      if (grouped)
+        conn->fec_group_delivered = true;
       continue;
     }
     if (obj->size > conn->negotiated_limits.max_fec_object_size) {

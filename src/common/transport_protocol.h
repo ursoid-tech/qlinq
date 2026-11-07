@@ -4,6 +4,8 @@
 #include "transport_internal.h"
 
 void transport_protocol_resume_deferred(transport_conn_t *conn);
+void transport_protocol_receive_datagram(transport_conn_t *, ptls_iovec_t,
+                                         bool);
 void transport_protocol_setup(transport_t *t);
 bool transport_protocol_send_hello(transport_conn_t *conn);
 void transport_protocol_maybe_emit_connected(transport_conn_t *conn);

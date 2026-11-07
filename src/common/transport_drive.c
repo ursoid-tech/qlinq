@@ -72,7 +72,7 @@ size_t transport_drive_paths(transport_t *t, transport_drive_path_t *paths,
   return n;
 }
 /* implemented beside the common protocol dispatcher and interface lifecycle */
-void transport_drive_dispatch(transport_t *, size_t, const uint8_t *, size_t,
+void transport_drive_dispatch(transport_t *, size_t, uint8_t *, size_t,
                               struct sockaddr_storage *,
                               const struct sockaddr_storage *, uint32_t,
                               uint8_t);

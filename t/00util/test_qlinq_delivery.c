@@ -35,9 +35,11 @@ static bool receive_callback(void *user_data, const qlinq_event_t *event) {
 
 /* Exercise the public event boundary: transport-only tests cannot detect a
  * received object's descriptor no longer matching its application stream. */
-static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
-                        bool callback_delivery,
-                        qlinq_congestion_control_t congestion_control) {
+static int run_delivery_mode(qlinq_delivery_t delivery,
+                             qlinq_content_type_t content,
+                             bool callback_delivery,
+                             qlinq_congestion_control_t congestion_control,
+                             bool group_delivery) {
   callback_state_t callback = {
       .delivery = delivery, .content = content, .valid = true};
   qlinq_context_config_t context_config = {
@@ -68,6 +70,8 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
       .security = {.shared_secret = "delivery",
                    .shared_secret_size = 8,
                    .allow_insecure_peer = true}};
+  source.group_delivery.enabled = group_delivery;
+  receiver.group_delivery.enabled = group_delivery;
   qlinq_endpoint_t *listener = qlinq_listen(context, &source);
   qlinq_endpoint_t *client = qlinq_connect(context, &receiver);
   if (!listener || !client)
@@ -108,7 +112,8 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
     }
     qlinq_endpoint_stats_t stats;
     if (joined && qlinq_endpoint_get_stats(listener, &stats) &&
-        stats.active_connections == 1) {
+        stats.active_connections == 1 &&
+        (!group_delivery || stats.active_group_members == 1)) {
       ready = true;
       break;
     }
@@ -205,6 +210,9 @@ static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
       after_publish.publish_buffered != published.publish_buffered ||
       after_publish.publish_no_recipients != published.publish_no_recipients)
     goto Exit;
+  if (group_delivery && (after_publish.group_packets_sent == 0 ||
+                         stats.group_packets_received == 0))
+    goto Exit;
   if (callback_delivery)
     failed = !received || saw_queued_record || !callback.valid ||
              stats.records_received != callback.received ||
@@ -223,6 +231,13 @@ Exit:
     fprintf(stderr, "delivery failed: mode=%d content=%d callback=%d cc=%d\n",
             delivery, content, callback_delivery, congestion_control);
   return failed;
+}
+
+static int run_delivery(qlinq_delivery_t delivery, qlinq_content_type_t content,
+                        bool callback_delivery,
+                        qlinq_congestion_control_t congestion_control) {
+  return run_delivery_mode(delivery, content, callback_delivery,
+                           congestion_control, false);
 }
 
 static int run_reliable_boundaries(void) {
@@ -341,6 +356,11 @@ int main(void) {
       run_delivery(QLINQ_DELIVERY_DATAGRAM, QLINQ_CONTENT_DATA, false,
                    QLINQ_CC_BBR))
     return 1;
+  for (size_t m = 0; m < 3; m++)
+    for (size_t callback = 0; callback < 2; callback++)
+      if (run_delivery_mode(modes[m], QLINQ_CONTENT_DATA, callback != 0,
+                            QLINQ_CC_DEFAULT, true))
+        return 1;
   puts("===QLINQ DELIVERY MATRIX OK===");
   return 0;
 }

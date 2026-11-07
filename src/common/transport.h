@@ -150,7 +150,7 @@ typedef bool (*transport_interface_callback_t)(
     void *user_data, const transport_interface_info_t *iface);
 
 #define TRANSPORT_MAX_PATHS 4
-#define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 1U)
+#define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 3U)
 enum {
   TRANSPORT_CC_DEFAULT,
   TRANSPORT_CC_RENO,
@@ -282,6 +282,20 @@ typedef struct {
   bool reconnect_enabled;
   uint32_t reconnect_initial_delay_ms;
   uint32_t reconnect_max_delay_ms;
+  /* percentage of flexicast PATH_ACK attempts to drop in tests */
+  uint8_t simulated_flexicast_feedback_loss_rate;
+  /* enable experimental flexicast datagram path */
+  bool enable_flexicast;
+  /* optional IPv4/IPv6 SSM group, UDP port, and local interface address */
+  const char *flexicast_group;
+  uint16_t flexicast_group_port;
+  const char *flexicast_interface;
+  /* multicast congestion controller rate bounds in bytes/s (0 = default) */
+  uint64_t flexicast_cc_startup_rate;
+  uint64_t flexicast_cc_minimum_rate;
+  uint64_t flexicast_cc_maximum_rate;
+  uint64_t flexicast_cc_aggregate_rate_limit;
+  uint32_t flexicast_cc_feedback_timeout_ms;
   transport_repair_mode_t repair_mode;
   unsigned congestion_control;
   unsigned pacing;
@@ -469,6 +483,27 @@ typedef struct {
   size_t recovery_cache_entries, recovery_cache_peak_entries;
   size_t recovery_checkpoints_pending;
   uint64_t recovery_oldest_checkpoint_age_ms;
+  uint64_t flexicast_packets_sent;
+  uint64_t flexicast_native_packets_sent;
+  uint64_t flexicast_packets_received;
+  uint64_t flexicast_acks_received;
+  uint64_t flexicast_fallbacks;
+  uint64_t flexicast_rekeys;
+  uint64_t flexicast_feedback_fallbacks;
+  uint64_t flexicast_control_frames_throttled;
+  uint64_t flexicast_paced_packets;
+  uint64_t flexicast_pacing_delays;
+  uint64_t flexicast_pacing_backpressure;
+  uint64_t flexicast_pacing_dropped;
+  uint64_t flexicast_pacing_rate_bytes_per_second;
+  size_t flexicast_queued_packets;
+  uint64_t flexicast_membership_joins;
+  uint64_t flexicast_membership_leaves;
+  uint64_t flexicast_interface_fallbacks;
+  uint64_t flexicast_interface_rejoins;
+  size_t flexicast_active_memberships;
+  size_t flexicast_active_flows;
+  size_t flexicast_active_members;
   uint64_t events_emitted;
   uint64_t api_thread_violations;
   uint64_t recursive_tick_rejections;
@@ -579,9 +614,8 @@ int64_t transport_get_first_timeout(transport_t *t);
 struct pollfd;
 
 /* collect socket file descriptors for polling */
-/* Includes the interface monitor; reserve TRANSPORT_MAX_POLL_FDS entries. */
-/* Capacity TRANSPORT_MAX_POLL_FDS includes UDP sockets and interface wakeups.
- */
+/* includes interface monitor and multicast sockets; reserve
+ * TRANSPORT_MAX_POLL_FDS entries */
 size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
                               size_t max_fds);
 

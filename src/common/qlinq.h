@@ -192,6 +192,20 @@ typedef struct {
 } qlinq_security_config_t;
 
 typedef struct {
+  bool enabled;
+  /* source sets group_address, port, and interface_address; receiver may set
+   * only interface_address */
+  const char *group_address;
+  uint16_t port;
+  const char *interface_address;
+  uint64_t startup_rate_bytes_per_second;
+  uint64_t minimum_rate_bytes_per_second;
+  uint64_t maximum_rate_bytes_per_second;
+  uint64_t aggregate_rate_bytes_per_second;
+  uint32_t feedback_timeout_ms;
+} qlinq_group_delivery_config_t;
+
+typedef struct {
   uint32_t interface_index;
   const char *interface_name;
   const char *local_address;
@@ -229,6 +243,7 @@ typedef struct {
   uint32_t reconnect_initial_delay_ms;
   uint32_t reconnect_max_delay_ms;
   qlinq_security_config_t security;
+  qlinq_group_delivery_config_t group_delivery;
   qlinq_repair_mode_t repair_mode;
   qlinq_congestion_control_t congestion_control;
   /* BBR enables pacing by default and rejects QLINQ_PACING_DISABLED. */
@@ -378,6 +393,13 @@ typedef struct {
   size_t stream_egress_peak_vectors;
   uint64_t stream_egress_blocked;
   uint64_t stream_control_failures;
+  uint64_t group_packets_sent;
+  uint64_t group_packets_received;
+  uint64_t group_native_packets_sent;
+  uint64_t group_fallbacks;
+  uint64_t group_rekeys;
+  size_t active_group_flows;
+  size_t active_group_members;
   size_t active_connections;
   size_t queued_packets;
   size_t queued_bytes;
