@@ -6,6 +6,7 @@
 #include "transport_drive.h"
 #include "transport_egress.h"
 #include "transport_fec_state.h"
+#include "transport_flexicast.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
 #include "transport_probe.h"
@@ -152,6 +153,8 @@ struct transport_t {
   ptls_openssl_verify_certificate_t verifier;
   bool verifier_initialized;
   quicly_receive_datagram_frame_t receive_datagram;
+  quicly_receive_flexicast_frame_t receive_flexicast;
+  quicly_receive_flexicast_ack_t receive_flexicast_ack;
 
   transport_sent_cache_t sent_cache;
   transport_repair_mode_t repair_mode;
@@ -161,6 +164,7 @@ struct transport_t {
   size_t recovery_conn_cursor;
   uint32_t fec_assembler_timeout_ms;
   uint8_t simulated_loss_rate;
+  uint8_t simulated_flexicast_feedback_loss_rate;
   arena_t arena;
   uint8_t send_buffer[64 * 1500];
 
@@ -169,6 +173,26 @@ struct transport_t {
 
   transport_fec_cache_t fec_cache;
   size_t assembler_memory_bytes;
+  transport_flexicast_registry_t flexicast;
+  uint64_t flexicast_retired_flow_ids[TRANSPORT_FLEXICAST_MAX_FLOWS];
+  uint32_t flexicast_retired_flow_epochs[TRANSPORT_FLEXICAST_MAX_FLOWS];
+  size_t flexicast_retired_flow_count;
+  size_t flexicast_retired_flow_next;
+  bool flexicast_enabled;
+  uint64_t flexicast_cc_startup_rate;
+  uint64_t flexicast_cc_minimum_rate;
+  uint64_t flexicast_cc_maximum_rate;
+  uint64_t flexicast_cc_aggregate_rate_limit;
+  uint32_t flexicast_cc_feedback_timeout_ms;
+  bool flexicast_native_source;
+  int flexicast_fds[2]; /* IPv4, IPv6 */
+  uint16_t flexicast_receive_ports[2];
+  struct sockaddr_storage flexicast_group_addr;
+  int flexicast_interface_family;
+  struct in_addr flexicast_interface_v4;
+  struct in6_addr flexicast_interface_v6;
+  uint32_t flexicast_interface_index;
+  bool flexicast_interface_set;
 };
 
 struct transport_conn_t {

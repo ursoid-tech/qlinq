@@ -751,6 +751,21 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.allow_insecure_peer = config->security.allow_insecure_peer;
   transport_config.verify_peer =
       config->security.verify_peer || !config->security.allow_insecure_peer;
+  transport_config.enable_flexicast = config->group_delivery.enabled;
+  transport_config.flexicast_group = config->group_delivery.group_address;
+  transport_config.flexicast_group_port = config->group_delivery.port;
+  transport_config.flexicast_interface =
+      config->group_delivery.interface_address;
+  transport_config.flexicast_cc_startup_rate =
+      config->group_delivery.startup_rate_bytes_per_second;
+  transport_config.flexicast_cc_minimum_rate =
+      config->group_delivery.minimum_rate_bytes_per_second;
+  transport_config.flexicast_cc_maximum_rate =
+      config->group_delivery.maximum_rate_bytes_per_second;
+  transport_config.flexicast_cc_aggregate_rate_limit =
+      config->group_delivery.aggregate_rate_bytes_per_second;
+  transport_config.flexicast_cc_feedback_timeout_ms =
+      config->group_delivery.feedback_timeout_ms;
   transport_config.repair_mode = map_repair_mode(config->repair_mode);
   transport_config.congestion_control = config->congestion_control;
   transport_config.pacing = config->pacing;
@@ -1549,6 +1564,14 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
       .stream_egress_peak_vectors = transport_stats.stream_egress_peak_vectors,
       .stream_egress_blocked = transport_stats.stream_egress_blocked,
       .stream_control_failures = transport_stats.stream_control_failures,
+      .group_packets_sent = transport_stats.flexicast_packets_sent,
+      .group_packets_received = transport_stats.flexicast_packets_received,
+      .group_native_packets_sent =
+          transport_stats.flexicast_native_packets_sent,
+      .group_fallbacks = transport_stats.flexicast_fallbacks,
+      .group_rekeys = transport_stats.flexicast_rekeys,
+      .active_group_flows = transport_stats.flexicast_active_flows,
+      .active_group_members = transport_stats.flexicast_active_members,
       .active_connections = transport_stats.active_connections,
       .queued_packets = transport_stats.egress_current_packets,
       .queued_bytes = transport_stats.egress_current_bytes,

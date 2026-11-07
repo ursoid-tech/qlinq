@@ -23,7 +23,7 @@ endif
 
 # Default CFLAGS for our code
 CFLAGS ?= -O2
-CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
+CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536 -DQUICLY_HAVE_FLEXICAST=1
 # CODEC_TARGET=portable disables native nanorq/shared OBL targeting.
 # Keep explicit FEC_NATIVE_CFLAGS and NANORQ_NATIVE_CFLAGS overrides supported.
 CODEC_TARGET ?= native
@@ -61,6 +61,9 @@ endif
 INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
+              deps/quicly/lib/flexicast.c \
+              deps/quicly/lib/flexicast_cc.c \
+              deps/quicly/lib/flexicast_cc_multicast.c \
               deps/quicly/lib/bplus_ranges.c \
               deps/quicly/lib/defaults.c \
               deps/quicly/lib/frame.c \
@@ -112,7 +115,9 @@ IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
 # The protocol engine has an independent positive object list. Native network
 # I/O and the application polling loop are composed only into the public host.
-ENGINE_OBJS = src/common/transport_repair_policy.o \
+ENGINE_OBJS = src/common/transport_flexicast.o \
+              src/common/transport_flexicast_dispatch.o \
+              src/common/transport_repair_policy.o \
               src/common/transport_policy_scheduler.o \
               src/common/cli_parse.o \
               src/common/transport_config.o \
@@ -144,7 +149,7 @@ ENGINE_OBJS = src/common/transport_repair_policy.o \
               $(PATHFLOW_OBJS)
 
 
-POLL_HOST_OBJS = src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
+POLL_HOST_OBJS = src/common/transport_flexicast_host.o src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
 TRANSPORT_OBJS = src/common/qlinq.o $(ENGINE_OBJS) $(POLL_HOST_OBJS)
 
 COMMON_OBJS = src/common/data_uds.o \
@@ -500,7 +505,7 @@ t/00util/test_transport_engine: t/00util/test_transport_engine.o $(ENGINE_OBJS)
 t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=clock_gettime,-Map,$@.map
 
-CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
+CHECK_BINARIES = t/00util/test_flexicast_transport $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
 	t/00util/test_datagram_mtu \
 	t/00util/test_path_probe \
 	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
@@ -570,6 +575,7 @@ check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean: 
+	rm -f t/00util/test_flexicast_transport
 	rm -f t/00util/test_transport_engine t/00util/test_transport_engine.map t/00util/test_recovery_latency t/00util/test_recovery_latency.map
 	rm -f $(QUICLY_INTEGRATION_TEST)
 	find src deps t examples -name "*.o" -delete
@@ -637,3 +643,6 @@ t/00util/test_tls_groups: t/00util/test_tls_groups.o t/00util/transport_tls_grou
 t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=ptls_handshake_is_complete,--wrap=ptls_get_negotiated_group,--wrap=ptls_is_psk_handshake,--wrap=transport_stream_write_frame,--wrap=quicly_receive
 .PHONY: check-tun-offloads
+
+t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)

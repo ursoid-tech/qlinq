@@ -14,8 +14,11 @@ typedef struct {
   char interface_name[64];
 } transport_drive_path_t;
 
+struct transport_flexicast_io;
 typedef struct transport_drive_host {
   void *context;
+  /* optional native multicast operations; NULL still supports replication */
+  const struct transport_flexicast_io *flexicast_io;
   /* quicly reserves 0 ms for an unlocked clock; start >= 1 ms */
   uint64_t initial_time_ns;
   /* open may assign ephemeral port and ifindex while preserving identity/family

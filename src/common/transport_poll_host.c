@@ -1,5 +1,8 @@
 /* default socket host for the explicit transport engine boundary */
 #include "transport_poll_host.h"
+#include "transport_flexicast.h"
+#include "transport_protocol.h"
+extern const transport_flexicast_io_t transport_poll_flexicast_io;
 #include "portable_sockets.h"
 #include "quicly/sendstate.h"
 #include <assert.h>
@@ -369,6 +372,7 @@ static void host_dispose(void *context) {
 transport_drive_host_t
 transport_poll_host_adapter(transport_poll_host_t *host) {
   return (transport_drive_host_t){.context = host,
+                                  .flexicast_io = &transport_poll_flexicast_io,
                                   .initial_time_ns = host_now(host),
                                   .open = host_open,
                                   .close = host_close,
@@ -427,6 +431,31 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
   transport_poll_host_t *host = transport_poll_host(t);
   assert_socket_alignment(t, host);
   size_t receive_budget = t->limits.max_packets_per_tick;
+  size_t multicast_budget = (receive_budget + 1U) / 2U;
+  for (size_t slot = 0; t->flexicast_enabled && slot < 2 && multicast_budget;
+       slot++) {
+    while (t->flexicast_fds[slot] >= 0 && multicast_budget) {
+      uint8_t packet[2048];
+      transport_conn_t *source = NULL;
+      ptls_iovec_t payload = ptls_iovec_init(NULL, 0);
+      ssize_t received = transport_flexicast_receive_native(
+          t, slot, packet, sizeof(packet), &source, &payload);
+      if (received < 0) {
+        if (errno == EINTR)
+          continue;
+        break;
+      }
+      --receive_budget;
+      --multicast_budget;
+      if (source && payload.base) {
+        if (source->authenticated && t->simulated_loss_rate > 0 &&
+            (rand() % 100) < t->simulated_loss_rate)
+          continue;
+        transport_protocol_receive_datagram(source, payload, false);
+      }
+    }
+  }
+
   size_t receive_start =
       t->socket_count ? host->receive_cursor % t->socket_count : 0;
   host->receive_cursor =
@@ -604,6 +633,10 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
       count++;
     }
   }
+  for (size_t i = 0; t->flexicast_enabled && i < 2 && count < max_fds; i++)
+    if (t->flexicast_fds[i] >= 0)
+      fds[count++] =
+          (struct pollfd){.fd = t->flexicast_fds[i], .events = POLLIN};
   if (host->ifmon_pipe[0] >= 0 && count < max_fds) {
     fds[count++] = (struct pollfd){.fd = host->ifmon_pipe[0], .events = POLLIN};
   }
@@ -613,9 +646,9 @@ bool transport_rx_cadence_mask(transport_t *t, struct pollfd *fds,
                                size_t count) {
   transport_poll_host_t *host = transport_poll_host(t);
   if (!host || !transport_owner_ok(t) || t->turn_active || !fds ||
-      t->tick_active || t->shutting_down || t->reconnect_in_progress ||
-      t->pending_group.size || t->socket_count == 0 ||
-      transport_connection_count(t) != 1)
+      t->flexicast_enabled || t->tick_active || t->shutting_down ||
+      t->reconnect_in_progress || t->pending_group.size ||
+      t->socket_count == 0 || transport_connection_count(t) != 1)
     return false;
   assert_socket_alignment(t, host);
   transport_conn_t *conn = transport_connection_at(t, 0);

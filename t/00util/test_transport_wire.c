@@ -92,6 +92,31 @@ int main(void) {
             strcmp(decoded_track.name, track.name) == 0,
         "track roundtrip");
 
+  qlinq_wire_flexicast_bind_t bind = {
+      .alias = 7, .flow_id = UINT64_C(0xfedcba9876543210), .key_epoch = 3};
+  qlinq_wire_flexicast_bind_t decoded_bind;
+  uint8_t binding[QLINQ_WIRE_FLEXICAST_BIND_SIZE];
+  CHECK(qlinq_wire_encode_flexicast_bind(binding, sizeof(binding), &bind) ==
+                QLINQ_WIRE_OK &&
+            qlinq_wire_decode_flexicast_bind(binding, sizeof(binding),
+                                             &decoded_bind) == QLINQ_WIRE_OK &&
+            decoded_bind.alias == bind.alias &&
+            decoded_bind.flow_id == bind.flow_id &&
+            decoded_bind.key_epoch == bind.key_epoch,
+        "Flexicast binding roundtrip");
+  binding[1] = 1;
+  CHECK(qlinq_wire_decode_flexicast_bind(binding, sizeof(binding),
+                                         &decoded_bind) == QLINQ_WIRE_INVALID,
+        "Flexicast binding reserved bytes");
+  binding[1] = 0;
+  CHECK(qlinq_wire_decode_flexicast_bind(binding, sizeof(binding) - 1,
+                                         &decoded_bind) == QLINQ_WIRE_INVALID,
+        "truncated Flexicast binding");
+  bind.key_epoch = 0;
+  CHECK(qlinq_wire_encode_flexicast_bind(binding, sizeof(binding), &bind) ==
+            QLINQ_WIRE_INVALID,
+        "zero Flexicast key epoch");
+
   uint8_t corrupted[8192];
   memcpy(corrupted, frame_buf, frame_len);
   corrupted[2] = QLINQ_WIRE_VERSION + 1;
@@ -104,10 +129,10 @@ int main(void) {
                                 &frame) == QLINQ_WIRE_INVALID,
         "magic rejection");
   memcpy(corrupted, frame_buf, frame_len);
-  corrupted[3] = 10;
+  corrupted[3] = 14;
   CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
                                 &frame) == QLINQ_WIRE_INVALID,
-        "reserved Flexicast type rejection");
+        "unassigned type rejection");
   memcpy(corrupted, frame_buf, frame_len);
   corrupted[3] = 0xff;
   CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
