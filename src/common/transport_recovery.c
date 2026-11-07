@@ -175,8 +175,9 @@ void transport_recovery_flush_acks(transport_conn_t *conn) {
     return;
   for (size_t i = 0; i < conn->receive_subscriptions.capacity; i++) {
     const track_subscription_t *sub = &conn->receive_subscriptions.entries[i];
-    if (sub->active && sub->track_id.type == MOQ_TRACK_DATA &&
-        (sub->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0)
+    if (sub->active &&
+        transport_get_track_profile(conn->transport, &sub->track_id)
+            .checkpoint_recovery)
       (void)acknowledge_completed_recovery_windows(conn, sub->alias);
   }
 }
@@ -434,6 +435,17 @@ static int64_t assembler_deadline_ms(const transport_t *t,
       idle_timeout > INT64_MAX / (int64_t)QLINQ_FEC_ASSEMBLER_MAX_AGE_FACTOR
           ? INT64_MAX
           : idle_timeout * (int64_t)QLINQ_FEC_ASSEMBLER_MAX_AGE_FACTOR;
+  if (assembler->owner) {
+    moq_track_id_t resolved_track;
+    if (transport_subscriptions_find_by_alias(
+            &assembler->owner->receive_subscriptions, assembler->track_id,
+            &resolved_track) == 0) {
+      transport_track_profile_t profile =
+          transport_get_track_profile(t, &resolved_track);
+      if (profile.policy.enabled && profile.policy.max_object_age_ms != 0)
+        max_age = (int64_t)profile.policy.max_object_age_ms;
+    }
+  }
   int64_t idle_expires =
       assembler->last_activity_time_ms > INT64_MAX - idle_timeout
           ? INT64_MAX
@@ -504,8 +516,8 @@ void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
       const track_subscription_t *sub =
           &conn->receive_subscriptions.entries[slot];
       /* object gaps and checkpoint windows exist only for rateless data */
-      if (!sub->active || sub->track_id.type != MOQ_TRACK_DATA ||
-          (sub->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+      if (!sub->active ||
+          !transport_get_track_profile(t, &sub->track_id).checkpoint_recovery)
         continue;
       uint8_t alias = sub->alias;
       transport_object_gap_state_t *gap = transport_object_gap(conn, alias);
@@ -594,8 +606,8 @@ void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
         if (transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                                   asm_slot->track_id,
                                                   &resolved_track) != 0 ||
-            !(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
-          continue; /* Fixed RS-FEC does not send NACKs */
+            !transport_get_track_profile(t, &resolved_track).reactive_repair)
+          continue; /* reactive repair disabled for this track */
         transport_repair_mode_t repair_mode =
             transport_get_effective_repair_mode(t, conn, &resolved_track);
         uint16_t missing_count = 0;

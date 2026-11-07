@@ -319,18 +319,25 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
   if (transport_subscriptions_find_by_alias(&conn->send_subscriptions,
                                             nack.alias, &track) != 0)
     return true;
+  transport_track_profile_t profile = transport_get_track_profile(t, &track);
   bool rateless = (nack.flags & QLINQ_WIRE_NACK_RATELESS) != 0;
   if (rateless &&
-      ((track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
+      (!profile.fec_rateless ||
        (conn->peer_capabilities & QLINQ_WIRE_CAP_RATELESS_REPAIR) == 0))
     return close_protocol_error(conn, "protocol error: repair mode mismatch");
   if (rateless)
     t->stats.repair_rateless_requests_received++;
   else
     t->stats.repair_indexed_requests_received++;
+  if (!profile.reactive_repair) {
+    t->stats.repair_cache_misses++;
+    return true;
+  }
+  int64_t now = transport_now_ms(t);
   sent_object_cache_t *cached = transport_sent_cache_find(
       &t->sent_cache, &track, nack.group_id, nack.object_id);
-  if (!cached) {
+  if (!cached || (cached->expires_at_ms > 0 && now >= cached->expires_at_ms) ||
+      cached->remaining_repair_symbols == 0) {
     t->stats.repair_cache_misses++;
     return true;
   }
@@ -358,7 +365,8 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
     if (missing_count > TRANSPORT_REPAIR_MAX_SYMBOLS)
       missing_count = TRANSPORT_REPAIR_MAX_SYMBOLS;
   }
-  int64_t now = transport_now_ms(t);
+  if (missing_count > cached->remaining_repair_symbols)
+    missing_count = cached->remaining_repair_symbols;
   if (!transport_repair_limiter_take(
           &t->aggregate_repair_limiter,
           t->limits.max_aggregate_repair_requests_per_second, now)) {
@@ -394,10 +402,18 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
     t->stats.repair_build_failures++;
     return true;
   }
+  if (repair.count > cached->remaining_repair_symbols)
+    repair.count = cached->remaining_repair_symbols;
 
   size_t queued = queue_repairs(conn, nack.alias, cached, &repair);
   if (queued < repair.count)
     t->stats.repair_queue_failures++;
+  if (cached->remaining_repair_symbols != UINT32_MAX) {
+    cached->remaining_repair_symbols =
+        queued < cached->remaining_repair_symbols
+            ? cached->remaining_repair_symbols - (uint32_t)queued
+            : 0U;
+  }
   if (queued != 0 && rateless) {
     bool committed =
         systematic_fallback
@@ -512,8 +528,7 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
         transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                               checkpoint.alias,
                                               &resolved_track) != 0 ||
-        resolved_track.type != MOQ_TRACK_DATA ||
-        (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
+        !transport_get_track_profile(t, &resolved_track).checkpoint_recovery) {
       return close_protocol_error(
           conn, "protocol error: invalid recovery checkpoint");
     }
@@ -532,8 +547,7 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
             QLINQ_WIRE_OK ||
         transport_subscriptions_find_by_alias(
             &conn->send_subscriptions, ack.alias, &resolved_track) != 0 ||
-        resolved_track.type != MOQ_TRACK_DATA ||
-        (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
+        !transport_get_track_profile(t, &resolved_track).checkpoint_recovery ||
         !transport_publish_checkpoint_acked(t, conn, &ack, &resolved_track)) {
       return close_protocol_error(
           conn, "protocol error: invalid recovery checkpoint ACK");
@@ -549,8 +563,7 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
             QLINQ_WIRE_OK ||
         transport_subscriptions_find_by_alias(
             &conn->receive_subscriptions, end.alias, &resolved_track) != 0 ||
-        resolved_track.type != MOQ_TRACK_DATA ||
-        (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
+        !transport_get_track_profile(t, &resolved_track).checkpoint_recovery) {
       return close_protocol_error(conn,
                                   "protocol error: invalid track completion");
     }
@@ -1024,8 +1037,10 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     }
   }
 
-  bool rateless = (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
-  bool rateless_data = resolved_track.type == MOQ_TRACK_DATA && rateless;
+  transport_track_profile_t profile =
+      transport_get_track_profile(t, &resolved_track);
+  bool rateless = profile.fec_rateless;
+  bool rateless_data = profile.checkpoint_recovery;
   transport_subscription_state_t *subscription_state =
       transport_subscriptions_get_state(&tconn->receive_subscriptions,
                                         track_id);

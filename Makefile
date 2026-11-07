@@ -472,7 +472,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -Dtransport_policy_schedule=policy_schedule_reference -Dtransport_policy_estimate_parity=policy_estimate_reference -c $< -o $@
 
-t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
+t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o src/common/transport_tracks.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 ifeq ($(UNAME_S),Linux)

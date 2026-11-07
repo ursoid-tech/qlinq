@@ -5,10 +5,6 @@
 #include "transport_repair_policy.h"
 
 #define TRANSPORT_POLICY_PATHS 4U
-#define TRANSPORT_PROTECTION_QUEUE_LIMIT                                       \
-  QLINQ_REPAIR_REASON_BIT(QLINQ_REPAIR_QUEUE_LIMIT)
-#define TRANSPORT_PROTECTION_TIME_LIMIT                                        \
-  QLINQ_REPAIR_REASON_BIT(QLINQ_REPAIR_TIME_LIMIT)
 
 typedef struct {
   path_t measurement;

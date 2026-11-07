@@ -1,5 +1,6 @@
 #include "transport_policy_scheduler.h"
 #include "transport_repair_policy.h"
+#include "transport_tracks.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -221,10 +222,72 @@ static void test_scheduler(void) {
   }
 }
 
+static void test_track_profile(void) {
+  const moq_track_type_t types[] = {MOQ_TRACK_VIDEO, MOQ_TRACK_AUDIO,
+                                    MOQ_TRACK_INPUT, MOQ_TRACK_TEXT,
+                                    MOQ_TRACK_DATA,  MOQ_TRACK_TELEMETRY};
+  for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+    bool is_data = types[i] == MOQ_TRACK_DATA;
+    moq_track_id_t dgram = {.type = types[i], .flags = 0, .name = "t"};
+    transport_track_profile_t p = transport_track_profile(&dgram);
+    assert(!p.reliable && !p.fec_enabled && !p.fec_rateless &&
+           !p.proactive_fec && !p.reactive_repair && !p.grouped_records &&
+           !p.checkpoint_recovery && !p.policy.enabled);
+
+    moq_track_id_t rel = {
+        .type = types[i], .flags = MOQ_TRACK_FLAG_RELIABLE, .name = "t"};
+    p = transport_track_profile(&rel);
+    assert(p.reliable && !p.proactive_fec && !p.reactive_repair &&
+           !p.grouped_records && !p.checkpoint_recovery && !p.policy.enabled);
+
+    moq_track_id_t fixed = {
+        .type = types[i], .flags = MOQ_TRACK_FLAG_FEC_ENABLED, .name = "t"};
+    p = transport_track_profile(&fixed);
+    assert(!p.reliable && p.fec_enabled && !p.fec_rateless && p.proactive_fec &&
+           !p.reactive_repair && p.grouped_records == is_data &&
+           !p.checkpoint_recovery && !p.policy.enabled);
+
+    moq_track_id_t rateless = {
+        .type = types[i], .flags = MOQ_TRACK_FLAG_FEC_RATELESS, .name = "t"};
+    p = transport_track_profile(&rateless);
+    assert(!p.reliable && !p.fec_enabled && p.fec_rateless &&
+           !p.proactive_fec && p.reactive_repair &&
+           p.grouped_records == is_data && p.checkpoint_recovery == is_data &&
+           !p.policy.enabled);
+
+    /* partial policy on rateless keeps proactive_fec false by default */
+    qlinq_repair_policy_t raw = {.present = QLINQ_REPAIR_MAX_EXTRA,
+                                 .max_extra_percent = 50};
+    qlinq_effective_repair_policy_t eff;
+    assert(qlinq_repair_policy_resolve(&raw, NULL, &eff, NULL, 0));
+    p = transport_track_profile_resolve(&rateless, &eff);
+    assert(p.policy.enabled && !p.proactive_fec && p.reactive_repair &&
+           p.policy.proactive_confidence == 0 &&
+           p.policy.max_extra_percent == 50 && p.policy.max_object_age_ms == 0);
+
+    /* enabling min_initial_parity_symbols on rateless turns on proactive_fec */
+    raw = (qlinq_repair_policy_t){.present = QLINQ_REPAIR_MIN_INITIAL,
+                                  .min_initial_parity_symbols = 2};
+    assert(qlinq_repair_policy_resolve(&raw, NULL, &eff, NULL, 0));
+    p = transport_track_profile_resolve(&rateless, &eff);
+    assert(p.policy.enabled && p.proactive_fec && p.reactive_repair &&
+           p.policy.min_initial_parity_symbols == 2);
+
+    /* enabling reactive_repair on fixed-rate keeps proactive_fec true */
+    raw = (qlinq_repair_policy_t){.present = QLINQ_REPAIR_REACTIVE,
+                                  .reactive_repair = true};
+    assert(qlinq_repair_policy_resolve(&raw, NULL, &eff, NULL, 0));
+    p = transport_track_profile_resolve(&fixed, &eff);
+    assert(p.policy.enabled && p.proactive_fec && p.reactive_repair &&
+           p.policy.proactive_confidence == 99);
+  }
+}
+
 int main(void) {
   test_greedy_equivalence();
   test_estimator();
   test_scheduler();
+  test_track_profile();
   qlinq_repair_policy_t p = example(), override = {0};
   qlinq_effective_repair_policy_t e;
   char error[128];

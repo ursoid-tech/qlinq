@@ -209,6 +209,9 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->symbol_size = symbol_size;
   entry->next_repair_symbol = total_symbols;
   entry->next_systematic_repair_symbol = 0;
+  entry->remaining_repair_symbols = UINT32_MAX;
+  entry->expires_at_ms = 0;
+  entry->policy_initialized = false;
   entry->recovery_protected = !allow_evict;
   entry->data = copy;
   if (object->object_id > cache->object_id_upper_bound)

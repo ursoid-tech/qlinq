@@ -297,6 +297,7 @@ typedef struct {
   uint64_t flexicast_cc_aggregate_rate_limit;
   uint32_t flexicast_cc_feedback_timeout_ms;
   transport_repair_mode_t repair_mode;
+  qlinq_repair_policy_t repair_policy;
   unsigned congestion_control;
   unsigned pacing;
   transport_limits_t limits; /* zero fields select documented defaults */
@@ -575,6 +576,14 @@ uint32_t transport_get_conn_id(transport_t *t, transport_conn_t *conn);
 transport_repair_mode_t
 transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
                                     const moq_track_id_t *track_id);
+bool transport_set_repair_policy(transport_t *t,
+                                 const qlinq_repair_policy_t *policy);
+bool transport_set_track_repair_policy(transport_t *t,
+                                       const moq_track_id_t *track_id,
+                                       const qlinq_repair_policy_t *policy);
+bool transport_get_track_repair_policy(
+    const transport_t *t, const moq_track_id_t *track_id,
+    qlinq_effective_repair_policy_t *effective);
 
 typedef struct {
   size_t subscribers;

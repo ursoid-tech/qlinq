@@ -11,7 +11,9 @@
 #include "transport_paths.h"
 #include "transport_probe.h"
 #include "transport_repair.h"
+#include "transport_repair_policy.h"
 #include "transport_subscriptions.h"
+#include "transport_tracks.h"
 
 #include "picotls.h"
 #include "picotls/openssl.h"
@@ -55,6 +57,13 @@ typedef struct {
   uint8_t priority;
   bool pending; /* Attempted bytes and identity stay fixed until completion. */
 } transport_pending_group_t;
+
+typedef struct {
+  moq_track_id_t track_id;
+  qlinq_repair_policy_t config;
+  qlinq_effective_repair_policy_t effective;
+  bool active;
+} transport_track_policy_t;
 
 /* logical local paths are shared by all peers; QUIC path IDs may differ */
 typedef struct {
@@ -163,6 +172,9 @@ struct transport_t {
 
   transport_sent_cache_t sent_cache;
   transport_repair_mode_t repair_mode;
+  qlinq_repair_policy_t repair_policy_config;
+  qlinq_effective_repair_policy_t repair_policy;
+  transport_track_policy_t track_policies[TRANSPORT_HARD_MAX_SUBSCRIPTIONS];
   transport_repair_limiter_t aggregate_repair_limiter;
   transport_repair_limiter_t aggregate_nack_limiter;
   int64_t aggregate_nack_retry_at_ms;
@@ -373,5 +385,8 @@ size_t transport_datagram_payload_limit(transport_conn_t *conn,
 size_t transport_connection_datagram_symbol_size(transport_conn_t *conn);
 bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
                               ptls_iovec_t datagram);
+transport_track_profile_t
+transport_get_track_profile(const transport_t *t,
+                            const moq_track_id_t *track_id);
 
 #endif

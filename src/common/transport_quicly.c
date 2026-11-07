@@ -1039,6 +1039,15 @@ transport_t *transport_drive_create(const transport_config_t *config) {
       config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS)
     goto Fail;
   t->repair_mode = config->repair_mode;
+  char repair_policy_error[160];
+  if (!qlinq_repair_policy_resolve(&config->repair_policy, NULL,
+                                   &t->repair_policy, repair_policy_error,
+                                   sizeof(repair_policy_error))) {
+    fprintf(stderr, "transport: invalid repair policy: %s\n",
+            repair_policy_error);
+    goto Fail;
+  }
+  t->repair_policy_config = config->repair_policy;
   if ((config->flexicast_cc_minimum_rate != 0 &&
        config->flexicast_cc_maximum_rate != 0 &&
        config->flexicast_cc_minimum_rate > config->flexicast_cc_maximum_rate) ||
@@ -2623,14 +2632,12 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
       return false;
   }
 
-  transport_track_profile_t profile = transport_track_profile(track_id);
+  transport_track_profile_t profile = transport_get_track_profile(t, track_id);
 
   /* A partially published group keeps its encoding on retries and blocks new
    * grouped data tracks until its remaining recipients accept it. */
   const transport_pending_group_t *group = &t->pending_group;
-  if (track_id->type == MOQ_TRACK_DATA && !profile.reliable &&
-      (profile.fec_enabled || profile.fec_rateless) && group->size != 0 &&
-      group->symbol_size != 0) {
+  if (profile.grouped_records && group->size != 0 && group->symbol_size != 0) {
     for (size_t c = 0; c < transport_connection_count(t); c++) {
       transport_conn_t *conn = transport_connection_at(t, c);
       if (transport_publish_recipient_eligible(t, conn, &group->track_id) &&
@@ -2801,4 +2808,108 @@ bool transport_get_track_stats(transport_t *t, const moq_track_id_t *track,
     }
   }
   return true;
+}
+
+bool transport_set_repair_policy(transport_t *t,
+                                 const qlinq_repair_policy_t *policy) {
+  if (!transport_owner_ok(t) || !policy)
+    return false;
+  qlinq_effective_repair_policy_t resolved;
+  if (!qlinq_repair_policy_resolve(policy, NULL, &resolved, NULL, 0))
+    return false;
+  size_t count = sizeof(t->track_policies) / sizeof(t->track_policies[0]);
+  qlinq_effective_repair_policy_t
+      track_resolved[TRANSPORT_HARD_MAX_SUBSCRIPTIONS];
+  for (size_t i = 0; i < count; i++) {
+    if (!t->track_policies[i].active)
+      continue;
+    if (!qlinq_repair_policy_resolve(policy, &t->track_policies[i].config,
+                                     &track_resolved[i], NULL, 0))
+      return false;
+  }
+  t->repair_policy_config = *policy;
+  t->repair_policy = resolved;
+  for (size_t i = 0; i < count; i++) {
+    if (t->track_policies[i].active)
+      t->track_policies[i].effective = track_resolved[i];
+  }
+  return true;
+}
+
+bool transport_set_track_repair_policy(transport_t *t,
+                                       const moq_track_id_t *track_id,
+                                       const qlinq_repair_policy_t *policy) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(track_id) || !policy)
+    return false;
+  transport_track_profile_t base_profile = transport_track_profile(track_id);
+  if (policy->present != 0 &&
+      (base_profile.reliable ||
+       !(base_profile.fec_enabled || base_profile.fec_rateless)))
+    return false;
+  qlinq_effective_repair_policy_t effective;
+  if (!qlinq_repair_policy_resolve(&t->repair_policy_config, policy, &effective,
+                                   NULL, 0))
+    return false;
+  size_t free_slot = SIZE_MAX;
+  size_t count = sizeof(t->track_policies) / sizeof(t->track_policies[0]);
+  for (size_t i = 0; i < count; i++) {
+    if (t->track_policies[i].active) {
+      if (transport_track_id_equal(&t->track_policies[i].track_id, track_id)) {
+        t->track_policies[i].track_id = *track_id;
+        t->track_policies[i].config = *policy;
+        t->track_policies[i].effective = effective;
+        return true;
+      }
+    } else if (free_slot == SIZE_MAX) {
+      free_slot = i;
+    }
+  }
+  if (free_slot == SIZE_MAX)
+    return false;
+  t->track_policies[free_slot] =
+      (transport_track_policy_t){.track_id = *track_id,
+                                 .config = *policy,
+                                 .effective = effective,
+                                 .active = true};
+  return true;
+}
+
+bool transport_get_track_repair_policy(
+    const transport_t *t, const moq_track_id_t *track_id,
+    qlinq_effective_repair_policy_t *effective) {
+  if (!t || !transport_owner_ok((transport_t *)t) ||
+      !transport_track_id_valid(track_id) || !effective)
+    return false;
+  transport_track_profile_t base_profile = transport_track_profile(track_id);
+  if (base_profile.reliable ||
+      !(base_profile.fec_enabled || base_profile.fec_rateless)) {
+    *effective = (qlinq_effective_repair_policy_t){0};
+    return true;
+  }
+  size_t count = sizeof(t->track_policies) / sizeof(t->track_policies[0]);
+  for (size_t i = 0; i < count; i++) {
+    if (t->track_policies[i].active &&
+        transport_track_id_equal(&t->track_policies[i].track_id, track_id)) {
+      *effective = t->track_policies[i].effective;
+      return true;
+    }
+  }
+  *effective = t->repair_policy;
+  return true;
+}
+
+transport_track_profile_t
+transport_get_track_profile(const transport_t *t,
+                            const moq_track_id_t *track_id) {
+  if (!t || !track_id)
+    return transport_track_profile(track_id);
+  size_t count = sizeof(t->track_policies) / sizeof(t->track_policies[0]);
+  for (size_t i = 0; i < count; i++) {
+    if (t->track_policies[i].active &&
+        transport_track_id_equal(&t->track_policies[i].track_id, track_id)) {
+      return transport_track_profile_resolve(track_id,
+                                             &t->track_policies[i].effective);
+    }
+  }
+  return transport_track_profile_resolve(track_id, &t->repair_policy);
 }
