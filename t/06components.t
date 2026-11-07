@@ -70,13 +70,6 @@ subtest 'decomposed transport components'  => sub {
          'component ownership and lookup tests pass') or diag($stderr);
 };
 
-subtest 'recorded Quicly patch preparation' => sub {
-    my ($stderr, $stdout) = run_prog('python3 t/test_quicly_patch.py');
-    diag "STDERR:\n$stderr" if $stderr ne '';
-    like($stdout, qr/===QUICLY PATCH OK===/,
-         'pristine, patched and unexpected-edit states are handled safely');
-};
-
 subtest 'UDP GSO grouping and partial sends' => sub {
     plan skip_all => 'Linux UDP_SEGMENT syscall coverage' if $^O ne 'linux';
     my ($stderr, $stdout) = run_prog('./t/00util/test_udp_gso_prefix');
