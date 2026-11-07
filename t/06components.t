@@ -109,4 +109,10 @@ subtest 'post-poll receive filtering' => sub {
          'readiness, timer ticks, receive budgets and replaced sockets preserve progress') or diag($stderr);
 };
 
+subtest 'interface discovery and configured bind recovery' => sub {
+    my ($stderr, $stdout) = run_prog('./t/00util/test_transport_ifmon');
+    like($stdout, qr/===TRANSPORT IFMON OK===/,
+         'loopback overrides, explicit IPv4/IPv6 recovery and large queued snapshots pass') or diag($stderr);
+};
+
 done_testing;

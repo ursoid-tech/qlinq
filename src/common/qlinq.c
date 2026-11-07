@@ -63,6 +63,8 @@ struct qlinq_endpoint {
   uint64_t record_callbacks_accepted;
   uint64_t record_callbacks_rejected;
   uint64_t rx_service_started_ns;
+  qlinq_interface_callback_t interface_callback;
+  void *interface_user_data;
   bool service_pending;
   bool listener;
   bool active;
@@ -78,6 +80,7 @@ struct qlinq_context {
   pthread_t owner_thread;
   bool in_log;
   bool in_record_callback;
+  bool in_interface_callback;
   qlinq_endpoint_t *endpoints;
   qlinq_event_node_t *event_head;
   qlinq_event_node_t *event_tail;
@@ -138,7 +141,8 @@ _Static_assert((int)QLINQ_PACING_ENABLED == TRANSPORT_PACING_ENABLED,
 
 static bool context_access(const qlinq_context_t *context) {
   return context && pthread_equal(context->owner_thread, pthread_self()) &&
-         !context->in_log && !context->in_record_callback;
+         !context->in_log && !context->in_record_callback &&
+         !context->in_interface_callback;
 }
 
 static bool endpoint_access(const qlinq_endpoint_t *endpoint) {
@@ -235,6 +239,23 @@ static void on_transport_log(void *user_data,
   endpoint->context->in_log = true;
   endpoint->context->log_callback(endpoint->context->log_user_data, &event);
   endpoint->context->in_log = false;
+}
+
+static bool on_transport_interface(void *user_data,
+                                   const transport_interface_info_t *source) {
+  qlinq_endpoint_t *endpoint = user_data;
+  if (!endpoint || !source || !endpoint->context ||
+      !endpoint->interface_callback)
+    return true;
+  qlinq_interface_info_t info = {.interface_index = source->interface_index,
+                                 .interface_name = source->interface_name,
+                                 .local_address = source->local_address,
+                                 .address_family = source->address_family};
+  endpoint->context->in_interface_callback = true;
+  bool allowed = endpoint->interface_callback(endpoint->interface_user_data,
+                                              endpoint, &info);
+  endpoint->context->in_interface_callback = false;
+  return allowed;
 }
 
 static bool queue_event(qlinq_context_t *context, const qlinq_event_t *source,
@@ -710,6 +731,8 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   endpoint->context = context;
   endpoint->listener = listener;
   endpoint->active = true;
+  endpoint->interface_callback = config->interface_callback;
+  endpoint->interface_user_data = config->interface_user_data;
   if (config->security.shared_secret_size != 0) {
     endpoint->shared_secret = malloc(config->security.shared_secret_size);
     if (!endpoint->shared_secret) {
@@ -767,6 +790,9 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.log_callback =
       endpoint->context->log_callback ? on_transport_log : NULL;
   transport_config.log_user_data = endpoint;
+  transport_config.interface_callback =
+      config->interface_callback ? on_transport_interface : NULL;
+  transport_config.interface_user_data = endpoint;
 
   endpoint->transport = transport_create(&transport_config);
   if (!endpoint->transport) {

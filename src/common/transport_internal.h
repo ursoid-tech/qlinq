@@ -106,6 +106,8 @@ struct transport_t {
   void *user_data;
   transport_log_callback_t log_callback;
   void *log_user_data;
+  transport_interface_callback_t interface_callback;
+  void *interface_user_data;
   bool is_server;
   bool shutting_down;
   bool reconnect_enabled;
@@ -118,6 +120,8 @@ struct transport_t {
   transport_local_path_t sockets[TRANSPORT_MAX_PATHS];
   size_t socket_count;
   uint16_t bind_port; /* Stable while all local interfaces are unavailable. */
+  struct sockaddr_storage configured_bind_addrs[TRANSPORT_MAX_PATHS];
+  size_t num_configured_bind_addrs;
   char path_interface_names[TRANSPORT_MAX_PATHS][64];
   size_t num_path_interface_names;
   transport_limits_t limits;
@@ -126,6 +130,7 @@ struct transport_t {
   pthread_t owner_thread;
   bool tick_active;
   bool log_callback_active;
+  bool interface_callback_active;
   bool send_backlog;
   size_t callback_depth;
 
@@ -298,6 +303,8 @@ typedef struct {
   socklen_t addr_len;
   int is_added;
 } transport_interface_event_t;
+bool transport_is_configured_address(const transport_t *,
+                                     const struct sockaddr_storage *);
 const char *transport_engine_open_path(transport_t *, transport_local_path_t *);
 bool transport_drive_input_pending(transport_t *t);
 bool transport_engine_begin_turn(transport_t *t);

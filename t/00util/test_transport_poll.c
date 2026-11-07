@@ -54,6 +54,7 @@ static void init_fixture(fixture_t *f) {
   t->log_callback = log_event;
   t->log_user_data = f;
   f->host.transport = t;
+  atomic_init(&f->host.interface_updates, NULL);
   f->host.ifmon_pipe[0] = f->host.ifmon_pipe[1] = -1;
   t->drive_host = transport_poll_host_adapter(&f->host);
   t->drive_now_ns = t->drive_host.initial_time_ns;
