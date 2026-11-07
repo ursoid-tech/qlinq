@@ -206,6 +206,22 @@ typedef struct {
 } qlinq_group_delivery_config_t;
 
 typedef struct {
+  uint32_t interface_index;
+  const char *interface_name;
+  const char *local_address;
+  int address_family;
+} qlinq_interface_info_t;
+
+/* synchronous owner-thread filter for newly discovered or multihome interfaces.
+ * strings in iface are borrowed and valid only during the callback. return true
+ * to bind and open a path for this interface/address, or false to ignore it.
+ * explicit bind addresses bypass this filter, including when they return.
+ * the callback must not call QLINQ through the delivering context. */
+typedef bool (*qlinq_interface_callback_t)(void *user_data,
+                                           qlinq_endpoint_t *endpoint,
+                                           const qlinq_interface_info_t *iface);
+
+typedef struct {
   const char *bind_addresses[QLINQ_MAX_PATHS];
   size_t bind_address_count;
   const char *remote_addresses[QLINQ_MAX_PATHS];
@@ -234,7 +250,7 @@ typedef struct {
   qlinq_pacing_t pacing;
   qlinq_limits_t limits;
   /* exact interface allowlist for paths discovered after startup. initial
-   * bind addresses must also belong to the selected interfaces. */
+   * bind addresses are restored independently of this allowlist. */
   const char *path_interface_names[QLINQ_MAX_PATHS];
   size_t path_interface_count;
   /* Initial congestion window per QUIC path. Zero preserves the default of
@@ -246,8 +262,12 @@ typedef struct {
   uint32_t default_jumpstart_packets;
   /* maximum jumpstart packets permitted for resumed sessions */
   uint32_t max_jumpstart_packets;
-  /* automatically detect and bind non-loopback network interfaces */
+  /* discover existing interfaces at startup using the configured filters */
   bool multihome;
+  /* optional filter callback for discovered interfaces; overrides default
+   * virtual/loopback exclusion when set */
+  qlinq_interface_callback_t interface_callback;
+  void *interface_user_data;
 } qlinq_endpoint_config_t;
 
 typedef struct {

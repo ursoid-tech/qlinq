@@ -4,6 +4,7 @@
 #define IFMON_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -19,7 +20,6 @@
 extern "C" {
 #endif
 
-#define IFMON_MAX_INTERFACES 16
 #define IFMON_MAX_IPS_PER_IFACE 16
 
 /* an IP address (v4 or v6) paired with its prefix length */
@@ -42,10 +42,12 @@ typedef struct ifmon_iface {
   int addr_count;
 } ifmon_iface_t;
 
-/* snapshot */
+/* owned snapshot. zero-initialize before use; release with ifmon_list_dispose.
+ * assignment transfers ownership; do not copy a live snapshot by value. */
 typedef struct ifmon_list {
-  ifmon_iface_t ifaces[IFMON_MAX_INTERFACES];
+  ifmon_iface_t *ifaces;
   int count; /* number of interfaces */
+  int capacity;
 } ifmon_list_t;
 
 /* diff for a single interface */
@@ -60,15 +62,16 @@ typedef struct ifmon_iface_diff {
   int addrs_removed_count;
 } ifmon_iface_diff_t;
 
-/* update delivered to the callback */
+/* update storage belongs to the watcher and is valid only during the callback.
+ * the interfaces pointer borrows the current snapshot. */
 typedef struct ifmon_update {
-  int is_initial;                       /* 1 on the very first callback */
-  const ifmon_list_t *interfaces;       /* current snapshot */
-  uint32_t added[IFMON_MAX_INTERFACES]; /* array of added ifindex values */
+  int is_initial;                 /* 1 on the very first callback */
+  const ifmon_list_t *interfaces; /* current snapshot */
+  uint32_t *added;                /* array of added ifindex values */
   int added_count;
-  uint32_t removed[IFMON_MAX_INTERFACES]; /* array of removed ifindex values */
+  uint32_t *removed; /* array of removed ifindex values */
   int removed_count;
-  ifmon_iface_diff_t modified[IFMON_MAX_INTERFACES]; /* per-interface diffs */
+  ifmon_iface_diff_t *modified; /* per-interface diffs */
   int modified_count;
 } ifmon_update_t;
 
@@ -91,6 +94,7 @@ typedef struct ifmon_watcher {
   ifmon_list_t prev_list;
   ifmon_list_t curr_list;
   ifmon_update_t update;
+  int initial_pending;
   uint8_t scratchpad[IFMON_SCRATCHPAD_SIZE];
 #ifndef _WIN32
   pthread_t thread;
@@ -100,18 +104,29 @@ typedef struct ifmon_watcher {
 #else
   HANDLE notify_handle;
   CRITICAL_SECTION lock;
+  int lock_initialized;
 #endif
 } ifmon_watcher_t;
 
-/* populate a snapshot into the caller's struct */
+/* replace an initialized snapshot on success; leave it intact on failure.
+ * the scratchpad is reused when possible; larger dumps allocate temporary
+ * storage. release the snapshot with ifmon_list_dispose when finished. */
 int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
                    size_t scratchpad_size);
+
+void ifmon_list_dispose(ifmon_list_t *list);
+
+/* release owned diff arrays, without releasing the borrowed snapshot */
+void ifmon_update_dispose(ifmon_update_t *update);
 
 /* begin watching for interface changes. caller keeps watcher alive. */
 int ifmon_watch_start(ifmon_watcher_t *w, ifmon_callback_t cb, void *userdata);
 
 /* stop watching */
 void ifmon_watch_stop(ifmon_watcher_t *w);
+
+/* default filter excluding loopback, tunnel, and virtual bridge interfaces */
+int ifmon_is_default_iface(const char *name);
 
 #ifdef __cplusplus
 }

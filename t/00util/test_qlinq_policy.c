@@ -10,6 +10,39 @@ static void ignore_transport_event(void *data, const transport_event_t *event) {
   (void)event;
 }
 
+typedef struct {
+  qlinq_context_t *context;
+  qlinq_endpoint_t *expected_endpoint;
+  size_t calls;
+  bool allow;
+  bool valid;
+  uint32_t last_index;
+  char last_name[64];
+  char last_address[64];
+  int last_family;
+} iface_filter_state_t;
+
+static bool filter_interface(void *user_data, qlinq_endpoint_t *endpoint,
+                             const qlinq_interface_info_t *iface) {
+  iface_filter_state_t *state = user_data;
+  state->calls++;
+  state->valid &= endpoint == state->expected_endpoint && iface != NULL &&
+                  iface->interface_name != NULL && iface->local_address != NULL;
+  /* re-entrant API calls must be rejected while the callback is active */
+  state->valid &=
+      qlinq_service(state->context, 0) == QLINQ_STATUS_STATE &&
+      qlinq_context_last_status(state->context) == QLINQ_STATUS_INVALID;
+  if (iface) {
+    state->last_index = iface->interface_index;
+    snprintf(state->last_name, sizeof(state->last_name), "%s",
+             iface->interface_name);
+    snprintf(state->last_address, sizeof(state->last_address), "%s",
+             iface->local_address);
+    state->last_family = iface->address_family;
+  }
+  return state->allow;
+}
+
 int main(void) {
   qlinq_context_t *context = qlinq_context_create(NULL);
   assert(context);
@@ -228,6 +261,45 @@ int main(void) {
   assert(server_info.tls.selected_group ==
          (server->transport->tls_hybrid_available ? PTLS_GROUP_X25519MLKEM768
                                                   : PTLS_GROUP_SECP256R1));
+
+  /* test synchronous interface filter callback on hot-added interfaces */
+  iface_filter_state_t filter_state = {.context = context, .valid = true};
+  qlinq_endpoint_config_t filter_config = client_config;
+  filter_config.port = 20204;
+  filter_config.interface_callback = filter_interface;
+  filter_config.interface_user_data = &filter_state;
+  qlinq_endpoint_t *filtered = qlinq_connect(context, &filter_config);
+  assert(filtered);
+  filter_state.expected_endpoint = filtered;
+
+  struct sockaddr_storage cand = {0};
+  struct sockaddr_in *sin = (struct sockaddr_in *)&cand;
+  sin->sin_family = AF_INET;
+  assert(inet_pton(AF_INET, "127.0.0.2", &sin->sin_addr) == 1);
+
+  /* reject candidate interface first */
+  filter_state.allow = false;
+  assert(
+      transport_drive_interface(filtered->transport, true, &cand, 42, "tun0"));
+  assert(filter_state.valid && filter_state.calls == 1);
+  assert(filter_state.last_index == 42 &&
+         strcmp(filter_state.last_name, "tun0") == 0 &&
+         strcmp(filter_state.last_address, "127.0.0.2") == 0 &&
+         filter_state.last_family == AF_INET);
+  assert(filtered->transport->socket_count == 1);
+
+  /* accept candidate interface (even virtual tun0 that default filter hides) */
+  filter_state.allow = true;
+  assert(
+      transport_drive_interface(filtered->transport, true, &cand, 42, "tun0"));
+  assert(filter_state.valid && filter_state.calls == 2);
+  assert(filtered->transport->socket_count == 2);
+  qlinq_path_stats_t path_stats = {0};
+  assert(qlinq_endpoint_get_path_stats(filtered, 1, &path_stats));
+  assert(strcmp(path_stats.interface_name, "tun0") == 0);
+  assert(strcmp(path_stats.local_address, "127.0.0.2") == 0);
+  qlinq_endpoint_close(filtered);
+
   qlinq_context_destroy(context);
   puts("===QLINQ POLICY OK===");
   return 0;

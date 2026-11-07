@@ -10,13 +10,16 @@ typedef struct {
   transport_udp_gro_t *gro;
   bool receive_backlog;
 } transport_poll_socket_t;
+typedef struct transport_interface_batch transport_interface_batch_t;
 typedef struct {
   transport_t *transport;
   transport_poll_socket_t sockets[TRANSPORT_MAX_PATHS];
   size_t socket_count, receive_cursor;
   ifmon_watcher_t ifmon_w;
   int ifmon_pipe[2];
+  _Atomic(transport_interface_batch_t *) interface_updates;
   bool multihome;
+  bool custom_iface_filter;
   transport_log_callback_t log_callback;
   void *log_user_data;
 } transport_poll_host_t;

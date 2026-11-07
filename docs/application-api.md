@@ -20,6 +20,16 @@ strings need only remain valid during endpoint creation.
 selected interfaces. Match initial bind addresses to the same interfaces;
 the allowlist does not configure OS routing.
 
+Set `multihome` to discover existing interfaces at startup. The optional
+`interface_callback` filters discovered interface/address pairs on the context's
+owner thread, including later interface changes. It replaces the default
+virtual/loopback exclusion; an explicit interface-name allowlist still applies.
+Return `true` to admit a candidate or `false` to ignore it. Callback strings are
+borrowed until the callback returns, and the callback must not call QLINQ through
+the delivering context. Explicit bind addresses bypass discovery filters both
+at startup and when restored after an interface goes down and comes back up;
+other addresses on that interface remain subject to the filters.
+
 `qlinq_publish` and `qlinq_subscribe` return named stream handles. Each stream
 selects content type and datagram, reliable, fixedrate or rateless delivery.
 Subscriptions created before authentication activate when peers become ready,

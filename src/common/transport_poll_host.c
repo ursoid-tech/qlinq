@@ -83,115 +83,151 @@ static void bind_to_device(int fd, uint32_t index) {
              sizeof(idx));
 #endif
 }
+static bool host_iface_allowed(const transport_poll_host_t *t,
+                               const char *name) {
+  return t->custom_iface_filter || ifmon_is_default_iface(name);
+}
+
+/* the pipe only wakes the owner. snapshot-sized batches avoid losing later
+ * candidates when discovery produces more events than the pipe can hold. */
+struct transport_interface_batch {
+  transport_interface_batch_t *next;
+  size_t count, capacity;
+  bool filter_discovery;
+  transport_interface_event_t events[];
+};
+
+static bool append_interface_event(transport_interface_batch_t **batch,
+                                   const transport_interface_event_t *event) {
+  if (!*batch || (*batch)->count == (*batch)->capacity) {
+    bool initial = *batch == NULL;
+    size_t capacity = *batch ? (*batch)->capacity : 8;
+    if (capacity > (SIZE_MAX - sizeof(**batch)) / 2 / sizeof(*event))
+      return false;
+    capacity *= 2;
+    transport_interface_batch_t *grown =
+        realloc(*batch, sizeof(**batch) + capacity * sizeof(*event));
+    if (!grown)
+      return false;
+    if (initial)
+      *grown = (transport_interface_batch_t){0};
+    grown->capacity = capacity;
+    *batch = grown;
+  }
+  (*batch)->events[(*batch)->count++] = *event;
+  return true;
+}
+
+static void queue_interface_batch(transport_poll_host_t *host,
+                                  transport_interface_batch_t *batch) {
+  if (!batch)
+    return;
+  transport_interface_batch_t *head =
+      atomic_load_explicit(&host->interface_updates, memory_order_relaxed);
+  do {
+    batch->next = head;
+  } while (!atomic_compare_exchange_weak_explicit(
+      &host->interface_updates, &head, batch, memory_order_release,
+      memory_order_relaxed));
+  if (!head) {
+    char wake = 1;
+    ssize_t written;
+    do {
+      written = write(host->ifmon_pipe[1], &wake, sizeof(wake));
+    } while (written < 0 && errno == EINTR);
+    /* EAGAIN means an existing wake already makes the descriptor readable */
+  }
+}
+
+static bool append_interface_address(transport_interface_batch_t **batch,
+                                     const ifmon_iface_t *iface,
+                                     const ifmon_addr_t *address, bool added) {
+  transport_interface_event_t msg = {.index = iface->index, .is_added = added};
+  copy_interface_name(msg.name, iface->name);
+  msg.addr_len = ifmon_socket_address(&msg.addr, address, msg.index);
+  return append_interface_event(batch, &msg);
+}
+
 static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
-  transport_poll_host_t *t = userdata;
+  transport_poll_host_t *host = userdata;
+  transport_interface_batch_t *batch = NULL;
 
   if (update->is_initial) {
-    if (!t->multihome)
+    if (!host->multihome)
       return;
     for (int j = 0; j < update->interfaces->count; j++) {
       const ifmon_iface_t *iface = &update->interfaces->ifaces[j];
       if (!iface->is_up)
         continue;
-      if (strncmp(iface->name, "lo", 2) == 0 && update->interfaces->count > 1)
-        continue;
-      for (int k = 0; k < iface->addr_count; k++) {
-        const ifmon_addr_t *a = &iface->addrs[k];
-        transport_interface_event_t msg = {0};
-        msg.index = iface->index;
-        copy_interface_name(msg.name, iface->name);
-        msg.is_added = 1;
-        msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-        ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-        (void)w;
-      }
+      for (int k = 0; k < iface->addr_count; k++)
+        if (!append_interface_address(&batch, iface, &iface->addrs[k], true))
+          goto Fail;
     }
-    return;
+    goto Queue;
+  }
+
+  /* retire old addresses before additions so replacements can reuse slots */
+  for (int i = 0; i < update->removed_count; i++) {
+    transport_interface_event_t msg = {.index = update->removed[i]};
+    msg.addr.ss_family = AF_UNSPEC;
+    if (!append_interface_event(&batch, &msg))
+      goto Fail;
+  }
+  for (int i = 0; i < update->modified_count; i++) {
+    const ifmon_iface_diff_t *diff = &update->modified[i];
+    ifmon_iface_t iface = {.index = diff->index};
+    for (int j = 0; j < update->interfaces->count; j++)
+      if (update->interfaces->ifaces[j].index == diff->index) {
+        iface = update->interfaces->ifaces[j];
+        break;
+      }
+    if (diff->link_state_changed && !diff->is_up) {
+      transport_interface_event_t msg = {.index = diff->index};
+      msg.addr.ss_family = AF_UNSPEC;
+      if (!append_interface_event(&batch, &msg))
+        goto Fail;
+    }
+    for (int j = 0; j < diff->addrs_removed_count; j++)
+      if (!append_interface_address(&batch, &iface, &diff->addrs_removed[j],
+                                    false))
+        goto Fail;
   }
 
   for (int i = 0; i < update->added_count; i++) {
-    uint32_t idx = update->added[i];
     for (int j = 0; j < update->interfaces->count; j++) {
-      if (update->interfaces->ifaces[j].index == idx) {
-        const ifmon_iface_t *iface = &update->interfaces->ifaces[j];
-        for (int k = 0; k < iface->addr_count; k++) {
-          const ifmon_addr_t *a = &iface->addrs[k];
-          transport_interface_event_t msg = {0};
-          msg.index = idx;
-          copy_interface_name(msg.name, iface->name);
-          msg.is_added = 1;
-          msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-          ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-          (void)w;
-        }
-        break;
-      }
+      const ifmon_iface_t *iface = &update->interfaces->ifaces[j];
+      if (iface->index != update->added[i] || !iface->is_up)
+        continue;
+      for (int k = 0; k < iface->addr_count; k++)
+        if (!append_interface_address(&batch, iface, &iface->addrs[k], true))
+          goto Fail;
+      break;
     }
   }
-
-  for (int i = 0; i < update->removed_count; i++) {
-    transport_interface_event_t msg = {0};
-    msg.index = update->removed[i];
-    msg.is_added = 0;
-    msg.addr.ss_family = AF_UNSPEC;
-    ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-    (void)w;
-  }
-
   for (int i = 0; i < update->modified_count; i++) {
     const ifmon_iface_diff_t *diff = &update->modified[i];
-
-    if (diff->link_state_changed) {
-      for (int k = 0; k < update->interfaces->count; k++) {
-        const ifmon_iface_t *iface = &update->interfaces->ifaces[k];
-        if (iface->index == diff->index) {
-          for (int a_idx = 0; a_idx < iface->addr_count; a_idx++) {
-            const ifmon_addr_t *a = &iface->addrs[a_idx];
-            transport_interface_event_t msg = {0};
-            msg.index = diff->index;
-            copy_interface_name(msg.name, iface->name);
-            msg.is_added = diff->is_up ? 1 : 0;
-            msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-            ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-            (void)w;
-          }
-          break;
-        }
-      }
-    }
-
-    for (int j = 0; j < diff->addrs_added_count; j++) {
-      const ifmon_addr_t *a = &diff->addrs_added[j];
-      transport_interface_event_t msg = {0};
-      msg.index = diff->index;
-      msg.is_added = 1;
-      for (int k = 0; k < update->interfaces->count; k++) {
-        if (update->interfaces->ifaces[k].index == diff->index) {
-          copy_interface_name(msg.name, update->interfaces->ifaces[k].name);
-          break;
-        }
-      }
-      msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-      ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-      (void)w;
-    }
-
-    for (int j = 0; j < diff->addrs_removed_count; j++) {
-      const ifmon_addr_t *a = &diff->addrs_removed[j];
-      transport_interface_event_t msg = {0};
-      msg.index = diff->index;
-      msg.is_added = 0;
-      for (int k = 0; k < update->interfaces->count; k++) {
-        if (update->interfaces->ifaces[k].index == diff->index) {
-          copy_interface_name(msg.name, update->interfaces->ifaces[k].name);
-          break;
-        }
-      }
-      msg.addr_len = ifmon_socket_address(&msg.addr, a, msg.index);
-      ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
-      (void)w;
+    for (int j = 0; j < update->interfaces->count; j++) {
+      const ifmon_iface_t *iface = &update->interfaces->ifaces[j];
+      if (iface->index != diff->index || !iface->is_up)
+        continue;
+      const ifmon_addr_t *addrs =
+          diff->link_state_changed ? iface->addrs : diff->addrs_added;
+      int count = diff->link_state_changed ? iface->addr_count
+                                           : diff->addrs_added_count;
+      for (int k = 0; k < count; k++)
+        if (!append_interface_address(&batch, iface, &addrs[k], true))
+          goto Fail;
+      break;
     }
   }
+Queue:
+  if (batch) {
+    batch->filter_discovery = true;
+    queue_interface_batch(host, batch);
+  }
+  return;
+Fail:
+  free(batch);
 }
 static bool set_fd_nonblocking(int fd) {
   int flags = fcntl(fd, F_GETFL, 0);
@@ -262,8 +298,10 @@ static void resolve_interface(transport_drive_path_t *path) {
     return;
   ifmon_list_t list = {0};
   uint8_t scratch[IFMON_SCRATCHPAD_SIZE];
-  if (ifmon_list_get(&list, scratch, sizeof(scratch)))
+  if (ifmon_list_get(&list, scratch, sizeof(scratch))) {
+    ifmon_list_dispose(&list);
     return;
+  }
   for (int i = 0; i < list.count; i++)
     for (int a = 0; a < list.ifaces[i].addr_count; a++) {
       struct sockaddr_storage address;
@@ -273,9 +311,11 @@ static void resolve_interface(transport_drive_path_t *path) {
                                   (struct sockaddr *)&path->local)) {
         path->interface_index = list.ifaces[i].index;
         copy_interface_name(path->interface_name, list.ifaces[i].name);
+        ifmon_list_dispose(&list);
         return;
       }
     }
+  ifmon_list_dispose(&list);
 }
 /* keep unicast tuples exclusive; SO_REUSEADDR can steal QUIC replies */
 static bool host_open(void *context, transport_drive_path_t *path) {
@@ -367,6 +407,13 @@ static void host_dispose(void *context) {
     CLOSE_SOCKET(host->ifmon_pipe[0]);
     CLOSE_SOCKET(host->ifmon_pipe[1]);
   }
+  transport_interface_batch_t *batch =
+      atomic_load_explicit(&host->interface_updates, memory_order_relaxed);
+  while (batch) {
+    transport_interface_batch_t *next = batch->next;
+    free(batch);
+    batch = next;
+  }
   free(host);
 }
 transport_drive_host_t
@@ -389,7 +436,10 @@ transport_t *transport_create(const transport_config_t *config) {
   if (!host)
     return NULL;
   host->ifmon_pipe[0] = host->ifmon_pipe[1] = -1;
+  atomic_init(&host->interface_updates, NULL);
   host->multihome = config->multihome;
+  host->custom_iface_filter = config->interface_callback != NULL ||
+                              config->num_path_interface_names > 0;
   host->log_callback = config->log_callback;
   host->log_user_data = config->log_user_data;
   /* capture interface changes during TLS and path construction */
@@ -534,12 +584,34 @@ static bool service_interfaces(transport_t *t) {
   transport_poll_host_t *host = transport_poll_host(t);
   if (host->ifmon_pipe[0] < 0)
     return false;
-  bool consumed = false;
-  transport_interface_event_t msg;
-  while (read(host->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
-    consumed = true;
-    (void)transport_drive_interface(t, msg.is_added, &msg.addr, msg.index,
-                                    msg.name);
+  char wake[64];
+  ssize_t received;
+  do {
+    received = read(host->ifmon_pipe[0], wake, sizeof(wake));
+  } while (received > 0 || (received < 0 && errno == EINTR));
+  transport_interface_batch_t *pending = atomic_exchange_explicit(
+      &host->interface_updates, NULL, memory_order_acquire);
+  bool consumed = pending != NULL;
+  transport_interface_batch_t *ordered = NULL;
+  while (pending) {
+    transport_interface_batch_t *next = pending->next;
+    pending->next = ordered;
+    ordered = pending;
+    pending = next;
+  }
+  while (ordered) {
+    transport_interface_batch_t *next = ordered->next;
+    for (size_t i = 0; i < ordered->count; i++) {
+      const transport_interface_event_t *msg = &ordered->events[i];
+      if (msg->is_added && ordered->filter_discovery &&
+          !host_iface_allowed(host, msg->name) &&
+          !transport_is_configured_address(t, &msg->addr))
+        continue;
+      (void)transport_drive_interface(t, msg->is_added, &msg->addr, msg->index,
+                                      msg->name);
+    }
+    free(ordered);
+    ordered = next;
   }
   return consumed;
 }
@@ -712,8 +784,11 @@ static void transport_mock_iface_change(transport_t *t, const char *ip_addr,
     return;
   msg.addr_len = sizeof(*sin);
 
-  ssize_t w = write(host->ifmon_pipe[1], &msg, sizeof(msg));
-  (void)w;
+  transport_interface_batch_t *batch = NULL;
+  if (append_interface_event(&batch, &msg))
+    queue_interface_batch(host, batch);
+  else
+    free(batch);
 }
 void transport_mock_iface_add(transport_t *t, const char *ip_addr) {
   transport_mock_iface_change(t, ip_addr, true);
