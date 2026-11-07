@@ -207,7 +207,6 @@ struct transport_conn_t {
   transport_subscription_table_t send_subscriptions;
   transport_subscription_table_t receive_subscriptions;
   bool quic_ready;
-  bool rx_cadence_handshake_confirmed;
   bool path_probe_handshake_confirmed;
   bool hello_sent;
   bool hello_received;
@@ -318,6 +317,14 @@ transport_checkpoint_ack(const transport_conn_t *conn, uint8_t alias) {
   transport_subscription_state_t *state =
       transport_subscriptions_get_state(&conn->send_subscriptions, alias);
   return state ? &state->checkpoint_ack : NULL;
+}
+
+static inline bool transport_simulated_loss(transport_t *t, uint8_t rate) {
+  if (rate == 0)
+    return false;
+  uint32_t sample = 0;
+  t->tls_ctx.random_bytes(&sample, sizeof(sample));
+  return (sample % 100U) < rate;
 }
 
 typedef struct {

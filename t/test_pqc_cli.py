@@ -111,7 +111,7 @@ class PqcCLI(unittest.TestCase):
         return self.wait_for(ready, f"{name} did not authenticate", timeout=15)
 
     def test_strict_cli_parsing(self):
-        for executable in ("qlinq-app", "qlinqd", "qlinq-tun"):
+        for executable in ("qlinq-app", "qlinq-tun"):
             for invalid in ("", "hybrid", "CLASSICAL", " prefer-hybrid", "require-hybrid "):
                 result = subprocess.run([str(ROOT / executable), "--tls-group-policy", invalid,
                                          "--help"], cwd=ROOT, capture_output=True, timeout=4)
@@ -336,70 +336,6 @@ class PqcCLI(unittest.TestCase):
         for name in self.profiles:
             self.assertEqual(json.loads((self.path / name / "config.json").read_text())["tls_group_policy"], "require-hybrid")
         print("managed restart: required policy preserved, pending status reset, verified full group=4588 on both workers", flush=True)
-
-    def test_daemon_bidirectional_reload(self):
-        policy = "require-hybrid" if self.hybrid else "prefer-hybrid"
-        group = 4588 if self.hybrid else 23
-        port = free_port()
-        stem = f"pqc-{os.getpid()}-{self.path.name}"
-        server_name, client_name = stem + "-s", stem + "-c"
-        common = [*IDENTITY, "--auth-token", "pqc-test", "--tls-group-policy", policy,
-                  "--track", "pqc", "--mode", "reliable"]
-        server, server_log = self.launch("qlinqd", [*common, "--listen", str(port),
-            "--bind", "127.0.0.1", "--socket", server_name], "daemon-server")
-        client, client_log = self.launch("qlinqd", [*common, "--peer", f"127.0.0.1:{port}",
-            "--socket", client_name], "daemon-client")
-        self.wait_for(lambda: self.logged(server_log, "peer authentication successful") and
-                      self.logged(client_log, "authentication to peer successful"), "daemons did not authenticate")
-        sockets = []
-        def connect_uds(name):
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(8)
-            sock.connect(f"/tmp/{name}.sock")
-            sock.sendall(bytes((4, 1, 3)) + b"pqc")
-            sockets.append(sock)
-            return sock
-        def read_exact(sock, size):
-            result = bytearray()
-            while len(result) < size:
-                chunk = sock.recv(size - len(result))
-                self.assertTrue(chunk)
-                result.extend(chunk)
-            return bytes(result)
-        def exchange(sender, receiver, payload):
-            sender.sendall(struct.pack("!IB", len(payload), 2) + payload)
-            size, priority = struct.unpack("!IB", read_exact(receiver, 5))
-            self.assertEqual(priority, 2)
-            self.assertEqual(read_exact(receiver, size), payload)
-        try:
-            left, right = connect_uds(client_name), connect_uds(server_name)
-            self.wait_for(lambda: self.logged(server_log, "peer subscribed") and self.logged(client_log, "peer subscribed"),
-                          "daemon tracks were not subscribed")
-            time.sleep(0.05)  # allow the bounded UDS registration to be consumed
-            exchange(left, right, bytes(range(256)) * 31)
-            exchange(right, left, b"verified-reverse-daemon\x00\xff")
-            for proc in (server, client):
-                os.kill(proc.pid, signal.SIGHUP)
-            self.wait_for(lambda: self.logged(server_log, "TLS credential reload complete") and
-                          self.logged(client_log, "TLS credential reload complete"), "daemon identity reload failed")
-            left.close()
-            self.stop(client)
-            new_name = client_name + "2"
-            new_client, new_log = self.launch("qlinqd", [*common, "--peer", f"127.0.0.1:{port}",
-                "--socket", new_name], "daemon-client-reloaded")
-            self.wait_for(lambda: self.logged(new_log, "authentication to peer successful") and
-                          server_log.read_text().count("peer authentication successful") == 2,
-                          "fresh daemon connection after reload did not authenticate")
-            new_socket = connect_uds(new_name)
-            time.sleep(0.05)
-            exchange(new_socket, right, b"verified-after-reload")
-            for log in (server_log, client_log, new_log):
-                self.assertRegex(log.read_text(), rf"policy={policy} group={group} result=.*handshake=full verify_peer=1")
-            self.assertEqual(server_log.read_text().count(f"group={group} result="), 2)
-            print(f"daemon: verified bidirectional exact payloads, reload and fresh connection policy={policy} group={group}", flush=True)
-        finally:
-            for sock in sockets:
-                sock.close()
 
 
 if __name__ == "__main__":

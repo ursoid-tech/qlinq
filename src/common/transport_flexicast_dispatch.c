@@ -42,7 +42,6 @@ static void queue_pop(transport_flexicast_queue_t *queue) {
   queue->bytes =
       payload->size <= queue->bytes ? queue->bytes - payload->size : 0;
   free(payload->data);
-  free(payload->packet);
   memset(payload, 0, sizeof(*payload));
   queue->head = (queue->head + 1U) % queue->capacity;
   queue->count--;
@@ -352,15 +351,15 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
   int64_t now = transport_now_ms(t);
   if (now < flow->dispatch_retry_at_ms)
     return FLEXICAST_DISPATCH_BLOCKED;
-  if (queued->packet && queued->packet_epoch != flow->key_epoch) {
-    free(queued->packet);
-    queued->packet = NULL;
+  if (queued->packet_ready && queued->packet_epoch != flow->key_epoch) {
+    queued->packet_ready = false;
+    queued->packet_size = 0;
     queued->next_member = 0;
     queued->counted = false;
     /* keep interrupted replicated packet replicated across key rotation */
     queued->replicated = true;
   }
-  if (!queued->packet) {
+  if (!queued->packet_ready) {
     for (size_t i = 0; i < flow->member_count; i++) {
       if (flow->members[i].joined && !flow->members[i].listening) {
         flow->dispatch_retry_at_ms = now + 10;
@@ -368,26 +367,23 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       }
     }
     size_t size = pacing_cost(flow, queued->size);
-    if (size == 0 || size > t->limits.max_udp_payload_size)
+    if (size == 0 || size > t->limits.max_udp_payload_size ||
+        size > queued->packet_capacity)
       return FLEXICAST_DISPATCH_FAILED;
     if (size > pacing_available(t, flow))
       return FLEXICAST_DISPATCH_BLOCKED;
-    queued->packet = malloc(size);
-    if (!queued->packet)
-      return FLEXICAST_DISPATCH_FAILED;
     int result = quicly_flexicast_send_datagram_at(
         flow->crypto, ptls_iovec_init(queued->data, queued->size),
         queued->packet, size, &queued->packet_size, &queued->packet_number,
         now);
     if (result != QUICLY_FLEXICAST_OK) {
-      free(queued->packet);
-      queued->packet = NULL;
       if (result == QUICLY_FLEXICAST_ERROR_SEND_WINDOW) {
         flow->dispatch_retry_at_ms = now + 10;
         return FLEXICAST_DISPATCH_BLOCKED;
       }
       return FLEXICAST_DISPATCH_FAILED;
     }
+    queued->packet_ready = true;
     queued->packet_epoch = flow->key_epoch;
     if (queued->delivery_id == 0) {
       if (++flow->next_payload_delivery_id == 0) {
@@ -493,20 +489,24 @@ bool transport_flexicast_can_queue(const transport_t *t,
 }
 
 static bool queue_payload(transport_t *t, transport_flexicast_flow_t *flow,
-                          ptls_iovec_t payload) {
-  if (payload.len > SIZE_MAX - 128U ||
+                          ptls_iovec_t payload, size_t packet_capacity) {
+  if (payload.len > SIZE_MAX - packet_capacity ||
       !transport_flexicast_can_queue(t, flow, 1, payload.len)) {
     t->stats.flexicast_pacing_backpressure++;
     return false;
   }
-  uint8_t *copy = malloc(payload.len);
-  if (!copy)
+  uint8_t *storage = malloc(payload.len + packet_capacity);
+  if (!storage)
     return false;
-  memcpy(copy, payload.base, payload.len);
-  transport_flexicast_queued_payload_t queued = {.data = copy,
-                                                 .size = payload.len};
+  memcpy(storage, payload.base, payload.len);
+  transport_flexicast_queued_payload_t queued = {
+      .data = storage,
+      .size = payload.len,
+      .packet = storage + payload.len,
+      .packet_capacity = packet_capacity,
+  };
   if (!queue_push(&flow->data_queue, &queued)) {
-    free(copy);
+    free(storage);
     return false;
   }
   return true;
@@ -518,7 +518,7 @@ bool tf_enqueue_payload(transport_t *t, transport_flexicast_flow_t *flow,
     return false;
   size_t cost = pacing_cost(flow, payload.len);
   return cost != 0 && cost <= t->limits.max_udp_payload_size &&
-         flow->listening_count != 0 && queue_payload(t, flow, payload);
+         flow->listening_count != 0 && queue_payload(t, flow, payload, cost);
 }
 
 void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {

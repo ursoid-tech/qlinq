@@ -113,11 +113,41 @@ static size_t ip_version_slot(uint8_t ip_version) {
   return ip_version == 4 ? 0U : ip_version == 6 ? 1U : SIZE_MAX;
 }
 
+static size_t flow_bucket_index(uint64_t flow_id) {
+  uint64_t h = flow_id ^ (flow_id >> 32);
+  h *= UINT64_C(0x9e3779b97f4a7c15);
+  return (size_t)((h >> 56) & (TRANSPORT_FLEXICAST_MAX_FLOWS - 1U));
+}
+
+static void index_flow(transport_t *t, transport_flexicast_flow_t *flow,
+                       uint64_t flow_id) {
+  flow->flow_id = flow_id;
+  size_t bucket = flow_bucket_index(flow_id);
+  flow->hash_next = t->flexicast.flow_buckets[bucket];
+  t->flexicast.flow_buckets[bucket] = flow;
+}
+
+static void unindex_flow(transport_t *t, transport_flexicast_flow_t *flow) {
+  if (!t || !flow || flow->flow_id == 0)
+    return;
+  size_t bucket = flow_bucket_index(flow->flow_id);
+  transport_flexicast_flow_t **cursor = &t->flexicast.flow_buckets[bucket];
+  while (*cursor) {
+    if (*cursor == flow) {
+      *cursor = flow->hash_next;
+      flow->hash_next = NULL;
+      return;
+    }
+    cursor = &(*cursor)->hash_next;
+  }
+}
+
 static transport_flexicast_flow_t *find_flow(transport_t *t, uint64_t flow_id) {
-  if (!t || flow_id == 0)
+  if (!t || flow_id == 0 || t->flexicast.active_count == 0)
     return NULL;
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
+  for (transport_flexicast_flow_t *flow =
+           t->flexicast.flow_buckets[flow_bucket_index(flow_id)];
+       flow; flow = flow->hash_next) {
     if (flow->active && flow->flow_id == flow_id)
       return flow;
   }
@@ -132,6 +162,7 @@ static transport_flexicast_flow_t *alloc_flow(transport_t *t) {
       flow->active = true;
       flow->member_capacity = t->flexicast.member_capacity;
       flow->data_queue.capacity = TRANSPORT_FLEXICAST_QUEUE_CAPACITY;
+      t->flexicast.active_count++;
       return flow;
     }
   }
@@ -443,6 +474,9 @@ static void release_membership(transport_t *t,
 }
 
 static void release_flow(transport_t *t, transport_flexicast_flow_t *flow) {
+  unindex_flow(t, flow);
+  if (t && flow && flow->active && t->flexicast.active_count > 0)
+    t->flexicast.active_count--;
   release_membership(t, flow);
   dispose_flow(flow);
 }
@@ -989,7 +1023,7 @@ static bool rekey_source_flow(transport_t *t,
     return false;
 
   uint8_t next_secret[TRANSPORT_FLEXICAST_SECRET_SIZE];
-  ptls_openssl_random_bytes(next_secret, sizeof(next_secret));
+  t->tls_ctx.random_bytes(next_secret, sizeof(next_secret));
   uint64_t first_packet_number =
       quicly_flexicast_get_next_packet_number(flow->crypto);
   if (quicly_flexicast_flow_rekey(
@@ -1136,7 +1170,7 @@ void transport_flexicast_interface_added(transport_t *t, uint8_t ip_version,
     if (!flow->active || flow->ip_version != ip_version)
       continue;
     if (flow->source) {
-      if (!flow->native_multicast) {
+      if (t->flexicast_native_source && !flow->native_multicast) {
         flow->native_multicast = true;
         t->stats.flexicast_interface_rejoins++;
       }
@@ -1187,7 +1221,6 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
     if (!flow)
       return false;
     flow->source = true;
-    flow->alias = alias;
     flow->key_epoch = 1;
     flow->track_id = *track;
     flow->cc_config.startup_rate_bytes_per_second =
@@ -1206,12 +1239,14 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
             ? t->flexicast_cc_feedback_timeout_ms
             : 1000U;
     flow->cc_config.packet_reordering_threshold = 3;
+    uint64_t candidate_id = 0;
     do {
-      ptls_openssl_random_bytes(&flow->flow_id, sizeof(flow->flow_id));
-      flow->flow_id &= PTLS_QUICINT_MAX;
-    } while (flow->flow_id <= TRANSPORT_MAX_PATHS ||
-             find_flow(t, flow->flow_id) != flow);
-    ptls_openssl_random_bytes(flow->secret, sizeof(flow->secret));
+      t->tls_ctx.random_bytes(&candidate_id, sizeof(candidate_id));
+      candidate_id &= PTLS_QUICINT_MAX;
+    } while (candidate_id <= TRANSPORT_MAX_PATHS ||
+             find_flow(t, candidate_id) != NULL);
+    index_flow(t, flow, candidate_id);
+    t->tls_ctx.random_bytes(flow->secret, sizeof(flow->secret));
     if (!create_crypto(t, flow, 0)) {
       release_flow(t, flow);
       return false;
@@ -1343,7 +1378,7 @@ bool transport_flexicast_receive_bind(transport_t *t, transport_conn_t *conn,
     if (!flow)
       return false;
     flow->source = false;
-    flow->flow_id = bind->flow_id;
+    index_flow(t, flow, bind->flow_id);
     flow->control_conn = conn;
   } else if (flow->source || flow->control_conn != conn) {
     return false;
@@ -1421,7 +1456,7 @@ receive_quic_announce(transport_t *t, transport_conn_t *conn,
     if (!flow)
       return false;
     flow->source = false;
-    flow->flow_id = flow_id;
+    index_flow(t, flow, flow_id);
     flow->key_epoch = (uint32_t)announce->sequence;
     flow->control_conn = conn;
   } else if (flow->source || flow->control_conn != conn) {
@@ -1644,7 +1679,8 @@ bool transport_flexicast_native_packet_valid(
     transport_t *t, const uint8_t *packet, size_t size,
     const transport_flexicast_ingress_t *ingress) {
   if (!t || !packet || size < 9 || !ingress || ingress->truncated ||
-      !ingress->interface_index || !t->flexicast_enabled)
+      !ingress->interface_index || !t->flexicast_enabled || t->is_server ||
+      t->flexicast.active_count == 0 || (packet[0] & 0xc0U) != 0x40U)
     return false;
   const uint8_t *at = packet + 1;
   transport_flexicast_flow_t *flow = find_flow(t, quicly_decode64(&at));
@@ -1664,7 +1700,9 @@ bool transport_flexicast_native_packet_valid(
 bool transport_flexicast_receive_unicast_ecn(
     transport_t *t, uint8_t *packet, size_t size, const struct sockaddr *peer,
     transport_conn_t **source, ptls_iovec_t *payload, uint8_t ecn) {
-  if (!t || !packet || size < 9 || !source || !payload || !t->flexicast_enabled)
+  if (!t || !packet || size < 9 || !source || !payload ||
+      !t->flexicast_enabled || t->is_server || t->flexicast.active_count == 0 ||
+      (packet[0] & 0xc0U) != 0x40U)
     return false;
   const uint8_t *at = packet + 1;
   transport_flexicast_flow_t *flow = find_flow(t, quicly_decode64(&at));
@@ -1710,7 +1748,8 @@ bool transport_flexicast_receive_packet_ecn(transport_t *t, uint8_t *packet,
                                             ptls_iovec_t *payload,
                                             uint8_t ecn) {
   if (!t || !packet || !source_conn || !payload || packet_size < 9 ||
-      !t->flexicast_enabled)
+      !t->flexicast_enabled || t->is_server || t->flexicast.active_count == 0 ||
+      (packet[0] & 0xc0U) != 0x40U)
     return false;
   const uint8_t *flow_at = packet + 1;
   uint64_t flow_id = quicly_decode64(&flow_at);
@@ -1724,19 +1763,17 @@ bool transport_flexicast_receive_packet_ecn(transport_t *t, uint8_t *packet,
   if (quicly_flexicast_receive_datagram_ecn_at(
           flow->crypto, packet, packet_size, payload, &packet_number, now,
           ecn) == QUICLY_FLEXICAST_OK) {
-    /* rewrite header alias to subscriber-local alias */
-    qlinq_wire_fec_header_t header;
-    if (qlinq_wire_decode_fec_header(payload->base, payload->len, &header) ==
-        QLINQ_WIRE_OK) {
-      header.alias = flow->alias;
-      if (qlinq_wire_encode_fec_header(payload->base, payload->len, &header) !=
-          QLINQ_WIRE_OK)
-        *payload = ptls_iovec_init(NULL, 0);
+    /* rewrite header alias to subscriber-local alias in place */
+    uint8_t type = 0;
+    if (payload->len >= QLINQ_WIRE_FEC_HEADER_SIZE &&
+        qlinq_wire_decode_datagram_type(payload->base, payload->len, &type) ==
+            QLINQ_WIRE_OK &&
+        type == QLINQ_WIRE_DATAGRAM_FEC) {
+      payload->base[4] = flow->alias;
     }
     t->stats.flexicast_packets_received++;
     if (quicly_flexicast_ack_is_due(flow->crypto, now) &&
-        !(t->simulated_flexicast_feedback_loss_rate > 0 &&
-          (rand() % 100) < t->simulated_flexicast_feedback_loss_rate))
+        !transport_simulated_loss(t, t->simulated_flexicast_feedback_loss_rate))
       (void)quicly_flexicast_send_pending_ack(
           flow->crypto, flow->control_conn->quic, now, false);
   }
@@ -1779,8 +1816,7 @@ void transport_flexicast_tick(transport_t *t) {
     if (!flow->active || flow->source || !flow->crypto || !flow->control_conn ||
         !flow->control_conn->quic ||
         !quicly_flexicast_ack_is_due(flow->crypto, now) ||
-        (t->simulated_flexicast_feedback_loss_rate > 0 &&
-         (rand() % 100) < t->simulated_flexicast_feedback_loss_rate))
+        transport_simulated_loss(t, t->simulated_flexicast_feedback_loss_rate))
       continue;
     (void)quicly_flexicast_send_pending_ack(
         flow->crypto, flow->control_conn->quic, now, false);

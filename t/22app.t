@@ -4,7 +4,7 @@ use Test::More;
 use t::Util;
 
 subtest 'BBR command-line selection' => sub {
-    for my $program ('qlinq-app', 'qlinqd', 'qlinq-tun') {
+    for my $program ('qlinq-app', 'qlinq-tun') {
         my ($stderr, $stdout) = run_prog("./$program --cc bbr --help");
         like($stdout, qr/--cc[^\n]*bbr/, "$program accepts and documents BBR")
             or diag($stderr);
@@ -18,7 +18,7 @@ subtest 'qlinq-app direct transport API' => sub {
 };
 
 subtest 'idle path probe command-line option' => sub {
-    for my $program ('qlinq-app', 'qlinqd', 'qlinq-tun') {
+    for my $program ('qlinq-app', 'qlinq-tun') {
         for my $interval (0, 500, 4294967295) {
             my ($stderr, $stdout) = run_prog("./$program --path-probe-ms $interval --help");
             like($stdout, qr/--path-probe-ms/, "$program accepts $interval ms")

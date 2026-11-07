@@ -484,6 +484,9 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
   size_t multicast_budget = (receive_budget + 1U) / 2U;
   for (size_t slot = 0; t->flexicast_enabled && slot < 2 && multicast_budget;
        slot++) {
+    if (t->flexicast_fds[slot] < 0 ||
+        !socket_receive_ready(t->flexicast_fds[slot], fds, count))
+      continue;
     while (t->flexicast_fds[slot] >= 0 && multicast_budget) {
       uint8_t packet[2048];
       transport_conn_t *source = NULL;
@@ -498,8 +501,8 @@ static void receive_packets(transport_t *t, const struct pollfd *fds,
       --receive_budget;
       --multicast_budget;
       if (source && payload.base) {
-        if (source->authenticated && t->simulated_loss_rate > 0 &&
-            (rand() % 100) < t->simulated_loss_rate)
+        if (source->authenticated &&
+            transport_simulated_loss(t, t->simulated_loss_rate))
           continue;
         transport_protocol_receive_datagram(source, payload, false);
       }
@@ -713,61 +716,6 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
     fds[count++] = (struct pollfd){.fd = host->ifmon_pipe[0], .events = POLLIN};
   }
   return count;
-}
-bool transport_rx_cadence_mask(transport_t *t, struct pollfd *fds,
-                               size_t count) {
-  transport_poll_host_t *host = transport_poll_host(t);
-  if (!host || !transport_owner_ok(t) || t->turn_active || !fds ||
-      t->flexicast_enabled || t->tick_active || t->shutting_down ||
-      t->reconnect_in_progress || t->pending_group.size ||
-      t->socket_count == 0 || transport_connection_count(t) != 1)
-    return false;
-  assert_socket_alignment(t, host);
-  transport_conn_t *conn = transport_connection_at(t, 0);
-  if (!conn || !conn->quic || !conn->authenticated || !conn->protocol_ready ||
-      !conn->quic_ready || !quicly_connection_is_ready(conn->quic) ||
-      quicly_has_pending_stream_data(conn->quic) ||
-      quicly_has_datagram_frames(conn->quic) ||
-      quicly_get_state(conn->quic) != QUICLY_STATE_CONNECTED ||
-      transport_subscriptions_count(&conn->send_subscriptions) != 0 ||
-      transport_subscriptions_count(&conn->receive_subscriptions) == 0)
-    return false;
-
-  if (!conn->rx_cadence_handshake_confirmed) {
-    quicly_stats_t stats;
-    if (quicly_get_stats(conn->quic, &stats) != 0 ||
-        stats.handshake_confirmed_msec == UINT64_MAX)
-      return false;
-    conn->rx_cadence_handshake_confirmed = true;
-  }
-
-  /* validate before mutating any mask; reject stale or recycled fd snapshots */
-  size_t slot = 0;
-  for (size_t i = 0; i < t->socket_count; i++) {
-    transport_local_path_t *path = &t->sockets[i];
-    transport_poll_socket_t *socket = &host->sockets[i];
-    if (path->egress.count || path->open_pending || socket->receive_backlog ||
-        transport_udp_gro_pending(socket->gro))
-      return false;
-    if (socket->fd < 0)
-      continue;
-    if (slot >= count || fds[slot].fd != socket->fd ||
-        fds[slot].events != POLLIN || fds[slot].revents != 0)
-      return false;
-    slot++;
-  }
-  size_t udp_count = slot;
-  if (host->ifmon_pipe[0] >= 0) {
-    if (slot >= count || fds[slot].fd != host->ifmon_pipe[0] ||
-        fds[slot].events != POLLIN || fds[slot].revents != 0)
-      return false;
-    slot++;
-  }
-  if (!udp_count || slot != count)
-    return false;
-  for (size_t i = 0; i < udp_count; i++)
-    fds[i].events &= (short)~POLLIN;
-  return true;
 }
 static void transport_mock_iface_change(transport_t *t, const char *ip_addr,
                                         bool added) {

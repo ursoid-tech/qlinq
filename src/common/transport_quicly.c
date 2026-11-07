@@ -1632,8 +1632,8 @@ void transport_drive_dispatch(transport_t *t, size_t fd_idx, uint8_t *buf,
           t, buf, len, (struct sockaddr *)source, &flexicast_source,
           &flexicast_payload, ecn)) {
     if (flexicast_source && flexicast_payload.base &&
-        !(flexicast_source->authenticated && t->simulated_loss_rate > 0 &&
-          (rand() % 100) < t->simulated_loss_rate))
+        !(flexicast_source->authenticated &&
+          transport_simulated_loss(t, t->simulated_loss_rate)))
       transport_protocol_receive_datagram(flexicast_source, flexicast_payload,
                                           false);
     return;
@@ -1740,12 +1740,9 @@ void transport_drive_dispatch(transport_t *t, size_t fd_idx, uint8_t *buf,
       }
     }
 
-    if (target && target->authenticated && t->simulated_loss_rate > 0) {
-      uint32_t sample;
-      t->tls_ctx.random_bytes(&sample, sizeof(sample));
-      if (sample % 100 < t->simulated_loss_rate)
-        continue;
-    }
+    if (target && target->authenticated &&
+        transport_simulated_loss(t, t->simulated_loss_rate))
+      continue;
 
     if (target) {
       quicly_error_t ret = quicly_receive(

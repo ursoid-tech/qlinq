@@ -58,11 +58,13 @@ typedef struct transport_flexicast_queued_payload_t {
   size_t size;
   /* retain plaintext so unfinished fanout can resume after rekeying */
   uint8_t *packet;
+  size_t packet_capacity;
   size_t packet_size;
   uint64_t packet_number;
   uint32_t packet_epoch;
   uint64_t delivery_id;
   size_t next_member;
+  bool packet_ready;
   bool replicated;
   bool counted;
 } transport_flexicast_queued_payload_t;
@@ -120,6 +122,7 @@ typedef struct transport_flexicast_flow_t {
   bool rekey_pending;
   int64_t rekey_ready_at_ms;
   uint64_t delivery_epoch;
+  struct transport_flexicast_flow_t *hash_next;
 } transport_flexicast_flow_t;
 
 typedef struct transport_flexicast_membership_t {
@@ -134,8 +137,10 @@ typedef struct transport_flexicast_membership_t {
 
 typedef struct transport_flexicast_registry_t {
   transport_flexicast_flow_t *flows;
+  transport_flexicast_flow_t *flow_buckets[TRANSPORT_FLEXICAST_MAX_FLOWS];
   transport_flexicast_membership_t *memberships;
   size_t capacity;
+  size_t active_count;
   size_t member_capacity;
   uint64_t pacing_tokens;
   uint64_t pacing_rate;

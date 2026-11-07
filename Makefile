@@ -152,11 +152,7 @@ ENGINE_OBJS = src/common/transport_flexicast.o \
 POLL_HOST_OBJS = src/common/transport_flexicast_host.o src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
 TRANSPORT_OBJS = src/common/qlinq.o $(ENGINE_OBJS) $(POLL_HOST_OBJS)
 
-COMMON_OBJS = src/common/data_uds.o \
-              $(TRANSPORT_OBJS)
-
-DAEMON_OBJS = src/daemon/main.o \
-              $(COMMON_OBJS)
+COMMON_OBJS = $(TRANSPORT_OBJS)
 
 APP_OBJS = src/app/main.o src/app/xfer.o src/app/xfer_file.o
 
@@ -214,7 +210,7 @@ deps/nanors/%.o deps/nanorq/%.o: private CODEC_CFLAGS = $(FEC_CFLAGS) $(FEC_NATI
 deps/%.o: deps/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(CODEC_CFLAGS) -w -c $< -o $@
 
-all: qlinqd qlinq-app qlinq-tund qlinq-tun
+all: qlinq-app qlinq-tun
 
 # Track only backend inclusion here; other compiler flag changes still require
 # a clean build. Switching WITH_FUSION must rebuild its dispatch and tests.
@@ -239,14 +235,8 @@ libqlinq.a: $(TRANSPORT_OBJS) .build-config
 	$(AR) rcs $@.tmp $(TRANSPORT_OBJS)
 	mv $@.tmp $@
 
-qlinqd: $(DAEMON_OBJS)
-	$(CC) -o $@ $(DAEMON_OBJS) $(LDFLAGS)
-
 qlinq-app: $(APP_OBJS) libqlinq.a
 	$(CC) -o $@ $(APP_OBJS) libqlinq.a $(LDFLAGS)
-
-qlinq-tund: src/host/linux/tund.o src/host/linux/tun_device.o
-	$(CC) -o $@ $^ $(LDFLAGS)
 
 qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -371,7 +361,6 @@ TRANSPORT_TESTS = t/00util/test_transport_bind \
 	t/00util/test_stream_budget \
 	t/00util/test_transport \
 	t/00util/test_reliable_bidirectional \
-	t/00util/test_tund \
 	t/00util/test_transport_components \
 	t/00util/test_benchmark \
 	t/00util/test_tc_benchmark \
@@ -404,9 +393,6 @@ API_TESTS = t/00util/test_qlinq_policy \
 
 $(API_TESTS): %: %.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_data_uds: t/00util/test_data_uds.o src/common/data_uds.o
-	$(CC) -o $@ t/00util/test_data_uds.o src/common/data_uds.o $(LDFLAGS)
 
 t/00util/test_transport_wire: t/00util/test_transport_wire.o src/common/transport_wire.o
 	$(CC) -o $@ t/00util/test_transport_wire.o src/common/transport_wire.o $(LDFLAGS)
@@ -508,8 +494,6 @@ t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
 CHECK_BINARIES = t/00util/test_flexicast_transport $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
 	t/00util/test_datagram_mtu \
 	t/00util/test_path_probe \
-	t/00util/test_rx_cadence t/00util/test_rx_cadence_backlog \
-	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
 	t/00util/test_qlinq_policy \
 	t/00util/test_egress_errors t/00util/test_transport_bind t/00util/test_transport_poll t/00util/test_transport_ifmon \
@@ -519,8 +503,8 @@ CHECK_BINARIES = t/00util/test_flexicast_transport $(TLS_BARRIER_TEST) t/00util/
 	t/00util/test_qlinq_reconnect t/00util/test_qlinq_delivery \
 	t/00util/test_qlinq_event_ownership t/00util/test_generic_ports \
 	t/00util/test_stream_budget t/00util/test_transport \
-	t/00util/test_reliable_bidirectional t/00util/test_tund \
-	t/00util/test_data_uds t/00util/test_transport_wire \
+	t/00util/test_reliable_bidirectional \
+	t/00util/test_transport_wire \
 	t/00util/test_transport_components t/00util/test_udp_gso_prefix t/00util/test_udp_receive t/00util/test_udp_gro t/00util/test_ifmon \
 	t/00util/test_multipath t/00util/test_multipath_failover \
 	t/00util/test_multipath_feedback \
@@ -551,24 +535,6 @@ t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile .bu
 		-Dquicly_send_on_path=test_quicly_send_on_path -c $< -o $@
 
 t/00util/test_multipath_feedback: t/00util/test_multipath_feedback.o t/00util/transport_quicly_feedback.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-# These fixtures include the public service implementation to observe its
-# private wait state without adding production test hooks.
-t/00util/test_rx_cadence.o t/00util/test_rx_cadence_real.o: src/common/qlinq.c
-t/00util/test_rx_cadence_backlog.o: t/00util/test_transport_poll.c
-
-t/00util/test_rx_cadence: t/00util/test_rx_cadence.o $(filter-out src/common/qlinq.o,$(COMMON_OBJS))
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/test_rx_cadence_backlog: t/00util/test_rx_cadence_backlog.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
-t/00util/transport_poll_host_cadence.o: src/common/transport_poll_host.c Makefile .build-config
-	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
-		-Dtransport_udp_send_batch_ecn=test_cadence_udp_send_batch -c $< -o $@
-
-t/00util/test_rx_cadence_real: t/00util/test_rx_cadence_real.o t/00util/transport_poll_host_cadence.o $(filter-out src/common/qlinq.o src/common/transport_poll_host.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 check: all $(CHECK_BINARIES) gencerts check-reports
