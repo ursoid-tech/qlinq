@@ -421,6 +421,9 @@ t/00util/test_udp_gro: t/00util/test_udp_gro.o
 t/00util/test_ifmon: t/00util/test_ifmon.o
 	$(CC) -o $@ $< $(LDFLAGS)
 
+t/00util/test_transport_ifmon: t/00util/test_transport_ifmon.o $(filter-out src/common/transport_poll_host.o,$(COMMON_OBJS))
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
 	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
 		-o $@ t/00util/fuzz_transport_wire.c src/common/transport_wire.c
@@ -507,7 +510,7 @@ CHECK_BINARIES = $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_reco
 	t/00util/test_rx_cadence_real \
 	t/00util/test_crypto_backend \
 	t/00util/test_qlinq_policy \
-	t/00util/test_egress_errors t/00util/test_transport_bind t/00util/test_transport_poll \
+	t/00util/test_egress_errors t/00util/test_transport_bind t/00util/test_transport_poll t/00util/test_transport_ifmon \
 	t/00util/test_interleaved_receive t/00util/test_publication_limits \
 	t/00util/test_directional_subscriptions \
 	t/00util/test_qlinq_event_overflow t/00util/test_qlinq_compat \

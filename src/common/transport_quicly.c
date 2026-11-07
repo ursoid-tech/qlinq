@@ -247,7 +247,8 @@ bool transport_owner_ok(transport_t *t) {
   if (!t)
     return false;
   if (pthread_equal(t->owner_thread, pthread_self()))
-    return !t->log_callback_active && !t->host_callback_active;
+    return !t->log_callback_active && !t->interface_callback_active &&
+           !t->host_callback_active;
   atomic_fetch_add_explicit(&t->cross_thread_violations, 1,
                             memory_order_relaxed);
   return false;
@@ -725,6 +726,23 @@ static bool path_interface_allowed(const transport_t *t, const char *name) {
   return false;
 }
 
+static size_t configured_address_index(const transport_t *t,
+                                       const struct sockaddr_storage *address) {
+  for (size_t i = 0; i < t->num_configured_bind_addrs; i++) {
+    const struct sockaddr *configured =
+        (const struct sockaddr *)&t->configured_bind_addrs[i];
+    if (!transport_address_is_wildcard(configured) &&
+        transport_address_equal(configured, (const struct sockaddr *)address))
+      return i;
+  }
+  return SIZE_MAX;
+}
+
+bool transport_is_configured_address(const transport_t *t,
+                                     const struct sockaddr_storage *address) {
+  return configured_address_index(t, address) != SIZE_MAX;
+}
+
 static void remove_connection_physical_slot(transport_t *t,
                                             size_t removed_index) {
   size_t count = transport_connection_count(t);
@@ -748,6 +766,10 @@ static size_t select_remote_for_added_local(const transport_t *t,
 
   for (size_t remote_index = 0; remote_index < t->num_remote_addrs;
        remote_index++) {
+    if (remote_index < t->num_configured_bind_addrs &&
+        !transport_address_is_wildcard(
+            (const struct sockaddr *)&t->configured_bind_addrs[remote_index]))
+      continue;
     if (!path_endpoint_families_match(t, local_index, remote_index))
       continue;
     bool assigned = false;
@@ -853,6 +875,11 @@ static bool start_client_connection(transport_t *t) {
       t->client_conn)
     return false;
 
+  /* interfaces can return in a different order after an outage */
+  size_t remote_index = t->sockets[0].remote_index;
+  if (!path_endpoint_families_match(t, 0, remote_index))
+    return false;
+
   transport_conn_t *conn = calloc(1, sizeof(*conn));
   if (!conn)
     return false;
@@ -866,7 +893,7 @@ static bool start_client_connection(transport_t *t) {
 
   int ret =
       quicly_connect(&conn->quic, &t->quic_ctx, t->server_name,
-                     (struct sockaddr *)&t->remote_addrs[0],
+                     (struct sockaddr *)&t->remote_addrs[remote_index],
                      (struct sockaddr *)&t->sockets[0].local_addr, &t->next_cid,
                      ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
   if (ret != 0 || !conn->quic) {
@@ -887,8 +914,8 @@ static bool start_client_connection(transport_t *t) {
   }
 
   t->client_conn = conn;
-  for (size_t i = 1; i < t->socket_count; i++) {
-    t->sockets[i].open_pending = true;
+  for (size_t i = 0; i < t->socket_count; i++) {
+    t->sockets[i].open_pending = i != 0;
     t->sockets[i].open_retry_at_ms = 0;
   }
   return true;
@@ -1021,6 +1048,8 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   t->user_data = config->user_data;
   t->log_callback = config->log_callback;
   t->log_user_data = config->log_user_data;
+  t->interface_callback = config->interface_callback;
+  t->interface_user_data = config->interface_user_data;
   t->is_server = (config->num_remote_hosts == 0);
   t->bind_port = t->is_server ? config->port : 0;
   t->reconnect_enabled = !t->is_server && config->reconnect_enabled;
@@ -1176,6 +1205,8 @@ transport_t *transport_drive_create(const transport_config_t *config) {
                     config->bind_hosts[i]);
       goto Fail;
     }
+    t->configured_bind_addrs[t->num_configured_bind_addrs++] =
+        socket->local_addr;
     const char *error = transport_engine_open_path(t, socket);
     if (error) {
       transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i, "%s for %s:%u: %s",
@@ -1365,7 +1396,9 @@ void transport_destroy(transport_t *t) {
 
 static void add_interface(transport_t *t,
                           const transport_interface_event_t *msg) {
-  if (!path_interface_allowed(t, msg->name) ||
+  size_t configured_index = configured_address_index(t, &msg->addr);
+  bool configured = configured_index != SIZE_MAX;
+  if ((!configured && !path_interface_allowed(t, msg->name)) ||
       t->socket_count >= TRANSPORT_MAX_PATHS)
     return;
   for (size_t i = 0; i < t->socket_count; i++)
@@ -1373,6 +1406,25 @@ static void add_interface(transport_t *t,
             (const struct sockaddr *)&t->sockets[i].local_addr,
             (const struct sockaddr *)&msg->addr))
       return;
+
+  char ip_str[64] = {0};
+  const void *address =
+      msg->addr.ss_family == AF_INET
+          ? (const void *)&((const struct sockaddr_in *)&msg->addr)->sin_addr
+          : (const void *)&((const struct sockaddr_in6 *)&msg->addr)->sin6_addr;
+  inet_ntop(msg->addr.ss_family, address, ip_str, sizeof(ip_str));
+
+  if (!configured && t->interface_callback) {
+    transport_interface_info_t info = {.interface_index = msg->index,
+                                       .interface_name = msg->name,
+                                       .local_address = ip_str,
+                                       .address_family = msg->addr.ss_family};
+    t->interface_callback_active = true;
+    bool allowed = t->interface_callback(t->interface_user_data, &info);
+    t->interface_callback_active = false;
+    if (!allowed)
+      return;
+  }
 
   size_t local_index = t->socket_count;
   transport_local_path_t *socket = &t->sockets[local_index];
@@ -1386,7 +1438,9 @@ static void add_interface(transport_t *t,
   t->socket_count++;
 
   if (!t->is_server) {
-    socket->remote_index = select_remote_for_added_local(t, local_index);
+    socket->remote_index =
+        configured ? (t->num_remote_addrs == 1 ? 0 : configured_index)
+                   : select_remote_for_added_local(t, local_index);
     if (socket->remote_index == SIZE_MAX) {
       close_local_path(socket);
       t->socket_count--;
@@ -1395,12 +1449,6 @@ static void add_interface(transport_t *t,
     socket->open_pending = true;
   }
 
-  char ip_str[64];
-  const void *address =
-      msg->addr.ss_family == AF_INET
-          ? (const void *)&((const struct sockaddr_in *)&msg->addr)->sin_addr
-          : (const void *)&((const struct sockaddr_in6 *)&msg->addr)->sin6_addr;
-  inet_ntop(msg->addr.ss_family, address, ip_str, sizeof(ip_str));
   transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, local_index,
                 "opened socket for local IP %s", ip_str);
 }
@@ -1410,14 +1458,16 @@ static void discard_connection(transport_conn_t *conn, quicly_error_t error,
 
 static void remove_interface(transport_t *t,
                              const transport_interface_event_t *msg) {
-  for (size_t i = 0; i < t->socket_count; i++) {
+  for (size_t i = 0; i < t->socket_count;) {
     bool match = msg->addr.ss_family == AF_UNSPEC
                      ? t->sockets[i].interface_index == msg->index
                      : transport_address_equal(
                            (const struct sockaddr *)&t->sockets[i].local_addr,
                            (const struct sockaddr *)&msg->addr);
-    if (!match)
+    if (!match) {
+      i++;
       continue;
+    }
     accumulate_egress_stats(&t->stats, &t->sockets[i].egress, true);
     close_local_path(&t->sockets[i]);
     remove_connection_physical_slot(t, i);
@@ -1434,7 +1484,8 @@ static void remove_interface(transport_t *t,
     if (t->socket_count == 0 && t->client_conn && t->reconnect_enabled)
       discard_connection(t->client_conn, QUICLY_TRANSPORT_ERROR_NO_VIABLE_PATH,
                          "all local interfaces removed");
-    break;
+    if (msg->addr.ss_family != AF_UNSPEC)
+      break;
   }
 }
 

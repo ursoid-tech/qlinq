@@ -135,6 +135,20 @@ typedef struct {
 typedef void (*transport_callback_t)(void *user_data,
                                      const transport_event_t *event);
 
+typedef struct {
+  uint32_t interface_index;
+  const char *interface_name;
+  const char *local_address;
+  int address_family;
+} transport_interface_info_t;
+
+/* synchronous owner-thread filter for candidate interfaces; return true to bind
+ * and open a path, or false to ignore it. observational: must not call
+ * transport operations. explicit bind addresses bypass the filter, including
+ * when they return after an interface change. */
+typedef bool (*transport_interface_callback_t)(
+    void *user_data, const transport_interface_info_t *iface);
+
 #define TRANSPORT_MAX_PATHS 4
 #define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 1U)
 enum {
@@ -230,8 +244,9 @@ typedef struct {
    * addresses take the next compatible, unused remote endpoint. */
   const char *bind_hosts[TRANSPORT_MAX_PATHS];
   size_t num_bind_hosts;
-  /* Optional exact-name allowlist for interfaces discovered after startup.
-   * Zero entries accept every monitored interface. */
+  /* optional exact-name allowlist for interfaces discovered after startup.
+   * zero entries impose no extra restriction on the discovery policy.
+   * explicit bind addresses are restored independently of this allowlist. */
   const char *path_interface_names[TRANSPORT_MAX_PATHS];
   size_t num_path_interface_names;
   const char *remote_hosts[TRANSPORT_MAX_PATHS];
@@ -279,8 +294,12 @@ typedef struct {
   uint32_t default_jumpstart_packets;
   /* maximum jumpstart packets permitted for resumed sessions */
   uint32_t max_jumpstart_packets;
-  /* automatically detect and bind non-loopback network interfaces */
+  /* discover existing interfaces at startup using the configured filters */
   bool multihome;
+  /* optional filter callback for candidate interfaces; overrides default
+   * virtual/loopback exclusion when set */
+  transport_interface_callback_t interface_callback;
+  void *interface_user_data;
   /* optional externally driven internal host; NULL keeps the polling host */
   const struct transport_drive_host *drive_host;
 } transport_config_t;
