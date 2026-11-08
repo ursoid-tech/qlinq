@@ -55,7 +55,8 @@ typedef struct {
   uint32_t record_count;
   size_t symbol_size; /* frozen once any recipient accepts this group */
   uint8_t priority;
-  bool pending; /* Attempted bytes and identity stay fixed until completion. */
+  bool pending;  /* Attempted bytes and identity stay fixed until completion. */
+  bool retiring; /* Deadline expiry remains terminal across control retries. */
 } transport_pending_group_t;
 
 typedef struct {

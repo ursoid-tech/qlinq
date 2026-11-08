@@ -273,6 +273,18 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   return true;
 }
 
+bool transport_sent_cache_release_object(transport_sent_cache_t *cache,
+                                         const moq_track_id_t *track,
+                                         uint64_t group_id,
+                                         uint64_t object_id) {
+  sent_object_cache_t *entry =
+      transport_sent_cache_find(cache, track, group_id, object_id);
+  if (!entry)
+    return false;
+  release_entry(cache, entry);
+  return true;
+}
+
 size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
                                             const moq_track_id_t *track,
                                             uint64_t group_id,

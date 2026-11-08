@@ -461,6 +461,122 @@ static void policy_retirement(qlinq_repair_policy_t policy, unsigned sides,
   destroy(f);
 }
 
+static void retired_gap_reobservation(bool receiver_disabled) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  qlinq_repair_policy_t disabled = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = false};
+  assert(transport_set_repair_policy(f->host[0].transport, &disabled));
+  if (receiver_disabled)
+    assert(transport_set_repair_policy(f->host[1].transport, &disabled));
+  assert(send_record(f, 0, 512));
+  flush(f);
+  await_records(f, 1, f->net.now_ns + 100 * MS);
+  assert(f->endpoint[1].received == 1);
+  advance(f, 100);
+
+  /* A checkpoint retires a completely lost object without observing any of
+   * its datagrams, so the last observed object remains zero. */
+  f->host[0].drop_until_ns = f->net.now_ns + 20 * MS;
+  assert(send_record(f, 1, 512));
+  flush(f);
+  advance(f, 1000);
+  transport_t *receiver = f->host[1].transport;
+  transport_conn_t *conn = f->endpoint[1].base.conn;
+  track_subscription_t *sub =
+      transport_subscriptions_find(&conn->receive_subscriptions, &f->track);
+  assert(sub);
+  transport_object_gap_state_t *gap = transport_object_gap(conn, sub->alias);
+  assert(f->endpoint[1].received == 1 && f->endpoint[1].lost == 1);
+  assert(gap->last_seen == 0 && gap->pending_mask == 0);
+  assert(transport_recovery_was_retired(gap, 1) &&
+         !transport_recovery_was_delivered(gap, 1));
+  uint64_t nacks = receiver->stats.repair_requests_sent;
+  assert(!receiver_disabled || nacks == 0);
+
+  /* Let the normal group timer publish the next object. Explicit flush would
+   * add a checkpoint whose ACK masks a spuriously reintroduced gap. */
+  assert(send_record(f, 2, 512));
+  advance(f, 1000);
+  assert(f->endpoint[1].received == 2 && f->endpoint[1].lost == 1);
+  assert(gap->last_seen == 2 && gap->pending_mask == 0);
+  assert(receiver->stats.repair_requests_sent == nacks);
+  assert(transport_recovery_deadline(conn) == INT64_MAX);
+  advance(f, 2000);
+  assert(gap->pending_mask == 0 && f->endpoint[1].lost == 1);
+  assert(receiver->stats.repair_requests_sent == nacks);
+  assert(transport_recovery_deadline(conn) == INT64_MAX);
+
+  /* Even stale state must reconcile idempotently. Leave a genuine missing
+   * object in each window to ensure terminal cleanup never ACKs across it. */
+  transport_recovery_window_t *window = &gap->recovery_windows[0];
+  assert(!window->active);
+  uint64_t pending_base = gap->pending_base;
+  size_t frames = receiver->stats.stream_egress_frames;
+  uint64_t checkpoint_acks = receiver->stats.recovery_checkpoint_acks_sent;
+  for (uint64_t object_id = 1; object_id <= 2; object_id++) {
+    gap->pending_base = object_id;
+    gap->pending_mask = 1U | (1U << (3U - object_id));
+    *window = (transport_recovery_window_t){.active = true,
+                                            .group_id = 0,
+                                            .first_object_id = object_id,
+                                            .final_object_id = 3,
+                                            .missing_mask = gap->pending_mask};
+    assert(transport_recovery_retire(conn, sub->alias, 0, object_id));
+    assert(gap->pending_mask == (1U << (3U - object_id)));
+    assert(window->active && window->missing_mask == gap->pending_mask);
+    assert(receiver->stats.stream_egress_frames == frames);
+    assert(receiver->stats.recovery_checkpoint_acks_sent == checkpoint_acks);
+    assert(f->endpoint[1].lost == 1);
+  }
+  assert(transport_recovery_was_retired(gap, 1) &&
+         !transport_recovery_was_delivered(gap, 1));
+  assert(transport_recovery_was_delivered(gap, 2) &&
+         !transport_recovery_was_retired(gap, 2));
+  memset(window, 0, sizeof(*window));
+  gap->pending_base = pending_base;
+  gap->pending_mask = 0;
+  destroy(f);
+}
+
+static void uncached_retirement_bounds(void) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  transport_conn_t *sender = f->endpoint[0].base.conn;
+  transport_conn_t *receiver = f->endpoint[1].base.conn;
+  track_subscription_t *send_sub =
+      transport_subscriptions_find(&sender->send_subscriptions, &f->track);
+  track_subscription_t *receive_sub =
+      transport_subscriptions_find(&receiver->receive_subscriptions, &f->track);
+  assert(send_sub && receive_sub &&
+         f->host[0].transport->sent_cache.count == 0);
+  /* Model an expired, never transmitted object after a join baseline. Only
+   * the outstanding checkpoint interval authorizes a cache-miss retirement. */
+  transport_checkpoint_ack_state_t *ack =
+      transport_checkpoint_ack(sender, send_sub->alias);
+  transport_checkpoint_ack_state_t saved = *ack;
+  *ack = (transport_checkpoint_ack_state_t){.participating = true,
+                                            .sent_initialized = true,
+                                            .sent_group_id = 0,
+                                            .sent_object_id = 2,
+                                            .acked_initialized = true,
+                                            .acked_group_id = 0,
+                                            .acked_object_id = 1};
+  const uint64_t groups[] = {0, 0, 1, 0};
+  const uint64_t objects[] = {1, 3, 2, 2};
+  for (size_t i = 0; i < 4; i++) {
+    assert(transport_recovery_send_nack(receiver, receive_sub->alias, groups[i],
+                                        objects[i], NULL, 0, true));
+    advance(f, 100);
+    assert(f->endpoint[1].lost == (i == 3 ? 1U : 0U));
+  }
+  transport_object_gap_state_t *gap =
+      transport_object_gap(receiver, receive_sub->alias);
+  assert(!transport_recovery_was_retired(gap, 1) &&
+         transport_recovery_was_retired(gap, 2) &&
+         !transport_recovery_was_retired(gap, 3));
+  *ack = saved;
+  destroy(f);
+}
+
 static void legacy_assembler_retry(void) {
   latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
   transport_t *receiver = f->host[1].transport;
@@ -531,6 +647,9 @@ int main(void) {
   }
   policy_retirement(exhausted, 1, false);
   policy_retirement(disabled, 2, true);
+  retired_gap_reobservation(false);
+  retired_gap_reobservation(true);
+  uncached_retirement_bounds();
   legacy_assembler_retry();
   checkpoint_window_pressure();
   tail(0, false, false, 1);

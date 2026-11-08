@@ -38,6 +38,23 @@ with the same name are independent. Stream names are nonempty and at most
 63 bytes. `qlinq_stream_close` stops use of the handle and unsubscribes receive
 streams; it does not define a finite-transfer completion protocol.
 
+FEC streams accept an endpoint `repair_policy` and a per-stream override.
+Presence bits select the fields to override; omitted fields retain the delivery
+mode's behavior. Fixed-rate streams send proactive FEC by default, and rateless
+streams use reactive repair. Object-age and total-repair limits apply only when
+their presence bits are set. Setting a stream policy to a zero presence mask
+restores endpoint inheritance. Send and receive policies remain independent
+even when their stream names match, and closing a stream releases its override.
+`qlinq_stream_get_repair_policy` returns both the configured override and the
+effective delivery profile; the effective `present` mask identifies explicit
+constraints. Without `QLINQ_REPAIR_MAX_EXTRA`, reactive repair has no policy
+total cap, even though the initial FEC scheduler still has a planning bound.
+
+Rateless DATA streams report an object as lost when a repair policy retires it;
+the peers then release its checkpoint obligation without reporting delivery.
+Object age includes time spent waiting in a DATA group. Expired buffered groups
+are retired so later records can proceed once retirement is admitted.
+
 Drive progress with `qlinq_service(context, timeout_ms)` and drain events with
 `qlinq_next_event`. Zero timeout polls; -1 waits for network or timer activity.
 Pending events return immediately. Internal deadlines also service FEC group

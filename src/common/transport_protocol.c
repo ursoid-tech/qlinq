@@ -228,63 +228,85 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
   return true;
 }
 
-static size_t collect_repair_paths(transport_conn_t *conn, size_t packet_len,
-                                   fp_t horizon,
-                                   transport_publication_path_t *native,
-                                   transport_policy_path_t *candidates) {
+typedef struct {
+  transport_publication_path_t native[TRANSPORT_MAX_QUIC_PATHS];
+  path_t paths[TRANSPORT_MAX_QUIC_PATHS];
+  size_t count;
+  size_t capacity[TRANSPORT_MAX_PATHS], queued[TRANSPORT_MAX_PATHS];
+} repair_placement_t;
+
+static void collect_repair_paths(transport_conn_t *conn, size_t packet_len,
+                                 fp_t horizon, repair_placement_t *plan) {
+  memset(plan, 0, sizeof(*plan));
   uint64_t admission_ns = transport_now_ns(conn->transport);
-  size_t path_count = transport_publish_collect_paths(
-      conn->transport, conn, packet_len, packet_len, admission_ns, native);
-  if (path_count > TRANSPORT_POLICY_PATHS)
-    path_count = TRANSPORT_POLICY_PATHS;
-  for (size_t i = 0; i < path_count; i++) {
-    fp_t success = FP_ONE - native[i].state.p_ewma;
-    fp_t usable_b = success > 0 ? FP_MUL(native[i].state.b_ewma, success) : 0;
-    fp_t latency = native[i].state.l_ewma;
-    if (horizon != FP_MAX && !conn->paths[native[i].physical].state_overridden)
-      latency = native[i].rate_known ? native[i].sample.l : 0;
-    candidates[i] =
-        (transport_policy_path_t){.measurement = {.b = usable_b,
-                                                  .l = latency,
-                                                  .p = native[i].state.p_ewma,
-                                                  .q = native[i].state.q_ewma},
-                                  .capacity = native[i].available};
+  plan->count = transport_publish_collect_native_paths(
+      conn->transport, conn, packet_len, packet_len, admission_ns,
+      plan->native);
+  for (size_t i = 0; i < plan->count; i++) {
+    const transport_publication_path_t *native = &plan->native[i];
+    fp_t success = FP_ONE - native->state.p_ewma;
+    fp_t usable_b = success > 0 ? FP_MUL(native->state.b_ewma, success) : 0;
+    fp_t latency = native->state.l_ewma;
+    if (horizon != FP_MAX && !conn->paths[native->physical].state_overridden)
+      latency = native->rate_known ? native->sample.l : 0;
+    plan->paths[i] = (path_t){.b = usable_b,
+                              .l = latency,
+                              .p = native->state.p_ewma,
+                              .q = native->state.q_ewma};
+    size_t capacity =
+        horizon == FP_MAX
+            ? TRANSPORT_REPAIR_MAX_SYMBOLS
+            : transport_publish_path_capacity(conn, native, admission_ns);
+    /* Sibling native paths share one admission budget. Taking its maximum
+     * usable allowance lets them cooperate without multiplying that budget. */
+    if (capacity > plan->capacity[native->physical])
+      plan->capacity[native->physical] = capacity;
   }
-  return path_count;
+}
+
+static size_t select_repair_path(const repair_placement_t *plan, fp_t horizon) {
+  size_t best = SIZE_MAX, fallback = SIZE_MAX;
+  fp_t earliest = FP_MAX;
+  for (size_t i = 0; i < plan->count; i++) {
+    const transport_publication_path_t *native = &plan->native[i];
+    const path_t *path = &plan->paths[i];
+    if (path->x >= native->available ||
+        plan->queued[native->physical] >= plan->capacity[native->physical])
+      continue;
+    if (fallback == SIZE_MAX ||
+        native->sample.q < plan->native[fallback].sample.q ||
+        (native->sample.q == plan->native[fallback].sample.q &&
+         native->sample.l < plan->native[fallback].sample.l))
+      fallback = i;
+    if (path->b <= 0 || path->p >= FP_ONE)
+      continue;
+    /* Include all work admitted on the shared socket in every sibling's
+     * finish estimate, while retaining each native path's RTT and queue. */
+    fp_t finish =
+        FP_ADD(path->l,
+               FP_DIV(FP_ADD(FP_FROM_INT(path->q),
+                             FP_FROM_INT(plan->queued[native->physical] + 1U)),
+                      path->b));
+    if (finish <= horizon && finish < earliest) {
+      earliest = finish;
+      best = i;
+    }
+  }
+  /* Unbounded repairs retain the legacy fallback when estimates are unusable.
+   * A deadline always requires an eligible predicted completion. */
+  return best == SIZE_MAX && horizon == FP_MAX ? fallback : best;
 }
 
 static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
                             const sent_object_cache_t *cached,
                             const transport_repair_batch_t *repair,
-                            const transport_publication_path_t *native,
-                            const transport_policy_path_t *candidates,
-                            size_t path_count, fp_t horizon) {
-  transport_policy_schedule_t schedule = {0};
-  path_t planned_paths[TRANSPORT_POLICY_PATHS] = {0};
-  size_t packet_len = QLINQ_WIRE_FEC_HEADER_SIZE + repair->symbol_size;
-  qlinq_effective_repair_policy_t placement = {.enabled = true};
-  size_t planned_count = repair->count;
-  while (planned_count > 0 &&
-         !transport_policy_schedule(&placement, candidates, path_count,
-                                    planned_count, planned_count, horizon,
-                                    &schedule))
-    planned_count--;
-  for (size_t i = 0; i < path_count; i++)
-    planned_paths[i].x = schedule.source[i];
-
+                            repair_placement_t *plan, fp_t horizon) {
   size_t queued = 0;
   for (size_t i = 0; i < repair->count; i++) {
-    size_t path = SIZE_MAX;
-    if (i < planned_count) {
-      size_t slot =
-          transport_path_select_physical(planned_paths, path_count, i);
-      if (slot < path_count)
-        path = native[slot].quic;
-    }
-    if (path == SIZE_MAX && horizon == FP_MAX)
-      path = transport_select_datagram_path_for_size(conn, packet_len);
-    if (path == SIZE_MAX)
+    size_t slot = select_repair_path(plan, horizon);
+    if (slot == SIZE_MAX)
       break;
+    size_t path = plan->native[slot].quic;
     uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + QLINQ_FEC_MAX_SYMBOL_SIZE];
     qlinq_wire_fec_header_t header = {.alias = alias,
                                       .is_keyframe = cached->is_keyframe,
@@ -310,6 +332,11 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
     if (!transport_queue_datagram(conn, path,
                                   ptls_iovec_init(packet, wire_len)))
       break;
+    plan->paths[slot].x++;
+    size_t physical = plan->native[slot].physical;
+    plan->queued[physical]++;
+    if (horizon != FP_MAX && !conn->paths[physical].state_overridden)
+      transport_path_budget_charge(&conn->paths[physical].budget);
     queued++;
   }
   return queued;
@@ -354,7 +381,18 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
   if (!cached || (cached->expires_at_ms > 0 && now >= cached->expires_at_ms) ||
       cached->remaining_repair_symbols == 0) {
     t->stats.repair_cache_misses++;
-    if (cached && profile.checkpoint_recovery)
+    const transport_checkpoint_ack_state_t *ack =
+        transport_checkpoint_ack(conn, nack.alias);
+    /* An expired group may be checkpointed without ever allocating source
+     * storage. Repeat its terminal response after receiver control pressure,
+     * but never retire arbitrary future objects or records predating a join. */
+    bool outstanding =
+        ack && ack->participating && ack->sent_initialized &&
+        ack->sent_group_id == nack.group_id &&
+        nack.object_id <= ack->sent_object_id &&
+        (!ack->acked_initialized || ack->acked_group_id != nack.group_id ||
+         nack.object_id > ack->acked_object_id);
+    if (profile.checkpoint_recovery && (cached || outstanding))
       (void)transport_recovery_send_retire(conn, nack.alias, nack.group_id,
                                            nack.object_id);
     return true;
@@ -394,18 +432,9 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
   /* charge the request, but avoid encoding when no eligible path can deliver */
   size_t packet_len = QLINQ_WIRE_FEC_HEADER_SIZE + cached->symbol_size;
   fp_t horizon = transport_policy_remaining_horizon(cached->expires_at_ms, now);
-  transport_publication_path_t native[TRANSPORT_MAX_PATHS];
-  transport_policy_path_t candidates[TRANSPORT_POLICY_PATHS];
-  transport_policy_schedule_t probe_schedule;
-  qlinq_effective_repair_policy_t placement = {.enabled = true};
-  size_t path_count =
-      collect_repair_paths(conn, packet_len, horizon, native, candidates);
-  bool can_queue =
-      horizon == FP_MAX
-          ? transport_select_datagram_path_for_size(conn, packet_len) !=
-                SIZE_MAX
-          : transport_policy_schedule(&placement, candidates, path_count, 1, 1,
-                                      horizon, &probe_schedule);
+  repair_placement_t plan;
+  collect_repair_paths(conn, packet_len, horizon, &plan);
+  bool can_queue = select_repair_path(&plan, horizon) != SIZE_MAX;
   if (indices_valid && missing_count != 0 && !can_queue) {
     if (rateless && cached->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS)
       t->stats.repair_rateless_exhausted++;
@@ -435,8 +464,8 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
   if (repair.count > cached->remaining_repair_symbols)
     repair.count = cached->remaining_repair_symbols;
 
-  size_t queued = queue_repairs(conn, nack.alias, cached, &repair, native,
-                                candidates, path_count, horizon);
+  size_t queued =
+      queue_repairs(conn, nack.alias, cached, &repair, &plan, horizon);
   if (queued < repair.count)
     t->stats.repair_queue_failures++;
   if (cached->remaining_repair_symbols != UINT32_MAX) {

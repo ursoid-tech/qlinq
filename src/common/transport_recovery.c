@@ -240,16 +240,20 @@ bool transport_recovery_retire(transport_conn_t *conn, uint8_t alias,
                    &conn->receive_subscriptions, alias, &track) != 0)
     return false;
   transport_object_gap_state_t *state = transport_object_gap(conn, alias);
-  if (transport_recovery_was_delivered(state, object_id) ||
-      transport_recovery_was_retired(state, object_id))
-    return true;
-  /* Admit the explicit failed outcome before the cumulative checkpoint ACK.
-   * Both share an ordered reliable stream, so the sender never mistakes the
-   * ACK for delivery. On pressure retain the missing obligation and retry. */
-  if (!send_retirement(conn, QLINQ_WIRE_OBJECT_RETIRE_ACK, alias, group_id,
-                       object_id))
-    return false;
-  mark_object_retired(state, object_id);
+  bool terminal = transport_recovery_was_delivered(state, object_id) ||
+                  transport_recovery_was_retired(state, object_id);
+  if (!terminal) {
+    /* Admit the explicit failed outcome before the cumulative checkpoint ACK.
+     * Both share an ordered reliable stream, so the sender never mistakes the
+     * ACK for delivery. On pressure retain the missing obligation and retry. */
+    if (!send_retirement(conn, QLINQ_WIRE_OBJECT_RETIRE_ACK, alias, group_id,
+                         object_id))
+      return false;
+    mark_object_retired(state, object_id);
+  }
+  /* Reconcile stale missing state even for an already terminal object. This
+   * does not change a successful delivery into a failure or repeat its event.
+   */
   if (state->group_id == group_id && object_id >= state->pending_base &&
       object_id - state->pending_base < 32)
     state->pending_mask &= ~(UINT32_C(1) << (object_id - state->pending_base));
@@ -265,6 +269,9 @@ bool transport_recovery_retire(transport_conn_t *conn, uint8_t alias,
       transport_find_assembler(conn, alias, group_id, object_id);
   if (assembler)
     transport_release_assembler(conn->transport, assembler);
+  (void)acknowledge_completed_recovery_windows(conn, alias);
+  if (terminal)
+    return true;
   transport_event_t event = {.type = TRANSPORT_EVENT_OBJECT_LOST,
                              .conn = conn,
                              .track_id = track,
@@ -272,7 +279,6 @@ bool transport_recovery_retire(transport_conn_t *conn, uint8_t alias,
                                         .group_id = group_id,
                                         .object_id = object_id}};
   conn->transport->stats.fec_objects_lost++;
-  (void)acknowledge_completed_recovery_windows(conn, alias);
   transport_emit_event(conn->transport, &event);
   return true;
 }
@@ -380,8 +386,12 @@ static bool queue_missing_objects(transport_object_gap_state_t *state,
   uint32_t available = 32 - offset;
   uint32_t count =
       missing_count < available ? (uint32_t)missing_count : available;
-  uint32_t bits = count == 32 ? UINT32_MAX : ((1U << count) - 1U);
-  state->pending_mask |= bits << offset;
+  for (uint32_t bit = 0; bit < count; bit++) {
+    uint64_t object_id = first_missing + bit;
+    if (!transport_recovery_was_delivered(state, object_id) &&
+        !transport_recovery_was_retired(state, object_id))
+      state->pending_mask |= UINT32_C(1) << (offset + bit);
+  }
   return count == missing_count;
 }
 
