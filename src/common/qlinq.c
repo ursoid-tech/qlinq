@@ -41,6 +41,7 @@ struct qlinq_stream {
   struct qlinq_stream *next;
   qlinq_endpoint_t *endpoint;
   moq_track_id_t track;
+  qlinq_repair_policy_t repair_policy;
   qlinq_stream_direction_t direction;
   qlinq_stream_state_t state;
   uint64_t records_sent;
@@ -57,6 +58,7 @@ struct qlinq_endpoint {
   qlinq_peer_state_t *peers;
   uint8_t *shared_secret;
   size_t shared_secret_size;
+  qlinq_repair_policy_t repair_policy;
   uint64_t records_received;
   uint64_t record_events_queued;
   uint64_t record_payload_bytes_copied;
@@ -433,10 +435,9 @@ static void reject_received_record(qlinq_endpoint_t *endpoint,
 
 static void queue_received_object(qlinq_endpoint_t *endpoint,
                                   const transport_event_t *source) {
-  bool grouped_data =
-      source->track_id.type == MOQ_TRACK_DATA &&
-      (source->track_id.flags &
-       (MOQ_TRACK_FLAG_FEC_ENABLED | MOQ_TRACK_FLAG_FEC_RATELESS)) != 0;
+  bool grouped_data = transport_get_receive_track_profile(endpoint->transport,
+                                                          &source->track_id)
+                          .grouped_records;
   if (!grouped_data) {
     if (!deliver_record(endpoint, source->conn, &source->track_id,
                         &source->object, source->object.data,
@@ -677,6 +678,12 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
     set_status(context, QLINQ_STATUS_INVALID);
     return NULL;
   }
+  qlinq_effective_repair_policy_t effective_policy;
+  if (!qlinq_repair_policy_resolve(&config->repair_policy, NULL,
+                                   &effective_policy, NULL, 0)) {
+    set_status(context, QLINQ_STATUS_INVALID);
+    return NULL;
+  }
   for (size_t i = 0; i < config->bind_address_count; i++) {
     if (!config->bind_addresses[i]) {
       set_status(context, QLINQ_STATUS_INVALID);
@@ -706,6 +713,7 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   endpoint->context = context;
   endpoint->listener = listener;
   endpoint->active = true;
+  endpoint->repair_policy = config->repair_policy;
   endpoint->interface_callback = config->interface_callback;
   endpoint->interface_user_data = config->interface_user_data;
   if (config->security.shared_secret_size != 0) {
@@ -765,6 +773,7 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.flexicast_cc_feedback_timeout_ms =
       config->group_delivery.feedback_timeout_ms;
   transport_config.repair_mode = map_repair_mode(config->repair_mode);
+  transport_config.repair_policy = config->repair_policy;
   transport_config.congestion_control = config->congestion_control;
   transport_config.pacing = config->pacing;
   transport_config.initial_cwnd_packets = config->initial_cwnd_packets;
@@ -1006,7 +1015,17 @@ static qlinq_stream_t *open_stream(qlinq_endpoint_t *endpoint,
       config->name[0] == '\0' ||
       strlen(config->name) >= QLINQ_STREAM_NAME_CAPACITY ||
       !content_type_valid(config->content_type) ||
-      !delivery_valid(config->delivery)) {
+      !delivery_valid(config->delivery) ||
+      (config->repair_policy.present != 0 &&
+       (config->delivery == QLINQ_DELIVERY_DATAGRAM ||
+        config->delivery == QLINQ_DELIVERY_RELIABLE))) {
+    set_status(endpoint->context, QLINQ_STATUS_INVALID);
+    return NULL;
+  }
+  qlinq_effective_repair_policy_t effective_policy;
+  if (!qlinq_repair_policy_resolve(&endpoint->repair_policy,
+                                   &config->repair_policy, &effective_policy,
+                                   NULL, 0)) {
     set_status(endpoint->context, QLINQ_STATUS_INVALID);
     return NULL;
   }
@@ -1030,8 +1049,19 @@ static qlinq_stream_t *open_stream(qlinq_endpoint_t *endpoint,
     set_status(endpoint->context, QLINQ_STATUS_NO_MEMORY);
     return NULL;
   }
+  if ((config->delivery == QLINQ_DELIVERY_FIXEDRATE ||
+       config->delivery == QLINQ_DELIVERY_RATELESS) &&
+      !transport_set_directional_track_repair_policy(
+          endpoint->transport, &track, &config->repair_policy,
+          direction == QLINQ_STREAM_PUBLISH ? TRANSPORT_TRACK_SEND
+                                            : TRANSPORT_TRACK_RECEIVE)) {
+    free(stream);
+    set_status(endpoint->context, QLINQ_STATUS_RESOURCE_LIMIT);
+    return NULL;
+  }
   stream->endpoint = endpoint;
   stream->track = track;
+  stream->repair_policy = config->repair_policy;
   stream->direction = direction;
   stream->state = QLINQ_STREAM_OPEN;
   stream->next = endpoint->streams;
@@ -1075,6 +1105,12 @@ void qlinq_stream_close(qlinq_stream_t *stream) {
   if (stream->direction == QLINQ_STREAM_SUBSCRIBE &&
       stream->endpoint->transport)
     (void)transport_unsubscribe(stream->endpoint->transport, stream->track);
+  if (stream->endpoint->transport) {
+    transport_clear_directional_track_repair_policy(
+        stream->endpoint->transport, &stream->track,
+        stream->direction == QLINQ_STREAM_PUBLISH ? TRANSPORT_TRACK_SEND
+                                                  : TRANSPORT_TRACK_RECEIVE);
+  }
   stream->state = QLINQ_STREAM_CLOSED;
 }
 
@@ -1503,5 +1539,101 @@ bool qlinq_stream_get_stats(qlinq_stream_t *stream,
                                  &transport_stats))
     return false;
   stats->subscribers = transport_stats.subscribers;
+  return true;
+}
+
+bool qlinq_endpoint_get_repair_policy(qlinq_endpoint_t *endpoint,
+                                      qlinq_repair_policy_t *configured) {
+  if (!endpoint_access(endpoint))
+    return false;
+  if (!endpoint->active || !endpoint->transport || !configured) {
+    set_status(endpoint->context, QLINQ_STATUS_INVALID);
+    return false;
+  }
+  *configured = endpoint->repair_policy;
+  set_status(endpoint->context, QLINQ_STATUS_OK);
+  return true;
+}
+
+qlinq_status_t
+qlinq_endpoint_set_repair_policy(qlinq_endpoint_t *endpoint,
+                                 const qlinq_repair_policy_t *policy) {
+  if (!endpoint_access(endpoint))
+    return QLINQ_STATUS_STATE;
+  if (!endpoint->active || !endpoint->transport || !policy) {
+    set_status(endpoint->context, QLINQ_STATUS_INVALID);
+    return QLINQ_STATUS_INVALID;
+  }
+  if (!transport_set_repair_policy(endpoint->transport, policy)) {
+    set_status(endpoint->context, QLINQ_STATUS_INVALID);
+    return QLINQ_STATUS_INVALID;
+  }
+  endpoint->repair_policy = *policy;
+  endpoint->service_pending = true;
+  set_status(endpoint->context, QLINQ_STATUS_OK);
+  return QLINQ_STATUS_OK;
+}
+
+qlinq_status_t
+qlinq_stream_set_repair_policy(qlinq_stream_t *stream,
+                               const qlinq_repair_policy_t *policy) {
+  if (!stream_access(stream))
+    return QLINQ_STATUS_STATE;
+  if (!policy) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_INVALID);
+    return QLINQ_STATUS_INVALID;
+  }
+  if (stream->state != QLINQ_STREAM_OPEN || !stream->endpoint->active ||
+      !stream->endpoint->transport) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_STATE);
+    return QLINQ_STATUS_STATE;
+  }
+  qlinq_delivery_t delivery = flags_delivery(stream->track.flags);
+  if (policy->present != 0 && (delivery == QLINQ_DELIVERY_DATAGRAM ||
+                               delivery == QLINQ_DELIVERY_RELIABLE)) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_INVALID);
+    return QLINQ_STATUS_INVALID;
+  }
+  if ((delivery == QLINQ_DELIVERY_FIXEDRATE ||
+       delivery == QLINQ_DELIVERY_RATELESS) &&
+      !transport_set_directional_track_repair_policy(
+          stream->endpoint->transport, &stream->track, policy,
+          stream->direction == QLINQ_STREAM_PUBLISH
+              ? TRANSPORT_TRACK_SEND
+              : TRANSPORT_TRACK_RECEIVE)) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_INVALID);
+    return QLINQ_STATUS_INVALID;
+  }
+  stream->repair_policy = *policy;
+  stream->endpoint->service_pending = true;
+  set_status(stream->endpoint->context, QLINQ_STATUS_OK);
+  return QLINQ_STATUS_OK;
+}
+
+bool qlinq_stream_get_repair_policy(
+    qlinq_stream_t *stream, qlinq_repair_policy_t *configured,
+    qlinq_effective_repair_policy_t *effective) {
+  if (!stream_access(stream))
+    return false;
+  if (!configured && !effective) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_INVALID);
+    return false;
+  }
+  if (stream->state != QLINQ_STREAM_OPEN || !stream->endpoint->active ||
+      !stream->endpoint->transport) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_STATE);
+    return false;
+  }
+  if (effective && !transport_get_directional_track_repair_policy(
+                       stream->endpoint->transport, &stream->track, effective,
+                       stream->direction == QLINQ_STREAM_PUBLISH
+                           ? TRANSPORT_TRACK_SEND
+                           : TRANSPORT_TRACK_RECEIVE)) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_INVALID);
+    return false;
+  }
+  if (configured)
+    *configured = stream->repair_policy;
+  set_status(stream->endpoint->context, QLINQ_STATUS_OK);
   return true;
 }

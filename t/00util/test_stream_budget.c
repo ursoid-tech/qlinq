@@ -440,6 +440,9 @@ static int retained_nack_retries(bool rateless) {
   int failed = 0;
   transport_t *t = fixture();
   CHECK(t && t->client_conn && t->client_conn->stream);
+  qlinq_repair_policy_t reactive = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = true};
+  CHECK(transport_set_repair_policy(t, &reactive));
   transport_conn_t *conn = t->client_conn;
   quicly_stream_t *stream = conn->stream;
   quicly_sendbuf_t *sb =
@@ -549,6 +552,9 @@ static int retained_nack_ack_gap(bool rateless) {
   int failed = 0;
   transport_t *t = fixture();
   CHECK(t && t->client_conn && t->client_conn->stream);
+  qlinq_repair_policy_t reactive = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = true};
+  CHECK(transport_set_repair_policy(t, &reactive));
   transport_conn_t *conn = t->client_conn;
   conn->peer_capabilities |= QLINQ_WIRE_CAP_RATELESS_REPAIR;
   uint8_t flags =
@@ -599,6 +605,9 @@ static int repair_pressure(bool endpoint, bool rateless) {
   int failed = 0;
   transport_t *t = fixture();
   CHECK(t && t->client_conn && t->client_conn->stream);
+  qlinq_repair_policy_t reactive = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = true};
+  CHECK(transport_set_repair_policy(t, &reactive));
   transport_conn_t *conn = t->client_conn;
   conn->peer_capabilities |= QLINQ_WIRE_CAP_RATELESS_REPAIR;
   uint8_t flags =
@@ -1061,6 +1070,9 @@ static int control_dispatch_consumption(void) {
                                       .name = "throttled"},
                          .data = (const uint8_t *)"abc",
                          .size = 3};
+  qlinq_repair_policy_t reactive = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = true};
+  CHECK(transport_set_track_repair_policy(t, &object.track_id, &reactive));
   CHECK(transport_subscriptions_add(&conn->send_subscriptions,
                                     object.track_id.type, object.track_id.flags,
                                     object.track_id.name, 1));

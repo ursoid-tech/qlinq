@@ -17,6 +17,13 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
                                        size_t symbol_bytes,
                                        size_t payload_bytes, uint64_t now_ns,
                                        transport_publication_path_t *paths);
+/* Include every eligible native path, including siblings on one local socket.
+ * The caller must share admission capacity between paths with one physical ID.
+ */
+size_t transport_publish_collect_native_paths(
+    transport_t *t, transport_conn_t *conn, size_t symbol_bytes,
+    size_t payload_bytes, uint64_t now_ns,
+    transport_publication_path_t paths[TRANSPORT_MAX_QUIC_PATHS]);
 size_t transport_publish_path_capacity(transport_conn_t *conn,
                                        const transport_publication_path_t *path,
                                        uint64_t now_ns);

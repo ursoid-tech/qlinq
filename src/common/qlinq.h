@@ -14,6 +14,8 @@
 #ifndef QLINQ_H
 #define QLINQ_H
 
+#include "repair_policy.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -268,6 +270,8 @@ typedef struct {
    * virtual/loopback exclusion when set */
   qlinq_interface_callback_t interface_callback;
   void *interface_user_data;
+  /* default repair policy for FEC streams on this endpoint */
+  qlinq_repair_policy_t repair_policy;
 } qlinq_endpoint_config_t;
 
 typedef struct {
@@ -287,6 +291,8 @@ typedef struct {
   qlinq_content_type_t content_type;
   qlinq_delivery_t delivery;
   const char *name;
+  /* optional per-stream repair policy override */
+  qlinq_repair_policy_t repair_policy;
 } qlinq_stream_config_t;
 
 /* Payload bytes retain transport.h wire compatibility. FEC DATA records are
@@ -561,6 +567,17 @@ qlinq_stream_t *qlinq_subscribe(qlinq_endpoint_t *endpoint,
 void qlinq_stream_close(qlinq_stream_t *stream);
 
 bool qlinq_stream_is_writable(qlinq_stream_t *stream);
+bool qlinq_endpoint_get_repair_policy(qlinq_endpoint_t *endpoint,
+                                      qlinq_repair_policy_t *configured);
+qlinq_status_t
+qlinq_endpoint_set_repair_policy(qlinq_endpoint_t *endpoint,
+                                 const qlinq_repair_policy_t *policy);
+qlinq_status_t
+qlinq_stream_set_repair_policy(qlinq_stream_t *stream,
+                               const qlinq_repair_policy_t *policy);
+bool qlinq_stream_get_repair_policy(qlinq_stream_t *stream,
+                                    qlinq_repair_policy_t *configured,
+                                    qlinq_effective_repair_policy_t *effective);
 qlinq_send_result_t qlinq_stream_send(qlinq_stream_t *stream,
                                       const qlinq_record_t *record);
 

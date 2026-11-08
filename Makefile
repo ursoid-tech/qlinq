@@ -472,7 +472,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -Dtransport_policy_schedule=policy_schedule_reference -Dtransport_policy_estimate_parity=policy_estimate_reference -c $< -o $@
 
-t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
+t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o src/common/transport_tracks.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 ifeq ($(UNAME_S),Linux)
@@ -491,7 +491,11 @@ t/00util/test_transport_engine: t/00util/test_transport_engine.o $(ENGINE_OBJS)
 t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=clock_gettime,-Map,$@.map
 
+t/00util/test_publication_deadlines: t/00util/test_publication_deadlines.o $(ENGINE_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
 CHECK_BINARIES = t/00util/test_flexicast_transport $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
+	t/00util/test_publication_deadlines \
 	t/00util/test_datagram_mtu \
 	t/00util/test_path_probe \
 	t/00util/test_crypto_backend \
@@ -542,6 +546,7 @@ check: all $(CHECK_BINARIES) gencerts check-reports
 
 clean: 
 	rm -f t/00util/test_flexicast_transport
+	rm -f t/00util/test_publication_deadlines
 	rm -f t/00util/test_transport_engine t/00util/test_transport_engine.map t/00util/test_recovery_latency t/00util/test_recovery_latency.map
 	rm -f $(QUICLY_INTEGRATION_TEST)
 	find src deps t examples -name "*.o" -delete

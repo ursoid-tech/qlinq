@@ -1,6 +1,9 @@
 #include "transport_fixture.h"
 #include "transport_paths.h"
 #include "transport_publish.h"
+#include "transport_protocol.h"
+#include "transport_repair.h"
+#include "transport_sim_host.h"
 #include "transport_stream.h"
 #include "transport_wire.h"
 
@@ -73,6 +76,9 @@ static void check_constrained_multipath(void) {
 
   transport_t *t = f.server.transport;
   transport_conn_t *conn = f.server.conn;
+  qlinq_repair_policy_t reactive = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = true};
+  assert(transport_set_track_repair_policy(t, &track, &reactive));
 
   /* leave 2 datagram slots on each path so a 3-symbol object must split */
   uint8_t ignored = 0xff;
@@ -102,7 +108,7 @@ static void check_constrained_multipath(void) {
          memcmp(f.client.payload, payload, sizeof(payload)) == 0);
 
   /* repair responses must avoid a degraded path when a healthy path exists */
-  assert(transport_sent_cache_store(&t->sent_cache, &object, 2, 2, 1000, true));
+  assert(transport_sent_cache_find(&t->sent_cache, &track, 1, 0));
   uint8_t alias = 0;
   assert(transport_subscriptions_find_alias(&conn->send_subscriptions, &track,
                                             &alias) == 0);
@@ -118,6 +124,71 @@ static void check_constrained_multipath(void) {
          p0_before);
   assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
          p1_before + 2U);
+
+  /* deadline-aware publication and repair must exclude paths above max age */
+  for (size_t i = 0; i < 20; i++)
+    fixture_tick(&f);
+  qlinq_repair_policy_t deadline_policy = {.present = QLINQ_REPAIR_REACTIVE |
+                                                      QLINQ_REPAIR_MAX_AGE |
+                                                      QLINQ_REPAIR_MAX_EXTRA,
+                                           .reactive_repair = true,
+                                           .max_object_age_ms = 25,
+                                           .max_extra_percent = 200};
+  assert(transport_set_track_repair_policy(t, &track, &deadline_policy));
+  assert(transport_mock_path_state(t, 0, 100000, 100, 0.0f));
+  assert(transport_mock_path_state(t, 1, 100000, 100, 0.0f));
+  moq_object_t deadline_obj = {.track_id = track,
+                               .group_id = 2,
+                               .object_id = 0,
+                               .data = payload,
+                               .size = sizeof(payload)};
+  assert(transport_publish_ex(t, &deadline_obj) ==
+         TRANSPORT_PUBLISH_BACKPRESSURE);
+
+  assert(transport_mock_path_state(t, 0, 100000, 100, 0.0f));
+  assert(transport_mock_path_state(t, 1, 100000, 5, 0.0f));
+  p0_before = quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic);
+  p1_before = quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic);
+  assert(transport_publish_ex(t, &deadline_obj) == TRANSPORT_PUBLISH_DELIVERED);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         p0_before);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) >
+         p1_before);
+  fixture_receive(&f, &f.client, 1);
+
+  sent_object_cache_t *deadline_cached =
+      transport_sent_cache_find(&t->sent_cache, &track, 2, 0);
+  assert(deadline_cached && deadline_cached->expires_at_ms > 0);
+  deadline_cached->expires_at_ms =
+      (int64_t)(transport_get_monotonic_ns() / 1000000ULL) + 20;
+  uint32_t budget_before = deadline_cached->remaining_repair_symbols;
+  assert(budget_before >= 2U);
+
+  /* neither path can meet a 20 ms remaining deadline at 100 ms latency */
+  assert(transport_mock_path_state(t, 0, 100000, 100, 0.0f));
+  assert(transport_mock_path_state(t, 1, 100000, 100, 0.0f));
+  p0_before = quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic);
+  p1_before = quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic);
+  inject_nack(conn->stream, alias, 2, 0, missing, 2);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         p0_before);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
+         p1_before);
+  assert(deadline_cached->remaining_repair_symbols == budget_before);
+
+  /* cap repair burst to the 1 symbol that can finish before deadline */
+  deadline_cached->expires_at_ms =
+      (int64_t)(transport_get_monotonic_ns() / 1000000ULL) + 20;
+  conn->paths[1].state.b_ewma = FP_FROM_INT(100);
+  conn->paths[1].state.l_ewma = FP_FROM_FLOAT(0.005f);
+  conn->paths[1].state.p_ewma = 0;
+  conn->paths[1].state.q_ewma = 0;
+  inject_nack(conn->stream, alias, 2, 0, missing, 2);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         p0_before);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
+         p1_before + 1U);
+  assert(deadline_cached->remaining_repair_symbols == budget_before - 1U);
   fixture_destroy(&f);
 }
 
@@ -160,6 +231,88 @@ static void create_shared_socket(transport_fixture_t *f, size_t paths[2]) {
       break;
   }
   assert(f->server.transport->socket_count == 1 && count == 2);
+}
+
+static void check_shared_socket_repair_deadline(void) {
+  transport_fixture_t f;
+  size_t paths[2];
+  create_shared_socket(&f, paths);
+  moq_track_id_t track = {.type = MOQ_TRACK_VIDEO,
+                          .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                          .name = "shared-repair-deadline"};
+  fixture_subscribe(&f, &f.client, track);
+  for (size_t i = 0; i < 100; i++)
+    fixture_tick(&f);
+  transport_t *t = f.server.transport;
+  transport_conn_t *conn = f.server.conn;
+  qlinq_repair_policy_t policy = {.present = QLINQ_REPAIR_REACTIVE |
+                                             QLINQ_REPAIR_MAX_AGE,
+                                  .reactive_repair = true,
+                                  .max_object_age_ms = 1000};
+  assert(transport_set_track_repair_policy(t, &track, &policy));
+  uint8_t data[32] = {0};
+  moq_object_t object = {
+      .track_id = track, .group_id = 1, .data = data, .size = sizeof(data)};
+  assert(transport_sent_cache_store(&t->sent_cache, &object, 2, 2, 16, false));
+  sent_object_cache_t *cached =
+      transport_sent_cache_find(&t->sent_cache, &track, 1, 0);
+  assert(cached && transport_sent_recipient_store(cached, conn->id, 2));
+  cached->expires_at_ms = transport_now_ms(t) + 1000;
+  cached->remaining_repair_symbols = 3;
+  uint8_t alias;
+  assert(transport_subscriptions_find_alias(&conn->send_subscriptions, &track,
+                                            &alias) == 0);
+  uint8_t ignored = 0xff;
+  while (quicly_get_num_datagram_frames_path(conn->quic, paths[0]) <
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1U)
+    assert(
+        transport_queue_datagram(conn, paths[0], ptls_iovec_init(&ignored, 1)));
+  size_t alternate_before =
+      quicly_get_num_datagram_frames_path(conn->quic, paths[1]);
+  uint16_t missing[] = {0, 1};
+
+  /* A full deadline rejection cannot consume the repair budget. */
+  assert(transport_mock_path_state(t, 0, 100000, 2000, 0));
+  inject_nack(conn->stream, alias, 1, 0, missing, 2);
+  assert(cached->remaining_repair_symbols == 3 &&
+         quicly_get_num_datagram_frames_path(conn->quic, paths[1]) ==
+             alternate_before);
+
+  /* The first native remains eligible, but only its sibling can meet the
+   * deadline. Its per-path delay and historical loss must stay with its owner.
+   */
+  transport_conn_path_t *physical = &conn->paths[0];
+  physical->state_overridden = false;
+  physical->state = (path_state_t){.b_ewma = FP_FROM_INT(10000),
+                                   .l_ewma = FP_FROM_INT(2),
+                                   .p_ewma = FP_FROM_FLOAT(0.25f),
+                                   .initialized = true};
+  physical->budget = (transport_path_budget_t){0};
+  physical->owd_initialized = true;
+  physical->telemetry_path = paths[0];
+  physical->latest_owd_fp = FP_FROM_INT(2);
+  assert(physical->measurement.quic_path == paths[0]);
+  inject_nack(conn->stream, alias, 1, 0, missing, 2);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0]) ==
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1U);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1]) ==
+         alternate_before + 2U);
+  assert(cached->remaining_repair_symbols == 1 &&
+         physical->budget.debt == 2 * FP_ONE);
+  assert(physical->measurement.quic_path == paths[0] &&
+         physical->state.l_ewma == FP_FROM_INT(2) &&
+         physical->state.p_ewma == FP_FROM_FLOAT(0.25f) &&
+         physical->telemetry_path == paths[0]);
+
+  /* Swapping the delayed native must select the first path independently. */
+  physical->telemetry_path = paths[1];
+  inject_nack(conn->stream, alias, 1, 0, missing, 1);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0]) ==
+         QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1]) ==
+         alternate_before + 2U);
+  assert(cached->remaining_repair_symbols == 0);
+  fixture_destroy(&f);
 }
 
 static void update_measurements(transport_fixture_t *f) {
@@ -216,7 +369,142 @@ static void check_feedback(transport_fixture_t *f,
       transport_release_assembler(t, &conn->assemblers[i]);
 }
 
+static void receive_fixed_symbol(transport_conn_t *conn, uint8_t alias,
+                                 uint16_t index, uint16_t total,
+                                 const sent_object_cache_t *object,
+                                 const uint8_t *payload) {
+  uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + QLINQ_FEC_MAX_SYMBOL_SIZE];
+  qlinq_wire_fec_header_t header = {.alias = alias,
+                                    .group_id = object->group_id,
+                                    .object_id = object->object_id,
+                                    .symbol_index = index,
+                                    .total_symbols = total,
+                                    .data_symbols = object->data_symbols,
+                                    .symbol_size = object->symbol_size,
+                                    .original_size = (uint32_t)object->size};
+  size_t payload_size = qlinq_wire_fec_payload_size(&header);
+  assert(qlinq_wire_encode_fec_header(packet, sizeof(packet), &header) ==
+         QLINQ_WIRE_OK);
+  memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE, payload, payload_size);
+  transport_protocol_receive_datagram(
+      conn, ptls_iovec_init(packet, QLINQ_WIRE_FEC_HEADER_SIZE + payload_size),
+      false);
+}
+
+/* A shared source cache must reproduce each recipient's fixed codeword,
+ * including when path estimates change before a publication retry. */
+static void check_fixed_recipient_geometry(void) {
+  sim_network_t net = {.now_ns = 1000000000};
+  sim_node_t nodes[3] = {0};
+  fixture_endpoint_t endpoints[3] = {0};
+  transport_drive_host_t hosts[3];
+  const char *addresses[] = {"127.0.0.1", "127.0.0.2", "127.0.0.3"};
+  for (size_t i = 0; i < 3; i++)
+    hosts[i] = sim_host(&nodes[i], &net);
+  for (size_t i = 0; i < 3; i++) {
+    endpoints[i].server = i == 0;
+    transport_config_t config = {.bind_hosts = {addresses[i]},
+                                 .num_bind_hosts = 1,
+                                 .port = 19928,
+                                 .callback = fixture_event,
+                                 .user_data = &endpoints[i],
+                                 .allow_insecure_peer = true,
+                                 .cert_file = "t/assets/server.crt",
+                                 .key_file = "t/assets/server.key",
+                                 .drive_host = &hosts[i]};
+    if (i) {
+      config.remote_hosts[0] = addresses[0];
+      config.num_remote_hosts = 1;
+    }
+    nodes[i].transport = endpoints[i].transport =
+        transport_drive_create(&config);
+    assert(nodes[i].transport);
+  }
+  for (size_t i = 0; i < 1000; i++)
+    sim_advance(&net, 1000000);
+  assert(endpoints[1].authenticated && endpoints[2].authenticated);
+  moq_track_id_t track = {.type = MOQ_TRACK_VIDEO,
+                          .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                          .name = "fixed-geometry"};
+  assert(transport_subscribe(endpoints[1].transport, track));
+  assert(transport_subscribe(endpoints[2].transport, track));
+  for (size_t i = 0; i < 100; i++)
+    sim_advance(&net, 1000000);
+  assert(endpoints[0].subscriptions == 2);
+  transport_t *sender = endpoints[0].transport;
+  qlinq_repair_policy_t policy = {.present = QLINQ_REPAIR_REACTIVE,
+                                  .reactive_repair = true};
+  assert(transport_set_track_repair_policy(sender, &track, &policy));
+  for (size_t i = 0; i < 2; i++) {
+    transport_conn_t *conn = transport_connection_at(sender, i);
+    conn->paths[0].state_overridden = true;
+    conn->paths[0].state = (path_state_t){.initialized = true,
+                                          .b_ewma = FP_FROM_INT(100000),
+                                          .l_ewma = FP_FROM_FLOAT(.01f),
+                                          .p_ewma = i ? FP_FROM_FLOAT(.5f) : 0};
+  }
+  uint8_t payload[3000];
+  for (size_t i = 0; i < sizeof(payload); i++)
+    payload[i] = (uint8_t)(i * 37U + i / 64U);
+  moq_object_t object = {.track_id = track,
+                         .group_id = 1,
+                         .object_id = 1,
+                         .data = payload,
+                         .size = sizeof(payload)};
+  assert(transport_publish_ex(sender, &object) == TRANSPORT_PUBLISH_DELIVERED);
+  sent_object_cache_t *cached = transport_sent_cache_find(
+      &sender->sent_cache, &track, object.group_id, object.object_id);
+  assert(cached && cached->data_symbols == 3 && cached->recipient_count == 2);
+  uint16_t totals[2];
+  for (size_t i = 0; i < 2; i++) {
+    transport_conn_t *conn = transport_connection_at(sender, i);
+    totals[i] = transport_sent_recipient_total(cached, conn->id);
+    assert(totals[i] == quicly_get_num_datagram_frames_path(conn->quic, 0));
+    conn->paths[0].state.p_ewma = i ? 0 : FP_FROM_FLOAT(.5f);
+  }
+  assert(totals[0] < totals[1] && cached->total_symbols == totals[1]);
+  assert(transport_publish_ex(sender, &object) == TRANSPORT_PUBLISH_DELIVERED);
+  for (size_t i = 0; i < 2; i++) {
+    transport_conn_t *conn = transport_connection_at(sender, i);
+    assert(quicly_get_num_datagram_frames_path(conn->quic, 0) ==
+           2U * totals[i]);
+    assert(transport_sent_recipient_total(cached, conn->id) == totals[i]);
+    transport_conn_t *receiver = endpoints[i + 1].conn;
+    uint8_t alias;
+    assert(transport_subscriptions_find_alias(&receiver->receive_subscriptions,
+                                              &track, &alias) == 0);
+    /* Deliver two systematic symbols, then repair with parity: this also
+     * verifies the encoder uses the recipient's geometry, not just its header.
+     */
+    for (uint16_t symbol = 0; symbol < 2; symbol++)
+      receive_fixed_symbol(receiver, alias, symbol, totals[i], cached,
+                           cached->data + symbol * cached->symbol_size);
+    uint16_t missing[] = {cached->data_symbols};
+    transport_repair_batch_t repair;
+    assert(transport_repair_build_for_recipient(
+        &sender->fec_cache, cached, conn->id, false, missing, 1, &repair));
+    assert(repair.total_symbols == totals[i]);
+    receive_fixed_symbol(receiver, alias, repair.indices[0],
+                         repair.total_symbols, cached, repair.symbols);
+    transport_repair_batch_destroy(&repair);
+    assert(endpoints[i + 1].objects == 1);
+    assert(endpoints[i + 1].payload_size == sizeof(payload));
+    assert(memcmp(endpoints[i + 1].payload, payload, sizeof(payload)) == 0);
+    assert(receiver->transport->stats.malformed_datagrams == 0);
+  }
+  transport_repair_batch_t repair;
+  const uint16_t missing[] = {0};
+  assert(!transport_repair_build_for_recipient(
+      &sender->fec_cache, cached, UINT32_MAX, false, missing, 1, &repair));
+  assert(transport_sent_cache_release_track(&sender->sent_cache, &track) == 1);
+  assert(sender->sent_cache.count == 0);
+  for (size_t i = 3; i > 0; i--)
+    transport_destroy(nodes[i - 1].transport);
+}
+
 int main(void) {
+  check_fixed_recipient_geometry();
+  check_shared_socket_repair_deadline();
   transport_fixture_t f;
   size_t paths[2];
   create_shared_socket(&f, paths);

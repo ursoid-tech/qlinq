@@ -66,7 +66,9 @@ bool transport_schedule_build(pathflow_context_t *context,
   }
 
   if (data_symbols == 1) {
-    schedule->paths[*round_robin % num_paths].x = 1;
+    size_t chosen = *round_robin % num_paths;
+    schedule->paths[chosen].m = 1;
+    schedule->paths[chosen].x = 1;
     (*round_robin)++;
     return true;
   }

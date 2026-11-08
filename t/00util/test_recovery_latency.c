@@ -2,6 +2,8 @@
 #include "transport_fixture.h"
 #include "transport_sim_host.h"
 #include "transport_wire.h"
+#include "transport_recovery.h"
+#include "transport_stream.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
@@ -382,7 +384,274 @@ static void reconnect(void) {
   destroy(f);
 }
 
+/* A bounded repair policy may lose an object without wedging all subsequent
+ * checkpoints. Exercise asymmetric policy settings over the real wire. */
+static void policy_retirement(qlinq_repair_policy_t policy, unsigned sides,
+                              bool control_pressure) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  for (unsigned side = 0; side < 2; side++)
+    if (sides & (1U << side))
+      assert(transport_set_repair_policy(f->host[side].transport, &policy));
+  transport_t *receiver = f->host[1].transport;
+  transport_conn_t *conn = f->endpoint[1].base.conn;
+  assert(conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_RETIREMENT);
+  track_subscription_t *sub =
+      transport_subscriptions_find(&conn->receive_subscriptions, &f->track);
+  assert(sub);
+  transport_stream_ctx_t *control = conn->stream->data;
+  size_t pressure = receiver->limits.max_stream_egress_bytes;
+  if (control_pressure)
+    control->retained_frame_bytes += pressure;
+  f->host[0].drop_until_ns = f->net.now_ns + 20 * MS;
+  assert(send_record(f, 0, MAX_BYTES));
+  flush(f);
+  advance(f, 1000);
+  if (control_pressure) {
+    assert(!f->endpoint[1].lost);
+    assert(!transport_recovery_was_retired(
+        transport_object_gap(conn, sub->alias), 0));
+    control->retained_frame_bytes -= pressure;
+    /* Exhausted feedback tokens must not prevent terminal control progress. */
+    receiver->aggregate_nack_limiter.last_refill_ms =
+        transport_now_ms(receiver);
+    receiver->aggregate_nack_limiter.tokens_milli = 0;
+    advance(f, 1000);
+  }
+  assert(f->endpoint[1].lost == 1 && !f->endpoint[1].received);
+  assert(f->host[0].transport->sent_cache.count == 0);
+  assert(transport_recovery_was_retired(transport_object_gap(conn, sub->alias),
+                                        0));
+  assert(!transport_recovery_was_delivered(
+      transport_object_gap(conn, sub->alias), 0));
+  if ((sides & 2U) && (policy.present & QLINQ_REPAIR_REACTIVE) &&
+      !policy.reactive_repair)
+    assert(receiver->stats.repair_requests_sent == 0);
+
+  /* More than the entire checkpoint-window table must continue flowing. The
+   * payload record ID is reused; coding-object IDs remain distinct. */
+  for (unsigned i = 0; i < TRANSPORT_RECOVERY_MAX_WINDOWS + 2U; i++) {
+    f->seen[0] = false;
+    f->attempted[0] = false;
+    assert(send_record(f, 0, 512));
+    flush(f);
+    await_records(f, i + 1U, f->net.now_ns + 100 * MS);
+    assert(f->endpoint[1].received == i + 1U);
+  }
+  advance(f, 100);
+  assert(f->endpoint[1].lost == 1 &&
+         f->host[0].transport->sent_cache.count == 0);
+  /* Late packets and duplicate retirement cannot resurrect a failed object or
+   * emit another loss event. */
+  uint8_t datagram[QLINQ_WIRE_FEC_HEADER_SIZE + 3] = {0};
+  qlinq_wire_fec_header_t header = {.alias = sub->alias,
+                                    .group_id = 0,
+                                    .object_id = 0,
+                                    .total_symbols = 1,
+                                    .data_symbols = 1,
+                                    .symbol_size = 3,
+                                    .original_size = 3};
+  assert(qlinq_wire_encode_fec_header(datagram, sizeof(datagram), &header) ==
+         QLINQ_WIRE_OK);
+  memcpy(datagram + QLINQ_WIRE_FEC_HEADER_SIZE, "abc", 3);
+  receiver->receive_datagram.cb(&receiver->receive_datagram, conn->quic,
+                                ptls_iovec_init(datagram, sizeof(datagram)));
+  assert(transport_recovery_retire(conn, sub->alias, 0, 0));
+  assert(f->endpoint[1].lost == 1 &&
+         f->endpoint[1].received == TRANSPORT_RECOVERY_MAX_WINDOWS + 2U);
+  destroy(f);
+}
+
+static void retired_gap_reobservation(bool receiver_disabled) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  qlinq_repair_policy_t disabled = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = false};
+  assert(transport_set_repair_policy(f->host[0].transport, &disabled));
+  if (receiver_disabled)
+    assert(transport_set_repair_policy(f->host[1].transport, &disabled));
+  assert(send_record(f, 0, 512));
+  flush(f);
+  await_records(f, 1, f->net.now_ns + 100 * MS);
+  assert(f->endpoint[1].received == 1);
+  advance(f, 100);
+
+  /* A checkpoint retires a completely lost object without observing any of
+   * its datagrams, so the last observed object remains zero. */
+  f->host[0].drop_until_ns = f->net.now_ns + 20 * MS;
+  assert(send_record(f, 1, 512));
+  flush(f);
+  advance(f, 1000);
+  transport_t *receiver = f->host[1].transport;
+  transport_conn_t *conn = f->endpoint[1].base.conn;
+  track_subscription_t *sub =
+      transport_subscriptions_find(&conn->receive_subscriptions, &f->track);
+  assert(sub);
+  transport_object_gap_state_t *gap = transport_object_gap(conn, sub->alias);
+  assert(f->endpoint[1].received == 1 && f->endpoint[1].lost == 1);
+  assert(gap->last_seen == 0 && gap->pending_mask == 0);
+  assert(transport_recovery_was_retired(gap, 1) &&
+         !transport_recovery_was_delivered(gap, 1));
+  uint64_t nacks = receiver->stats.repair_requests_sent;
+  assert(!receiver_disabled || nacks == 0);
+
+  /* Let the normal group timer publish the next object. Explicit flush would
+   * add a checkpoint whose ACK masks a spuriously reintroduced gap. */
+  assert(send_record(f, 2, 512));
+  advance(f, 1000);
+  assert(f->endpoint[1].received == 2 && f->endpoint[1].lost == 1);
+  assert(gap->last_seen == 2 && gap->pending_mask == 0);
+  assert(receiver->stats.repair_requests_sent == nacks);
+  assert(transport_recovery_deadline(conn) == INT64_MAX);
+  advance(f, 2000);
+  assert(gap->pending_mask == 0 && f->endpoint[1].lost == 1);
+  assert(receiver->stats.repair_requests_sent == nacks);
+  assert(transport_recovery_deadline(conn) == INT64_MAX);
+
+  /* Even stale state must reconcile idempotently. Leave a genuine missing
+   * object in each window to ensure terminal cleanup never ACKs across it. */
+  transport_recovery_window_t *window = &gap->recovery_windows[0];
+  assert(!window->active);
+  uint64_t pending_base = gap->pending_base;
+  size_t frames = receiver->stats.stream_egress_frames;
+  uint64_t checkpoint_acks = receiver->stats.recovery_checkpoint_acks_sent;
+  for (uint64_t object_id = 1; object_id <= 2; object_id++) {
+    gap->pending_base = object_id;
+    gap->pending_mask = 1U | (1U << (3U - object_id));
+    *window = (transport_recovery_window_t){.active = true,
+                                            .group_id = 0,
+                                            .first_object_id = object_id,
+                                            .final_object_id = 3,
+                                            .missing_mask = gap->pending_mask};
+    assert(transport_recovery_retire(conn, sub->alias, 0, object_id));
+    assert(gap->pending_mask == (1U << (3U - object_id)));
+    assert(window->active && window->missing_mask == gap->pending_mask);
+    assert(receiver->stats.stream_egress_frames == frames);
+    assert(receiver->stats.recovery_checkpoint_acks_sent == checkpoint_acks);
+    assert(f->endpoint[1].lost == 1);
+  }
+  assert(transport_recovery_was_retired(gap, 1) &&
+         !transport_recovery_was_delivered(gap, 1));
+  assert(transport_recovery_was_delivered(gap, 2) &&
+         !transport_recovery_was_retired(gap, 2));
+  memset(window, 0, sizeof(*window));
+  gap->pending_base = pending_base;
+  gap->pending_mask = 0;
+  destroy(f);
+}
+
+static void uncached_retirement_bounds(void) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  transport_conn_t *sender = f->endpoint[0].base.conn;
+  transport_conn_t *receiver = f->endpoint[1].base.conn;
+  track_subscription_t *send_sub =
+      transport_subscriptions_find(&sender->send_subscriptions, &f->track);
+  track_subscription_t *receive_sub =
+      transport_subscriptions_find(&receiver->receive_subscriptions, &f->track);
+  assert(send_sub && receive_sub &&
+         f->host[0].transport->sent_cache.count == 0);
+  /* Model an expired, never transmitted object after a join baseline. Only
+   * the outstanding checkpoint interval authorizes a cache-miss retirement. */
+  transport_checkpoint_ack_state_t *ack =
+      transport_checkpoint_ack(sender, send_sub->alias);
+  transport_checkpoint_ack_state_t saved = *ack;
+  *ack = (transport_checkpoint_ack_state_t){.participating = true,
+                                            .sent_initialized = true,
+                                            .sent_group_id = 0,
+                                            .sent_object_id = 2,
+                                            .acked_initialized = true,
+                                            .acked_group_id = 0,
+                                            .acked_object_id = 1};
+  const uint64_t groups[] = {0, 0, 1, 0};
+  const uint64_t objects[] = {1, 3, 2, 2};
+  for (size_t i = 0; i < 4; i++) {
+    assert(transport_recovery_send_nack(receiver, receive_sub->alias, groups[i],
+                                        objects[i], NULL, 0, true));
+    advance(f, 100);
+    assert(f->endpoint[1].lost == (i == 3 ? 1U : 0U));
+  }
+  transport_object_gap_state_t *gap =
+      transport_object_gap(receiver, receive_sub->alias);
+  assert(!transport_recovery_was_retired(gap, 1) &&
+         transport_recovery_was_retired(gap, 2) &&
+         !transport_recovery_was_retired(gap, 3));
+  *ack = saved;
+  destroy(f);
+}
+
+static void legacy_assembler_retry(void) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  transport_t *receiver = f->host[1].transport;
+  transport_conn_t *conn = f->endpoint[1].base.conn;
+  track_subscription_t *sub =
+      transport_subscriptions_find(&conn->receive_subscriptions, &f->track);
+  receiver->fec_assembler_timeout_ms = 5;
+  uint8_t datagram[QLINQ_WIRE_FEC_HEADER_SIZE + 8] = {0};
+  qlinq_wire_fec_header_t header = {.alias = sub->alias,
+                                    .total_symbols = 2,
+                                    .data_symbols = 2,
+                                    .symbol_size = 8,
+                                    .original_size = 16};
+  assert(qlinq_wire_encode_fec_header(datagram, sizeof(datagram), &header) ==
+         QLINQ_WIRE_OK);
+  receiver->receive_datagram.cb(&receiver->receive_datagram, conn->quic,
+                                ptls_iovec_init(datagram, sizeof(datagram)));
+  assert(transport_find_assembler(conn, sub->alias, 0, 0));
+  advance(f, 6);
+  assert(!transport_find_assembler(conn, sub->alias, 0, 0));
+  assert(!transport_recovery_was_retired(transport_object_gap(conn, sub->alias),
+                                         0));
+  assert(send_record(f, 0, 512));
+  flush(f);
+  await_records(f, 1, f->net.now_ns + 100 * MS);
+  assert(f->endpoint[1].received == 1 && f->endpoint[1].lost == 1);
+  destroy(f);
+}
+
+static void checkpoint_window_pressure(void) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  qlinq_repair_policy_t disabled = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = false};
+  assert(transport_set_repair_policy(f->host[0].transport, &disabled));
+  f->host[1].blocked =
+      true; /* Delay checkpoint ACKs for an entire window table. */
+  for (unsigned i = 0; i <= TRANSPORT_RECOVERY_MAX_WINDOWS; i++) {
+    f->seen[0] = f->attempted[0] = false;
+    assert(send_record(f, 0, 512));
+    bool flushed = transport_publish_flush(f->host[0].transport);
+    assert(flushed == (i < TRANSPORT_RECOVERY_MAX_WINDOWS));
+    await_records(f, i + 1U, f->net.now_ns + 100 * MS);
+    assert(f->endpoint[1].received == i + 1U);
+  }
+  transport_conn_t *sender = f->endpoint[0].base.conn;
+  track_subscription_t *sub =
+      transport_subscriptions_find(&sender->send_subscriptions, &f->track);
+  assert(transport_checkpoint_ack(sender, sub->alias)->pending_window_count ==
+         TRANSPORT_RECOVERY_MAX_WINDOWS);
+  f->host[1].blocked = false;
+  advance(f, 1000);
+  assert(transport_publish_flush(f->host[0].transport));
+  advance(f, 100);
+  assert(f->host[0].transport->sent_cache.count == 0 && !f->endpoint[1].lost);
+  destroy(f);
+}
+
 int main(void) {
+  qlinq_repair_policy_t disabled = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = false};
+  qlinq_repair_policy_t expiry = {.present = QLINQ_REPAIR_MAX_AGE,
+                                  .max_object_age_ms = 10};
+  qlinq_repair_policy_t exhausted = {.present = QLINQ_REPAIR_MAX_EXTRA,
+                                     .max_extra_percent = 0};
+  for (unsigned sides = 1; sides <= 3; sides++) {
+    policy_retirement(disabled, sides, false);
+    policy_retirement(expiry, sides, false);
+  }
+  policy_retirement(exhausted, 1, false);
+  policy_retirement(disabled, 2, true);
+  retired_gap_reobservation(false);
+  retired_gap_reobservation(true);
+  uncached_retirement_bounds();
+  legacy_assembler_retry();
+  checkpoint_window_pressure();
   tail(0, false, false, 1);
   tail(MOQ_TRACK_FLAG_RELIABLE, false, false, 1);
   tail(MOQ_TRACK_FLAG_FEC_RATELESS, false, true, 1);

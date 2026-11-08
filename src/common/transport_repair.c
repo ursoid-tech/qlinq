@@ -211,6 +211,23 @@ cleanup:
   return true;
 }
 
+bool transport_repair_build_for_recipient(
+    transport_fec_cache_t *fec_cache, const sent_object_cache_t *object,
+    uint32_t connection_id, bool whole_object, const uint16_t *missing,
+    size_t missing_count, transport_repair_batch_t *batch) {
+  if (!object)
+    return false;
+  sent_object_cache_t recipient = *object;
+  if ((object->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
+    recipient.total_symbols =
+        transport_sent_recipient_total(object, connection_id);
+    if (recipient.total_symbols == 0)
+      return false;
+  }
+  return transport_repair_build(fec_cache, &recipient, whole_object, missing,
+                                missing_count, batch);
+}
+
 bool transport_repair_build_rateless(transport_fec_cache_t *fec_cache,
                                      sent_object_cache_t *object,
                                      size_t requested,

@@ -1,15 +1,24 @@
 #ifndef QLINQ_TRANSPORT_TRACKS_H
 #define QLINQ_TRANSPORT_TRACKS_H
 
+#include "repair_policy.h"
 #include "transport.h"
 
 typedef struct {
   bool reliable;
   bool fec_enabled;
   bool fec_rateless;
+  bool proactive_fec;
+  bool reactive_repair;
+  bool grouped_records;
+  bool checkpoint_recovery;
+  qlinq_effective_repair_policy_t policy;
 } transport_track_profile_t;
 
 transport_track_profile_t transport_track_profile(const moq_track_id_t *track);
+transport_track_profile_t
+transport_track_profile_resolve(const moq_track_id_t *track,
+                                const qlinq_effective_repair_policy_t *policy);
 bool transport_track_type_valid(uint8_t type);
 bool transport_track_id_valid(const moq_track_id_t *track);
 bool transport_track_id_equal(const moq_track_id_t *a, const moq_track_id_t *b);

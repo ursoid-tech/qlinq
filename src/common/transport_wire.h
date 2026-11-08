@@ -15,6 +15,7 @@
 #define QLINQ_WIRE_TRACK_END_SIZE 17U
 #define QLINQ_WIRE_TRACK_CHECKPOINT_SIZE 28U
 #define QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE 17U
+#define QLINQ_WIRE_OBJECT_RETIRE_SIZE 17U
 #define QLINQ_WIRE_MAX_TRACK_NAME 63U
 #define QLINQ_WIRE_MAX_NACK_SYMBOLS 1024U
 #define QLINQ_WIRE_NACK_WHOLE_OBJECT 0x01U
@@ -42,7 +43,9 @@ typedef enum {
   QLINQ_WIRE_FLEXICAST_BIND = 10,
   QLINQ_WIRE_TRACK_END = 11,
   QLINQ_WIRE_TRACK_CHECKPOINT = 12,
-  QLINQ_WIRE_TRACK_CHECKPOINT_ACK = 13
+  QLINQ_WIRE_TRACK_CHECKPOINT_ACK = 13,
+  QLINQ_WIRE_OBJECT_RETIRE = 14,
+  QLINQ_WIRE_OBJECT_RETIRE_ACK = 15
 } qlinq_wire_frame_type_t;
 
 #define QLINQ_WIRE_ROLE_CLIENT 0U
@@ -57,12 +60,13 @@ typedef enum {
 #define QLINQ_WIRE_CAP_FLEXICAST_DATAGRAM 0x00000040U
 #define QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS 0x00000080U
 #define QLINQ_WIRE_CAP_RATELESS_REPAIR 0x00000100U
+#define QLINQ_WIRE_CAP_RECOVERY_RETIREMENT 0x00000200U
 #define QLINQ_WIRE_CAP_KNOWN                                                   \
   (QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |                         \
    QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |             \
    QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |                  \
    QLINQ_WIRE_CAP_FLEXICAST_DATAGRAM | QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS |   \
-   QLINQ_WIRE_CAP_RATELESS_REPAIR)
+   QLINQ_WIRE_CAP_RATELESS_REPAIR | QLINQ_WIRE_CAP_RECOVERY_RETIREMENT)
 
 typedef enum {
   QLINQ_WIRE_DATAGRAM_FEC = 1,
@@ -164,6 +168,22 @@ typedef struct {
   uint64_t group_id;
   uint64_t final_object_id;
 } qlinq_wire_track_checkpoint_ack_t;
+
+/* A failed object is terminal independently of successful delivery. RETIRE
+ * flows from publisher to receiver; RETIRE_ACK also permits a receiver to
+ * announce its own deadline or disabled-repair decision. */
+typedef struct {
+  uint8_t alias;
+  uint64_t group_id;
+  uint64_t object_id;
+} qlinq_wire_object_retire_t;
+
+qlinq_wire_result_t
+qlinq_wire_encode_object_retire(uint8_t *dst, size_t capacity,
+                                const qlinq_wire_object_retire_t *retire);
+qlinq_wire_result_t
+qlinq_wire_decode_object_retire(const uint8_t *src, size_t len,
+                                qlinq_wire_object_retire_t *retire);
 
 /* Borrow the next length-prefixed DATA record, including empty records.
  * On exhaustion or truncation, return false without advancing the cursor.

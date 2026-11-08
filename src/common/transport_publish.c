@@ -4,6 +4,7 @@
 #include "portable_sockets.h"
 #include "transport_fec_state.h"
 #include "transport_policy_scheduler.h"
+#include "transport_recovery.h"
 #include "transport_scheduler.h"
 #include "transport_stream.h"
 #include "transport_subscriptions.h"
@@ -152,17 +153,24 @@ typedef struct {
   uint8_t **data, **parity;
 } publication_symbols_t;
 
-size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
-                                       size_t estimate_symbol_size,
-                                       size_t payload_bytes,
-                                       uint64_t admission_now,
-                                       transport_publication_path_t *paths) {
+static size_t collect_publication_paths(transport_t *t, transport_conn_t *conn,
+                                        size_t estimate_symbol_size,
+                                        size_t payload_bytes,
+                                        uint64_t admission_now,
+                                        transport_publication_path_t *paths,
+                                        bool all_native) {
   size_t active_paths = 0;
+  uint64_t native_seen = 0;
   uint64_t measure_now = transport_now_ms(t);
+  struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
+  if (all_native)
+    for (size_t i = 0; i < t->socket_count; i++)
+      local_addrs[i] = t->sockets[i].local_addr;
   for (size_t physical = 0; physical < t->socket_count; physical++) {
-    quicly_path_stats_t stats;
-    size_t mapped = SIZE_MAX, queued = 0;
     for (size_t native = 0; native < TRANSPORT_MAX_QUIC_PATHS; native++) {
+      if (all_native && (native_seen & (UINT64_C(1) << native)))
+        continue;
+      quicly_path_stats_t stats;
       quicly_path_health_t health;
       if (quicly_get_path_stats(conn->quic, native, &stats) != 0 ||
           !transport_path_matches_local(&stats,
@@ -171,82 +179,109 @@ size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
           (quicly_get_path_health(conn->quic, native, &health) == 0 &&
            health.state == QUICLY_PATH_SUSPECT))
         continue;
-      queued = quicly_get_num_datagram_frames_path(conn->quic, native);
+      if (all_native &&
+          transport_path_socket_for_source(local_addrs, t->socket_count,
+                                           &stats.local.sa) != physical)
+        continue;
+      size_t queued = quicly_get_num_datagram_frames_path(conn->quic, native);
       size_t limit = quicly_get_datagram_payload_limit(conn->quic, native);
       if (limit == 0 || limit < payload_bytes)
         continue;
-      mapped = native;
-      break;
+      if (all_native && active_paths == TRANSPORT_MAX_QUIC_PATHS)
+        return active_paths;
+      size_t mapped = native;
+      transport_publication_path_t *candidate = &paths[active_paths];
+      transport_conn_path_t *path = &conn->paths[physical];
+      /* Publications can precede the first periodic measurement. Establish its
+       * native owner now so the sampled state and queue remain available to the
+       * next publication; an unowned automatic EWMA is not usable history. */
+      if (!path->state_overridden && !path->measurement.initialized) {
+        (void)transport_path_measure_on_path(&path->measurement, conn->quic,
+                                             &stats, mapped, queued,
+                                             measure_now);
+        memset(&path->state, 0, sizeof(path->state));
+      }
+      bool measured = path->measurement.initialized &&
+                      path->measurement.quic_path == mapped;
+      fp_t relative_owd =
+          path->owd_initialized && path->telemetry_path == mapped
+              ? path->latest_owd_fp
+              : 0;
+      candidate->quic = mapped;
+      candidate->available =
+          quicly_get_max_datagram_frames_path(conn->quic, mapped) - queued;
+      candidate->sample = transport_path_estimate_on_path(
+          conn->quic, mapped, &stats, queued, t->sockets[physical].egress.bytes,
+          estimate_symbol_size, relative_owd);
+      candidate->sample.p =
+          transport_path_recent_loss(measured ? &path->measurement : NULL);
+      /* Datagram groups leave QLINQ's queue quickly, but remain serialized by
+       * QUIC until the path ACKs them.  Include that outstanding work in the
+       * Pathflow input, as the stream scheduler does, so a fast path is not
+       * repeatedly selected simply because its local queue has drained. */
+      size_t in_flight = stats.bytes_in_flight / estimate_symbol_size +
+                         (stats.bytes_in_flight % estimate_symbol_size != 0);
+      candidate->sample.q = in_flight > FP_SAFE_WHOLE - candidate->sample.q
+                                ? FP_SAFE_WHOLE
+                                : candidate->sample.q + in_flight;
+      if (!path->state_overridden) {
+        fp_t cap =
+            transport_path_probe_cap(measured ? &path->measurement : NULL,
+                                     &stats, estimate_symbol_size, measure_now);
+        if (candidate->sample.b > cap)
+          candidate->sample.b = cap;
+        /* use current estimate rather than lagging ewma for admission rate */
+        fp_t rate = candidate->sample.b;
+        if (rate > cap)
+          rate = cap;
+        /* supply admission headroom up to capacity ceiling so cwnd can grow */
+        rate = transport_path_admission_rate(rate, cap);
+        size_t reserved =
+            transport_path_budget_update(&path->budget, rate, admission_now);
+        if (reserved > candidate->sample.q)
+          candidate->sample.q = reserved;
+      }
+      candidate->rate_known = stats.cwnd > 0 && stats.rtt_smoothed > 0;
+      candidate->physical = physical;
+      /* A healthy alternate can share the failed path's socket. Its native
+       * measurements are independent; only the physical egress budget is
+       * shared. Do not overwrite the history still owned by the measured native
+       * path. */
+      candidate->state =
+          path->state_overridden || measured ? path->state : (path_state_t){0};
+      if (!path->state_overridden) {
+        transport_path_update_state(&candidate->state, &candidate->sample,
+                                    false);
+        if (measured)
+          path->state = candidate->state;
+      }
+      if (!path->state_overridden &&
+          candidate->state.b_ewma > candidate->sample.b)
+        candidate->state.b_ewma = candidate->sample.b;
+      native_seen |= UINT64_C(1) << native;
+      active_paths++;
+      if (!all_native)
+        break;
     }
-    if (mapped == SIZE_MAX)
-      continue;
-    transport_publication_path_t *candidate = &paths[active_paths];
-    transport_conn_path_t *path = &conn->paths[physical];
-    /* Publications can precede the first periodic measurement. Establish its
-     * native owner now so the sampled state and queue remain available to the
-     * next publication; an unowned automatic EWMA is not usable history. */
-    if (!path->state_overridden && !path->measurement.initialized) {
-      (void)transport_path_measure_on_path(&path->measurement, conn->quic,
-                                           &stats, mapped, queued, measure_now);
-      memset(&path->state, 0, sizeof(path->state));
-    }
-    bool measured =
-        path->measurement.initialized && path->measurement.quic_path == mapped;
-    fp_t relative_owd = path->owd_initialized && path->telemetry_path == mapped
-                            ? path->latest_owd_fp
-                            : 0;
-    candidate->quic = mapped;
-    candidate->available =
-        quicly_get_max_datagram_frames_path(conn->quic, mapped) - queued;
-    candidate->sample = transport_path_estimate_on_path(
-        conn->quic, mapped, &stats, queued, t->sockets[physical].egress.bytes,
-        estimate_symbol_size, relative_owd);
-    candidate->sample.p =
-        transport_path_recent_loss(measured ? &path->measurement : NULL);
-    /* Datagram groups leave QLINQ's queue quickly, but remain serialized by
-     * QUIC until the path ACKs them.  Include that outstanding work in the
-     * Pathflow input, as the stream scheduler does, so a fast path is not
-     * repeatedly selected simply because its local queue has drained. */
-    size_t in_flight = stats.bytes_in_flight / estimate_symbol_size +
-                       (stats.bytes_in_flight % estimate_symbol_size != 0);
-    candidate->sample.q = in_flight > FP_SAFE_WHOLE - candidate->sample.q
-                              ? FP_SAFE_WHOLE
-                              : candidate->sample.q + in_flight;
-    if (!path->state_overridden) {
-      fp_t cap =
-          transport_path_probe_cap(measured ? &path->measurement : NULL, &stats,
-                                   estimate_symbol_size, measure_now);
-      if (candidate->sample.b > cap)
-        candidate->sample.b = cap;
-      /* use current estimate rather than lagging ewma for admission rate */
-      fp_t rate = candidate->sample.b;
-      if (rate > cap)
-        rate = cap;
-      /* supply admission headroom up to capacity ceiling so cwnd can grow */
-      rate = transport_path_admission_rate(rate, cap);
-      size_t reserved =
-          transport_path_budget_update(&path->budget, rate, admission_now);
-      if (reserved > candidate->sample.q)
-        candidate->sample.q = reserved;
-    }
-    candidate->rate_known = stats.cwnd > 0 && stats.rtt_smoothed > 0;
-    candidate->physical = physical;
-    /* A healthy alternate can share the failed path's socket. Its native
-     * measurements are independent; only the physical egress budget is shared.
-     * Do not overwrite the history still owned by the measured native path. */
-    candidate->state =
-        path->state_overridden || measured ? path->state : (path_state_t){0};
-    if (!path->state_overridden) {
-      transport_path_update_state(&candidate->state, &candidate->sample, false);
-      if (measured)
-        path->state = candidate->state;
-    }
-    if (!path->state_overridden &&
-        candidate->state.b_ewma > candidate->sample.b)
-      candidate->state.b_ewma = candidate->sample.b;
-    active_paths++;
   }
   return active_paths;
+}
+
+size_t transport_publish_collect_paths(transport_t *t, transport_conn_t *conn,
+                                       size_t estimate_symbol_size,
+                                       size_t payload_bytes,
+                                       uint64_t admission_now,
+                                       transport_publication_path_t *paths) {
+  return collect_publication_paths(t, conn, estimate_symbol_size, payload_bytes,
+                                   admission_now, paths, false);
+}
+
+size_t transport_publish_collect_native_paths(
+    transport_t *t, transport_conn_t *conn, size_t symbol_bytes,
+    size_t payload_bytes, uint64_t now_ns,
+    transport_publication_path_t paths[TRANSPORT_MAX_QUIC_PATHS]) {
+  return collect_publication_paths(t, conn, symbol_bytes, payload_bytes, now_ns,
+                                   paths, true);
 }
 
 size_t transport_publish_path_capacity(transport_conn_t *conn,
@@ -265,10 +300,152 @@ size_t transport_publish_path_capacity(transport_conn_t *conn,
   return 0;
 }
 
+static fp_t schedule_path_finish(const path_t *path, size_t symbols) {
+  if (symbols == 0)
+    return 0;
+  if (path->b <= 0 || path->p >= FP_ONE)
+    return FP_MAX;
+  return FP_ADD(
+      path->l,
+      FP_DIV(FP_ADD(FP_FROM_INT(path->q), FP_FROM_INT(symbols)), path->b));
+}
+
+static bool resize_schedule_parity(transport_schedule_t *schedule,
+                                   size_t active_paths, size_t parity_symbols,
+                                   const size_t *capacities, fp_t horizon,
+                                   bool require_exact) {
+  size_t placed = 0;
+  for (size_t i = 0; i < active_paths; i++) {
+    if (schedule->paths[i].x > schedule->paths[i].m)
+      placed += schedule->paths[i].x - schedule->paths[i].m;
+    else
+      schedule->paths[i].x = schedule->paths[i].m;
+  }
+  for (;;) {
+    size_t worst = SIZE_MAX;
+    fp_t latest = -1;
+    for (size_t i = 0; i < active_paths; i++) {
+      if (schedule->paths[i].x <= schedule->paths[i].m)
+        continue;
+      fp_t finish =
+          schedule_path_finish(&schedule->paths[i], schedule->paths[i].x);
+      if ((placed > parity_symbols || finish > horizon) && finish >= latest) {
+        latest = finish;
+        worst = i;
+      }
+    }
+    if (worst == SIZE_MAX)
+      break;
+    schedule->paths[worst].x--;
+    placed--;
+  }
+  while (placed < parity_symbols) {
+    size_t best = SIZE_MAX;
+    fp_t earliest = FP_MAX;
+    for (size_t i = 0; i < active_paths; i++) {
+      if (schedule->paths[i].m == 0 ||
+          (capacities && schedule->paths[i].x >= capacities[i]))
+        continue;
+      fp_t finish =
+          schedule_path_finish(&schedule->paths[i], schedule->paths[i].x + 1U);
+      if (finish <= horizon && finish < earliest) {
+        earliest = finish;
+        best = i;
+      }
+    }
+    if (best == SIZE_MAX) {
+      if (require_exact || horizon == FP_MAX)
+        return false;
+      break;
+    }
+    schedule->paths[best].x++;
+    placed++;
+  }
+  if (require_exact && placed != parity_symbols)
+    return false;
+  schedule->parity_symbols = placed;
+  return true;
+}
+
+static bool
+apply_schedule_repair_policy(const transport_track_profile_t *profile,
+                             size_t active_paths, size_t data_symbols,
+                             fp_t horizon, transport_schedule_t *schedule) {
+  if (!profile->fec_enabled && !profile->fec_rateless)
+    return true;
+  if (!profile->proactive_fec) {
+    schedule->parity_symbols = 0;
+    for (size_t i = 0; i < active_paths; i++)
+      schedule->paths[i].x = schedule->paths[i].m;
+    return true;
+  }
+  if (!profile->policy.enabled)
+    return true;
+
+  size_t requested_parity = schedule->parity_symbols;
+  if ((profile->policy.present & QLINQ_REPAIR_CONFIDENCE) != 0) {
+    requested_parity = 0;
+    for (size_t i = 0; i < active_paths; i++) {
+      size_t p = transport_policy_estimate_parity(
+          schedule->paths[i].m, schedule->paths[i].p,
+          profile->policy.proactive_confidence);
+      if (p == SIZE_MAX || p > SIZE_MAX - requested_parity)
+        return false;
+      requested_parity += p;
+    }
+    if (profile->fec_enabled &&
+        (profile->policy.present & QLINQ_REPAIR_MIN_INITIAL) == 0 &&
+        data_symbols > 1 && requested_parity == 0)
+      requested_parity = 1;
+  } else if (profile->fec_rateless) {
+    requested_parity = 0;
+  }
+
+  transport_protection_plan_t protection;
+  if (!transport_repair_policy_plan(&profile->policy, data_symbols,
+                                    requested_parity,
+                                    QLINQ_FEC_MAX_TOTAL_SYMBOLS, &protection))
+    return false;
+
+  return resize_schedule_parity(
+      schedule, active_paths, protection.initial_parity, NULL, horizon, false);
+}
+
+static fp_t
+publication_deadline_latency(const transport_conn_t *conn,
+                             const transport_publication_path_t *path,
+                             fp_t horizon) {
+  if (horizon != FP_MAX && !conn->paths[path->physical].state_overridden)
+    return path->rate_known ? path->sample.l : 0;
+  return path->state.l_ewma;
+}
+
+static fp_t publication_horizon(transport_t *t,
+                                const transport_track_profile_t *profile,
+                                const sent_object_cache_t *retained,
+                                bool grouped) {
+  if (retained && retained->expires_at_ms > 0)
+    return transport_policy_remaining_horizon(retained->expires_at_ms,
+                                              transport_now_ms(t));
+  if (!profile->policy.enabled || profile->policy.max_object_age_ms == 0)
+    return FP_MAX;
+  if (grouped && t->pending_group.size != 0) {
+    int64_t start_ms = (int64_t)t->pending_group.started_at_ms;
+    uint32_t age_ms = profile->policy.max_object_age_ms;
+    int64_t expires_at_ms = (uint64_t)age_ms > (uint64_t)(INT64_MAX - start_ms)
+                                ? INT64_MAX
+                                : start_ms + (int64_t)age_ms;
+    return transport_policy_remaining_horizon(expires_at_ms,
+                                              transport_now_ms(t));
+  }
+  return transport_policy_horizon_seconds(profile->policy.max_object_age_ms);
+}
+
 static transport_publish_result_t
 plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                const transport_track_profile_t *profile,
-               publication_plan_t *plan) {
+               publication_plan_t *plan, uint16_t retained_total,
+               bool grouped) {
   /* yield new datagram admission until pending control can be emitted */
   if (transport_stream_control_pending(conn->stream))
     return TRANSPORT_PUBLISH_BACKPRESSURE;
@@ -285,6 +462,16 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     return TRANSPORT_PUBLISH_BACKPRESSURE;
 
   bool use_fec = profile->fec_enabled || profile->fec_rateless;
+  const sent_object_cache_t *retained =
+      (profile->reactive_repair || profile->checkpoint_recovery)
+          ? transport_sent_cache_find(&t->sent_cache, &obj->track_id,
+                                      obj->group_id, obj->object_id)
+          : NULL;
+  if (!retained_total && profile->reactive_repair && !profile->fec_rateless)
+    retained_total = transport_sent_recipient_total(retained, conn->id);
+  fp_t horizon = publication_horizon(t, profile, retained, grouped);
+  if (horizon < 0)
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
   /* Replan without a path that cannot admit its allocation. This bounded
    * fallback leaves feasible partial-capacity combinations to future planner
    * improvements, but never blocks an empty alternate behind a full favorite.
@@ -294,32 +481,21 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     size_t capacities[TRANSPORT_MAX_PATHS];
     for (size_t i = 0; i < active_paths; i++) {
       states[i] = paths[i].state;
+      states[i].l_ewma = publication_deadline_latency(conn, &paths[i], horizon);
       capacities[i] =
           transport_publish_path_capacity(conn, &paths[i], admission_now);
     }
     if (!transport_schedule_build(&conn->scheduler_context, states,
                                   active_paths, data_symbols, symbol_size,
                                   use_fec, obj->priority,
-                                  &conn->round_robin_path, &plan->schedule))
+                                  &conn->round_robin_path, &plan->schedule) ||
+        !apply_schedule_repair_policy(profile, active_paths, data_symbols,
+                                      horizon, &plan->schedule) ||
+        (retained_total &&
+         !resize_schedule_parity(&plan->schedule, active_paths,
+                                 retained_total - data_symbols, NULL, horizon,
+                                 true)))
       return TRANSPORT_PUBLISH_ERROR;
-    /* Rateless tracks keep their source transmission systematic. They retain
-     * the object for on-demand RaptorQ symbols after a NACK, but do not pay a
-     * full RaptorQ precompute or speculative parity cost on every healthy
-     * object. Fixed-rate FEC continues to transmit the pathflow-selected
-     * parity. */
-    if (profile->fec_rateless) {
-      plan->schedule.parity_symbols = 0;
-      size_t source_symbols = 0;
-      for (size_t i = 0; i < active_paths; i++)
-        source_symbols += plan->schedule.paths[i].m;
-      /* Pathflow is not invoked for a one-symbol source object, so its m
-       * vector is empty. Keep transport_schedule_build's round-robin placement
-       * in that case; otherwise send the Pathflow source allocation without
-       * speculative parity. */
-      if (source_symbols == data_symbols)
-        for (size_t i = 0; i < active_paths; i++)
-          plan->schedule.paths[i].x = plan->schedule.paths[i].m;
-    }
 
     size_t blocked = active_paths;
     for (size_t i = 0; i < active_paths; i++) {
@@ -339,14 +515,17 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
           burst = symbols;
         note_admission_retry(conn, physical, burst, symbols, admission_now);
       }
-      if (symbols > capacities[i]) {
+      bool over_deadline =
+          horizon != FP_MAX &&
+          schedule_path_finish(&plan->schedule.paths[i], symbols) > horizon;
+      if (symbols > capacities[i] || over_deadline) {
         blocked = i;
         break;
       }
     }
     if (blocked == active_paths)
       break;
-    if (active_paths > 1 && capacities[blocked] > 0 &&
+    if (active_paths > 1 && (capacities[blocked] > 0 || horizon != FP_MAX) &&
         active_paths <= TRANSPORT_POLICY_PATHS) {
       transport_policy_path_t candidates[TRANSPORT_POLICY_PATHS];
       for (size_t i = 0; i < active_paths; i++) {
@@ -357,34 +536,53 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
         }
         candidates[i] = (transport_policy_path_t){
             .measurement = {.b = b,
-                            .l = paths[i].state.l_ewma,
+                            .l = publication_deadline_latency(conn, &paths[i],
+                                                              horizon),
                             .p = paths[i].state.p_ewma,
                             .q = paths[i].state.q_ewma},
             .capacity = capacities[i]};
       }
-      qlinq_effective_repair_policy_t policy = {
-          .enabled = true,
-          .proactive_confidence = profile->fec_enabled ? 99U : 0U,
-          .max_extra_percent =
-              profile->fec_enabled ? QLINQ_REPAIR_MAX_PERCENT : 0U,
-          .min_initial_parity_symbols =
-              (uint16_t)(profile->fec_enabled && data_symbols > 1 ? 1U : 0U),
-          .max_initial_extra_percent =
-              profile->fec_enabled ? QLINQ_REPAIR_MAX_PERCENT : 0U};
+      qlinq_effective_repair_policy_t policy =
+          profile->policy.enabled
+              ? profile->policy
+              : (qlinq_effective_repair_policy_t){
+                    .enabled = true,
+                    .proactive_confidence = profile->proactive_fec ? 99U : 0U,
+                    .max_extra_percent =
+                        profile->proactive_fec ? QLINQ_REPAIR_MAX_PERCENT : 0U,
+                    .min_initial_parity_symbols =
+                        (uint16_t)(profile->proactive_fec && data_symbols > 1
+                                       ? 1U
+                                       : 0U),
+                    .max_initial_extra_percent =
+                        profile->proactive_fec ? QLINQ_REPAIR_MAX_PERCENT : 0U};
+      /* A selective override (for example, enabling reactive repair) must
+       * retain fixed FEC's default initial symbol in the constrained planner.
+       * Explicit zero ceilings still disable that default protection. */
+      if (profile->fec_enabled && profile->proactive_fec && data_symbols > 1 &&
+          data_symbols < QLINQ_FEC_MAX_TOTAL_SYMBOLS &&
+          !(profile->policy.present & QLINQ_REPAIR_MIN_INITIAL) &&
+          data_symbols * policy.max_initial_extra_percent >= 100U)
+        policy.min_initial_parity_symbols = 1;
       transport_policy_schedule_t constrained;
+      uint32_t fatal_reasons = TRANSPORT_PROTECTION_QUEUE_LIMIT;
+      if (horizon == FP_MAX)
+        fatal_reasons |= TRANSPORT_PROTECTION_MINIMUM_UNMET;
       if (transport_policy_schedule(&policy, candidates, active_paths,
                                     data_symbols, QLINQ_FEC_MAX_TOTAL_SYMBOLS,
-                                    FP_MAX, &constrained) &&
-          (constrained.protection.reasons &
-           (TRANSPORT_PROTECTION_QUEUE_LIMIT |
-            TRANSPORT_PROTECTION_MINIMUM_UNMET)) == 0) {
+                                    horizon, &constrained) &&
+          (constrained.protection.reasons & fatal_reasons) == 0) {
         plan->schedule.parity_symbols = constrained.protection.initial_parity;
         for (size_t i = 0; i < active_paths; i++) {
           plan->schedule.paths[i].m = constrained.source[i];
           plan->schedule.paths[i].x =
               constrained.source[i] + constrained.parity[i];
         }
-        break;
+        if (!retained_total ||
+            resize_schedule_parity(&plan->schedule, active_paths,
+                                   retained_total - data_symbols, capacities,
+                                   horizon, true))
+          break;
       }
     }
     if (--active_paths == 0)
@@ -566,9 +764,31 @@ static transport_publish_result_t publish_datagram_to_flexicast(
     transport_t *t, transport_flexicast_flow_t *flow, const moq_object_t *obj,
     const transport_track_profile_t *profile, size_t symbol_size,
     size_t data_symbols, publication_symbols_t *cached,
-    size_t *cached_total_symbols, uint16_t *sent_total_symbols) {
+    size_t *cached_total_symbols, uint16_t *sent_total_symbols, bool grouped) {
   size_t parity_symbols = 0;
   bool scheduled = false;
+  uint16_t retained_total = 0;
+  const sent_object_cache_t *retained =
+      (profile->reactive_repair || profile->checkpoint_recovery)
+          ? transport_sent_cache_find(&t->sent_cache, &obj->track_id,
+                                      obj->group_id, obj->object_id)
+          : NULL;
+  if (profile->reactive_repair && !profile->fec_rateless) {
+    for (size_t i = 0; i < flow->member_count; i++) {
+      const transport_conn_t *member = flow->members[i].conn;
+      if (!member || !flow->members[i].listening)
+        continue;
+      uint16_t total = transport_sent_recipient_total(retained, member->id);
+      /* Different previous unicast geometries cannot share a fixed codeword. */
+      if (total && retained_total && total != retained_total)
+        return TRANSPORT_PUBLISH_NO_RECIPIENTS;
+      if (total)
+        retained_total = total;
+    }
+  }
+  fp_t horizon = publication_horizon(t, profile, retained, grouped);
+  if (horizon < 0)
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
   for (size_t i = 0; i < flow->member_count; i++) {
     transport_conn_t *member = flow->members[i].conn;
     if (!member || !flow->members[i].listening || !member->quic ||
@@ -596,6 +816,8 @@ static transport_publish_result_t publish_datagram_to_flexicast(
         if (live->measurement.quic_path != mapped)
           memset(&state, 0, sizeof(state));
         transport_path_update_state(&state, &sample, false);
+        if (horizon != FP_MAX)
+          state.l_ewma = stats.rtt_smoothed > 0 ? sample.l : 0;
       }
       active_states[active_paths] = state;
       quicly_flexicast_member_stats_t shared;
@@ -612,8 +834,9 @@ static transport_publish_result_t publish_datagram_to_flexicast(
     }
     if (active_paths == 0)
       continue;
-    /* rateless source packets are systematic; defer repair until requested */
-    if (profile->fec_rateless) {
+    /* rateless source packets are systematic by default unless policy enables
+     * proactive parity */
+    if (!profile->proactive_fec) {
       scheduled = true;
       continue;
     }
@@ -623,7 +846,9 @@ static transport_publish_result_t publish_datagram_to_flexicast(
     if (!transport_schedule_build(&member->scheduler_context, active_states,
                                   active_paths, data_symbols, symbol_size,
                                   use_fec, obj->priority, &scratch_round_robin,
-                                  &member_schedule))
+                                  &member_schedule) ||
+        !apply_schedule_repair_policy(profile, active_paths, data_symbols,
+                                      horizon, &member_schedule))
       return TRANSPORT_PUBLISH_ERROR;
     if (member_schedule.parity_symbols > parity_symbols)
       parity_symbols = member_schedule.parity_symbols;
@@ -632,7 +857,8 @@ static transport_publish_result_t publish_datagram_to_flexicast(
   if (!scheduled)
     return TRANSPORT_PUBLISH_NO_RECIPIENTS;
 
-  size_t total_symbols = data_symbols + parity_symbols;
+  size_t total_symbols =
+      retained_total ? retained_total : data_symbols + parity_symbols;
   if (total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS || total_symbols > UINT16_MAX)
     return TRANSPORT_PUBLISH_INVALID;
   if (sent_total_symbols)
@@ -696,14 +922,14 @@ static transport_publish_result_t publish_datagram_to_flexicast(
 static transport_publish_result_t publish_datagram_to_conn(
     transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     const transport_track_profile_t *profile, size_t symbol_size,
-    size_t estimate_symbol_size, size_t data_symbols,
+    size_t estimate_symbol_size, size_t data_symbols, uint16_t retained_total,
     publication_symbols_t *cached, size_t *cached_total_symbols,
-    uint16_t *sent_total_symbols) {
+    uint16_t *sent_total_symbols, bool grouped) {
   publication_plan_t plan = {.symbol_size = symbol_size,
                              .estimate_symbol_size = estimate_symbol_size,
                              .data_symbols = data_symbols};
   transport_publish_result_t result =
-      plan_datagrams(t, conn, obj, profile, &plan);
+      plan_datagrams(t, conn, obj, profile, &plan, retained_total, grouped);
   if (result != TRANSPORT_PUBLISH_DELIVERED)
     return result;
   if (sent_total_symbols)
@@ -832,8 +1058,7 @@ void transport_publish_checkpoint_member_added(transport_t *t,
     conn->fec_group_delivered = false;
   if (!t || !conn || !track_id ||
       (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
-      track_id->type != MOQ_TRACK_DATA ||
-      (track_id->flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+      !transport_get_track_profile(t, track_id).checkpoint_recovery)
     return;
   transport_checkpoint_ack_state_t *ack = transport_checkpoint_ack(conn, alias);
   if (!ack)
@@ -902,6 +1127,13 @@ bool transport_publish_checkpoint_acked(
     state->acked_initialized = true;
     state->acked_group_id = ack->group_id;
     state->acked_object_id = ack->final_object_id;
+    while (state->pending_window_count != 0 &&
+           state->pending_window_ends[state->pending_window_head] <=
+               ack->final_object_id) {
+      state->pending_window_head =
+          (state->pending_window_head + 1U) % QLINQ_RECOVERY_MAX_WINDOWS;
+      state->pending_window_count--;
+    }
   }
   if (!checkpoint_ack_pending(state))
     state->oldest_unacked_sent_at_ms = 0;
@@ -935,8 +1167,7 @@ bool transport_publish_recovery_ready(transport_t *t,
                                       const moq_track_id_t *track_id) {
   if (!t || !track_id)
     return false;
-  if (track_id->type != MOQ_TRACK_DATA ||
-      !transport_track_profile(track_id).fec_rateless)
+  if (!transport_get_track_profile(t, track_id).checkpoint_recovery)
     return true;
   const transport_sent_cache_t *cache = &t->sent_cache;
   size_t needed = t->pending_group.size != 0 ? t->pending_group.size : 1;
@@ -999,6 +1230,10 @@ static bool emit_rolling_checkpoint(transport_t *t,
         continue;
       recipient_first_object_id = ack->sent_object_id + 1U;
     }
+    if (ack->pending_window_count == QLINQ_RECOVERY_MAX_WINDOWS) {
+      succeeded = false;
+      continue;
+    }
     if (!transport_stream_can_accept(conn->stream,
                                      QLINQ_WIRE_FRAME_HEADER_SIZE +
                                          QLINQ_WIRE_TRACK_CHECKPOINT_SIZE,
@@ -1010,6 +1245,10 @@ static bool emit_rolling_checkpoint(transport_t *t,
       continue;
     }
     checkpoint_mark_sent(t, ack, group_id, final_object_id);
+    ack->pending_window_ends[(ack->pending_window_head +
+                              ack->pending_window_count) %
+                             QLINQ_RECOVERY_MAX_WINDOWS] = final_object_id;
+    ack->pending_window_count++;
     t->stats.recovery_checkpoints_sent++;
   }
   if (succeeded) {
@@ -1023,7 +1262,7 @@ static bool emit_rolling_checkpoint(transport_t *t,
 static bool flush_recovery_checkpoint(transport_t *t,
                                       transport_fec_track_state_t *track) {
   if (!track->active || !track->has_objects ||
-      (track->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+      !transport_get_track_profile(t, &track->track_id).checkpoint_recovery)
     return true;
   uint64_t final_object_id = track->next_object_id - 1U;
   if (track->checkpoint_initialized &&
@@ -1036,8 +1275,69 @@ static bool flush_recovery_checkpoint(transport_t *t,
   return emit_rolling_checkpoint(t, track, 0, first_object_id, final_object_id);
 }
 
-static transport_publish_result_t flush_group(transport_t *t) {
+static bool pending_group_expired(transport_t *t) {
+  const transport_pending_group_t *group = &t->pending_group;
+  if (group->size == 0)
+    return false;
+  if (group->retiring)
+    return true;
+  transport_track_profile_t profile =
+      transport_get_track_profile(t, &group->track_id);
+  transport_fec_track_state_t *track =
+      find_fec_track_state(t, &group->track_id, false);
+  const sent_object_cache_t *retained =
+      track ? transport_sent_cache_find(&t->sent_cache, &group->track_id, 0,
+                                        track->next_object_id)
+            : NULL;
+  return publication_horizon(t, &profile, retained, true) < 0;
+}
+
+/* An expired group still consumes its object ID. Announce its checkpoint
+ * before retirement can emit a loss callback that unsubscribes the receiver.
+ * Missing recipients cannot ACK that checkpoint until their terminal outcome;
+ * retain the group on control pressure so every recipient gets that outcome. */
+static bool retire_pending_group(transport_t *t,
+                                 transport_fec_track_state_t *track) {
+  uint64_t object_id = track->next_object_id;
+  if (!transport_get_track_profile(t, &track->track_id).checkpoint_recovery) {
+    (void)transport_sent_cache_release_object(&t->sent_cache, &track->track_id,
+                                              0, object_id);
+    return true;
+  }
+
+  /* A prior attempt may have announced this checkpoint before retirement
+   * hit pressure. Retry the current ID so a newly joined peer also gets it;
+   * recipients already covered are skipped by their sent watermark. */
+  uint64_t first_object_id = !track->checkpoint_initialized ? 0
+                             : track->last_checkpoint_object_id < object_id
+                                 ? track->last_checkpoint_object_id + 1U
+                                 : object_id;
+  if (!emit_rolling_checkpoint(t, track, 0, first_object_id, object_id))
+    return false;
+
+  bool succeeded = true;
+  size_t count = transport_connection_count(t);
+  for (size_t i = 0; i < count; i++) {
+    transport_conn_t *conn = transport_connection_at(t, i);
+    if (!transport_publish_recipient_eligible(t, conn, &track->track_id))
+      continue;
+    const track_subscription_t *sub =
+        matching_send_subscription(conn, &track->track_id);
+    if (!transport_recovery_send_retire(conn, sub->alias, 0, object_id))
+      succeeded = false;
+  }
+  if (!succeeded)
+    return false;
+  /* Partial publication source stays protected until all terminal ACKs. With
+   * no remaining subscribers there is no outstanding recovery obligation. */
+  release_acked_checkpoints(t, &track->track_id);
+  return true;
+}
+
+static transport_publish_result_t flush_group(transport_t *t, bool *expired) {
   transport_pending_group_t *group = &t->pending_group;
+  if (expired)
+    *expired = false;
   if (group->size == 0)
     return TRANSPORT_PUBLISH_DELIVERED;
   transport_fec_track_state_t *track_state =
@@ -1059,13 +1359,21 @@ static transport_publish_result_t flush_group(transport_t *t) {
                       .is_keyframe = false,
                       .priority = group->priority};
   group->pending = true;
-  if (!publication_valid(t, &obj))
-    return TRANSPORT_PUBLISH_INVALID;
-  transport_publish_result_t result =
-      publish_object(t, &obj, publication_fec_limit(t, &obj.track_id), true);
-  if (result != TRANSPORT_PUBLISH_DELIVERED &&
-      result != TRANSPORT_PUBLISH_NO_RECIPIENTS)
-    return result;
+  if (pending_group_expired(t)) {
+    group->retiring = true;
+    if (!retire_pending_group(t, track_state))
+      return TRANSPORT_PUBLISH_BACKPRESSURE;
+    if (expired)
+      *expired = true;
+  } else {
+    if (!publication_valid(t, &obj))
+      return TRANSPORT_PUBLISH_INVALID;
+    transport_publish_result_t result =
+        publish_object(t, &obj, publication_fec_limit(t, &obj.track_id), true);
+    if (result != TRANSPORT_PUBLISH_DELIVERED &&
+        result != TRANSPORT_PUBLISH_NO_RECIPIENTS)
+      return result;
+  }
   track_state->next_object_id++;
   track_state->has_objects = true;
   group->size = 0;
@@ -1075,7 +1383,9 @@ static transport_publish_result_t flush_group(transport_t *t) {
   group->record_count = 0;
   group->symbol_size = 0;
   group->pending = false;
-  if ((track_state->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
+  group->retiring = false;
+  if (transport_get_track_profile(t, &track_state->track_id)
+          .checkpoint_recovery &&
       track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
     (void)flush_recovery_checkpoint(t, track_state);
   }
@@ -1083,7 +1393,7 @@ static transport_publish_result_t flush_group(transport_t *t) {
 }
 
 bool transport_publish_flush_grouped(transport_t *t) {
-  transport_publish_result_t result = flush_group(t);
+  transport_publish_result_t result = flush_group(t, NULL);
   return result == TRANSPORT_PUBLISH_DELIVERED ||
          result == TRANSPORT_PUBLISH_NO_RECIPIENTS;
 }
@@ -1135,12 +1445,12 @@ group_record(transport_t *t, const moq_object_t *obj, size_t fec_limit) {
     return TRANSPORT_PUBLISH_INVALID;
 
   if (group->size > 0 &&
-      (group->pending ||
+      (group->pending || pending_group_expired(t) ||
        !transport_track_id_equal(&group->track_id, &obj->track_id) ||
        group->priority != obj->priority || group->record_count >= 4 ||
        obj->size > group_limit - 2U ||
        group->size > group_limit - 2U - obj->size)) {
-    transport_publish_result_t result = flush_group(t);
+    transport_publish_result_t result = flush_group(t, NULL);
     /* This record has not been admitted while an earlier group is pending,
      * even when that group has already reached some recipients. */
     if (result == TRANSPORT_PUBLISH_BACKPRESSURE ||
@@ -1163,6 +1473,7 @@ group_record(transport_t *t, const moq_object_t *obj, size_t fec_limit) {
     group->track_id = obj->track_id;
     group->priority = obj->priority;
     group->symbol_size = 0;
+    group->retiring = false;
   }
 
   if (obj->size > SIZE_MAX - 2 - group->size)
@@ -1191,12 +1502,14 @@ group_record(transport_t *t, const moq_object_t *obj, size_t fec_limit) {
   group->record_count++;
 
   if (group->record_count >= 4 || group->size >= group_limit) {
-    transport_publish_result_t result = flush_group(t);
+    bool expired;
+    transport_publish_result_t result = flush_group(t, &expired);
     if (result == TRANSPORT_PUBLISH_BACKPRESSURE ||
         result == TRANSPORT_PUBLISH_PARTIAL)
       return TRANSPORT_PUBLISH_BUFFERED;
-    return result == TRANSPORT_PUBLISH_DELIVERED ? TRANSPORT_PUBLISH_DELIVERED
-                                                 : TRANSPORT_PUBLISH_ERROR;
+    return result == TRANSPORT_PUBLISH_DELIVERED && !expired
+               ? TRANSPORT_PUBLISH_DELIVERED
+               : TRANSPORT_PUBLISH_ERROR;
   }
   return TRANSPORT_PUBLISH_BUFFERED;
 }
@@ -1259,7 +1572,8 @@ static transport_publish_result_t publish_object(transport_t *t,
                                                  const moq_object_t *obj,
                                                  size_t fec_limit,
                                                  bool grouped) {
-  transport_track_profile_t profile = transport_track_profile(&obj->track_id);
+  transport_track_profile_t profile =
+      transport_get_track_profile(t, &obj->track_id);
   if (profile.reliable)
     return publish_reliable(t, obj);
 
@@ -1267,10 +1581,17 @@ static transport_publish_result_t publish_object(transport_t *t,
   size_t data_size = obj->size;
   if (data_size == 0 || data_size > fec_limit)
     return TRANSPORT_PUBLISH_INVALID;
-  bool protect_repair_cache = obj->track_id.type == MOQ_TRACK_DATA &&
-                              profile.fec_rateless &&
+  bool fixed_repair = profile.reactive_repair && !profile.fec_rateless;
+  const sent_object_cache_t *retained =
+      fixed_repair ? transport_sent_cache_find(&t->sent_cache, &obj->track_id,
+                                               obj->group_id, obj->object_id)
+                   : NULL;
+  if (retained && (retained->size != obj->size ||
+                   memcmp(retained->data, obj->data, obj->size) != 0))
+    return TRANSPORT_PUBLISH_INVALID;
+  bool protect_repair_cache = profile.checkpoint_recovery &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
-  if (obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&
+  if (profile.checkpoint_recovery &&
       !transport_sent_cache_can_store(&t->sent_cache, obj,
                                       !protect_repair_cache)) {
     t->stats.recovery_cache_backpressure++;
@@ -1300,6 +1621,8 @@ static transport_publish_result_t publish_object(transport_t *t,
    * and retries. Newly joined recipients must accept that same geometry. */
   if (grouped && t->pending_group.symbol_size != 0)
     estimate_symbol_size = t->pending_group.symbol_size;
+  if (retained)
+    estimate_symbol_size = retained->symbol_size;
   if (estimate_symbol_size == 0)
     return TRANSPORT_PUBLISH_BACKPRESSURE;
   size_t symbol_size = estimate_symbol_size;
@@ -1311,6 +1634,25 @@ static transport_publish_result_t publish_object(transport_t *t,
     data_symbols = 1;
 
   size_t active_count = transport_connection_count(t);
+  /* Reserve fixed geometry bookkeeping before sending: an allocation failure
+   * after a grouped recipient was marked delivered cannot be retried safely. */
+  if (fixed_repair) {
+    if (!transport_sent_cache_store(&t->sent_cache, obj, (uint16_t)data_symbols,
+                                    (uint16_t)data_symbols,
+                                    (uint16_t)symbol_size, true))
+      return TRANSPORT_PUBLISH_ERROR;
+    sent_object_cache_t *entry = transport_sent_cache_find(
+        &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
+    size_t capacity = entry->recipient_count;
+    for (size_t c = 0; c < active_count; c++) {
+      transport_conn_t *conn = transport_connection_at(t, c);
+      if (transport_publish_recipient_eligible(t, conn, &obj->track_id) &&
+          !transport_sent_recipient_total(entry, conn->id))
+        capacity++;
+    }
+    if (!transport_sent_recipient_reserve(entry, capacity))
+      return TRANSPORT_PUBLISH_ERROR;
+  }
   size_t eligible = 0;
   size_t delivered = 0;
   uint16_t maximum_sent_symbols = (uint16_t)data_symbols;
@@ -1318,9 +1660,15 @@ static transport_publish_result_t publish_object(transport_t *t,
   transport_publish_result_t failure = TRANSPORT_PUBLISH_ERROR;
   publication_symbols_t cached_symbols = {0};
   size_t cached_total_symbols = 0;
+  uint16_t recipient_totals[TRANSPORT_HARD_MAX_CONNECTIONS] = {0};
 
-  transport_flexicast_flow_t *delivered_flows[TRANSPORT_FLEXICAST_MAX_FLOWS];
-  size_t delivered_flow_count = 0;
+  struct {
+    transport_flexicast_flow_t *flow;
+    uint16_t total_symbols;
+    bool complete;
+  } sent_flows[TRANSPORT_FLEXICAST_MAX_FLOWS];
+  size_t sent_flow_count = 0;
+  bool flexicast_backpressure = false;
   if (t->flexicast_enabled && t->is_server) {
     for (size_t f = 0; f < t->flexicast.capacity; f++) {
       transport_flexicast_flow_t *flow = &t->flexicast.flows[f];
@@ -1331,17 +1679,20 @@ static transport_publish_result_t publish_object(transport_t *t,
       uint16_t sent_symbols = 0;
       transport_publish_result_t result = publish_datagram_to_flexicast(
           t, flow, obj, &profile, symbol_size, data_symbols, &cached_symbols,
-          &cached_total_symbols, &sent_symbols);
-      if (sent_symbols > maximum_sent_symbols)
-        maximum_sent_symbols = sent_symbols;
-      if (result == TRANSPORT_PUBLISH_DELIVERED) {
-        delivered_flows[delivered_flow_count++] = flow;
-      } else if (result == TRANSPORT_PUBLISH_PARTIAL) {
-        partially_queued = true;
+          &cached_total_symbols, &sent_symbols, grouped);
+      if (result == TRANSPORT_PUBLISH_DELIVERED ||
+          result == TRANSPORT_PUBLISH_PARTIAL) {
+        if (sent_symbols > maximum_sent_symbols)
+          maximum_sent_symbols = sent_symbols;
+        sent_flows[sent_flow_count].flow = flow;
+        sent_flows[sent_flow_count].total_symbols = sent_symbols;
+        sent_flows[sent_flow_count++].complete =
+            result == TRANSPORT_PUBLISH_DELIVERED;
+        partially_queued |= result == TRANSPORT_PUBLISH_PARTIAL;
       } else if (result == TRANSPORT_PUBLISH_BACKPRESSURE) {
-        transport_arena_reset(&t->arena);
-        return delivered_flow_count > 0 ? TRANSPORT_PUBLISH_PARTIAL
-                                        : TRANSPORT_PUBLISH_BACKPRESSURE;
+        failure = TRANSPORT_PUBLISH_BACKPRESSURE;
+        flexicast_backpressure = true;
+        break;
       }
     }
   }
@@ -1356,9 +1707,10 @@ static transport_publish_result_t publish_object(transport_t *t,
       continue;
     }
     bool flexicast_delivered = false;
-    for (size_t f = 0; f < delivered_flow_count; f++) {
-      if (transport_flexicast_member_is_listening(delivered_flows[f], conn)) {
-        flexicast_delivered = true;
+    for (size_t f = 0; f < sent_flow_count; f++) {
+      if (transport_flexicast_member_is_listening(sent_flows[f].flow, conn)) {
+        recipient_totals[c] = sent_flows[f].total_symbols;
+        flexicast_delivered = sent_flows[f].complete;
         break;
       }
     }
@@ -1368,6 +1720,10 @@ static transport_publish_result_t publish_object(transport_t *t,
         conn->fec_group_delivered = true;
       continue;
     }
+    /* Retain metadata for earlier shared deliveries, but do not bypass a
+     * blocked shared queue by admitting this publication over unicast. */
+    if (flexicast_backpressure)
+      continue;
     if (obj->size > conn->negotiated_limits.max_fec_object_size) {
       failure = TRANSPORT_PUBLISH_INVALID;
       continue;
@@ -1375,18 +1731,24 @@ static transport_publish_result_t publish_object(transport_t *t,
     uint16_t sent_symbols = 0;
     transport_publish_result_t result = publish_datagram_to_conn(
         t, conn, obj, &profile, symbol_size, estimate_symbol_size, data_symbols,
-        &cached_symbols, &cached_total_symbols, &sent_symbols);
-    if (sent_symbols > maximum_sent_symbols)
+        fixed_repair ? recipient_totals[c] : 0, &cached_symbols,
+        &cached_total_symbols, &sent_symbols, grouped);
+    if ((result == TRANSPORT_PUBLISH_DELIVERED ||
+         result == TRANSPORT_PUBLISH_PARTIAL) &&
+        sent_symbols > maximum_sent_symbols)
       maximum_sent_symbols = sent_symbols;
     if (result == TRANSPORT_PUBLISH_DELIVERED) {
+      recipient_totals[c] = sent_symbols;
       delivered++;
       if (grouped)
         conn->fec_group_delivered = true;
     } else if (result == TRANSPORT_PUBLISH_NO_RECIPIENTS) {
       eligible--;
     } else {
-      if (result == TRANSPORT_PUBLISH_PARTIAL)
+      if (result == TRANSPORT_PUBLISH_PARTIAL) {
+        recipient_totals[c] = sent_symbols;
         partially_queued = true;
+      }
       if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
         failure = TRANSPORT_PUBLISH_BACKPRESSURE;
     }
@@ -1397,11 +1759,51 @@ static transport_publish_result_t publish_object(transport_t *t,
     t->pending_group.symbol_size = symbol_size;
 
   if ((delivered > 0 || partially_queued) &&
-      obj->track_id.type == MOQ_TRACK_DATA && profile.fec_rateless &&
-      !transport_sent_cache_store(&t->sent_cache, obj, maximum_sent_symbols,
-                                  (uint16_t)data_symbols, (uint16_t)symbol_size,
-                                  !protect_repair_cache))
-    return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
+      (profile.reactive_repair || profile.checkpoint_recovery)) {
+    if (!transport_sent_cache_store(
+            &t->sent_cache, obj, maximum_sent_symbols, (uint16_t)data_symbols,
+            (uint16_t)symbol_size, !protect_repair_cache)) {
+      if (profile.checkpoint_recovery || fixed_repair)
+        return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL
+                             : TRANSPORT_PUBLISH_ERROR;
+    } else {
+      sent_object_cache_t *cached_entry = transport_sent_cache_find(
+          &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
+      if (fixed_repair)
+        for (size_t c = 0; c < active_count; c++)
+          if (recipient_totals[c] &&
+              !transport_sent_recipient_store(cached_entry,
+                                              transport_connection_at(t, c)->id,
+                                              recipient_totals[c]))
+            return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL
+                                 : TRANSPORT_PUBLISH_ERROR;
+      if (cached_entry && !cached_entry->policy_initialized) {
+        cached_entry->policy_initialized = true;
+        if (profile.policy.enabled &&
+            (profile.policy.present & QLINQ_REPAIR_MAX_EXTRA) != 0) {
+          size_t max_extra =
+              data_symbols * profile.policy.max_extra_percent / 100U;
+          size_t initial_parity = maximum_sent_symbols > data_symbols
+                                      ? maximum_sent_symbols - data_symbols
+                                      : 0U;
+          cached_entry->remaining_repair_symbols =
+              max_extra > initial_parity
+                  ? (uint32_t)(max_extra - initial_parity)
+                  : 0U;
+        }
+        if (profile.policy.enabled && profile.policy.max_object_age_ms != 0) {
+          int64_t start_ms = grouped && t->pending_group.size != 0
+                                 ? (int64_t)t->pending_group.started_at_ms
+                                 : transport_now_ms(t);
+          uint32_t age_ms = profile.policy.max_object_age_ms;
+          cached_entry->expires_at_ms =
+              (uint64_t)age_ms > (uint64_t)(INT64_MAX - start_ms)
+                  ? INT64_MAX
+                  : start_ms + (int64_t)age_ms;
+        }
+      }
+    }
+  }
 
   if (partially_queued || (delivered > 0 && delivered != eligible))
     return TRANSPORT_PUBLISH_PARTIAL;
@@ -1420,9 +1822,9 @@ static transport_publish_result_t publish_record(transport_t *t,
   if (!publication_valid(t, obj))
     return TRANSPORT_PUBLISH_INVALID;
   size_t fec_limit = publication_fec_limit(t, &obj->track_id);
-  transport_track_profile_t profile = transport_track_profile(&obj->track_id);
-  if (obj->track_id.type == MOQ_TRACK_DATA && !profile.reliable &&
-      (profile.fec_enabled || profile.fec_rateless)) {
+  transport_track_profile_t profile =
+      transport_get_track_profile(t, &obj->track_id);
+  if (profile.grouped_records) {
     if (obj->size == 0 || obj->size > TRANSPORT_MAX_FEC_RECORD_SIZE ||
         fec_limit < 2U || obj->size > fec_limit - 2U)
       return TRANSPORT_PUBLISH_INVALID;
@@ -1472,8 +1874,7 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 
 bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
   if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id) ||
-      track_id.type != MOQ_TRACK_DATA ||
-      (track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+      !transport_get_track_profile(t, &track_id).checkpoint_recovery)
     return false;
 
   uint64_t final_object_id = 0;

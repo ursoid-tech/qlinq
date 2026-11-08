@@ -3,22 +3,6 @@
 #include <stdio.h>
 #include <string.h>
 
-const char *qlinq_repair_reason_name(qlinq_repair_reason_t reason) {
-  static const char *const names[QLINQ_REPAIR_REASON_COUNT] = {
-      "proactive-disabled", "initial-limit",
-      "total-limit",        "codec-limit",
-      "minimum-unmet",      "queue-limit",
-      "time-limit",         "fixed-source-fallback",
-      "extra-exhausted",    "expired",
-      "abandoned",          "source-resource",
-      "encoding-resource",  "unsupported",
-      "path-unavailable",   "peer-unavailable",
-      "no-progress",        "final-wait",
-      "reactive-disabled",  "control-pending"};
-  return (unsigned)reason < QLINQ_REPAIR_REASON_COUNT ? names[reason]
-                                                      : "unknown";
-}
-
 void qlinq_repair_policy_init(qlinq_repair_policy_t *policy) {
   if (policy)
     memset(policy, 0, sizeof(*policy));
@@ -95,6 +79,7 @@ bool qlinq_repair_policy_resolve(const qlinq_repair_policy_t *endpoint,
       return invalid(error, capacity,
                      "initial extra ceiling exceeds total extra ceiling");
     result.enabled = true;
+    result.present = merged.present;
     result.proactive_confidence = (uint8_t)merged.proactive_confidence;
     result.max_object_age_ms = (uint32_t)merged.max_object_age_ms;
     result.reactive_repair = merged.reactive_repair;

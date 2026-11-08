@@ -67,8 +67,7 @@ bool qlinq_wire_next_record(qlinq_wire_cursor_t *cursor, const uint8_t **data,
 }
 
 bool qlinq_wire_frame_type_is_known(uint8_t type) {
-  return type >= QLINQ_WIRE_SUBSCRIBE &&
-         type <= QLINQ_WIRE_TRACK_CHECKPOINT_ACK;
+  return type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_OBJECT_RETIRE_ACK;
 }
 
 qlinq_wire_result_t
@@ -557,5 +556,29 @@ qlinq_wire_decode_track_checkpoint_ack(const uint8_t *src, size_t len,
   ack->alias = src[0];
   ack->group_id = read_u64(src + 1);
   ack->final_object_id = read_u64(src + 9);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_encode_object_retire(uint8_t *dst, size_t capacity,
+                                const qlinq_wire_object_retire_t *retire) {
+  if (!dst || !retire)
+    return QLINQ_WIRE_INVALID;
+  if (capacity < QLINQ_WIRE_OBJECT_RETIRE_SIZE)
+    return QLINQ_WIRE_TOO_LARGE;
+  dst[0] = retire->alias;
+  write_u64(dst + 1, retire->group_id);
+  write_u64(dst + 9, retire->object_id);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_decode_object_retire(const uint8_t *src, size_t len,
+                                qlinq_wire_object_retire_t *retire) {
+  if (!src || !retire || len != QLINQ_WIRE_OBJECT_RETIRE_SIZE)
+    return QLINQ_WIRE_INVALID;
+  retire->alias = src[0];
+  retire->group_id = read_u64(src + 1);
+  retire->object_id = read_u64(src + 9);
   return QLINQ_WIRE_OK;
 }
