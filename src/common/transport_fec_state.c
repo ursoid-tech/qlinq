@@ -7,6 +7,53 @@
 
 uint64_t transport_get_monotonic_ns(void);
 
+uint16_t transport_sent_recipient_total(const sent_object_cache_t *object,
+                                        uint32_t connection_id) {
+  if (object)
+    for (size_t i = 0; i < object->recipient_count; i++)
+      if (object->recipients[i].connection_id == connection_id)
+        return object->recipients[i].total_symbols;
+  return 0;
+}
+
+bool transport_sent_recipient_reserve(sent_object_cache_t *object,
+                                      size_t capacity) {
+  if (!object || !object->data || capacity > TRANSPORT_HARD_MAX_CONNECTIONS)
+    return false;
+  if (capacity <= object->recipient_capacity)
+    return true;
+  size_t grown =
+      object->recipient_capacity ? object->recipient_capacity * 2U : 4U;
+  if (grown < capacity)
+    grown = capacity;
+  if (grown > TRANSPORT_HARD_MAX_CONNECTIONS)
+    grown = TRANSPORT_HARD_MAX_CONNECTIONS;
+  transport_sent_recipient_t *recipients =
+      realloc(object->recipients, grown * sizeof(*recipients));
+  if (!recipients)
+    return false;
+  object->recipients = recipients;
+  object->recipient_capacity = (uint16_t)grown;
+  return true;
+}
+
+bool transport_sent_recipient_store(sent_object_cache_t *object,
+                                    uint32_t connection_id,
+                                    uint16_t total_symbols) {
+  if (!object || !object->data || connection_id == 0 ||
+      total_symbols < object->data_symbols ||
+      total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS)
+    return false;
+  uint16_t existing = transport_sent_recipient_total(object, connection_id);
+  if (existing)
+    return existing == total_symbols;
+  if (!transport_sent_recipient_reserve(object, object->recipient_count + 1U))
+    return false;
+  object->recipients[object->recipient_count++] =
+      (transport_sent_recipient_t){connection_id, total_symbols};
+  return true;
+}
+
 static size_t cache_capacity(const transport_sent_cache_t *cache) {
   return cache && cache->capacity ? cache->capacity : TRANSPORT_SENT_CACHE_SIZE;
 }
@@ -120,6 +167,7 @@ bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
 
 static void release_entry(transport_sent_cache_t *cache,
                           sent_object_cache_t *entry) {
+  free(entry->recipients);
   if (entry->data) {
     cache->payload_bytes -= entry->size;
     cache->count--;
@@ -279,8 +327,10 @@ size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
 void transport_sent_cache_destroy(transport_sent_cache_t *cache) {
   if (!cache)
     return;
-  for (size_t i = 0; cache->entries && i < cache_capacity(cache); i++)
+  for (size_t i = 0; cache->entries && i < cache_capacity(cache); i++) {
     free(cache->entries[i].data);
+    free(cache->entries[i].recipients);
+  }
   free(cache->entries);
   memset(cache, 0, sizeof(*cache));
 }

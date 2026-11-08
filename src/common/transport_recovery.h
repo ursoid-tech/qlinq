@@ -9,6 +9,12 @@
  */
 bool transport_recovery_was_delivered(const transport_object_gap_state_t *state,
                                       uint64_t object_id);
+bool transport_recovery_was_retired(const transport_object_gap_state_t *state,
+                                    uint64_t object_id);
+bool transport_recovery_send_retire(transport_conn_t *conn, uint8_t alias,
+                                    uint64_t group_id, uint64_t object_id);
+bool transport_recovery_retire(transport_conn_t *conn, uint8_t alias,
+                               uint64_t group_id, uint64_t object_id);
 void transport_recovery_observe_at(transport_object_gap_state_t *gap,
                                    int64_t now_ms, uint64_t group_id,
                                    uint64_t object_id);

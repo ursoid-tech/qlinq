@@ -20,7 +20,8 @@ extern "C" {
 #define QLINQ_REPAIR_MAX_PERCENT 10000U
 #define QLINQ_REPAIR_MAX_SYMBOLS 1024U
 
-/* defaults apply only after an explicit nonzero presence mask opts in */
+/* Defaults for standalone policy resolution, before applying a delivery mode.
+ */
 #define QLINQ_REPAIR_DEFAULT_CONFIDENCE 99U
 #define QLINQ_REPAIR_DEFAULT_MAX_AGE_MS 150U
 #define QLINQ_REPAIR_DEFAULT_REACTIVE true
@@ -28,9 +29,12 @@ extern "C" {
 
 /* presence is independent of values. initialize before setting fields. a zero
  * present mask preserves legacy behavior, even in zero-initialized callers.
- * after endpoint/stream inheritance, omitted primary fields use the defaults
- * above. the minimum defaults to zero; the initial ceiling inherits the total
- * ceiling. explicit zero values override defaults and inherited values.
+ * Standalone resolution fills omitted primary fields with the defaults above.
+ * Transport streams instead preserve their delivery mode for omitted fields:
+ * fixed-rate enables proactive FEC; rateless enables reactive repair. There is
+ * no policy deadline or total repair cap unless its presence bit is set. The
+ * minimum defaults to zero; the initial ceiling inherits the total ceiling.
+ * Explicit zero values override inherited values.
  *
  * confidence is double so fractional/non-finite inputs can be rejected before
  * conversion to pathflow's integer representation. percentages are integer
@@ -49,6 +53,10 @@ typedef struct {
 
 typedef struct {
   bool enabled;
+  /* In stream/transport getters, this is the merged explicit constraint mask.
+   * Returned values reflect the applied delivery profile. In particular, an
+   * absent MAX_EXTRA bit means reactive repairs have no policy total cap;
+   * max_extra_percent then describes the initial scheduler's planning bound. */
   uint32_t present;
   uint8_t proactive_confidence;
   uint32_t max_object_age_ms;

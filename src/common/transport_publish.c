@@ -275,6 +275,57 @@ static fp_t schedule_path_finish(const path_t *path, size_t symbols) {
       FP_DIV(FP_ADD(FP_FROM_INT(path->q), FP_FROM_INT(symbols)), path->b));
 }
 
+static bool resize_schedule_parity(transport_schedule_t *schedule,
+                                   size_t active_paths, size_t parity_symbols,
+                                   const size_t *capacities) {
+  size_t placed = 0;
+  for (size_t i = 0; i < active_paths; i++) {
+    if (schedule->paths[i].x > schedule->paths[i].m)
+      placed += schedule->paths[i].x - schedule->paths[i].m;
+    else
+      schedule->paths[i].x = schedule->paths[i].m;
+  }
+  while (placed > parity_symbols) {
+    size_t worst = SIZE_MAX;
+    fp_t latest = -1;
+    for (size_t i = 0; i < active_paths; i++) {
+      if (schedule->paths[i].x <= schedule->paths[i].m)
+        continue;
+      fp_t finish =
+          schedule_path_finish(&schedule->paths[i], schedule->paths[i].x);
+      if (finish >= latest) {
+        latest = finish;
+        worst = i;
+      }
+    }
+    if (worst == SIZE_MAX)
+      return false;
+    schedule->paths[worst].x--;
+    placed--;
+  }
+  while (placed < parity_symbols) {
+    size_t best = SIZE_MAX;
+    fp_t earliest = FP_MAX;
+    for (size_t i = 0; i < active_paths; i++) {
+      if (schedule->paths[i].m == 0 ||
+          (capacities && schedule->paths[i].x >= capacities[i]))
+        continue;
+      fp_t finish =
+          schedule_path_finish(&schedule->paths[i], schedule->paths[i].x + 1U);
+      if (finish < earliest) {
+        earliest = finish;
+        best = i;
+      }
+    }
+    if (best == SIZE_MAX)
+      return false;
+    schedule->paths[best].x++;
+    placed++;
+  }
+  schedule->parity_symbols = placed;
+  return true;
+}
+
 static bool
 apply_schedule_repair_policy(const transport_track_profile_t *profile,
                              size_t active_paths, size_t data_symbols,
@@ -315,57 +366,14 @@ apply_schedule_repair_policy(const transport_track_profile_t *profile,
                                     QLINQ_FEC_MAX_TOTAL_SYMBOLS, &protection))
     return false;
 
-  size_t placed = 0;
-  for (size_t i = 0; i < active_paths; i++) {
-    if (schedule->paths[i].x > schedule->paths[i].m)
-      placed += schedule->paths[i].x - schedule->paths[i].m;
-    else
-      schedule->paths[i].x = schedule->paths[i].m;
-  }
-  while (placed > protection.initial_parity) {
-    size_t worst = SIZE_MAX;
-    fp_t latest = -1;
-    for (size_t i = 0; i < active_paths; i++) {
-      if (schedule->paths[i].x <= schedule->paths[i].m)
-        continue;
-      fp_t finish =
-          schedule_path_finish(&schedule->paths[i], schedule->paths[i].x);
-      if (finish >= latest) {
-        latest = finish;
-        worst = i;
-      }
-    }
-    if (worst == SIZE_MAX)
-      return false;
-    schedule->paths[worst].x--;
-    placed--;
-  }
-  while (placed < protection.initial_parity) {
-    size_t best = SIZE_MAX;
-    fp_t earliest = FP_MAX;
-    for (size_t i = 0; i < active_paths; i++) {
-      if (schedule->paths[i].m == 0)
-        continue;
-      fp_t finish =
-          schedule_path_finish(&schedule->paths[i], schedule->paths[i].x + 1U);
-      if (finish < earliest) {
-        earliest = finish;
-        best = i;
-      }
-    }
-    if (best == SIZE_MAX)
-      return false;
-    schedule->paths[best].x++;
-    placed++;
-  }
-  schedule->parity_symbols = placed;
-  return true;
+  return resize_schedule_parity(schedule, active_paths,
+                                protection.initial_parity, NULL);
 }
 
 static transport_publish_result_t
 plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                const transport_track_profile_t *profile,
-               publication_plan_t *plan) {
+               publication_plan_t *plan, uint16_t retained_total) {
   /* yield new datagram admission until pending control can be emitted */
   if (transport_stream_control_pending(conn->stream))
     return TRANSPORT_PUBLISH_BACKPRESSURE;
@@ -382,6 +390,11 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     return TRANSPORT_PUBLISH_BACKPRESSURE;
 
   bool use_fec = profile->fec_enabled || profile->fec_rateless;
+  if (!retained_total && profile->reactive_repair && !profile->fec_rateless) {
+    const sent_object_cache_t *retained = transport_sent_cache_find(
+        &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
+    retained_total = transport_sent_recipient_total(retained, conn->id);
+  }
   /* Replan without a path that cannot admit its allocation. This bounded
    * fallback leaves feasible partial-capacity combinations to future planner
    * improvements, but never blocks an empty alternate behind a full favorite.
@@ -399,7 +412,10 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                                   use_fec, obj->priority,
                                   &conn->round_robin_path, &plan->schedule) ||
         !apply_schedule_repair_policy(profile, active_paths, data_symbols,
-                                      &plan->schedule))
+                                      &plan->schedule) ||
+        (retained_total &&
+         !resize_schedule_parity(&plan->schedule, active_paths,
+                                 retained_total - data_symbols, NULL)))
       return TRANSPORT_PUBLISH_ERROR;
 
     size_t blocked = active_paths;
@@ -457,6 +473,14 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                                        : 0U),
                     .max_initial_extra_percent =
                         profile->proactive_fec ? QLINQ_REPAIR_MAX_PERCENT : 0U};
+      /* A selective override (for example, enabling reactive repair) must
+       * retain fixed FEC's default initial symbol in the constrained planner.
+       * Explicit zero ceilings still disable that default protection. */
+      if (profile->fec_enabled && profile->proactive_fec && data_symbols > 1 &&
+          data_symbols < QLINQ_FEC_MAX_TOTAL_SYMBOLS &&
+          !(profile->policy.present & QLINQ_REPAIR_MIN_INITIAL) &&
+          data_symbols * policy.max_initial_extra_percent >= 100U)
+        policy.min_initial_parity_symbols = 1;
       transport_policy_schedule_t constrained;
       if (transport_policy_schedule(&policy, candidates, active_paths,
                                     data_symbols, QLINQ_FEC_MAX_TOTAL_SYMBOLS,
@@ -470,7 +494,10 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
           plan->schedule.paths[i].x =
               constrained.source[i] + constrained.parity[i];
         }
-        break;
+        if (!retained_total ||
+            resize_schedule_parity(&plan->schedule, active_paths,
+                                   retained_total - data_symbols, capacities))
+          break;
       }
     }
     if (--active_paths == 0)
@@ -655,6 +682,22 @@ static transport_publish_result_t publish_datagram_to_flexicast(
     size_t *cached_total_symbols, uint16_t *sent_total_symbols) {
   size_t parity_symbols = 0;
   bool scheduled = false;
+  uint16_t retained_total = 0;
+  if (profile->reactive_repair && !profile->fec_rateless) {
+    const sent_object_cache_t *retained = transport_sent_cache_find(
+        &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
+    for (size_t i = 0; i < flow->member_count; i++) {
+      const transport_conn_t *member = flow->members[i].conn;
+      if (!member || !flow->members[i].listening)
+        continue;
+      uint16_t total = transport_sent_recipient_total(retained, member->id);
+      /* Different previous unicast geometries cannot share a fixed codeword. */
+      if (total && retained_total && total != retained_total)
+        return TRANSPORT_PUBLISH_NO_RECIPIENTS;
+      if (total)
+        retained_total = total;
+    }
+  }
   for (size_t i = 0; i < flow->member_count; i++) {
     transport_conn_t *member = flow->members[i].conn;
     if (!member || !flow->members[i].listening || !member->quic ||
@@ -721,7 +764,8 @@ static transport_publish_result_t publish_datagram_to_flexicast(
   if (!scheduled)
     return TRANSPORT_PUBLISH_NO_RECIPIENTS;
 
-  size_t total_symbols = data_symbols + parity_symbols;
+  size_t total_symbols =
+      retained_total ? retained_total : data_symbols + parity_symbols;
   if (total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS || total_symbols > UINT16_MAX)
     return TRANSPORT_PUBLISH_INVALID;
   if (sent_total_symbols)
@@ -785,14 +829,14 @@ static transport_publish_result_t publish_datagram_to_flexicast(
 static transport_publish_result_t publish_datagram_to_conn(
     transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     const transport_track_profile_t *profile, size_t symbol_size,
-    size_t estimate_symbol_size, size_t data_symbols,
+    size_t estimate_symbol_size, size_t data_symbols, uint16_t retained_total,
     publication_symbols_t *cached, size_t *cached_total_symbols,
     uint16_t *sent_total_symbols) {
   publication_plan_t plan = {.symbol_size = symbol_size,
                              .estimate_symbol_size = estimate_symbol_size,
                              .data_symbols = data_symbols};
   transport_publish_result_t result =
-      plan_datagrams(t, conn, obj, profile, &plan);
+      plan_datagrams(t, conn, obj, profile, &plan, retained_total);
   if (result != TRANSPORT_PUBLISH_DELIVERED)
     return result;
   if (sent_total_symbols)
@@ -990,6 +1034,13 @@ bool transport_publish_checkpoint_acked(
     state->acked_initialized = true;
     state->acked_group_id = ack->group_id;
     state->acked_object_id = ack->final_object_id;
+    while (state->pending_window_count != 0 &&
+           state->pending_window_ends[state->pending_window_head] <=
+               ack->final_object_id) {
+      state->pending_window_head =
+          (state->pending_window_head + 1U) % QLINQ_RECOVERY_MAX_WINDOWS;
+      state->pending_window_count--;
+    }
   }
   if (!checkpoint_ack_pending(state))
     state->oldest_unacked_sent_at_ms = 0;
@@ -1086,6 +1137,10 @@ static bool emit_rolling_checkpoint(transport_t *t,
         continue;
       recipient_first_object_id = ack->sent_object_id + 1U;
     }
+    if (ack->pending_window_count == QLINQ_RECOVERY_MAX_WINDOWS) {
+      succeeded = false;
+      continue;
+    }
     if (!transport_stream_can_accept(conn->stream,
                                      QLINQ_WIRE_FRAME_HEADER_SIZE +
                                          QLINQ_WIRE_TRACK_CHECKPOINT_SIZE,
@@ -1097,6 +1152,10 @@ static bool emit_rolling_checkpoint(transport_t *t,
       continue;
     }
     checkpoint_mark_sent(t, ack, group_id, final_object_id);
+    ack->pending_window_ends[(ack->pending_window_head +
+                              ack->pending_window_count) %
+                             QLINQ_RECOVERY_MAX_WINDOWS] = final_object_id;
+    ack->pending_window_count++;
     t->stats.recovery_checkpoints_sent++;
   }
   if (succeeded) {
@@ -1356,6 +1415,14 @@ static transport_publish_result_t publish_object(transport_t *t,
   size_t data_size = obj->size;
   if (data_size == 0 || data_size > fec_limit)
     return TRANSPORT_PUBLISH_INVALID;
+  bool fixed_repair = profile.reactive_repair && !profile.fec_rateless;
+  const sent_object_cache_t *retained =
+      fixed_repair ? transport_sent_cache_find(&t->sent_cache, &obj->track_id,
+                                               obj->group_id, obj->object_id)
+                   : NULL;
+  if (retained && (retained->size != obj->size ||
+                   memcmp(retained->data, obj->data, obj->size) != 0))
+    return TRANSPORT_PUBLISH_INVALID;
   bool protect_repair_cache = profile.checkpoint_recovery &&
                               checkpoint_cache_is_protected(t, &obj->track_id);
   if (profile.checkpoint_recovery &&
@@ -1388,6 +1455,8 @@ static transport_publish_result_t publish_object(transport_t *t,
    * and retries. Newly joined recipients must accept that same geometry. */
   if (grouped && t->pending_group.symbol_size != 0)
     estimate_symbol_size = t->pending_group.symbol_size;
+  if (retained)
+    estimate_symbol_size = retained->symbol_size;
   if (estimate_symbol_size == 0)
     return TRANSPORT_PUBLISH_BACKPRESSURE;
   size_t symbol_size = estimate_symbol_size;
@@ -1399,6 +1468,25 @@ static transport_publish_result_t publish_object(transport_t *t,
     data_symbols = 1;
 
   size_t active_count = transport_connection_count(t);
+  /* Reserve fixed geometry bookkeeping before sending: an allocation failure
+   * after a grouped recipient was marked delivered cannot be retried safely. */
+  if (fixed_repair) {
+    if (!transport_sent_cache_store(&t->sent_cache, obj, (uint16_t)data_symbols,
+                                    (uint16_t)data_symbols,
+                                    (uint16_t)symbol_size, true))
+      return TRANSPORT_PUBLISH_ERROR;
+    sent_object_cache_t *entry = transport_sent_cache_find(
+        &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
+    size_t capacity = entry->recipient_count;
+    for (size_t c = 0; c < active_count; c++) {
+      transport_conn_t *conn = transport_connection_at(t, c);
+      if (transport_publish_recipient_eligible(t, conn, &obj->track_id) &&
+          !transport_sent_recipient_total(entry, conn->id))
+        capacity++;
+    }
+    if (!transport_sent_recipient_reserve(entry, capacity))
+      return TRANSPORT_PUBLISH_ERROR;
+  }
   size_t eligible = 0;
   size_t delivered = 0;
   uint16_t maximum_sent_symbols = (uint16_t)data_symbols;
@@ -1406,9 +1494,15 @@ static transport_publish_result_t publish_object(transport_t *t,
   transport_publish_result_t failure = TRANSPORT_PUBLISH_ERROR;
   publication_symbols_t cached_symbols = {0};
   size_t cached_total_symbols = 0;
+  uint16_t recipient_totals[TRANSPORT_HARD_MAX_CONNECTIONS] = {0};
 
-  transport_flexicast_flow_t *delivered_flows[TRANSPORT_FLEXICAST_MAX_FLOWS];
-  size_t delivered_flow_count = 0;
+  struct {
+    transport_flexicast_flow_t *flow;
+    uint16_t total_symbols;
+    bool complete;
+  } sent_flows[TRANSPORT_FLEXICAST_MAX_FLOWS];
+  size_t sent_flow_count = 0;
+  bool flexicast_backpressure = false;
   if (t->flexicast_enabled && t->is_server) {
     for (size_t f = 0; f < t->flexicast.capacity; f++) {
       transport_flexicast_flow_t *flow = &t->flexicast.flows[f];
@@ -1420,16 +1514,19 @@ static transport_publish_result_t publish_object(transport_t *t,
       transport_publish_result_t result = publish_datagram_to_flexicast(
           t, flow, obj, &profile, symbol_size, data_symbols, &cached_symbols,
           &cached_total_symbols, &sent_symbols);
-      if (sent_symbols > maximum_sent_symbols)
-        maximum_sent_symbols = sent_symbols;
-      if (result == TRANSPORT_PUBLISH_DELIVERED) {
-        delivered_flows[delivered_flow_count++] = flow;
-      } else if (result == TRANSPORT_PUBLISH_PARTIAL) {
-        partially_queued = true;
+      if (result == TRANSPORT_PUBLISH_DELIVERED ||
+          result == TRANSPORT_PUBLISH_PARTIAL) {
+        if (sent_symbols > maximum_sent_symbols)
+          maximum_sent_symbols = sent_symbols;
+        sent_flows[sent_flow_count].flow = flow;
+        sent_flows[sent_flow_count].total_symbols = sent_symbols;
+        sent_flows[sent_flow_count++].complete =
+            result == TRANSPORT_PUBLISH_DELIVERED;
+        partially_queued |= result == TRANSPORT_PUBLISH_PARTIAL;
       } else if (result == TRANSPORT_PUBLISH_BACKPRESSURE) {
-        transport_arena_reset(&t->arena);
-        return delivered_flow_count > 0 ? TRANSPORT_PUBLISH_PARTIAL
-                                        : TRANSPORT_PUBLISH_BACKPRESSURE;
+        failure = TRANSPORT_PUBLISH_BACKPRESSURE;
+        flexicast_backpressure = true;
+        break;
       }
     }
   }
@@ -1444,9 +1541,10 @@ static transport_publish_result_t publish_object(transport_t *t,
       continue;
     }
     bool flexicast_delivered = false;
-    for (size_t f = 0; f < delivered_flow_count; f++) {
-      if (transport_flexicast_member_is_listening(delivered_flows[f], conn)) {
-        flexicast_delivered = true;
+    for (size_t f = 0; f < sent_flow_count; f++) {
+      if (transport_flexicast_member_is_listening(sent_flows[f].flow, conn)) {
+        recipient_totals[c] = sent_flows[f].total_symbols;
+        flexicast_delivered = sent_flows[f].complete;
         break;
       }
     }
@@ -1456,6 +1554,10 @@ static transport_publish_result_t publish_object(transport_t *t,
         conn->fec_group_delivered = true;
       continue;
     }
+    /* Retain metadata for earlier shared deliveries, but do not bypass a
+     * blocked shared queue by admitting this publication over unicast. */
+    if (flexicast_backpressure)
+      continue;
     if (obj->size > conn->negotiated_limits.max_fec_object_size) {
       failure = TRANSPORT_PUBLISH_INVALID;
       continue;
@@ -1463,18 +1565,24 @@ static transport_publish_result_t publish_object(transport_t *t,
     uint16_t sent_symbols = 0;
     transport_publish_result_t result = publish_datagram_to_conn(
         t, conn, obj, &profile, symbol_size, estimate_symbol_size, data_symbols,
-        &cached_symbols, &cached_total_symbols, &sent_symbols);
-    if (sent_symbols > maximum_sent_symbols)
+        fixed_repair ? recipient_totals[c] : 0, &cached_symbols,
+        &cached_total_symbols, &sent_symbols);
+    if ((result == TRANSPORT_PUBLISH_DELIVERED ||
+         result == TRANSPORT_PUBLISH_PARTIAL) &&
+        sent_symbols > maximum_sent_symbols)
       maximum_sent_symbols = sent_symbols;
     if (result == TRANSPORT_PUBLISH_DELIVERED) {
+      recipient_totals[c] = sent_symbols;
       delivered++;
       if (grouped)
         conn->fec_group_delivered = true;
     } else if (result == TRANSPORT_PUBLISH_NO_RECIPIENTS) {
       eligible--;
     } else {
-      if (result == TRANSPORT_PUBLISH_PARTIAL)
+      if (result == TRANSPORT_PUBLISH_PARTIAL) {
+        recipient_totals[c] = sent_symbols;
         partially_queued = true;
+      }
       if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
         failure = TRANSPORT_PUBLISH_BACKPRESSURE;
     }
@@ -1484,16 +1592,25 @@ static transport_publish_result_t publish_object(transport_t *t,
   if ((delivered > 0 || partially_queued) && grouped)
     t->pending_group.symbol_size = symbol_size;
 
-  if ((delivered > 0 || partially_queued) && profile.reactive_repair) {
+  if ((delivered > 0 || partially_queued) &&
+      (profile.reactive_repair || profile.checkpoint_recovery)) {
     if (!transport_sent_cache_store(
             &t->sent_cache, obj, maximum_sent_symbols, (uint16_t)data_symbols,
             (uint16_t)symbol_size, !protect_repair_cache)) {
-      if (profile.checkpoint_recovery)
+      if (profile.checkpoint_recovery || fixed_repair)
         return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL
                              : TRANSPORT_PUBLISH_ERROR;
     } else {
       sent_object_cache_t *cached_entry = transport_sent_cache_find(
           &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
+      if (fixed_repair)
+        for (size_t c = 0; c < active_count; c++)
+          if (recipient_totals[c] &&
+              !transport_sent_recipient_store(cached_entry,
+                                              transport_connection_at(t, c)->id,
+                                              recipient_totals[c]))
+            return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL
+                                 : TRANSPORT_PUBLISH_ERROR;
       if (cached_entry && !cached_entry->policy_initialized) {
         cached_entry->policy_initialized = true;
         if (profile.policy.enabled &&

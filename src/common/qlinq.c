@@ -435,9 +435,9 @@ static void reject_received_record(qlinq_endpoint_t *endpoint,
 
 static void queue_received_object(qlinq_endpoint_t *endpoint,
                                   const transport_event_t *source) {
-  bool grouped_data =
-      transport_get_track_profile(endpoint->transport, &source->track_id)
-          .grouped_records;
+  bool grouped_data = transport_get_receive_track_profile(endpoint->transport,
+                                                          &source->track_id)
+                          .grouped_records;
   if (!grouped_data) {
     if (!deliver_record(endpoint, source->conn, &source->track_id,
                         &source->object, source->object.data,
@@ -1044,17 +1044,19 @@ static qlinq_stream_t *open_stream(qlinq_endpoint_t *endpoint,
     }
   }
 
-  if ((config->delivery == QLINQ_DELIVERY_FIXEDRATE ||
-       config->delivery == QLINQ_DELIVERY_RATELESS) &&
-      !transport_set_track_repair_policy(endpoint->transport, &track,
-                                         &config->repair_policy)) {
-    set_status(endpoint->context, QLINQ_STATUS_RESOURCE_LIMIT);
-    return NULL;
-  }
-
   qlinq_stream_t *stream = calloc(1, sizeof(*stream));
   if (!stream) {
     set_status(endpoint->context, QLINQ_STATUS_NO_MEMORY);
+    return NULL;
+  }
+  if ((config->delivery == QLINQ_DELIVERY_FIXEDRATE ||
+       config->delivery == QLINQ_DELIVERY_RATELESS) &&
+      !transport_set_directional_track_repair_policy(
+          endpoint->transport, &track, &config->repair_policy,
+          direction == QLINQ_STREAM_PUBLISH ? TRANSPORT_TRACK_SEND
+                                            : TRANSPORT_TRACK_RECEIVE)) {
+    free(stream);
+    set_status(endpoint->context, QLINQ_STATUS_RESOURCE_LIMIT);
     return NULL;
   }
   stream->endpoint = endpoint;
@@ -1103,6 +1105,12 @@ void qlinq_stream_close(qlinq_stream_t *stream) {
   if (stream->direction == QLINQ_STREAM_SUBSCRIBE &&
       stream->endpoint->transport)
     (void)transport_unsubscribe(stream->endpoint->transport, stream->track);
+  if (stream->endpoint->transport) {
+    transport_clear_directional_track_repair_policy(
+        stream->endpoint->transport, &stream->track,
+        stream->direction == QLINQ_STREAM_PUBLISH ? TRANSPORT_TRACK_SEND
+                                                  : TRANSPORT_TRACK_RECEIVE);
+  }
   stream->state = QLINQ_STREAM_CLOSED;
 }
 
@@ -1588,8 +1596,11 @@ qlinq_stream_set_repair_policy(qlinq_stream_t *stream,
   }
   if ((delivery == QLINQ_DELIVERY_FIXEDRATE ||
        delivery == QLINQ_DELIVERY_RATELESS) &&
-      !transport_set_track_repair_policy(stream->endpoint->transport,
-                                         &stream->track, policy)) {
+      !transport_set_directional_track_repair_policy(
+          stream->endpoint->transport, &stream->track, policy,
+          stream->direction == QLINQ_STREAM_PUBLISH
+              ? TRANSPORT_TRACK_SEND
+              : TRANSPORT_TRACK_RECEIVE)) {
     set_status(stream->endpoint->context, QLINQ_STATUS_INVALID);
     return QLINQ_STATUS_INVALID;
   }
@@ -1613,9 +1624,11 @@ bool qlinq_stream_get_repair_policy(
     set_status(stream->endpoint->context, QLINQ_STATUS_STATE);
     return false;
   }
-  if (effective &&
-      !transport_get_track_repair_policy(stream->endpoint->transport,
-                                         &stream->track, effective)) {
+  if (effective && !transport_get_directional_track_repair_policy(
+                       stream->endpoint->transport, &stream->track, effective,
+                       stream->direction == QLINQ_STREAM_PUBLISH
+                           ? TRANSPORT_TRACK_SEND
+                           : TRANSPORT_TRACK_RECEIVE)) {
     set_status(stream->endpoint->context, QLINQ_STATUS_INVALID);
     return false;
   }

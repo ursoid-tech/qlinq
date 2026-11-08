@@ -234,6 +234,22 @@ static void inject_nack(quicly_stream_t *stream, uint8_t alias, uint64_t group,
   stream->callbacks->on_receive(stream, offset, frame, received);
 }
 
+/* Synthetic cached publications must retain the recipient's original geometry
+ * and explicitly enable the repair path exercised by the injected NACKs. */
+static void retain_for_repair(transport_t *t, transport_conn_t *conn,
+                              const moq_object_t *object,
+                              uint16_t source_symbols, uint16_t symbol_size) {
+  qlinq_repair_policy_t reactive = {.present = QLINQ_REPAIR_REACTIVE,
+                                    .reactive_repair = true};
+  assert(transport_set_track_repair_policy(t, &object->track_id, &reactive));
+  assert(transport_sent_cache_store(&t->sent_cache, object, source_symbols,
+                                    source_symbols, symbol_size, true));
+  sent_object_cache_t *cached = transport_sent_cache_find(
+      &t->sent_cache, &object->track_id, object->group_id, object->object_id);
+  assert(cached &&
+         transport_sent_recipient_store(cached, conn->id, source_symbols));
+}
+
 static void differing_path_mtu(void) {
   mtu_fixture_t *f = create(2, 1200, 1280);
   moq_track_id_t track = {.type = MOQ_TRACK_VIDEO,
@@ -271,8 +287,7 @@ static void differing_path_mtu(void) {
   size_t symbol_size = limits[1] - QLINQ_WIRE_FEC_HEADER_SIZE;
   object.group_id = 900;
   object.size = 2000;
-  assert(transport_sent_cache_store(&t->sent_cache, &object, 2, 2,
-                                    (uint16_t)symbol_size, true));
+  retain_for_repair(t, conn, &object, 2, (uint16_t)symbol_size);
   sent_object_cache_t *cached =
       transport_sent_cache_find(&t->sent_cache, &track, 900, 0);
   assert(cached && cached->symbol_size == symbol_size);
@@ -353,8 +368,7 @@ static void mtu_blackhole_fallback(void) {
   moq_object_t object = {
       .track_id = track, .group_id = 54, .data = object_payload, .size = 2000};
   size_t original_symbol = large_limit - QLINQ_WIRE_FEC_HEADER_SIZE;
-  assert(transport_sent_cache_store(&t->sent_cache, &object, 2, 2,
-                                    (uint16_t)original_symbol, true));
+  retain_for_repair(t, conn, &object, 2, (uint16_t)original_symbol);
   sent_object_cache_t *cached =
       transport_sent_cache_find(&t->sent_cache, &track, 54, 0);
   assert(cached);
@@ -487,8 +501,7 @@ static void shared_socket_mtu(void) {
                          .data = payload,
                          .size = sizeof(payload)};
   size_t symbol_size = limits[1] - QLINQ_WIRE_FEC_HEADER_SIZE;
-  assert(transport_sent_cache_store(&t->sent_cache, &object, 2, 2,
-                                    (uint16_t)symbol_size, true));
+  retain_for_repair(t, conn, &object, 2, (uint16_t)symbol_size);
   uint8_t alias;
   assert(transport_subscriptions_find_alias(&conn->send_subscriptions, &track,
                                             &alias) == 0);
@@ -553,8 +566,7 @@ static void implicit_source_tails(void) {
                                .group_id = receiver->observe_group,
                                .data = data,
                                .size = capacity * 2 + 17};
-      assert(transport_sent_cache_store(&t->sent_cache, &retained, 3, 3,
-                                        (uint16_t)capacity, true));
+      retain_for_repair(t, conn, &retained, 3, (uint16_t)capacity);
       size_t before = receiver->observed_symbols;
       receiver->observed_source_bytes = 0;
       inject_nack(conn->stream, alias, receiver->observe_group, 0, 2);

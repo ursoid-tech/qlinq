@@ -578,9 +578,12 @@ transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
                                     const moq_track_id_t *track_id);
 bool transport_set_repair_policy(transport_t *t,
                                  const qlinq_repair_policy_t *policy);
+/* Applies to both send and receive directions atomically. A zero presence
+ * mask removes the track override and restores endpoint inheritance. */
 bool transport_set_track_repair_policy(transport_t *t,
                                        const moq_track_id_t *track_id,
                                        const qlinq_repair_policy_t *policy);
+/* Returns the applied send profile, including delivery-mode defaults. */
 bool transport_get_track_repair_policy(
     const transport_t *t, const moq_track_id_t *track_id,
     qlinq_effective_repair_policy_t *effective);

@@ -129,7 +129,7 @@ int main(void) {
                                 &frame) == QLINQ_WIRE_INVALID,
         "magic rejection");
   memcpy(corrupted, frame_buf, frame_len);
-  corrupted[3] = 14;
+  corrupted[3] = QLINQ_WIRE_OBJECT_RETIRE_ACK + 1;
   CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
                                 &frame) == QLINQ_WIRE_INVALID,
         "unassigned type rejection");
@@ -447,6 +447,46 @@ int main(void) {
             decoded_checkpoint_ack.final_object_id ==
                 checkpoint_ack.final_object_id,
         "recovery checkpoint ACK roundtrip");
+
+  qlinq_wire_object_retire_t retire = {
+      .alias = 22, .group_id = large_group_id, .object_id = large_object_id};
+  CHECK(qlinq_wire_encode_object_retire(payload, sizeof(payload), &retire) ==
+            QLINQ_WIRE_OK,
+        "object retirement encode");
+  qlinq_wire_object_retire_t decoded_retire;
+  CHECK(qlinq_wire_decode_object_retire(payload, QLINQ_WIRE_OBJECT_RETIRE_SIZE,
+                                        &decoded_retire) == QLINQ_WIRE_OK &&
+            decoded_retire.alias == retire.alias &&
+            decoded_retire.group_id == retire.group_id &&
+            decoded_retire.object_id == retire.object_id,
+        "object retirement roundtrip preserves full identifiers");
+  CHECK(qlinq_wire_decode_object_retire(
+            payload, QLINQ_WIRE_OBJECT_RETIRE_SIZE - 1U, &decoded_retire) ==
+                QLINQ_WIRE_INVALID &&
+            qlinq_wire_decode_object_retire(
+                payload, QLINQ_WIRE_OBJECT_RETIRE_SIZE + 1U, &decoded_retire) ==
+                QLINQ_WIRE_INVALID,
+        "object retirement requires exact payload size");
+  CHECK(qlinq_wire_encode_object_retire(payload,
+                                        QLINQ_WIRE_OBJECT_RETIRE_SIZE - 1U,
+                                        &retire) == QLINQ_WIRE_TOO_LARGE,
+        "object retirement output capacity");
+  const uint8_t retirement_types[] = {QLINQ_WIRE_OBJECT_RETIRE,
+                                      QLINQ_WIRE_OBJECT_RETIRE_ACK};
+  for (size_t i = 0; i < sizeof(retirement_types); i++) {
+    CHECK(qlinq_wire_encode_frame_header(
+              frame_buf, sizeof(frame_buf), retirement_types[i],
+              QLINQ_WIRE_OBJECT_RETIRE_SIZE, sizeof(payload)) == QLINQ_WIRE_OK,
+          "retirement frame header encode");
+    memcpy(frame_buf + QLINQ_WIRE_FRAME_HEADER_SIZE, payload,
+           QLINQ_WIRE_OBJECT_RETIRE_SIZE);
+    CHECK(qlinq_wire_decode_frame(frame_buf,
+                                  QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                      QLINQ_WIRE_OBJECT_RETIRE_SIZE,
+                                  sizeof(payload), &frame) == QLINQ_WIRE_OK &&
+              frame.type == retirement_types[i],
+          "retirement and acknowledgement frame types");
+  }
 
   printf("===TRANSPORT WIRE OK===\n");
   return 0;

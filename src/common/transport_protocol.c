@@ -24,7 +24,8 @@ static uint32_t local_capabilities(const transport_t *t) {
       QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |
       QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |
       QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |
-      QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS | QLINQ_WIRE_CAP_RATELESS_REPAIR;
+      QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS | QLINQ_WIRE_CAP_RATELESS_REPAIR |
+      QLINQ_WIRE_CAP_RECOVERY_RETIREMENT;
   if (t->flexicast_enabled)
     capabilities |= QLINQ_WIRE_CAP_FLEXICAST_DATAGRAM;
   return capabilities;
@@ -331,6 +332,9 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
     t->stats.repair_indexed_requests_received++;
   if (!profile.reactive_repair) {
     t->stats.repair_cache_misses++;
+    if (profile.checkpoint_recovery)
+      (void)transport_recovery_send_retire(conn, nack.alias, nack.group_id,
+                                           nack.object_id);
     return true;
   }
   int64_t now = transport_now_ms(t);
@@ -339,6 +343,9 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
   if (!cached || (cached->expires_at_ms > 0 && now >= cached->expires_at_ms) ||
       cached->remaining_repair_symbols == 0) {
     t->stats.repair_cache_misses++;
+    if (cached && profile.checkpoint_recovery)
+      (void)transport_recovery_send_retire(conn, nack.alias, nack.group_id,
+                                           nack.object_id);
     return true;
   }
 
@@ -385,12 +392,12 @@ static bool receive_nack(transport_t *t, transport_conn_t *conn,
 
   transport_repair_batch_t repair;
   bool systematic_fallback = false;
-  bool built =
-      indices_valid &&
-      (rateless ? transport_repair_build_rateless(&t->fec_cache, cached,
-                                                  missing_count, &repair)
-                : transport_repair_build(&t->fec_cache, cached, whole_object,
-                                         missing, missing_count, &repair));
+  bool built = indices_valid &&
+               (rateless ? transport_repair_build_rateless(
+                               &t->fec_cache, cached, missing_count, &repair)
+                         : transport_repair_build_for_recipient(
+                               &t->fec_cache, cached, conn->id, whole_object,
+                               missing, missing_count, &repair));
   if (!built && indices_valid && rateless &&
       cached->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
     t->stats.repair_rateless_exhausted++;
@@ -528,7 +535,8 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
         transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
                                               checkpoint.alias,
                                               &resolved_track) != 0 ||
-        !transport_get_track_profile(t, &resolved_track).checkpoint_recovery) {
+        !transport_get_receive_track_profile(t, &resolved_track)
+             .checkpoint_recovery) {
       return close_protocol_error(
           conn, "protocol error: invalid recovery checkpoint");
     }
@@ -555,6 +563,34 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
     t->stats.recovery_checkpoint_acks_received++;
     return true;
   }
+  case QLINQ_WIRE_OBJECT_RETIRE:
+  case QLINQ_WIRE_OBJECT_RETIRE_ACK: {
+    qlinq_wire_object_retire_t retire;
+    moq_track_id_t track;
+    bool from_sender = frame->type == QLINQ_WIRE_OBJECT_RETIRE;
+    if (!conn->authenticated ||
+        !(conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_RETIREMENT) ||
+        qlinq_wire_decode_object_retire(input.base, input.len, &retire) !=
+            QLINQ_WIRE_OK ||
+        transport_subscriptions_find_by_alias(from_sender
+                                                  ? &conn->receive_subscriptions
+                                                  : &conn->send_subscriptions,
+                                              retire.alias, &track) != 0)
+      return close_protocol_error(conn, "protocol error: invalid retirement");
+    transport_track_profile_t profile =
+        from_sender ? transport_get_receive_track_profile(t, &track)
+                    : transport_get_track_profile(t, &track);
+    if (!profile.checkpoint_recovery)
+      return close_protocol_error(conn,
+                                  "protocol error: invalid retirement track");
+    if (from_sender)
+      (void)transport_recovery_retire(conn, retire.alias, retire.group_id,
+                                      retire.object_id);
+    /* RETIRE_ACK explicitly reports failed delivery. Its following cumulative
+     * checkpoint ACK releases storage after all recipients are terminal. No
+     * successful-delivery event or counter is synthesized for this outcome. */
+    return true;
+  }
   case QLINQ_WIRE_TRACK_END: {
     qlinq_wire_track_end_t end;
     moq_track_id_t resolved_track;
@@ -563,7 +599,8 @@ static bool receive_control_frame(transport_t *t, transport_conn_t *conn,
             QLINQ_WIRE_OK ||
         transport_subscriptions_find_by_alias(
             &conn->receive_subscriptions, end.alias, &resolved_track) != 0 ||
-        !transport_get_track_profile(t, &resolved_track).checkpoint_recovery) {
+        !transport_get_receive_track_profile(t, &resolved_track)
+             .checkpoint_recovery) {
       return close_protocol_error(conn,
                                   "protocol error: invalid track completion");
     }
@@ -1038,7 +1075,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
   }
 
   transport_track_profile_t profile =
-      transport_get_track_profile(t, &resolved_track);
+      transport_get_receive_track_profile(t, &resolved_track);
   bool rateless = profile.fec_rateless;
   bool rateless_data = profile.checkpoint_recovery;
   transport_subscription_state_t *subscription_state =
@@ -1054,7 +1091,8 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     return;
   }
   if (rateless_data &&
-      transport_recovery_was_delivered(object_state, object_id)) {
+      (transport_recovery_was_delivered(object_state, object_id) ||
+       transport_recovery_was_retired(object_state, object_id))) {
     t->stats.fec_duplicate_objects_suppressed++;
     return;
   }

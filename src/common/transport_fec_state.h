@@ -19,6 +19,11 @@
 #define TRANSPORT_FEC_CACHE_SIZE 8U
 
 typedef struct {
+  uint32_t connection_id;
+  uint16_t total_symbols;
+} transport_sent_recipient_t;
+
+typedef struct {
   moq_track_id_t track_id;
   uint64_t group_id;
   uint64_t object_id;
@@ -34,6 +39,9 @@ typedef struct {
   uint32_t remaining_repair_symbols;
   int64_t expires_at_ms;
   bool policy_initialized;
+  /* Fixed codecs retain the geometry actually sent to each recipient. */
+  transport_sent_recipient_t *recipients;
+  uint16_t recipient_count, recipient_capacity;
   /* Retain unconfirmed recovery obligations until explicit release. */
   bool recovery_protected;
 } sent_object_cache_t;
@@ -49,6 +57,14 @@ typedef struct {
    * New monotonic object IDs can skip a lookup without assuming track order. */
   uint64_t object_id_upper_bound;
 } transport_sent_cache_t;
+
+uint16_t transport_sent_recipient_total(const sent_object_cache_t *object,
+                                        uint32_t connection_id);
+bool transport_sent_recipient_reserve(sent_object_cache_t *object,
+                                      size_t capacity);
+bool transport_sent_recipient_store(sent_object_cache_t *object,
+                                    uint32_t connection_id,
+                                    uint16_t total_symbols);
 
 bool transport_sent_cache_init(transport_sent_cache_t *cache,
                                size_t max_payload_bytes,

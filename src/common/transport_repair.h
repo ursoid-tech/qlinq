@@ -28,6 +28,10 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
                             bool whole_object, const uint16_t *missing,
                             size_t missing_count,
                             transport_repair_batch_t *batch);
+bool transport_repair_build_for_recipient(
+    transport_fec_cache_t *fec_cache, const sent_object_cache_t *object,
+    uint32_t connection_id, bool whole_object, const uint16_t *missing,
+    size_t missing_count, transport_repair_batch_t *batch);
 bool transport_repair_build_rateless(transport_fec_cache_t *fec_cache,
                                      sent_object_cache_t *object,
                                      size_t requested,

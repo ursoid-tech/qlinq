@@ -44,7 +44,115 @@ static bool filter_interface(void *user_data, qlinq_endpoint_t *endpoint,
   return state->allow;
 }
 
+static void test_stream_policy_lifecycle(void) {
+  qlinq_context_t *context = qlinq_context_create(NULL);
+  assert(context);
+  qlinq_endpoint_config_t config = {.bind_addresses = {"127.0.0.1"},
+                                    .bind_address_count = 1,
+                                    .remote_addresses = {"127.0.0.1"},
+                                    .remote_address_count = 1,
+                                    .port = 19938,
+                                    .security = {.allow_insecure_peer = true}};
+  qlinq_endpoint_t *endpoint = qlinq_connect(context, &config);
+  assert(endpoint);
+  qlinq_stream_config_t stream_config = {
+      .name = "duplex-policy",
+      .content_type = QLINQ_CONTENT_VIDEO,
+      .delivery = QLINQ_DELIVERY_RATELESS,
+      .repair_policy = {.present = QLINQ_REPAIR_MAX_EXTRA,
+                        .max_extra_percent = 25}};
+  qlinq_stream_t *publisher = qlinq_publish(endpoint, &stream_config);
+  assert(publisher);
+  stream_config.repair_policy.max_extra_percent = 75;
+  qlinq_stream_t *subscriber = qlinq_subscribe(endpoint, &stream_config);
+  assert(subscriber);
+  qlinq_repair_policy_t configured;
+  qlinq_effective_repair_policy_t effective;
+  assert(qlinq_stream_get_repair_policy(publisher, &configured, &effective));
+  assert(configured.max_extra_percent == 25 &&
+         effective.max_extra_percent == 25);
+  assert(effective.present == QLINQ_REPAIR_MAX_EXTRA &&
+         effective.proactive_confidence == 0 &&
+         effective.max_object_age_ms == 0 && effective.reactive_repair);
+  assert(qlinq_stream_get_repair_policy(subscriber, &configured, &effective));
+  assert(configured.max_extra_percent == 75 &&
+         effective.max_extra_percent == 75);
+
+  stream_config.repair_policy.max_extra_percent = 10;
+  assert(qlinq_stream_set_repair_policy(
+             publisher, &stream_config.repair_policy) == QLINQ_STATUS_OK);
+  qlinq_repair_policy_t endpoint_policy = {.present = QLINQ_REPAIR_MAX_AGE,
+                                           .max_object_age_ms = 90};
+  assert(qlinq_endpoint_set_repair_policy(endpoint, &endpoint_policy) ==
+         QLINQ_STATUS_OK);
+  assert(qlinq_stream_get_repair_policy(publisher, NULL, &effective));
+  assert(effective.max_extra_percent == 10 &&
+         effective.max_object_age_ms == 90);
+  assert(qlinq_stream_get_repair_policy(subscriber, NULL, &effective));
+  assert(effective.max_extra_percent == 75 &&
+         effective.max_object_age_ms == 90);
+
+  qlinq_stream_close(publisher);
+  assert(qlinq_stream_get_repair_policy(subscriber, NULL, &effective));
+  assert(effective.max_extra_percent == 75);
+  stream_config.repair_policy = (qlinq_repair_policy_t){0};
+  publisher = qlinq_publish(endpoint, &stream_config);
+  assert(publisher &&
+         qlinq_stream_get_repair_policy(publisher, NULL, &effective));
+  assert(effective.present == QLINQ_REPAIR_MAX_AGE &&
+         effective.max_object_age_ms == 90);
+  qlinq_stream_close(subscriber);
+  qlinq_stream_close(publisher);
+
+  /* Closed streams, with or without explicit overrides, consume no slots and
+   * no longer constrain subsequent endpoint policy changes. */
+  for (unsigned explicit_policy = 0; explicit_policy < 2; explicit_policy++) {
+    stream_config.repair_policy =
+        explicit_policy
+            ? (qlinq_repair_policy_t){.present = QLINQ_REPAIR_MAX_INITIAL_EXTRA,
+                                      .max_initial_extra_percent = 80}
+            : (qlinq_repair_policy_t){0};
+    for (size_t i = 0; i < TRANSPORT_HARD_MAX_SUBSCRIPTIONS + 10; i++) {
+      char name[64];
+      snprintf(name, sizeof(name), "lifetime-%u-%zu", explicit_policy, i);
+      stream_config.name = name;
+      publisher = qlinq_publish(endpoint, &stream_config);
+      subscriber = qlinq_subscribe(endpoint, &stream_config);
+      assert(publisher && subscriber);
+      qlinq_stream_close(publisher);
+      qlinq_stream_close(subscriber);
+    }
+  }
+  endpoint_policy = (qlinq_repair_policy_t){.present = QLINQ_REPAIR_MAX_EXTRA,
+                                            .max_extra_percent = 50};
+  assert(qlinq_endpoint_set_repair_policy(endpoint, &endpoint_policy) ==
+         QLINQ_STATUS_OK);
+
+  /* Legacy transport setters must reserve both directions atomically. */
+  moq_track_id_t target = {.type = MOQ_TRACK_VIDEO,
+                           .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                           .name = "atomic-policy"};
+  qlinq_repair_policy_t policy = {.present = QLINQ_REPAIR_MAX_EXTRA,
+                                  .max_extra_percent = 25};
+  assert(transport_set_directional_track_repair_policy(
+      endpoint->transport, &target, &policy, TRANSPORT_TRACK_SEND));
+  for (size_t i = 0; i < TRANSPORT_HARD_MAX_SUBSCRIPTIONS; i++) {
+    moq_track_id_t track = target;
+    snprintf(track.name, sizeof(track.name), "receive-limit-%zu", i);
+    assert(transport_set_directional_track_repair_policy(
+        endpoint->transport, &track, &policy, TRANSPORT_TRACK_RECEIVE));
+  }
+  policy.max_extra_percent = 75;
+  assert(!transport_set_track_repair_policy(endpoint->transport, &target,
+                                            &policy));
+  assert(transport_get_track_repair_policy(endpoint->transport, &target,
+                                           &effective));
+  assert(effective.max_extra_percent == 25);
+  qlinq_context_destroy(context);
+}
+
 int main(void) {
+  test_stream_policy_lifecycle();
   qlinq_context_t *context = qlinq_context_create(NULL);
   assert(context);
   qlinq_endpoint_config_t config = {.bind_addresses = {"127.0.0.1"},
