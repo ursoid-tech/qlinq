@@ -124,6 +124,71 @@ static void check_constrained_multipath(void) {
          p0_before);
   assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
          p1_before + 2U);
+
+  /* deadline-aware publication and repair must exclude paths above max age */
+  for (size_t i = 0; i < 20; i++)
+    fixture_tick(&f);
+  qlinq_repair_policy_t deadline_policy = {.present = QLINQ_REPAIR_REACTIVE |
+                                                      QLINQ_REPAIR_MAX_AGE |
+                                                      QLINQ_REPAIR_MAX_EXTRA,
+                                           .reactive_repair = true,
+                                           .max_object_age_ms = 25,
+                                           .max_extra_percent = 200};
+  assert(transport_set_track_repair_policy(t, &track, &deadline_policy));
+  assert(transport_mock_path_state(t, 0, 100000, 100, 0.0f));
+  assert(transport_mock_path_state(t, 1, 100000, 100, 0.0f));
+  moq_object_t deadline_obj = {.track_id = track,
+                               .group_id = 2,
+                               .object_id = 0,
+                               .data = payload,
+                               .size = sizeof(payload)};
+  assert(transport_publish_ex(t, &deadline_obj) ==
+         TRANSPORT_PUBLISH_BACKPRESSURE);
+
+  assert(transport_mock_path_state(t, 0, 100000, 100, 0.0f));
+  assert(transport_mock_path_state(t, 1, 100000, 5, 0.0f));
+  p0_before = quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic);
+  p1_before = quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic);
+  assert(transport_publish_ex(t, &deadline_obj) == TRANSPORT_PUBLISH_DELIVERED);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         p0_before);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) >
+         p1_before);
+  fixture_receive(&f, &f.client, 1);
+
+  sent_object_cache_t *deadline_cached =
+      transport_sent_cache_find(&t->sent_cache, &track, 2, 0);
+  assert(deadline_cached && deadline_cached->expires_at_ms > 0);
+  deadline_cached->expires_at_ms =
+      (int64_t)(transport_get_monotonic_ns() / 1000000ULL) + 20;
+  uint32_t budget_before = deadline_cached->remaining_repair_symbols;
+  assert(budget_before >= 2U);
+
+  /* neither path can meet a 20 ms remaining deadline at 100 ms latency */
+  assert(transport_mock_path_state(t, 0, 100000, 100, 0.0f));
+  assert(transport_mock_path_state(t, 1, 100000, 100, 0.0f));
+  p0_before = quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic);
+  p1_before = quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic);
+  inject_nack(conn->stream, alias, 2, 0, missing, 2);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         p0_before);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
+         p1_before);
+  assert(deadline_cached->remaining_repair_symbols == budget_before);
+
+  /* cap repair burst to the 1 symbol that can finish before deadline */
+  deadline_cached->expires_at_ms =
+      (int64_t)(transport_get_monotonic_ns() / 1000000ULL) + 20;
+  conn->paths[1].state.b_ewma = FP_FROM_INT(100);
+  conn->paths[1].state.l_ewma = FP_FROM_FLOAT(0.005f);
+  conn->paths[1].state.p_ewma = 0;
+  conn->paths[1].state.q_ewma = 0;
+  inject_nack(conn->stream, alias, 2, 0, missing, 2);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[0].quic) ==
+         p0_before);
+  assert(quicly_get_num_datagram_frames_path(conn->quic, paths[1].quic) ==
+         p1_before + 1U);
+  assert(deadline_cached->remaining_repair_symbols == budget_before - 1U);
   fixture_destroy(&f);
 }
 

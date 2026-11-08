@@ -277,7 +277,8 @@ static fp_t schedule_path_finish(const path_t *path, size_t symbols) {
 
 static bool resize_schedule_parity(transport_schedule_t *schedule,
                                    size_t active_paths, size_t parity_symbols,
-                                   const size_t *capacities) {
+                                   const size_t *capacities, fp_t horizon,
+                                   bool require_exact) {
   size_t placed = 0;
   for (size_t i = 0; i < active_paths; i++) {
     if (schedule->paths[i].x > schedule->paths[i].m)
@@ -285,7 +286,7 @@ static bool resize_schedule_parity(transport_schedule_t *schedule,
     else
       schedule->paths[i].x = schedule->paths[i].m;
   }
-  while (placed > parity_symbols) {
+  for (;;) {
     size_t worst = SIZE_MAX;
     fp_t latest = -1;
     for (size_t i = 0; i < active_paths; i++) {
@@ -293,13 +294,13 @@ static bool resize_schedule_parity(transport_schedule_t *schedule,
         continue;
       fp_t finish =
           schedule_path_finish(&schedule->paths[i], schedule->paths[i].x);
-      if (finish >= latest) {
+      if ((placed > parity_symbols || finish > horizon) && finish >= latest) {
         latest = finish;
         worst = i;
       }
     }
     if (worst == SIZE_MAX)
-      return false;
+      break;
     schedule->paths[worst].x--;
     placed--;
   }
@@ -312,16 +313,21 @@ static bool resize_schedule_parity(transport_schedule_t *schedule,
         continue;
       fp_t finish =
           schedule_path_finish(&schedule->paths[i], schedule->paths[i].x + 1U);
-      if (finish < earliest) {
+      if (finish <= horizon && finish < earliest) {
         earliest = finish;
         best = i;
       }
     }
-    if (best == SIZE_MAX)
-      return false;
+    if (best == SIZE_MAX) {
+      if (require_exact || horizon == FP_MAX)
+        return false;
+      break;
+    }
     schedule->paths[best].x++;
     placed++;
   }
+  if (require_exact && placed != parity_symbols)
+    return false;
   schedule->parity_symbols = placed;
   return true;
 }
@@ -329,7 +335,7 @@ static bool resize_schedule_parity(transport_schedule_t *schedule,
 static bool
 apply_schedule_repair_policy(const transport_track_profile_t *profile,
                              size_t active_paths, size_t data_symbols,
-                             transport_schedule_t *schedule) {
+                             fp_t horizon, transport_schedule_t *schedule) {
   if (!profile->fec_enabled && !profile->fec_rateless)
     return true;
   if (!profile->proactive_fec) {
@@ -366,8 +372,37 @@ apply_schedule_repair_policy(const transport_track_profile_t *profile,
                                     QLINQ_FEC_MAX_TOTAL_SYMBOLS, &protection))
     return false;
 
-  return resize_schedule_parity(schedule, active_paths,
-                                protection.initial_parity, NULL);
+  return resize_schedule_parity(
+      schedule, active_paths, protection.initial_parity, NULL, horizon, false);
+}
+
+static fp_t
+publication_deadline_latency(const transport_conn_t *conn,
+                             const transport_publication_path_t *path,
+                             fp_t horizon) {
+  if (horizon != FP_MAX && !conn->paths[path->physical].state_overridden)
+    return path->rate_known ? path->sample.l : 0;
+  return path->state.l_ewma;
+}
+
+static fp_t publication_horizon(transport_t *t,
+                                const transport_track_profile_t *profile,
+                                const sent_object_cache_t *retained) {
+  if (retained && retained->expires_at_ms > 0)
+    return transport_policy_remaining_horizon(retained->expires_at_ms,
+                                              transport_now_ms(t));
+  if (!profile->policy.enabled || profile->policy.max_object_age_ms == 0)
+    return FP_MAX;
+  if (t->pending_group.pending && t->pending_group.started_at_ms > 0) {
+    int64_t start_ms = (int64_t)t->pending_group.started_at_ms;
+    uint32_t age_ms = profile->policy.max_object_age_ms;
+    int64_t expires_at_ms = (uint64_t)age_ms > (uint64_t)(INT64_MAX - start_ms)
+                                ? INT64_MAX
+                                : start_ms + (int64_t)age_ms;
+    return transport_policy_remaining_horizon(expires_at_ms,
+                                              transport_now_ms(t));
+  }
+  return transport_policy_horizon_seconds(profile->policy.max_object_age_ms);
 }
 
 static transport_publish_result_t
@@ -390,11 +425,16 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     return TRANSPORT_PUBLISH_BACKPRESSURE;
 
   bool use_fec = profile->fec_enabled || profile->fec_rateless;
-  if (!retained_total && profile->reactive_repair && !profile->fec_rateless) {
-    const sent_object_cache_t *retained = transport_sent_cache_find(
-        &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
+  const sent_object_cache_t *retained =
+      (profile->reactive_repair || profile->checkpoint_recovery)
+          ? transport_sent_cache_find(&t->sent_cache, &obj->track_id,
+                                      obj->group_id, obj->object_id)
+          : NULL;
+  if (!retained_total && profile->reactive_repair && !profile->fec_rateless)
     retained_total = transport_sent_recipient_total(retained, conn->id);
-  }
+  fp_t horizon = publication_horizon(t, profile, retained);
+  if (horizon < 0)
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
   /* Replan without a path that cannot admit its allocation. This bounded
    * fallback leaves feasible partial-capacity combinations to future planner
    * improvements, but never blocks an empty alternate behind a full favorite.
@@ -404,6 +444,7 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
     size_t capacities[TRANSPORT_MAX_PATHS];
     for (size_t i = 0; i < active_paths; i++) {
       states[i] = paths[i].state;
+      states[i].l_ewma = publication_deadline_latency(conn, &paths[i], horizon);
       capacities[i] =
           transport_publish_path_capacity(conn, &paths[i], admission_now);
     }
@@ -412,10 +453,11 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
                                   use_fec, obj->priority,
                                   &conn->round_robin_path, &plan->schedule) ||
         !apply_schedule_repair_policy(profile, active_paths, data_symbols,
-                                      &plan->schedule) ||
+                                      horizon, &plan->schedule) ||
         (retained_total &&
          !resize_schedule_parity(&plan->schedule, active_paths,
-                                 retained_total - data_symbols, NULL)))
+                                 retained_total - data_symbols, NULL, horizon,
+                                 true)))
       return TRANSPORT_PUBLISH_ERROR;
 
     size_t blocked = active_paths;
@@ -436,14 +478,17 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
           burst = symbols;
         note_admission_retry(conn, physical, burst, symbols, admission_now);
       }
-      if (symbols > capacities[i]) {
+      bool over_deadline =
+          horizon != FP_MAX &&
+          schedule_path_finish(&plan->schedule.paths[i], symbols) > horizon;
+      if (symbols > capacities[i] || over_deadline) {
         blocked = i;
         break;
       }
     }
     if (blocked == active_paths)
       break;
-    if (active_paths > 1 && capacities[blocked] > 0 &&
+    if (active_paths > 1 && (capacities[blocked] > 0 || horizon != FP_MAX) &&
         active_paths <= TRANSPORT_POLICY_PATHS) {
       transport_policy_path_t candidates[TRANSPORT_POLICY_PATHS];
       for (size_t i = 0; i < active_paths; i++) {
@@ -454,7 +499,8 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
         }
         candidates[i] = (transport_policy_path_t){
             .measurement = {.b = b,
-                            .l = paths[i].state.l_ewma,
+                            .l = publication_deadline_latency(conn, &paths[i],
+                                                              horizon),
                             .p = paths[i].state.p_ewma,
                             .q = paths[i].state.q_ewma},
             .capacity = capacities[i]};
@@ -482,12 +528,13 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
           data_symbols * policy.max_initial_extra_percent >= 100U)
         policy.min_initial_parity_symbols = 1;
       transport_policy_schedule_t constrained;
+      uint32_t fatal_reasons = TRANSPORT_PROTECTION_QUEUE_LIMIT;
+      if (horizon == FP_MAX)
+        fatal_reasons |= TRANSPORT_PROTECTION_MINIMUM_UNMET;
       if (transport_policy_schedule(&policy, candidates, active_paths,
                                     data_symbols, QLINQ_FEC_MAX_TOTAL_SYMBOLS,
-                                    FP_MAX, &constrained) &&
-          (constrained.protection.reasons &
-           (TRANSPORT_PROTECTION_QUEUE_LIMIT |
-            TRANSPORT_PROTECTION_MINIMUM_UNMET)) == 0) {
+                                    horizon, &constrained) &&
+          (constrained.protection.reasons & fatal_reasons) == 0) {
         plan->schedule.parity_symbols = constrained.protection.initial_parity;
         for (size_t i = 0; i < active_paths; i++) {
           plan->schedule.paths[i].m = constrained.source[i];
@@ -496,7 +543,8 @@ plan_datagrams(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
         }
         if (!retained_total ||
             resize_schedule_parity(&plan->schedule, active_paths,
-                                   retained_total - data_symbols, capacities))
+                                   retained_total - data_symbols, capacities,
+                                   horizon, true))
           break;
       }
     }
@@ -683,9 +731,12 @@ static transport_publish_result_t publish_datagram_to_flexicast(
   size_t parity_symbols = 0;
   bool scheduled = false;
   uint16_t retained_total = 0;
+  const sent_object_cache_t *retained =
+      (profile->reactive_repair || profile->checkpoint_recovery)
+          ? transport_sent_cache_find(&t->sent_cache, &obj->track_id,
+                                      obj->group_id, obj->object_id)
+          : NULL;
   if (profile->reactive_repair && !profile->fec_rateless) {
-    const sent_object_cache_t *retained = transport_sent_cache_find(
-        &t->sent_cache, &obj->track_id, obj->group_id, obj->object_id);
     for (size_t i = 0; i < flow->member_count; i++) {
       const transport_conn_t *member = flow->members[i].conn;
       if (!member || !flow->members[i].listening)
@@ -698,6 +749,9 @@ static transport_publish_result_t publish_datagram_to_flexicast(
         retained_total = total;
     }
   }
+  fp_t horizon = publication_horizon(t, profile, retained);
+  if (horizon < 0)
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
   for (size_t i = 0; i < flow->member_count; i++) {
     transport_conn_t *member = flow->members[i].conn;
     if (!member || !flow->members[i].listening || !member->quic ||
@@ -725,6 +779,8 @@ static transport_publish_result_t publish_datagram_to_flexicast(
         if (live->measurement.quic_path != mapped)
           memset(&state, 0, sizeof(state));
         transport_path_update_state(&state, &sample, false);
+        if (horizon != FP_MAX)
+          state.l_ewma = stats.rtt_smoothed > 0 ? sample.l : 0;
       }
       active_states[active_paths] = state;
       quicly_flexicast_member_stats_t shared;
@@ -755,7 +811,7 @@ static transport_publish_result_t publish_datagram_to_flexicast(
                                   use_fec, obj->priority, &scratch_round_robin,
                                   &member_schedule) ||
         !apply_schedule_repair_policy(profile, active_paths, data_symbols,
-                                      &member_schedule))
+                                      horizon, &member_schedule))
       return TRANSPORT_PUBLISH_ERROR;
     if (member_schedule.parity_symbols > parity_symbols)
       parity_symbols = member_schedule.parity_symbols;
@@ -1626,12 +1682,14 @@ static transport_publish_result_t publish_object(transport_t *t,
                   : 0U;
         }
         if (profile.policy.enabled && profile.policy.max_object_age_ms != 0) {
-          int64_t now_ms = transport_now_ms(t);
+          int64_t start_ms = grouped && t->pending_group.started_at_ms > 0
+                                 ? (int64_t)t->pending_group.started_at_ms
+                                 : transport_now_ms(t);
           uint32_t age_ms = profile.policy.max_object_age_ms;
           cached_entry->expires_at_ms =
-              (uint64_t)age_ms > (uint64_t)(INT64_MAX - now_ms)
+              (uint64_t)age_ms > (uint64_t)(INT64_MAX - start_ms)
                   ? INT64_MAX
-                  : now_ms + (int64_t)age_ms;
+                  : start_ms + (int64_t)age_ms;
         }
       }
     }

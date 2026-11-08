@@ -36,4 +36,21 @@ bool transport_policy_schedule(const qlinq_effective_repair_policy_t *policy,
                                size_t max_total_symbols, fp_t horizon_seconds,
                                transport_policy_schedule_t *schedule);
 
+/* convert a millisecond deadline budget into fixed-point seconds */
+static inline fp_t transport_policy_horizon_seconds(uint64_t remaining_ms) {
+  if (remaining_ms == 0 || remaining_ms >= (uint64_t)FP_SAFE_WHOLE * 1000ULL)
+    return FP_MAX;
+  fp_t horizon = (fp_t)(((fp_wide_t)remaining_ms * FP_ONE) / 1000);
+  return horizon > 0 ? horizon : 1;
+}
+
+static inline fp_t transport_policy_remaining_horizon(int64_t expires_at_ms,
+                                                      int64_t now_ms) {
+  if (expires_at_ms <= 0)
+    return FP_MAX;
+  if (now_ms >= expires_at_ms)
+    return -1;
+  return transport_policy_horizon_seconds((uint64_t)(expires_at_ms - now_ms));
+}
+
 #endif
