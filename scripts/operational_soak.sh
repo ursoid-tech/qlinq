@@ -18,6 +18,13 @@ deadline=$((started + duration))
 iterations=0
 cases_run=0
 peak_kib=0
+time_file=
+run_log=
+
+cleanup_soak() {
+  rm -f ${time_file:+"$time_file"} ${run_log:+"$run_log"}
+}
+trap cleanup_soak EXIT INT TERM
 
 run_case() {
   case_name=$1
@@ -26,12 +33,16 @@ run_case() {
   run_log=$(mktemp)
   if ! /usr/bin/time -f '%M' -o "$time_file" "$executable" >"$run_log" 2>&1; then
     cat "$run_log" >&2
-    rm -f "$time_file" "$run_log"
+    cleanup_soak
+    time_file=
+    run_log=
     echo "operational soak case '$case_name' failed after $iterations completed cycles" >&2
     exit 1
   fi
   rss=$(sed -n '$p' "$time_file")
-  rm -f "$time_file" "$run_log"
+  cleanup_soak
+  time_file=
+  run_log=
   case "$rss" in
     ''|*[!0-9]*) rss=0 ;;
   esac

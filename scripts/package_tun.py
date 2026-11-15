@@ -25,14 +25,15 @@ def main():
         shutil.copy2(root / "docs/tun-tool.md", docs / "README.md")
         with tarfile.open(archive, "w:gz") as bundle:
             for path in sorted(stage.rglob("*")):
-                info = bundle.gettarinfo(str(path), arcname=str(path.relative_to(stage)))
+                if not path.is_file():
+                    continue
+                arcname = str(path.relative_to(stage))
+                info = bundle.gettarinfo(str(path), arcname=arcname)
                 info.uid = info.gid = 0
                 info.uname = info.gname = "root"
-                if path.is_file():
-                    with path.open("rb") as source:
-                        bundle.addfile(info, source)
-                else:
-                    bundle.addfile(info)
+                info.mode = 0o755 if arcname == "usr/local/bin/qlinq-tun" else 0o644
+                with path.open("rb") as source:
+                    bundle.addfile(info, source)
     print(archive.resolve())
 
 

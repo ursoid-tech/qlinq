@@ -19,6 +19,6 @@ done || bad_status=1
 python3 scripts/prepare_picotls.py --check
 export QLINQ_PICOTLS_PATCH="$(pwd)/patches/picotls-negotiated-group.patch"
 git submodule foreach --quiet --recursive \
-  'if ! git diff --quiet --ignore-submodules=all; then if [ "$displaypath" = "deps/quicly/deps/picotls" ] && git diff HEAD --binary | cmp -s - "$QLINQ_PICOTLS_PATCH"; then exit 0; fi; echo "tracked changes in submodule: $displaypath" >&2; exit 1; fi'
+  'if ! git diff HEAD --quiet --ignore-submodules=all; then if [ "$displaypath" = "deps/quicly/deps/picotls" ] && git diff HEAD --binary | cmp -s - "$QLINQ_PICOTLS_PATCH"; then exit 0; fi; echo "tracked changes in submodule: $displaypath" >&2; exit 1; fi'
 
 echo "submodule revisions are pinned and tracked contents match pins plus the recorded Picotls patch"

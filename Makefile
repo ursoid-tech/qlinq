@@ -58,7 +58,7 @@ endif
 endif
 
 # Include paths: use -isystem for quicly and picotls to suppress warning headers
-INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
+INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/flexicast.c \
@@ -206,17 +206,7 @@ deps/%.o: deps/%.c .build-config
 
 all: qlinq-app qlinq-tun
 
-# Track only backend inclusion here; other compiler flag changes still require
-# a clean build. Switching WITH_FUSION must rebuild its dispatch and tests.
-.PHONY: FORCE_FUSION_CONFIG
-FORCE_FUSION_CONFIG:
-
-tmp/fusion-config: FORCE_FUSION_CONFIG
-	@mkdir -p $(@D)
-	@printf 'WITH_FUSION=%s\n' '$(WITH_FUSION)' >$@.tmp
-	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
-
-src/common/transport_tls.o t/00util/test_crypto_backend.o: tmp/fusion-config Makefile
+src/common/transport_tls.o t/00util/test_crypto_backend.o: .build-config Makefile
 
 deps/quicly/deps/picotls/lib/fusion.o: deps/quicly/deps/picotls/lib/fusion.c Makefile .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(FUSION_CFLAGS) -w -c $< -o $@
@@ -288,7 +278,7 @@ t/00util/test_tun_packet: t/00util/test_tun_packet.o src/common/tun_packet.o
 t/00util/test_tun_receive_batch: t/00util/test_tun_receive_batch.o src/common/tun_receive_batch.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST)
+check-tun-tool: qlinq-tun t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST)
 	./t/00util/test_tun_packet
 	./t/00util/test_tun_segment
 	./t/00util/test_tun_coalesce
@@ -296,6 +286,7 @@ check-tun-tool: qlinq-tun t/00util/test_tun_names t/00util/test_tun_queue t/00ut
 	./t/00util/test_tun_receive_batch
 	./t/00util/test_tun_queue
 	./t/00util/test_tun_names
+	./t/00util/test_tun_json
 	python3 t/test_tun_tool.py
 	python3 t/test_tun_metrics.py
 
@@ -430,6 +421,8 @@ check-multipath-bw-reports:
 
 check-reports: check-transit-reports check-multipath-bw-reports
 
+check-examples: examples/data_multipath_benchmark examples/transit_benchmark examples/transit_udp_calibration check-reports
+
 check-multipath-bw-demo: check-multipath-bw-reports
 	@if [ "$${QLINQ_SKIP_PRIVILEGED:-0}" = 1 ]; then \
 		echo "SKIP privileged bandwidth demo (QLINQ_SKIP_PRIVILEGED=1)"; \
@@ -540,15 +533,16 @@ t/00util/test_multipath_feedback: t/00util/test_multipath_feedback.o t/00util/tr
 check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
-clean: 
-	rm -f t/00util/test_flexicast_transport
-	rm -f t/00util/test_publication_deadlines
-	rm -f t/00util/test_transport_engine t/00util/test_transport_engine.map t/00util/test_recovery_latency t/00util/test_recovery_latency.map
-	rm -f $(QUICLY_INTEGRATION_TEST)
+clean:
+	rm -f qlinq-app qlinq-tun libqlinq.a libqlinq.a.tmp .build-config .build-config.tmp tmp/fusion-config
+	rm -f $(CHECK_BINARIES) $(TRANSPORT_TESTS) $(API_TESTS)
+	rm -f t/00util/test_tun_tx_kernel t/00util/test_tun_rx_kernel t/00util/fuzz_transport_wire
+	rm -f t/00util/test_transport_engine.map t/00util/test_recovery_latency.map
+	rm -f examples/data_multipath_benchmark examples/transit_benchmark examples/transit_udp_calibration
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
-		$(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
+		deps/nanors/rs.d \
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
