@@ -359,6 +359,12 @@ int main(void) {
       break;
   }
   assert(server->peers && client->peers);
+  assert(server->transport->quic_ctx.transport_params.initial_max_path_id ==
+         16);
+  assert(!client->transport->quic_ctx.transport_params.enable_multipath);
+  assert(client->transport->quic_ctx.transport_params.initial_max_path_id == 0);
+  assert(!quicly_is_multipath(server->peers->connection->quic));
+  assert(!quicly_is_multipath(client->peers->connection->quic));
   qlinq_peer_info_t server_info, client_info;
   assert(qlinq_endpoint_get_peer(server, server->peers->id, &server_info));
   assert(qlinq_endpoint_get_peer(client, client->peers->id, &client_info));
@@ -379,6 +385,9 @@ int main(void) {
   filter_config.interface_user_data = &filter_state;
   qlinq_endpoint_t *filtered = qlinq_connect(context, &filter_config);
   assert(filtered);
+  assert(filtered->transport->quic_ctx.transport_params.enable_multipath);
+  assert(filtered->transport->quic_ctx.transport_params.initial_max_path_id ==
+         16);
   filter_state.expected_endpoint = filtered;
 
   struct sockaddr_storage cand = {0};

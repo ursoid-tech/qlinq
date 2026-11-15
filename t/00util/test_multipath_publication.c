@@ -589,9 +589,17 @@ int main(void) {
   physical->owd_initialized = true;
   physical->telemetry_path = paths[0];
   physical->latest_owd_fp = FP_FROM_INT(2);
+  uint8_t stale_dgram[16] = {0xa5};
+  assert(transport_queue_datagram(
+      f.server.conn, paths[0],
+      ptls_iovec_init(stale_dgram, sizeof(stale_dgram))));
+  assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]) ==
+         1);
   quicly_path_health_t health;
   assert(quicly_get_path_health(f.server.conn->quic, paths[0], &health) == 0);
   assert(quicly_abandon_path(f.server.conn->quic, health.path_id, 0) == 0);
+  assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]) ==
+         1);
   assert(transport_path_get_eligible_by_local(
              f.server.conn->quic, &f.server.transport->sockets[0].local_addr,
              &stats) == paths[1]);
@@ -624,6 +632,9 @@ int main(void) {
   assert(physical->state.p_ewma < FP_ONE / 2);
   assert(physical->state.l_ewma < FP_ONE);
   fixture_receive(&f, &f.client, 2);
+  assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]) ==
+         0);
+  assert(!quicly_has_datagram_frames(f.server.conn->quic));
   assert(f.client.payload_size == sizeof(payload) &&
          memcmp(f.client.payload, payload, sizeof(payload)) == 0);
   fixture_destroy(&f);

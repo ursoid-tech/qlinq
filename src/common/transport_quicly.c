@@ -509,23 +509,26 @@ static void abandon_removed_paths(transport_conn_t *conn) {
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
     quicly_path_health_t health;
     if (quicly_get_path_health(conn->quic, path, &health) != 0 ||
-        health.abandoned || qlinq_path_is_eligible(NULL, conn->quic, path))
+        qlinq_path_is_eligible(NULL, conn->quic, path))
       continue;
-    (void)quicly_abandon_path(conn->quic, health.path_id,
-                              QUICLY_PATH_ABANDON_ERROR_APPLICATION);
+    if (quicly_get_num_datagram_frames_path(conn->quic, path) != 0)
+      quicly_discard_datagram_frames(conn->quic, path);
+    if (!health.abandoned)
+      (void)quicly_abandon_path(conn->quic, health.path_id,
+                                QUICLY_PATH_ABANDON_ERROR_APPLICATION);
   }
 }
 
 static void refresh_scheduler_paths(transport_conn_t *conn) {
   transport_t *t = conn->transport;
   conn->scheduler_paths = 0;
+  bool has_datagrams = quicly_has_datagram_frames(conn->quic) != 0;
   /* The pinned QUIC API has no path iterator. Snapshot slot ownership once
    * before a service pass; each send batch refreshes only these paths' live
    * congestion and health state. Multiple remote paths may share one socket. */
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
     quicly_path_stats_t stats;
-    if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
-        !quicly_is_path_available(conn->quic, path))
+    if (quicly_get_path_stats(conn->quic, path, &stats) != 0)
       continue;
     size_t matched = SIZE_MAX;
     for (size_t physical = 0; physical < t->socket_count; physical++) {
@@ -535,7 +538,16 @@ static void refresh_scheduler_paths(transport_conn_t *conn) {
         break;
       }
     }
-    if (matched != SIZE_MAX) {
+    /* discard stale datagrams on unowned, abandoned, or suspect paths */
+    if (has_datagrams &&
+        quicly_get_num_datagram_frames_path(conn->quic, path) != 0) {
+      quicly_path_health_t health;
+      if (matched == SIZE_MAX ||
+          (quicly_get_path_health(conn->quic, path, &health) == 0 &&
+           (health.abandoned || health.state == QUICLY_PATH_SUSPECT)))
+        quicly_discard_datagram_frames(conn->quic, path);
+    }
+    if (matched != SIZE_MAX && quicly_is_path_available(conn->quic, path)) {
       conn->scheduler_paths |= UINT64_C(1) << path;
       conn->scheduler_sockets[path] = (uint8_t)matched;
     }
@@ -570,10 +582,13 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
         continue;
       quicly_path_stats_t stats;
       quicly_path_health_t health;
-      if (quicly_get_path_stats(quic, path, &stats) != 0 ||
-          (quicly_get_path_health(quic, path, &health) == 0 &&
-           health.state == QUICLY_PATH_SUSPECT))
+      if (quicly_get_path_stats(quic, path, &stats) != 0)
         continue;
+      if (quicly_get_path_health(quic, path, &health) == 0 &&
+          (health.abandoned || health.state == QUICLY_PATH_SUSPECT)) {
+        quicly_discard_datagram_frames(quic, path);
+        continue;
+      }
       size_t packets_sent = 0;
       quicly_error_t ret =
           quicly_send_on_path(quic, send_context, path, &packets_sent);
@@ -890,6 +905,11 @@ static void try_open_pending_paths(transport_t *t, transport_conn_t *conn,
                                    uint64_t now) {
   if (!t || !conn || t->is_server || !conn->quic_ready)
     return;
+  if (!quicly_is_multipath(conn->quic)) {
+    for (size_t i = 0; i < t->socket_count; i++)
+      t->sockets[i].open_pending = false;
+    return;
+  }
 
   bool handshake_confirmed = false;
   for (size_t local_index = 0; local_index < t->socket_count; local_index++) {
@@ -1351,7 +1371,14 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   t->quic_ctx.transport_params.max_streams_bidi = 1;
 
   t->quic_ctx.transport_params.active_connection_id_limit = 8;
-  t->quic_ctx.transport_params.initial_max_path_id = 16;
+  /* advertise MPQUIC only when secondary paths or flexicast are configured */
+  bool multipath_capable =
+      t->is_server || config->multihome || config->num_bind_hosts > 1 ||
+      config->num_remote_hosts > 1 || config->num_path_interface_names > 0 ||
+      config->interface_callback != NULL;
+  t->quic_ctx.transport_params.enable_multipath =
+      multipath_capable || t->flexicast_enabled;
+  t->quic_ctx.transport_params.initial_max_path_id = multipath_capable ? 16 : 0;
   t->quic_ctx.transport_params.flexicast_support.ipv4 = t->flexicast_enabled;
   t->quic_ctx.transport_params.flexicast_support.ipv6 = t->flexicast_enabled;
 
