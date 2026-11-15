@@ -8,9 +8,7 @@
 static path_t estimate_with_rtt(float rtt_ms, const quicly_path_stats_t *stats,
                                 size_t queued_datagrams, size_t egress_bytes,
                                 size_t symbol_size, fp_t relative_owd) {
-  path_t sample = {.b = FP_FROM_INT(100),
-                   .l = FP_FROM_FLOAT(0.050f),
-                   .p = FP_FROM_FLOAT(0.01f)};
+  path_t sample = transport_path_default_sample();
   if (stats) {
     if (isfinite(rtt_ms) && rtt_ms > 0) {
       fp_t latency = FP_FROM_FLOAT(rtt_ms / 2000.0f);
@@ -72,12 +70,52 @@ path_t transport_path_estimate_on_path(quicly_conn_t *quic, size_t path_index,
 
 void transport_path_update_state(path_state_t *state, const path_t *sample,
                                  bool periodic) {
-  if (!state->initialized || periodic)
-    pathflow_update_state(state, sample->b, sample->l, sample->p, sample->q,
-                          FP_FROM_FLOAT(0.1f));
-  /* An integer EWMA can hide small queues indefinitely and retain a phantom
-   * backlog after draining. Keep the existing field name for pathflow. */
-  state->q_ewma = sample->q;
+  if (!state || !sample)
+    return;
+  if (!state->initialized) {
+    state->b_ewma = sample->b;
+    state->l_ewma = sample->l;
+    state->p_ewma = sample->p;
+    state->initialized = 1;
+  } else if (periodic) {
+    const fp_t alpha = FP_FROM_FLOAT(0.1f);
+    const fp_t keep = FP_ONE - alpha;
+    state->b_ewma =
+        FP_ADD(FP_MUL(alpha, sample->b), FP_MUL(keep, state->b_ewma));
+    state->l_ewma =
+        FP_ADD(FP_MUL(alpha, sample->l), FP_MUL(keep, state->l_ewma));
+    state->p_ewma =
+        FP_ADD(FP_MUL(alpha, sample->p), FP_MUL(keep, state->p_ewma));
+  }
+  /* preserve current queue occupancy rather than smoothing it */
+  state->q_ewma = sample->q > FP_SAFE_WHOLE ? FP_SAFE_WHOLE : sample->q;
+}
+
+size_t transport_stream_select_path(const path_t *paths, size_t num_paths,
+                                    uint64_t excluded_paths) {
+  if (!paths || num_paths > TRANSPORT_MAX_QUIC_PATHS)
+    return SIZE_MAX;
+
+  size_t selected = SIZE_MAX;
+  fp_t earliest = FP_MAX;
+  for (size_t i = 0; i < num_paths; i++) {
+    if ((excluded_paths & (UINT64_C(1) << i)) != 0)
+      continue;
+    fp_t success = FP_ONE - paths[i].p;
+    if (success <= 0)
+      continue;
+    fp_t usable_rate = FP_MUL(paths[i].b, success);
+    if (usable_rate <= 0)
+      continue;
+    fp_t finish =
+        FP_ADD(paths[i].l,
+               FP_DIV(FP_ADD(FP_FROM_INT(paths[i].q), FP_ONE), usable_rate));
+    if (selected == SIZE_MAX || finish < earliest) {
+      selected = i;
+      earliest = finish;
+    }
+  }
+  return selected;
 }
 
 bool transport_address_equal(const struct sockaddr *a,
@@ -385,23 +423,58 @@ transport_path_socket_for_source(const struct sockaddr_storage *local_addrs,
   return wildcard;
 }
 
-size_t transport_path_socket_for_peer(
+size_t transport_path_select_peer_egress(
     quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
-    size_t num_local_addrs, struct sockaddr_storage *destination) {
+    size_t num_local_addrs, struct sockaddr_storage *destination,
+    struct sockaddr_storage *source) {
   if (!quic || !destination)
     return SIZE_MAX;
+  size_t fallback_socket = SIZE_MAX;
+  quicly_path_stats_t fallback_stats;
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
     quicly_path_stats_t stats;
+    quicly_path_health_t health;
     if (!quicly_is_path_available(quic, path) ||
         quicly_get_path_stats(quic, path, &stats) != 0)
+      continue;
+    bool has_health = quicly_get_path_health(quic, path, &health) == 0;
+    if (has_health && (health.abandoned || health.state == QUICLY_PATH_SUSPECT))
       continue;
     size_t socket = transport_path_socket_for_source(
         local_addrs, num_local_addrs, &stats.local.sa);
     if (socket == SIZE_MAX)
       continue;
-    memset(destination, 0, sizeof(*destination));
-    memcpy(destination, &stats.remote.sa, quicly_get_socklen(&stats.remote.sa));
-    return socket;
+    if (!has_health || health.validated) {
+      memset(destination, 0, sizeof(*destination));
+      memcpy(destination, &stats.remote.sa,
+             quicly_get_socklen(&stats.remote.sa));
+      if (source) {
+        memset(source, 0, sizeof(*source));
+        memcpy(source, &stats.local.sa, quicly_get_socklen(&stats.local.sa));
+      }
+      return socket;
+    }
+    if (fallback_socket == SIZE_MAX) {
+      fallback_socket = socket;
+      fallback_stats = stats;
+    }
   }
-  return SIZE_MAX;
+  if (fallback_socket != SIZE_MAX) {
+    memset(destination, 0, sizeof(*destination));
+    memcpy(destination, &fallback_stats.remote.sa,
+           quicly_get_socklen(&fallback_stats.remote.sa));
+    if (source) {
+      memset(source, 0, sizeof(*source));
+      memcpy(source, &fallback_stats.local.sa,
+             quicly_get_socklen(&fallback_stats.local.sa));
+    }
+  }
+  return fallback_socket;
+}
+
+size_t transport_path_socket_for_peer(
+    quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
+    size_t num_local_addrs, struct sockaddr_storage *destination) {
+  return transport_path_select_peer_egress(quic, local_addrs, num_local_addrs,
+                                           destination, NULL);
 }

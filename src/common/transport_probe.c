@@ -66,16 +66,26 @@ static int64_t probe_paths(transport_conn_t *conn, int64_t now, bool request) {
     }
 
     if (request && state->next_at_ms <= now && now != INT64_MAX) {
-      /* Match the native send loop's complete-batch output reservation. A
-       * blocked host must not gain an immediately due native control frame. */
+      /* check only the owning local socket so a congested sibling uplink does
+       * not suppress probes on healthy paths */
+      size_t owner = SIZE_MAX;
+      for (size_t i = 0; i < t->socket_count; i++) {
+        if (transport_path_matches_local(&stats, &t->sockets[i].local_addr)) {
+          owner = i;
+          break;
+        }
+      }
       bool room = true;
-      for (size_t i = 0; i < t->socket_count && room; i++)
-        room = transport_egress_can_accept(&t->sockets[i].egress, 64U,
+      if (owner != SIZE_MAX) {
+        room = transport_egress_can_accept(&t->sockets[owner].egress, 64U,
                                            64U * 1500U);
+      } else {
+        for (size_t i = 0; i < t->socket_count && room; i++)
+          room = transport_egress_can_accept(&t->sockets[i].egress, 64U,
+                                             64U * 1500U);
+      }
       if (room)
         (void)quicly_request_path_probe(conn->quic, path);
-      /* Requests coalesce in Quicly. A rejected or congestion-blocked request
-       * must also wait a full interval before this policy asks again. */
       state->next_at_ms = next_probe_at(now, interval);
     }
     if (state->next_at_ms < deadline)

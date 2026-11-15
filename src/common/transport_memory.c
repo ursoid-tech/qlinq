@@ -7,9 +7,6 @@ bool transport_arena_init(arena_t *arena, size_t capacity) {
   if (!arena || capacity == 0)
     return false;
   memset(arena, 0, sizeof(*arena));
-  arena->buffer = malloc(capacity);
-  if (!arena->buffer)
-    return false;
   arena->capacity = capacity;
   return true;
 }
@@ -23,10 +20,15 @@ void transport_arena_destroy(arena_t *arena) {
 }
 
 void *transport_arena_alloc(arena_t *arena, size_t size) {
-  if (!arena || !arena->buffer || size > SIZE_MAX - 7U)
+  if (!arena || arena->capacity == 0 || size > SIZE_MAX - 7U)
     return NULL;
   size = (size + 7U) & ~(size_t)7U;
-  if (arena->offset > arena->capacity ||
+  if (!arena->buffer && size <= arena->capacity) {
+    arena->buffer = malloc(arena->capacity);
+    if (!arena->buffer)
+      return NULL;
+  }
+  if (!arena->buffer || arena->offset > arena->capacity ||
       size > arena->capacity - arena->offset) {
     if (arena->fallback_count >= TRANSPORT_ARENA_MAX_FALLBACKS)
       return NULL;

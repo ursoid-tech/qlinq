@@ -1,7 +1,6 @@
 /* test_multipath.c */
 
 #include "ifmon.h"
-#include "pathflow.h"
 #include "picotls.h"
 #include "picotls/openssl.h"
 #include "quicly.h"
@@ -235,7 +234,7 @@ static void check_scheduler_log(void *data,
   check->events++;
   check->valid &= event->level == TRANSPORT_LOG_DEBUG &&
                   event->path_index < TRANSPORT_MAX_PATHS &&
-                  strstr(event->message, "mode=pathflow") != NULL &&
+                  strstr(event->message, "mode=greedy") != NULL &&
                   strstr(event->message, "raw_b_pps=") != NULL &&
                   strstr(event->message, " total=") != NULL && raw && used &&
                   sscanf(raw, " raw_q=%zu", &raw_q) == 1 &&

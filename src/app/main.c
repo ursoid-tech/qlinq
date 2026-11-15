@@ -435,6 +435,21 @@ static void on_event(void *user_data, const transport_event_t *event) {
   }
 }
 
+static void on_log(void *user_data, const transport_log_event_t *event) {
+  const app_t *app = user_data;
+  if (!event || !event->component || !event->message)
+    return;
+  bool accepted_tls = strcmp(event->component, "tls") == 0 &&
+                      strstr(event->message, "accepted=1") != NULL;
+  bool explicit_crypto = strcmp(event->component, "crypto") == 0 &&
+                         getenv("QLINQ_CRYPTO_BACKEND") != NULL;
+  if (event->level >= TRANSPORT_LOG_WARNING ||
+      (app && app->options && app->options->verbose) || accepted_tls ||
+      explicit_crypto) {
+    fprintf(stderr, "qlinq[%s] %s\n", event->component, event->message);
+  }
+}
+
 static void service_publish(app_t *app, int64_t now) {
   if (!app->input || app->input_eof ||
       app->subscriptions < app->options->required_subscriptions)
@@ -1306,6 +1321,8 @@ static int run_app(const options_t *options) {
   config.allow_insecure_peer = options->allow_insecure;
   config.callback = on_event;
   config.user_data = &app;
+  config.log_callback = on_log;
+  config.log_user_data = &app;
   config.simulated_loss_rate = options->simulated_loss;
   config.reconnect_enabled = options->peer_arg != NULL;
   config.repair_mode = options->repair_mode;

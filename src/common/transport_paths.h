@@ -1,7 +1,7 @@
 #ifndef QLINQ_TRANSPORT_PATHS_H
 #define QLINQ_TRANSPORT_PATHS_H
 
-#include "pathflow.h"
+#include "transport_fp.h"
 
 #include "quicly.h"
 
@@ -9,6 +9,30 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/socket.h>
+
+typedef struct {
+  fp_t b;
+  fp_t l;
+  fp_t p;
+  size_t q;
+  size_t m;
+  size_t x;
+  fp_t t;
+} path_t;
+
+typedef struct {
+  fp_t b_ewma;
+  fp_t l_ewma;
+  fp_t p_ewma;
+  size_t q_ewma;
+  int initialized;
+} path_state_t;
+
+static inline path_t transport_path_default_sample(void) {
+  return (path_t){.b = FP_FROM_INT(100),
+                  .l = FP_FROM_FLOAT(0.050f),
+                  .p = FP_FROM_FLOAT(0.01f)};
+}
 
 #define TRANSPORT_MAX_QUIC_PATHS 64U
 #ifndef TRANSPORT_PATH_BURST_MAX
@@ -122,5 +146,12 @@ transport_path_socket_for_source(const struct sockaddr_storage *local_addrs,
 size_t transport_path_socket_for_peer(
     quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
     size_t num_local_addrs, struct sockaddr_storage *destination);
+size_t transport_path_select_peer_egress(
+    quicly_conn_t *quic, const struct sockaddr_storage *local_addrs,
+    size_t num_local_addrs, struct sockaddr_storage *destination,
+    struct sockaddr_storage *source);
+/* select send path with earliest expected completion time without parity */
+size_t transport_stream_select_path(const path_t *paths, size_t num_paths,
+                                    uint64_t excluded_paths);
 
 #endif

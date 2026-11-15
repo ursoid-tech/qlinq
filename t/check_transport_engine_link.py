@@ -7,12 +7,13 @@ import sys
 
 binary = Path(sys.argv[1] if len(sys.argv) > 1 else 't/00util/test_transport_engine')
 link_map = Path(str(binary) + '.map').read_text()
-for name in ('transport_poll_host.o', 'transport_udp.o', 'ifmon.o', 'qlinq.o'):
+for name in ('transport_poll_host.o', 'transport_flexicast_host.o', 'transport_udp.o', 'ifmon.o', 'qlinq.o'):
     assert not re.search(r'^LOAD .*[/]' + re.escape(name) + r'$', link_map, re.M), name
 symbols = subprocess.check_output(['nm', str(binary)], text=True)
 for name in ('transport_create', 'transport_tick', 'transport_tick_ready',
              'transport_get_poll_fds', 'transport_rx_cadence_mask',
-             'transport_enable_qlog'):
+             'transport_enable_qlog', 'transport_get_time_ns',
+             'transport_select_datagram_path'):
     assert not re.search(r'\b' + name + r'$', symbols, re.M), name
 undefined = subprocess.check_output(['nm', '-u', str(binary)], text=True)
 for name in ('socket', 'bind', 'connect', 'getsockname', 'getsockopt', 'setsockopt',

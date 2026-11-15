@@ -16,10 +16,13 @@ queue_front(transport_flexicast_queue_t *queue) {
   return &queue->entries[queue->head % queue->capacity];
 }
 
-static bool queue_push(transport_flexicast_queue_t *queue,
-                       const transport_flexicast_queued_payload_t *payload) {
-  if (!queue || !payload || !payload->data || queue->count >= queue->capacity ||
-      payload->size > SIZE_MAX - queue->bytes)
+bool tf_reserve_queue_slots(transport_flexicast_flow_t *flow, size_t count,
+                            size_t slot_bytes) {
+  if (!flow || slot_bytes == 0)
+    return false;
+  transport_flexicast_queue_t *queue = &flow->data_queue;
+  if (queue->capacity == 0 || queue->count > queue->capacity ||
+      count > queue->capacity - queue->count)
     return false;
   if (!queue->entries) {
     if (queue->capacity > SIZE_MAX / sizeof(*queue->entries))
@@ -28,10 +31,52 @@ static bool queue_push(transport_flexicast_queue_t *queue,
     if (!queue->entries)
       return false;
   }
+  for (size_t i = 0; i < count; i++) {
+    size_t idx = (queue->head + queue->count + i) % queue->capacity;
+    transport_flexicast_queued_payload_t *slot = &queue->entries[idx];
+    if (slot->storage_capacity < slot_bytes) {
+      uint8_t *grown = realloc(slot->storage, slot_bytes);
+      if (!grown)
+        return false;
+      slot->storage = grown;
+      slot->storage_capacity = slot_bytes;
+    }
+  }
+  return true;
+}
+
+static bool
+queue_push_slot(transport_flexicast_flow_t *flow, ptls_iovec_t payload,
+                size_t packet_capacity,
+                const transport_flexicast_queued_payload_t *partial) {
+  if (!flow || !payload.base || payload.len > SIZE_MAX - packet_capacity)
+    return false;
+  size_t needed = payload.len + packet_capacity;
+  transport_flexicast_queue_t *queue = &flow->data_queue;
+  if (queue->count >= queue->capacity ||
+      payload.len > SIZE_MAX - queue->bytes ||
+      !tf_reserve_queue_slots(flow, 1, needed))
+    return false;
   size_t tail = (queue->head + queue->count) % queue->capacity;
-  queue->entries[tail] = *payload;
+  transport_flexicast_queued_payload_t *slot = &queue->entries[tail];
+  uint8_t *storage = slot->storage;
+  size_t storage_capacity = slot->storage_capacity;
+  if (partial)
+    *slot = *partial;
+  else
+    memset(slot, 0, sizeof(*slot));
+  slot->storage = storage;
+  slot->storage_capacity = storage_capacity;
+  memcpy(storage, payload.base, payload.len);
+  slot->data = storage;
+  slot->size = payload.len;
+  slot->packet = storage + payload.len;
+  slot->packet_capacity = packet_capacity;
+  if (partial && partial->packet_ready && partial->packet &&
+      partial->packet_size > 0 && partial->packet_size <= packet_capacity)
+    memcpy(slot->packet, partial->packet, partial->packet_size);
   queue->count++;
-  queue->bytes += payload->size;
+  queue->bytes += payload.len;
   return true;
 }
 
@@ -41,8 +86,11 @@ static void queue_pop(transport_flexicast_queue_t *queue) {
     return;
   queue->bytes =
       payload->size <= queue->bytes ? queue->bytes - payload->size : 0;
-  free(payload->data);
+  uint8_t *storage = payload->storage;
+  size_t storage_capacity = payload->storage_capacity;
   memset(payload, 0, sizeof(*payload));
+  payload->storage = storage;
+  payload->storage_capacity = storage_capacity;
   queue->head = (queue->head + 1U) % queue->capacity;
   queue->count--;
 }
@@ -60,9 +108,11 @@ size_t tf_clear_flow_queue(transport_flexicast_flow_t *flow) {
 void tf_queue_dispose(transport_flexicast_queue_t *queue) {
   if (!queue)
     return;
-  while (queue->count != 0)
-    queue_pop(queue);
-  free(queue->entries);
+  if (queue->entries) {
+    for (size_t i = 0; i < queue->capacity; i++)
+      free(queue->entries[i].storage);
+    free(queue->entries);
+  }
   memset(queue, 0, sizeof(*queue));
 }
 
@@ -167,6 +217,13 @@ static void refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
                 &registry->pacing_last_refill_ms, registry->pacing_rate, 1,
                 registry->pacing_burst, now);
   size_t active = active_sender_count(t, flow, now);
+  uint64_t aggregate = t->flexicast_cc_aggregate_rate_limit;
+  quicly_flexicast_cc_hints_t hints = {
+      .active_senders = (uint32_t)active,
+      .delivery_rate_divisor = 1U,
+      .aggregate_rate_limit_bytes_per_second =
+          aggregate != 0 ? aggregate / active + (aggregate % active != 0) : 0};
+  quicly_flexicast_cc_set_flow_hints(flow->crypto, &hints, now);
   quicly_flexicast_cc_output_t cc_output;
   quicly_flexicast_cc_get_flow_output(flow->crypto, &cc_output);
   if (flow->listening_count == 0)
@@ -189,7 +246,6 @@ static void refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
   }
   uint64_t numerator = rate;
   uint32_t divisor = 1;
-  uint64_t aggregate = t->flexicast_cc_aggregate_rate_limit;
   if (aggregate != 0 && rate > aggregate / active) {
     numerator = aggregate;
     divisor = (uint32_t)active;
@@ -281,11 +337,24 @@ typedef enum {
   FLEXICAST_DISPATCH_FAILED,
 } flexicast_dispatch_result_t;
 
-static int
-submit_protected_packet(transport_t *t, size_t socket_index,
-                        const struct sockaddr *destination,
-                        const struct sockaddr *source,
-                        const transport_flexicast_queued_payload_t *queued) {
+static uint8_t flow_ecn_mark(const transport_t *t,
+                             const transport_conn_t *conn) {
+  uint8_t mode = t->quic_ctx.egress[0].ecn;
+  if (mode == QUICLY_ECN_MODE_OFF)
+    return 0;
+  if (conn) {
+    quicly_stats_t qstats;
+    if (!conn->quic || quicly_get_stats(conn->quic, &qstats) != 0 ||
+        qstats.num_paths.ecn_validated == 0 || qstats.num_paths.ecn_failed != 0)
+      return 0;
+  }
+  return mode == QUICLY_ECN_MODE_L4S ? 1U : 2U;
+}
+
+static int submit_protected_packet(
+    transport_t *t, size_t socket_index, const struct sockaddr *destination,
+    const struct sockaddr *source, bool native_multicast, uint8_t ecn,
+    const transport_flexicast_queued_payload_t *queued) {
   if (socket_index == SIZE_MAX || socket_index >= t->socket_count ||
       t->sockets[socket_index].egress_id < 0)
     return -1;
@@ -299,14 +368,14 @@ submit_protected_packet(transport_t *t, size_t socket_index,
   socklen_t destination_len = destination->sa_family == AF_INET
                                   ? sizeof(struct sockaddr_in)
                                   : sizeof(struct sockaddr_in6);
+  uint32_t ifindex = native_multicast && t->flexicast_interface_index
+                         ? t->flexicast_interface_index
+                         : path.interface_index;
   t->host_callback_active = true;
   ssize_t sent = t->drive_host.send(
       t->drive_host.context, &path,
       source ? source : (const struct sockaddr *)&path.local, destination,
-      destination_len,
-      t->flexicast_interface_index ? t->flexicast_interface_index
-                                   : path.interface_index,
-      2, 0, &vec, 1);
+      destination_len, ifindex, ecn, 0, &vec, 1);
   t->host_callback_active = false;
   if (sent > 0) {
     egress->packets_sent++;
@@ -324,29 +393,41 @@ submit_protected_packet(transport_t *t, size_t socket_index,
 static void
 account_protected_packet(transport_t *t, transport_flexicast_flow_t *flow,
                          transport_flexicast_queued_payload_t *queued,
-                         transport_flexicast_member_t *recipient) {
+                         transport_flexicast_member_t *recipient,
+                         uint32_t physical_fanout, bool app_limited) {
   int64_t now = transport_now_ms(t);
-  (void)quicly_flexicast_mark_submitted(flow->crypto,
-                                        recipient ? recipient->conn->id : 0,
-                                        queued->packet_number, now);
+  quicly_flexicast_send_context_t ctx = {
+      .pacing_rate_bytes_per_second = flow->pacing_rate_bytes_per_second,
+      .physical_fanout = physical_fanout != 0 ? physical_fanout : 1U,
+      .flags = QUICLY_FLEXICAST_SAMPLE_VALID |
+               (app_limited ? QUICLY_FLEXICAST_SAMPLE_APP_LIMITED : 0U)};
+  (void)quicly_flexicast_mark_submitted_with_context(
+      flow->crypto, recipient ? recipient->conn->id : 0, queued->packet_number,
+      now, &ctx);
   tf_record_delivery_submission(t, flow, recipient, !queued->counted);
   if (!queued->counted) {
     t->stats.flexicast_packets_sent++;
     t->stats.flexicast_paced_packets++;
+    flow->pacing_tokens = queued->packet_size <= flow->pacing_tokens
+                              ? flow->pacing_tokens - queued->packet_size
+                              : 0;
+    if (t->flexicast_cc_aggregate_rate_limit != 0)
+      t->flexicast.pacing_tokens =
+          queued->packet_size <= t->flexicast.pacing_tokens
+              ? t->flexicast.pacing_tokens - queued->packet_size
+              : 0;
     queued->counted = true;
   }
   if (!recipient)
     t->stats.flexicast_native_packets_sent++;
   flow->last_payload_sent_ms = now;
-  flow->pacing_tokens -= queued->packet_size;
-  if (t->flexicast_cc_aggregate_rate_limit != 0)
-    t->flexicast.pacing_tokens -= queued->packet_size;
 }
 
 static flexicast_dispatch_result_t
 dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
-                 transport_flexicast_queued_payload_t *queued) {
-  if (flow->rekey_pending)
+                 transport_flexicast_queued_payload_t *queued,
+                 bool app_limited) {
+  if (flow->listening_count == 0)
     return FLEXICAST_DISPATCH_BLOCKED;
   int64_t now = transport_now_ms(t);
   if (now < flow->dispatch_retry_at_ms)
@@ -360,12 +441,6 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     queued->replicated = true;
   }
   if (!queued->packet_ready) {
-    for (size_t i = 0; i < flow->member_count; i++) {
-      if (flow->members[i].joined && !flow->members[i].listening) {
-        flow->dispatch_retry_at_ms = now + 10;
-        return FLEXICAST_DISPATCH_BLOCKED;
-      }
-    }
     size_t size = pacing_cost(flow, queued->size);
     if (size == 0 || size > t->limits.max_udp_payload_size ||
         size > queued->packet_capacity)
@@ -377,7 +452,13 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
         queued->packet, size, &queued->packet_size, &queued->packet_number,
         now);
     if (result != QUICLY_FLEXICAST_OK) {
-      if (result == QUICLY_FLEXICAST_ERROR_SEND_WINDOW) {
+      if (result == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED) {
+        if (!tf_rotate_source_flow(t, flow))
+          return FLEXICAST_DISPATCH_FAILED;
+        return FLEXICAST_DISPATCH_BLOCKED;
+      }
+      if (result == QUICLY_FLEXICAST_ERROR_SEND_WINDOW ||
+          result == QUICLY_FLEXICAST_ERROR_NO_MEMBERS) {
         flow->dispatch_retry_at_ms = now + 10;
         return FLEXICAST_DISPATCH_BLOCKED;
       }
@@ -395,7 +476,8 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     }
     for (size_t i = 0; i < flow->member_count; i++) {
       transport_flexicast_member_t *member = &flow->members[i];
-      if (member->payload_delivery_id == queued->delivery_id ||
+      if (!member->listening ||
+          member->payload_delivery_id == queued->delivery_id ||
           !transport_publish_recipient_eligible(t, member->conn,
                                                 &flow->track_id)) {
         int complete;
@@ -410,15 +492,16 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
   for (size_t i = 0; i < t->socket_count; i++)
     local_addrs[i] = t->sockets[i].local_addr;
   if (!queued->replicated && flow->native_multicast &&
-      t->flexicast_native_source) {
+      t->flexicast_native_source && !t->flexicast_interface_down) {
     struct sockaddr *group = (struct sockaddr *)&t->flexicast_group_addr;
     struct sockaddr_storage source = multicast_source_address(t);
     size_t fd_index = transport_path_socket_for_source(
         local_addrs, t->socket_count, (struct sockaddr *)&source);
-    int result = submit_protected_packet(t, fd_index, group,
-                                         (struct sockaddr *)&source, queued);
+    int result =
+        submit_protected_packet(t, fd_index, group, (struct sockaddr *)&source,
+                                true, flow_ecn_mark(t, NULL), queued);
     if (result > 0) {
-      account_protected_packet(t, flow, queued, NULL);
+      account_protected_packet(t, flow, queued, NULL, 1U, app_limited);
       return FLEXICAST_DISPATCH_OK;
     }
     if (result == 0) {
@@ -428,6 +511,15 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
     t->stats.flexicast_fallbacks++;
   }
   queued->replicated = true;
+  uint32_t fanout = 0;
+  for (size_t i = 0; i < flow->member_count; i++) {
+    transport_flexicast_member_t *m = &flow->members[i];
+    if (m->listening &&
+        transport_publish_recipient_eligible(t, m->conn, &flow->track_id))
+      fanout++;
+  }
+  if (fanout == 0)
+    fanout = 1U;
   while (queued->next_member < flow->member_count) {
     transport_flexicast_member_t *member = &flow->members[queued->next_member];
     if (!member->listening ||
@@ -437,19 +529,20 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       queued->next_member++;
       continue;
     }
-    if (queued->packet_size > pacing_available(t, flow))
-      return FLEXICAST_DISPATCH_BLOCKED;
-    struct sockaddr_storage destination;
-    size_t fd_index = transport_path_socket_for_peer(
-        member->conn->quic, local_addrs, t->socket_count, &destination);
+    struct sockaddr_storage destination, peer_source;
+    size_t fd_index = transport_path_select_peer_egress(
+        member->conn->quic, local_addrs, t->socket_count, &destination,
+        &peer_source);
     int result = submit_protected_packet(
-        t, fd_index, (struct sockaddr *)&destination, NULL, queued);
+        t, fd_index, (const struct sockaddr *)&destination,
+        (const struct sockaddr *)&peer_source, false,
+        flow_ecn_mark(t, member->conn), queued);
     if (result == 0) {
       flow->dispatch_retry_at_ms = now + 10;
       return FLEXICAST_DISPATCH_BLOCKED;
     }
     if (result > 0) {
-      account_protected_packet(t, flow, queued, member);
+      account_protected_packet(t, flow, queued, member, fanout, app_limited);
     } else {
       int complete;
       (void)quicly_flexicast_abandon_datagram(flow->crypto, member->conn->id,
@@ -489,40 +582,51 @@ bool transport_flexicast_can_queue(const transport_t *t,
 }
 
 static bool queue_payload(transport_t *t, transport_flexicast_flow_t *flow,
-                          ptls_iovec_t payload, size_t packet_capacity) {
+                          ptls_iovec_t payload, size_t packet_capacity,
+                          const transport_flexicast_queued_payload_t *partial) {
   if (payload.len > SIZE_MAX - packet_capacity ||
       !transport_flexicast_can_queue(t, flow, 1, payload.len)) {
     t->stats.flexicast_pacing_backpressure++;
     return false;
   }
-  uint8_t *storage = malloc(payload.len + packet_capacity);
-  if (!storage)
-    return false;
-  memcpy(storage, payload.base, payload.len);
-  transport_flexicast_queued_payload_t queued = {
-      .data = storage,
-      .size = payload.len,
-      .packet = storage + payload.len,
-      .packet_capacity = packet_capacity,
-  };
-  if (!queue_push(&flow->data_queue, &queued)) {
-    free(storage);
-    return false;
-  }
-  return true;
+  return queue_push_slot(flow, payload, packet_capacity, partial);
 }
 
 bool tf_enqueue_payload(transport_t *t, transport_flexicast_flow_t *flow,
                         ptls_iovec_t payload) {
-  if (!t || !flow || !flow->source || !flow->crypto || !payload.base)
+  if (!t || !flow || !flow->source || !flow->crypto || !payload.base ||
+      flow->listening_count == 0)
     return false;
   size_t cost = pacing_cost(flow, payload.len);
-  return cost != 0 && cost <= t->limits.max_udp_payload_size &&
-         flow->listening_count != 0 && queue_payload(t, flow, payload, cost);
+  if (cost == 0 || cost > t->limits.max_udp_payload_size)
+    return false;
+  if (flow->data_queue.count == 0 && cost <= sizeof(t->send_buffer) &&
+      payload.len <= SIZE_MAX - cost &&
+      transport_flexicast_can_queue(t, flow, 1, payload.len) &&
+      tf_reserve_queue_slots(flow, 1, payload.len + cost)) {
+    refresh_pacer_at(t, flow, transport_now_ms(t));
+    if (cost <= pacing_available(t, flow)) {
+      transport_flexicast_queued_payload_t direct = {
+          .data = (uint8_t *)payload.base,
+          .size = payload.len,
+          .packet = t->send_buffer,
+          .packet_capacity = sizeof(t->send_buffer)};
+      flexicast_dispatch_result_t result =
+          dispatch_payload(t, flow, &direct, true);
+      if (result == FLEXICAST_DISPATCH_OK)
+        return true;
+      if (result == FLEXICAST_DISPATCH_FAILED) {
+        t->stats.flexicast_pacing_dropped++;
+        return false;
+      }
+      return queue_push_slot(flow, payload, cost, &direct);
+    }
+  }
+  return queue_payload(t, flow, payload, cost, NULL);
 }
 
 void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {
-  if (flow->data_queue.count == 0 || flow->rekey_pending)
+  if (flow->data_queue.count == 0)
     return;
   if (transport_flexicast_listening_members(flow) == 0) {
     bool awaiting_rekey_ready = false;
@@ -539,9 +643,10 @@ void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {
     if (!queued || !queued->data)
       break;
     size_t cost = pacing_cost(flow, queued->size);
-    if (cost > pacing_available(t, flow))
+    if (!queued->counted && cost > pacing_available(t, flow))
       break;
-    flexicast_dispatch_result_t result = dispatch_payload(t, flow, queued);
+    flexicast_dispatch_result_t result =
+        dispatch_payload(t, flow, queued, flow->data_queue.count <= 1);
     if (result == FLEXICAST_DISPATCH_BLOCKED)
       break;
     if (result == FLEXICAST_DISPATCH_FAILED)
@@ -581,7 +686,16 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
   int64_t first_timeout = INT64_MAX;
   for (size_t i = 0; i < t->flexicast.capacity; i++) {
     transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
-    if (!flow->active || flow->source || !flow->crypto)
+    if (!flow->active || flow->source)
+      continue;
+    if ((flow->ready_pending && flow->crypto) ||
+        (flow->binding_received && flow->announcement_received &&
+         !flow->join_sent && !flow->multicast_unavailable)) {
+      int64_t retry = now > INT64_MAX - 10 ? INT64_MAX : now + 10;
+      if (retry < first_timeout)
+        first_timeout = retry;
+    }
+    if (!flow->crypto)
       continue;
     int64_t deadline = quicly_flexicast_get_ack_deadline(flow->crypto);
     if (deadline < first_timeout)
@@ -593,11 +707,8 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
     transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
     if (!flow->active || !flow->source || !flow->crypto)
       continue;
-    if (flow->rekey_pending) {
-      if (flow->rekey_ready_at_ms < first_timeout)
-        first_timeout = flow->rekey_ready_at_ms;
-      continue;
-    }
+    if (flow->rekey_pending && flow->rekey_ready_at_ms < first_timeout)
+      first_timeout = flow->rekey_ready_at_ms;
     for (size_t member_index = 0; member_index < flow->member_count;
          member_index++) {
       const transport_flexicast_member_t *member = &flow->members[member_index];

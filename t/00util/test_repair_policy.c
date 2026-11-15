@@ -9,6 +9,7 @@
 bool policy_schedule_reference(const qlinq_effective_repair_policy_t *,
                                const transport_policy_path_t *, size_t, size_t,
                                size_t, fp_t, transport_policy_schedule_t *);
+size_t policy_estimate_reference(size_t, fp_t, unsigned);
 
 static void equivalent(const qlinq_effective_repair_policy_t *policy,
                        const transport_policy_path_t *paths, size_t n, size_t k,
@@ -124,24 +125,32 @@ static qlinq_repair_policy_t example(void) {
 static void test_estimator(void) {
   const size_t counts[] = {1, 32, 100};
   const float losses[] = {0, 0.0001f, 0.01f, 0.1f, 0.5f, 0.999f};
-  pathflow_context_t context = {0};
   for (unsigned confidence = 50; confidence <= 99; confidence++) {
     for (size_t c = 0; c < sizeof(counts) / sizeof(counts[0]); c++) {
+      size_t prev_loss_est = 0;
       for (size_t l = 0; l < sizeof(losses) / sizeof(losses[0]); l++) {
-        path_t path = {.b = FP_FROM_INT(1000),
-                       .l = FP_FROM_FLOAT(0.01f),
-                       .p = FP_FROM_FLOAT(losses[l])};
-        assert(pathflow_optimize(&context, 1, counts[c], &path, FP_FROM_INT(10),
-                                 confidence,
-                                 PATHFLOW_SOLVER_GREEDY) != PATHFLOW_ERROR);
-        assert(transport_policy_estimate_parity(
-                   counts[c], path.p, confidence) == path.x - counts[c]);
+        fp_t p = FP_FROM_FLOAT(losses[l]);
+        size_t est = transport_policy_estimate_parity(counts[c], p, confidence);
+        assert(est != SIZE_MAX);
+        assert(est == policy_estimate_reference(counts[c], p, confidence));
+        assert(est >= prev_loss_est);
+        prev_loss_est = est;
+        if (confidence > 50) {
+          size_t lower =
+              transport_policy_estimate_parity(counts[c], p, confidence - 1);
+          assert(est >= lower);
+        }
       }
     }
   }
+  assert(transport_policy_estimate_parity(100, 0, 99) == 0);
   assert(transport_policy_estimate_parity(100, FP_FROM_FLOAT(0.5f), 99) == 133);
   assert(transport_policy_estimate_parity(100, FP_FROM_FLOAT(0.5f), 50) == 100);
   assert(transport_policy_estimate_parity(100, FP_FROM_FLOAT(0.5f), 0) == 0);
+  assert(transport_policy_estimate_parity(100, FP_FROM_FLOAT(0.5f), 49) ==
+         SIZE_MAX);
+  assert(transport_policy_estimate_parity(100, FP_FROM_FLOAT(0.5f), 100) ==
+         SIZE_MAX);
   assert(transport_policy_estimate_parity(SIZE_MAX, FP_ONE, 99) == SIZE_MAX);
 }
 

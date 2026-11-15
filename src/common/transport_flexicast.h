@@ -54,6 +54,8 @@ typedef struct transport_flexicast_member_map_entry_t {
 } transport_flexicast_member_map_entry_t;
 
 typedef struct transport_flexicast_queued_payload_t {
+  uint8_t *storage;
+  size_t storage_capacity;
   uint8_t *data;
   size_t size;
   /* retain plaintext so unfinished fanout can resume after rekeying */
@@ -84,6 +86,7 @@ typedef struct transport_flexicast_flow_t {
   bool binding_received;
   bool announcement_received;
   bool join_sent;
+  bool ready_pending;
   bool multicast_unavailable;
   bool membership_acquired;
   uint8_t ip_version;
@@ -203,8 +206,6 @@ bool transport_flexicast_receive_packet_ecn(transport_t *, uint8_t *, size_t,
                                             transport_conn_t **, ptls_iovec_t *,
                                             uint8_t);
 
-transport_flexicast_flow_t *
-transport_flexicast_find_source(transport_t *t, const moq_track_id_t *track);
 size_t
 transport_flexicast_listening_members(const transport_flexicast_flow_t *flow);
 bool transport_flexicast_member_is_listening(
@@ -225,6 +226,9 @@ int64_t tf_member_feedback_deadline(const transport_flexicast_flow_t *,
                                     const transport_flexicast_member_t *);
 size_t tf_clear_flow_queue(transport_flexicast_flow_t *flow);
 void tf_queue_dispose(transport_flexicast_queue_t *queue);
+bool tf_reserve_queue_slots(transport_flexicast_flow_t *flow, size_t count,
+                            size_t slot_bytes);
+bool tf_rotate_source_flow(transport_t *t, transport_flexicast_flow_t *flow);
 bool tf_enqueue_payload(transport_t *, transport_flexicast_flow_t *,
                         ptls_iovec_t);
 void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow);

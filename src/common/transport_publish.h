@@ -7,7 +7,7 @@
 /* shared native measurements and physical path budget for initial/repair work
  */
 typedef struct {
-  size_t physical, quic, available;
+  size_t physical, quic, available, payload_limit;
   path_state_t state;
   path_t sample;
   bool rate_known;

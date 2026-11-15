@@ -330,7 +330,13 @@ static int check_callback_and_completion_lifetimes(void) {
           t->assembler_memory_bytes != 0)
         abort();
       if (mode == 5) {
+        uint8_t active_alias = 0;
+        if (transport_subscriptions_find_alias(&conn->receive_subscriptions,
+                                               &track, &active_alias) != 0 ||
+            active_alias == 8)
+          abort();
         receive_symbol(conn, 8, 1, 0, 1);
+        receive_symbol(conn, active_alias, 1, 0, 1);
         if (state.records != 1)
           abort();
       }
@@ -341,7 +347,13 @@ static int check_callback_and_completion_lifetimes(void) {
       if (state.records != 0 || state.losses != 1)
         abort();
       if (mode == 1) {
+        uint8_t active_alias = 0;
+        if (transport_subscriptions_find_alias(&conn->receive_subscriptions,
+                                               &track, &active_alias) != 0 ||
+            active_alias == 8)
+          abort();
         receive_symbol(conn, 8, 1, 0, 1);
+        receive_symbol(conn, active_alias, 1, 0, 1);
         if (state.records != 1)
           abort();
       }
@@ -380,11 +392,23 @@ static int check_callback_and_completion_lifetimes(void) {
       /* Equal object IDs in different groups and new subscriptions are new
        * objects. Completion history must not leak across either boundary. */
       receive_symbol(conn, 8, 0, 0, 1);
+      uint8_t active_alias = 0;
       if (state.records != 2 || !transport_unsubscribe(t, track) ||
-          !transport_subscribe(t, track))
+          !transport_subscribe(t, track) ||
+          transport_subscriptions_find_alias(&conn->receive_subscriptions,
+                                             &track, &active_alias) != 0)
+        abort();
+      receive_symbol(conn, active_alias, 0, 0, 1);
+      if (state.records != 3)
+        abort();
+      /* Also verify same-alias generation isolation when aliases wrap around */
+      transport_subscriptions_remove(&conn->receive_subscriptions, track.type,
+                                     track.name);
+      if (!transport_subscriptions_add(&conn->receive_subscriptions, track.type,
+                                       track.flags, track.name, 8))
         abort();
       receive_symbol(conn, 8, 0, 0, 1);
-      if (state.records != 3)
+      if (state.records != 4)
         abort();
       transport_tick(t);
       if (state.losses != 0)

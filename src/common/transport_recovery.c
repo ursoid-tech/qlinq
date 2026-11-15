@@ -16,7 +16,7 @@ bool transport_recovery_was_delivered(const transport_object_gap_state_t *state,
     return false;
   uint64_t distance = state->largest_delivered - object_id;
   if (distance >= QLINQ_RECOVERY_HISTORY_OBJECTS)
-    return true;
+    return false;
   return (state->delivered_mask[distance / 64U] &
           (UINT64_C(1) << (distance % 64U))) != 0;
 }
@@ -26,9 +26,61 @@ bool transport_recovery_was_retired(const transport_object_gap_state_t *state,
   if (!state->retired_initialized || object_id > state->largest_retired)
     return false;
   uint64_t distance = state->largest_retired - object_id;
-  return distance >= QLINQ_RECOVERY_HISTORY_OBJECTS ||
-         (state->retired_mask[distance / 64U] &
+  if (distance >= QLINQ_RECOVERY_HISTORY_OBJECTS)
+    return false;
+  return (state->retired_mask[distance / 64U] &
           (UINT64_C(1) << (distance % 64U))) != 0;
+}
+
+static void sync_gap_group(transport_object_gap_state_t *state,
+                           uint64_t group_id) {
+  if (!state)
+    return;
+  if (!state->seen_initialized && !state->delivered_initialized &&
+      !state->retired_initialized && state->pending_mask == 0) {
+    state->group_id = group_id;
+    return;
+  }
+  if (group_id <= state->group_id)
+    return;
+  state->last_seen = 0;
+  state->seen_initialized = false;
+  state->pending_base = 0;
+  state->pending_mask = 0;
+  state->pending_cursor = 0;
+  state->largest_delivered = 0;
+  memset(state->delivered_mask, 0, sizeof(state->delivered_mask));
+  state->delivered_initialized = false;
+  state->largest_retired = 0;
+  memset(state->retired_mask, 0, sizeof(state->retired_mask));
+  state->retired_initialized = false;
+  state->group_id = group_id;
+}
+
+bool transport_recovery_is_terminal(const transport_object_gap_state_t *state,
+                                    uint64_t group_id, uint64_t object_id) {
+  if (!state)
+    return false;
+  for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+    const transport_recovery_window_t *window = &state->recovery_windows[i];
+    if (window->active && window->group_id == group_id &&
+        object_id >= window->first_object_id &&
+        object_id <= window->final_object_id) {
+      uint32_t bit = (uint32_t)(object_id - window->first_object_id);
+      if ((window->missing_mask & (UINT32_C(1) << bit)) == 0)
+        return true;
+    }
+  }
+  if (state->acked_initialized && state->acked_group_id == group_id &&
+      object_id <= state->acked_object_id)
+    return true;
+  if ((state->seen_initialized || state->delivered_initialized ||
+       state->retired_initialized || state->pending_mask != 0) &&
+      state->group_id == group_id) {
+    return transport_recovery_was_delivered(state, object_id) ||
+           transport_recovery_was_retired(state, object_id);
+  }
+  return false;
 }
 
 static bool
@@ -127,6 +179,20 @@ bool transport_recovery_send_retire(transport_conn_t *conn, uint8_t alias,
                          object_id);
 }
 
+static void record_acked_watermark(transport_object_gap_state_t *state,
+                                   uint64_t group_id,
+                                   uint64_t final_object_id) {
+  if (!state)
+    return;
+  if (!state->acked_initialized || group_id > state->acked_group_id ||
+      (group_id == state->acked_group_id &&
+       final_object_id > state->acked_object_id)) {
+    state->acked_initialized = true;
+    state->acked_group_id = group_id;
+    state->acked_object_id = final_object_id;
+  }
+}
+
 static bool send_checkpoint_ack(transport_conn_t *conn, uint8_t alias,
                                 uint64_t group_id, uint64_t final_object_id) {
   if (!conn ||
@@ -137,6 +203,40 @@ static bool send_checkpoint_ack(transport_conn_t *conn, uint8_t alias,
           conn->stream, alias, group_id, final_object_id))
     return false;
   conn->transport->stats.recovery_checkpoint_acks_sent++;
+  record_acked_watermark(transport_object_gap(conn, alias), group_id,
+                         final_object_id);
+  return true;
+}
+
+static bool send_or_defer_checkpoint_ack(transport_conn_t *conn, uint8_t alias,
+                                         uint64_t group_id,
+                                         uint64_t final_object_id) {
+  if (!conn ||
+      (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
+      !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate))
+    return false;
+  transport_object_gap_state_t *state = transport_object_gap(conn, alias);
+  if (!state)
+    return false;
+  if (!transport_stream_can_accept(conn->stream,
+                                   QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                       QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE,
+                                   false)) {
+    if (!state->ack_pending || group_id > state->pending_ack_group_id ||
+        (group_id == state->pending_ack_group_id &&
+         final_object_id >= state->pending_ack_object_id)) {
+      state->ack_pending = true;
+      state->pending_ack_group_id = group_id;
+      state->pending_ack_object_id = final_object_id;
+    }
+    record_acked_watermark(state, group_id, final_object_id);
+    return true;
+  }
+  if (!send_checkpoint_ack(conn, alias, group_id, final_object_id))
+    return false;
+  if (state->ack_pending && state->pending_ack_group_id == group_id &&
+      state->pending_ack_object_id <= final_object_id)
+    state->ack_pending = false;
   return true;
 }
 
@@ -240,20 +340,16 @@ bool transport_recovery_retire(transport_conn_t *conn, uint8_t alias,
                    &conn->receive_subscriptions, alias, &track) != 0)
     return false;
   transport_object_gap_state_t *state = transport_object_gap(conn, alias);
-  bool terminal = transport_recovery_was_delivered(state, object_id) ||
-                  transport_recovery_was_retired(state, object_id);
+  bool terminal = transport_recovery_is_terminal(state, group_id, object_id);
   if (!terminal) {
-    /* Admit the explicit failed outcome before the cumulative checkpoint ACK.
-     * Both share an ordered reliable stream, so the sender never mistakes the
-     * ACK for delivery. On pressure retain the missing obligation and retry. */
+    /* admit the explicit failed outcome before the cumulative checkpoint ACK */
     if (!send_retirement(conn, QLINQ_WIRE_OBJECT_RETIRE_ACK, alias, group_id,
                          object_id))
       return false;
+    sync_gap_group(state, group_id);
     mark_object_retired(state, object_id);
   }
-  /* Reconcile stale missing state even for an already terminal object. This
-   * does not change a successful delivery into a failure or repeat its event.
-   */
+  /* reconcile stale missing state even for an already terminal object */
   if (state->group_id == group_id && object_id >= state->pending_base &&
       object_id - state->pending_base < 32)
     state->pending_mask &= ~(UINT32_C(1) << (object_id - state->pending_base));
@@ -289,10 +385,21 @@ void transport_recovery_flush_acks(transport_conn_t *conn) {
     return;
   for (size_t i = 0; i < conn->receive_subscriptions.capacity; i++) {
     const track_subscription_t *sub = &conn->receive_subscriptions.entries[i];
-    if (sub->active &&
-        transport_get_receive_track_profile(conn->transport, &sub->track_id)
-            .checkpoint_recovery)
-      (void)acknowledge_completed_recovery_windows(conn, sub->alias);
+    if (!sub->active ||
+        !transport_get_receive_track_profile(conn->transport, &sub->track_id)
+             .checkpoint_recovery)
+      continue;
+    transport_object_gap_state_t *gap = transport_object_gap(conn, sub->alias);
+    if (gap && gap->ack_pending &&
+        transport_stream_can_accept(conn->stream,
+                                    QLINQ_WIRE_FRAME_HEADER_SIZE +
+                                        QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE,
+                                    false)) {
+      if (send_checkpoint_ack(conn, sub->alias, gap->pending_ack_group_id,
+                              gap->pending_ack_object_id))
+        gap->ack_pending = false;
+    }
+    (void)acknowledge_completed_recovery_windows(conn, sub->alias);
   }
 }
 
@@ -310,8 +417,8 @@ static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
 
   if (state->checkpoint_initialized) {
     if (final_object_id <= state->last_checkpoint_object_id)
-      return !acknowledge ||
-             send_checkpoint_ack(conn, alias, group_id, final_object_id);
+      return !acknowledge || send_or_defer_checkpoint_ack(conn, alias, group_id,
+                                                          final_object_id);
     if (state->last_checkpoint_object_id == UINT64_MAX ||
         first_object_id != state->last_checkpoint_object_id + 1U)
       return false;
@@ -331,11 +438,14 @@ static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
   window->group_id = group_id;
   window->first_object_id = first_object_id;
   window->final_object_id = final_object_id;
-  window->last_request_ms = transport_now_ms(conn->transport);
-  window->created_at_ms = window->last_request_ms;
+  window->created_at_ms = transport_now_ms(conn->transport);
   uint32_t count = (uint32_t)(final_object_id - first_object_id + 1U);
+  bool same_group =
+      (state->delivered_initialized || state->retired_initialized) &&
+      state->group_id == group_id;
   for (uint32_t bit = 0; bit < count; bit++)
-    if (!object_is_recently_terminal(state, first_object_id + bit))
+    if (!same_group ||
+        !object_is_recently_terminal(state, first_object_id + bit))
       window->missing_mask |= 1U << bit;
 
   state->checkpoint_initialized = true;
@@ -352,6 +462,7 @@ static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
 void transport_recovery_delivered(transport_conn_t *conn, uint8_t alias,
                                   uint64_t group_id, uint64_t object_id) {
   transport_object_gap_state_t *state = transport_object_gap(conn, alias);
+  sync_gap_group(state, group_id);
   mark_object_delivered(state, object_id);
   for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
     transport_recovery_window_t *window = &state->recovery_windows[i];
@@ -375,6 +486,7 @@ static bool queue_missing_objects(transport_object_gap_state_t *state,
     return false;
   if (state->pending_mask == 0) {
     state->pending_base = first_missing;
+    state->pending_cursor = 0;
     state->detected_at_ms = now_ms;
     state->first_missing_at_ms = now_ms;
     state->group_id = group_id;
@@ -398,6 +510,9 @@ static bool queue_missing_objects(transport_object_gap_state_t *state,
 void transport_recovery_observe_at(transport_object_gap_state_t *gap,
                                    int64_t now_ms, uint64_t group_id,
                                    uint64_t object_id) {
+  sync_gap_group(gap, group_id);
+  if (group_id < gap->group_id)
+    return;
   if (!gap->seen_initialized) {
     gap->seen_initialized = true;
     gap->last_seen = object_id;
@@ -424,8 +539,9 @@ transport_recovery_checkpoint(transport_conn_t *conn,
     if (checkpoint->first_object_id != checkpoint->final_object_id ||
         (gap->checkpoint_initialized &&
          checkpoint->final_object_id < gap->last_checkpoint_object_id) ||
-        !send_checkpoint_ack(conn, checkpoint->alias, checkpoint->group_id,
-                             checkpoint->final_object_id))
+        !send_or_defer_checkpoint_ack(conn, checkpoint->alias,
+                                      checkpoint->group_id,
+                                      checkpoint->final_object_id))
       return "protocol error: invalid recovery baseline";
     gap->checkpoint_initialized = true;
     gap->last_checkpoint_object_id = checkpoint->final_object_id;
@@ -450,8 +566,8 @@ const char *transport_recovery_finish(transport_conn_t *conn,
       for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++)
         outstanding |= gap->recovery_windows[i].active;
       if (!outstanding) {
-        if (!send_checkpoint_ack(conn, end->alias, end->group_id,
-                                 end->final_object_id))
+        if (!send_or_defer_checkpoint_ack(conn, end->alias, end->group_id,
+                                          end->final_object_id))
           return "protocol error: completion ACK failed";
         retire_recovery_through(conn, end->alias, end->group_id,
                                 end->final_object_id);
@@ -730,9 +846,34 @@ void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
         continue;
       if (gap->pending_mask != 0 &&
           now_nack_ms - gap->detected_at_ms >= QLINQ_FEC_NACK_DELAY_MS) {
-        for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
+        int64_t idle_timeout = (int64_t)t->fec_assembler_timeout_ms;
+        int64_t default_max_age =
+            idle_timeout >
+                    INT64_MAX / (int64_t)QLINQ_FEC_ASSEMBLER_MAX_AGE_FACTOR
+                ? INT64_MAX
+                : idle_timeout * (int64_t)QLINQ_FEC_ASSEMBLER_MAX_AGE_FACTOR;
+        int64_t gap_max_age =
+            profile.policy.enabled && profile.policy.max_object_age_ms != 0
+                ? (int64_t)profile.policy.max_object_age_ms
+                : default_max_age;
+        if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_RETIREMENT) ==
+                0 &&
+            now_nack_ms - gap->first_missing_at_ms >= gap_max_age) {
+          /* expire stale uncheckpointed gap bits when peer lacks retirement */
+          gap->pending_mask = 0;
+          gap->pending_cursor = 0;
+        }
+        uint32_t first_bit = gap->pending_cursor % 32U;
+        bool completed_pass = true;
+        bool sent_any = false;
+        for (uint32_t attempt = 0; attempt < 32; attempt++) {
+          uint32_t bit = (first_bit + attempt) % 32U;
           if ((gap->pending_mask & (1U << bit)) == 0)
             continue;
+          if (object_nack_budget == 0) {
+            completed_pass = false;
+            break;
+          }
           if (!profile.reactive_repair ||
               (profile.policy.max_object_age_ms != 0 &&
                now_nack_ms - gap->first_missing_at_ms >=
@@ -752,13 +893,17 @@ void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
           if (transport_recovery_send_nack(conn, (uint8_t)alias, gap->group_id,
                                            gap->pending_base + bit, NULL, 0,
                                            true)) {
-            gap->detected_at_ms = now_nack_ms;
+            gap->pending_cursor = (uint8_t)((bit + 1U) % 32U);
+            sent_any = true;
             object_nack_budget--;
             t->recovery_conn_cursor = (c + 1U) % active_conns;
           } else {
+            completed_pass = false;
             break;
           }
         }
+        if (completed_pass && sent_any)
+          gap->detected_at_ms = now_nack_ms;
       }
 
       for (size_t window_index = 0;
@@ -766,9 +911,14 @@ void transport_recovery_tick(transport_t *t, int64_t now_nack_ms) {
            window_index++) {
         transport_recovery_window_t *window =
             &gap->recovery_windows[window_index];
+        int64_t retry_delay = window->last_request_ms == 0
+                                  ? QLINQ_FEC_NACK_DELAY_MS
+                                  : QLINQ_FEC_COMPLETION_RETRY_MS;
+        int64_t reference_ms = window->last_request_ms == 0
+                                   ? window->created_at_ms
+                                   : window->last_request_ms;
         if (!window->active || window->missing_mask == 0 ||
-            now_nack_ms - window->last_request_ms <
-                QLINQ_FEC_COMPLETION_RETRY_MS)
+            now_nack_ms - reference_ms < retry_delay)
           continue;
         /* Pipeline distinct missing objects within the existing tick, token
          * and control-queue budgets. One request per retry interval adds
@@ -892,6 +1042,32 @@ aggregate_nack_exhausted:
           : now_nack_ms + (int64_t)aggregate_wait;
 }
 
+static int64_t add_clamped_ms(int64_t base, int64_t delta) {
+  return base > INT64_MAX - delta ? INT64_MAX : base + delta;
+}
+
+static int64_t clamp_nack_due(const transport_conn_t *conn, int64_t now,
+                              int64_t due, bool nack_stream_ready) {
+  if (due > now)
+    return due;
+  const transport_t *t = conn->transport;
+  transport_repair_limiter_t peer = conn->nack_request_limiter;
+  transport_repair_limiter_t agg = t->aggregate_nack_limiter;
+  uint64_t peer_wait = transport_repair_limiter_wait_ms(
+      &peer, t->limits.max_repair_requests_per_second, now);
+  uint64_t agg_wait = transport_repair_limiter_wait_ms(
+      &agg, t->limits.max_aggregate_nack_requests_per_second, now);
+  uint64_t wait = peer_wait > agg_wait ? peer_wait : agg_wait;
+  if (wait != 0) {
+    return wait == UINT64_MAX || wait > (uint64_t)(INT64_MAX - now)
+               ? INT64_MAX
+               : now + (int64_t)wait;
+  }
+  if (!nack_stream_ready)
+    return add_clamped_ms(now, RECOVERY_CONTROL_RETRY_MS);
+  return due;
+}
+
 int64_t transport_recovery_deadline(const transport_conn_t *conn) {
   const transport_t *t = conn->transport;
   int64_t first_timeout = INT64_MAX;
@@ -899,6 +1075,12 @@ int64_t transport_recovery_deadline(const transport_conn_t *conn) {
   bool retirement_ready = transport_stream_can_accept(
       conn->stream,
       QLINQ_WIRE_FRAME_HEADER_SIZE + QLINQ_WIRE_OBJECT_RETIRE_SIZE, false);
+  bool ack_ready = transport_stream_can_accept(
+      conn->stream,
+      QLINQ_WIRE_FRAME_HEADER_SIZE + QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE,
+      false);
+  bool nack_stream_ready = transport_stream_can_accept(
+      conn->stream, QLINQ_WIRE_FRAME_HEADER_SIZE + 20U, true);
   for (size_t i = transport_next_assembler(conn, 0);
        i < t->limits.max_assemblers_per_connection;
        i = transport_next_assembler(conn, i + 1U)) {
@@ -906,24 +1088,33 @@ int64_t transport_recovery_deadline(const transport_conn_t *conn) {
     if (assembler->total_symbols == 0)
       continue;
     int64_t expires = assembler_deadline_ms(t, assembler);
-    if (expires <= now && !retirement_ready) {
-      moq_track_id_t track;
-      if (transport_subscriptions_find_by_alias(
-              &conn->receive_subscriptions, assembler->track_id, &track) == 0) {
-        transport_track_profile_t profile =
-            transport_get_receive_track_profile(t, &track);
-        if (profile.checkpoint_recovery &&
-            retirement_due(&profile, assembler->first_symbol_time_ms, now))
-          expires = now > INT64_MAX - RECOVERY_CONTROL_RETRY_MS
-                        ? INT64_MAX
-                        : now + RECOVERY_CONTROL_RETRY_MS;
-      }
+    moq_track_id_t track;
+    bool has_track =
+        transport_subscriptions_find_by_alias(&conn->receive_subscriptions,
+                                              assembler->track_id, &track) == 0;
+    transport_track_profile_t profile = {0};
+    if (has_track)
+      profile = transport_get_receive_track_profile(t, &track);
+    if (expires <= now && !retirement_ready && has_track &&
+        profile.checkpoint_recovery &&
+        retirement_due(&profile, assembler->first_symbol_time_ms, now)) {
+      expires = add_clamped_ms(now, RECOVERY_CONTROL_RETRY_MS);
     }
     if (expires < first_timeout)
       first_timeout = expires;
+    if (has_track && profile.reactive_repair &&
+        assembler->received_count < assembler->data_symbols) {
+      int64_t nack_due =
+          add_clamped_ms(assembler->nack_sent ? assembler->last_nack_time_ms
+                                              : assembler->first_symbol_time_ms,
+                         QLINQ_FEC_NACK_DELAY_MS);
+      nack_due = clamp_nack_due(conn, now, nack_due, nack_stream_ready);
+      if (nack_due < first_timeout)
+        first_timeout = nack_due;
+    }
   }
-  if (!(conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_RETIREMENT))
-    return first_timeout;
+  bool has_retirement_cap =
+      (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_RETIREMENT) != 0;
   for (size_t i = 0; i < conn->receive_subscriptions.capacity; i++) {
     const track_subscription_t *sub = &conn->receive_subscriptions.entries[i];
     if (!sub->active)
@@ -932,6 +1123,71 @@ int64_t transport_recovery_deadline(const transport_conn_t *conn) {
         transport_get_receive_track_profile(t, &sub->track_id);
     if (!profile.checkpoint_recovery)
       continue;
+    const transport_object_gap_state_t *gap =
+        transport_object_gap((transport_conn_t *)conn, sub->alias);
+    if (!gap)
+      continue;
+
+    const transport_recovery_window_t *first_window = NULL;
+    for (size_t j = 0; j < QLINQ_RECOVERY_MAX_WINDOWS; j++) {
+      const transport_recovery_window_t *window = &gap->recovery_windows[j];
+      if (!window->active ||
+          (first_window &&
+           window->first_object_id >= first_window->first_object_id))
+        continue;
+      first_window = window;
+    }
+    if ((gap->ack_pending ||
+         (first_window && first_window->missing_mask == 0)) &&
+        !ack_ready) {
+      int64_t ack_due = add_clamped_ms(now, RECOVERY_CONTROL_RETRY_MS);
+      if (ack_due < first_timeout)
+        first_timeout = ack_due;
+    } else if (gap->ack_pending ||
+               (first_window && first_window->missing_mask == 0)) {
+      if (now < first_timeout)
+        first_timeout = now;
+    }
+
+    if (profile.reactive_repair) {
+      if (gap->pending_mask != 0) {
+        int64_t nack_due =
+            add_clamped_ms(gap->detected_at_ms, QLINQ_FEC_NACK_DELAY_MS);
+        nack_due = clamp_nack_due(conn, now, nack_due, nack_stream_ready);
+        if (nack_due < first_timeout)
+          first_timeout = nack_due;
+      }
+      for (size_t j = 0; j < QLINQ_RECOVERY_MAX_WINDOWS; j++) {
+        const transport_recovery_window_t *window = &gap->recovery_windows[j];
+        if (!window->active || window->missing_mask == 0)
+          continue;
+        bool needs_whole_nack = false;
+        for (uint32_t bit = 0; bit < QLINQ_RECOVERY_WINDOW_OBJECTS; bit++) {
+          if ((window->missing_mask & (1U << bit)) == 0)
+            continue;
+          uint64_t object_id = window->first_object_id + bit;
+          if (object_id <= window->final_object_id &&
+              !transport_find_assembler((transport_conn_t *)conn, sub->alias,
+                                        window->group_id, object_id)) {
+            needs_whole_nack = true;
+            break;
+          }
+        }
+        if (!needs_whole_nack)
+          continue;
+        int64_t win_due =
+            window->last_request_ms == 0
+                ? add_clamped_ms(window->created_at_ms, QLINQ_FEC_NACK_DELAY_MS)
+                : add_clamped_ms(window->last_request_ms,
+                                 QLINQ_FEC_COMPLETION_RETRY_MS);
+        win_due = clamp_nack_due(conn, now, win_due, nack_stream_ready);
+        if (win_due < first_timeout)
+          first_timeout = win_due;
+      }
+    }
+
+    if (!has_retirement_cap)
+      continue;
     int64_t delay =
         profile.reactive_repair ? INT64_MAX : QLINQ_FEC_NACK_DELAY_MS;
     if (profile.policy.max_object_age_ms &&
@@ -939,8 +1195,6 @@ int64_t transport_recovery_deadline(const transport_conn_t *conn) {
       delay = profile.policy.max_object_age_ms;
     if (delay == INT64_MAX)
       continue;
-    const transport_object_gap_state_t *gap =
-        transport_object_gap((transport_conn_t *)conn, sub->alias);
     int64_t first = gap->pending_mask ? gap->first_missing_at_ms : INT64_MAX;
     for (size_t j = 0; j < QLINQ_RECOVERY_MAX_WINDOWS; j++) {
       const transport_recovery_window_t *window = &gap->recovery_windows[j];
@@ -952,9 +1206,7 @@ int64_t transport_recovery_deadline(const transport_conn_t *conn) {
       continue;
     int64_t expires = first + delay;
     if (expires <= now && !retirement_ready)
-      expires = now > INT64_MAX - RECOVERY_CONTROL_RETRY_MS
-                    ? INT64_MAX
-                    : now + RECOVERY_CONTROL_RETRY_MS;
+      expires = add_clamped_ms(now, RECOVERY_CONTROL_RETRY_MS);
     if (expires < first_timeout)
       first_timeout = expires;
   }

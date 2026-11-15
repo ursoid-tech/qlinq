@@ -8,9 +8,7 @@ size_t transport_policy_estimate_parity(size_t sources, fp_t loss,
     return SIZE_MAX;
   if (confidence == 0 || sources == 0)
     return 0;
-  /* same quantiles, clamping, rounding and operation order as the pinned
-   * pathflow pathflow.c qnorm/calculate_n. keep equivalence tests against the
-   * native optimizer: constrained candidates cannot use its unlimited costs. */
+  /* normal quantile approximation for proactive binomial parity */
   static const float z[] = {
       0.000f, 0.025f, 0.050f, 0.075f, 0.100f, 0.126f, 0.151f, 0.176f, 0.202f,
       0.228f, 0.253f, 0.279f, 0.305f, 0.332f, 0.358f, 0.385f, 0.412f, 0.440f,
@@ -211,5 +209,113 @@ bool transport_policy_schedule(const qlinq_effective_repair_policy_t *policy,
     current = best;
   }
   *schedule = current;
+  return true;
+}
+
+bool transport_policy_build_schedule(const transport_track_profile_t *profile,
+                                     const path_state_t *states,
+                                     const size_t *capacities, size_t num_paths,
+                                     size_t data_symbols,
+                                     size_t max_total_symbols, uint8_t priority,
+                                     fp_t horizon, size_t *round_robin,
+                                     transport_schedule_t *schedule) {
+  if (!profile || !states || !round_robin || !schedule || num_paths == 0 ||
+      num_paths > TRANSPORT_POLICY_PATHS || data_symbols == 0 ||
+      data_symbols > max_total_symbols ||
+      max_total_symbols > QLINQ_REPAIR_MAX_SYMBOLS || horizon < 0)
+    return false;
+  memset(schedule, 0, sizeof(*schedule));
+
+  path_t defaults = transport_path_default_sample();
+  for (size_t i = 0; i < num_paths; i++) {
+    schedule->paths[i].b = states[i].b_ewma > 0 ? states[i].b_ewma : defaults.b;
+    schedule->paths[i].l =
+        states[i].initialized ? states[i].l_ewma : defaults.l;
+    schedule->paths[i].p =
+        states[i].initialized ? states[i].p_ewma : defaults.p;
+    schedule->paths[i].q = states[i].q_ewma;
+  }
+
+  bool use_fec = profile->fec_enabled || profile->fec_rateless;
+  if (use_fec && !profile->policy.enabled && data_symbols == 1) {
+    size_t start = *round_robin % num_paths;
+    size_t chosen = SIZE_MAX;
+    fp_t best = FP_MAX;
+    for (size_t offset = 0; offset < num_paths; offset++) {
+      size_t idx = (start + offset) % num_paths;
+      size_t cap = capacities ? capacities[idx] : max_total_symbols;
+      transport_policy_path_t single = {.measurement = schedule->paths[idx],
+                                        .capacity = cap};
+      fp_t done = finish(&single, 1);
+      if (cap >= 1U && done != FP_MAX && done <= horizon &&
+          (chosen == SIZE_MAX || done < best)) {
+        chosen = idx;
+        best = done;
+      }
+    }
+    if (chosen == SIZE_MAX)
+      return false;
+    schedule->paths[chosen].m = 1;
+    schedule->paths[chosen].x = 1;
+    (*round_robin)++;
+    return true;
+  }
+
+  transport_policy_path_t candidates[TRANSPORT_POLICY_PATHS] = {0};
+  for (size_t i = 0; i < num_paths; i++) {
+    fp_t b = schedule->paths[i].b;
+    if (!profile->proactive_fec) {
+      fp_t success = FP_ONE - schedule->paths[i].p;
+      b = success > 0 ? FP_MUL(b, success) : 0;
+    }
+    candidates[i] = (transport_policy_path_t){
+        .measurement = {.b = b,
+                        .l = schedule->paths[i].l,
+                        .p = schedule->paths[i].p,
+                        .q = schedule->paths[i].q},
+        .capacity = capacities ? capacities[i] : max_total_symbols};
+  }
+
+  qlinq_effective_repair_policy_t policy;
+  if (profile->policy.enabled) {
+    policy = profile->policy;
+    if (!profile->proactive_fec) {
+      policy.proactive_confidence = 0U;
+      policy.min_initial_parity_symbols = 0U;
+      policy.max_extra_percent = 0U;
+      policy.max_initial_extra_percent = 0U;
+    } else if (profile->fec_enabled && data_symbols > 1 &&
+               data_symbols < max_total_symbols &&
+               (profile->policy.present & QLINQ_REPAIR_MIN_INITIAL) == 0 &&
+               data_symbols * policy.max_initial_extra_percent >= 100U) {
+      policy.min_initial_parity_symbols = 1U;
+    }
+  } else {
+    uint8_t confidence =
+        !profile->proactive_fec
+            ? 0U
+            : (priority == 0 ? 85U : (priority == 2 ? 99U : 95U));
+    policy = (qlinq_effective_repair_policy_t){
+        .enabled = true,
+        .proactive_confidence = confidence,
+        .max_extra_percent =
+            profile->proactive_fec ? QLINQ_REPAIR_MAX_PERCENT : 0U,
+        .min_initial_parity_symbols =
+            (uint16_t)(profile->proactive_fec && data_symbols > 1 ? 1U : 0U),
+        .max_initial_extra_percent =
+            profile->proactive_fec ? QLINQ_REPAIR_MAX_PERCENT : 0U};
+  }
+
+  transport_policy_schedule_t planned;
+  if (!transport_policy_schedule(&policy, candidates, num_paths, data_symbols,
+                                 max_total_symbols, horizon, &planned))
+    return false;
+
+  schedule->parity_symbols = planned.protection.initial_parity;
+  schedule->reasons = planned.protection.reasons;
+  for (size_t i = 0; i < num_paths; i++) {
+    schedule->paths[i].m = use_fec ? planned.source[i] : 0U;
+    schedule->paths[i].x = planned.source[i] + planned.parity[i];
+  }
   return true;
 }

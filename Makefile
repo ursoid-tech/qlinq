@@ -23,7 +23,7 @@ endif
 
 # Default CFLAGS for our code
 CFLAGS ?= -O2
-CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536 -DQUICLY_HAVE_FLEXICAST=1
+CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DQUICLY_HAVE_FLEXICAST=1
 # CODEC_TARGET=portable disables native nanorq/shared OBL targeting.
 # Keep explicit FEC_NATIVE_CFLAGS and NANORQ_NATIVE_CFLAGS overrides supported.
 CODEC_TARGET ?= native
@@ -101,8 +101,6 @@ NANORQ_SRCS = deps/nanorq/lib/chooser.c \
               deps/nanorq/lib/tuple.c \
               deps/nanorq/lib/uvec.c
 
-PATHFLOW_SRCS = deps/pathflow/pathflow.c
-
 IFMON_SRCS = src/common/ifmon.c
 
 QUICLY_OBJS = $(QUICLY_SRCS:.c=.o)
@@ -110,7 +108,6 @@ NANORQ_OBJS = $(NANORQ_SRCS:.c=.o)
 # nanorq shares linked obl kernels with nanors
 NANORQ_CODEC_OBJS = $(NANORQ_OBJS) deps/nanors/deps/obl/oblas_common.o \
                    deps/nanors/deps/obl/oblas_lite.o
-PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
 # The protocol engine has an independent positive object list. Native network
@@ -130,7 +127,6 @@ ENGINE_OBJS = src/common/transport_flexicast.o \
               src/common/transport_publish.o \
               src/common/transport_recovery.o \
               src/common/transport_repair.o \
-              src/common/transport_scheduler.o \
               src/common/transport_stream.o \
               src/common/transport_subscriptions.o \
               src/common/transport_tls.o \
@@ -145,8 +141,7 @@ ENGINE_OBJS = src/common/transport_flexicast.o \
               deps/nanors/deps/obl/oblas_common.o \
               deps/nanors/deps/obl/oblas_lite.o \
               $(QUICLY_OBJS) \
-              $(NANORQ_OBJS) \
-              $(PATHFLOW_OBJS)
+              $(NANORQ_OBJS)
 
 
 POLL_HOST_OBJS = src/common/transport_flexicast_host.o src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
@@ -160,8 +155,7 @@ FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
            deps/nanors/deps/obl/oblas_common.o \
            deps/nanors/deps/obl/oblas_lite.o \
-           $(NANORQ_OBJS) \
-           $(PATHFLOW_OBJS)
+           $(NANORQ_OBJS)
 
 # Change the stamp only when effective build inputs change. All objects then
 # rebuild together, including tests that include implementations directly.
@@ -472,7 +466,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 t/00util/policy_scheduler_reference.o: t/00util/policy_scheduler_reference.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -Dtransport_policy_schedule=policy_schedule_reference -Dtransport_policy_estimate_parity=policy_estimate_reference -c $< -o $@
 
-t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o src/common/transport_tracks.o $(PATHFLOW_OBJS) t/00util/policy_scheduler_reference.o
+t/00util/test_repair_policy: t/00util/test_repair_policy.o src/common/transport_repair_policy.o src/common/transport_policy_scheduler.o src/common/transport_tracks.o t/00util/policy_scheduler_reference.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 ifeq ($(UNAME_S),Linux)
@@ -594,13 +588,13 @@ indent:
 	clang-format -style=file -i $(FORMAT_SOURCES)
 
 .PHONY: all clean check benchmark fuzz-wire check-submodules FORCE \
-	check-multipath-demo check-multipath-bw-demo check-multipath-bw-reports check-reports check-transit-reports check-transit-smoke check-sanitize soak release-check indent gencerts
+	check-multipath-demo check-multipath-bw-demo check-multipath-bw-reports check-reports check-examples check-transit-reports check-transit-smoke check-sanitize soak release-check indent gencerts
 
 .PHONY: install-tun check-tun-tool check-tun-real package-tun
 
 -include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
          $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
-         $(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
+         deps/nanors/rs.d \
          deps/nanors/deps/obl/oblas_common.d \
          deps/nanors/deps/obl/oblas_lite.d
 

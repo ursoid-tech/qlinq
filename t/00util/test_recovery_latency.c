@@ -634,6 +634,73 @@ static void checkpoint_window_pressure(void) {
   destroy(f);
 }
 
+static void beyond_history_and_group_advance(void) {
+  latency_fixture_t *f = create(MOQ_TRACK_FLAG_FEC_RATELESS, false, false);
+  transport_t *receiver = f->host[1].transport;
+  transport_conn_t *conn = f->endpoint[1].base.conn;
+  track_subscription_t *sub =
+      transport_subscriptions_find(&conn->receive_subscriptions, &f->track);
+  assert(sub);
+  transport_object_gap_state_t *gap = transport_object_gap(conn, sub->alias);
+  /* model an unacknowledged recovery window whose missing object falls beyond
+   * the 4096-object sliding bitmap while later objects advance
+   * largest_delivered */
+  gap->group_id = 0;
+  gap->seen_initialized = true;
+  gap->last_seen = QLINQ_RECOVERY_HISTORY_OBJECTS + 10U;
+  gap->delivered_initialized = true;
+  gap->largest_delivered = QLINQ_RECOVERY_HISTORY_OBJECTS + 10U;
+  gap->delivered_mask[0] = 1U;
+  gap->checkpoint_initialized = true;
+  gap->last_checkpoint_object_id = 31;
+  gap->recovery_windows[0] = (transport_recovery_window_t){
+      .active = true,
+      .group_id = 0,
+      .first_object_id = 0,
+      .final_object_id = 31,
+      .missing_mask = 1U,
+      .created_at_ms = transport_now_ms(receiver)};
+  assert(!transport_recovery_was_delivered(gap, 0));
+  assert(!transport_recovery_was_retired(gap, 0));
+  assert(!transport_recovery_is_terminal(gap, 0, 0));
+
+  /* late repair datagram for object 0 must be accepted and complete window 0 */
+  uint8_t record_buf[10] = {0, 8, 0, 0, 0, 0, 4, 21, 38, 55};
+  f->attempted[0] = true;
+  f->size[0] = 8;
+  for (size_t i = 4; i < 8; i++)
+    record_buf[2 + i] = (uint8_t)i;
+  uint8_t datagram[QLINQ_WIRE_FEC_HEADER_SIZE + sizeof(record_buf)] = {0};
+  qlinq_wire_fec_header_t header = {.alias = sub->alias,
+                                    .group_id = 0,
+                                    .object_id = 0,
+                                    .total_symbols = 1,
+                                    .data_symbols = 1,
+                                    .symbol_size = sizeof(record_buf),
+                                    .original_size = sizeof(record_buf)};
+  assert(qlinq_wire_encode_fec_header(datagram, sizeof(datagram), &header) ==
+         QLINQ_WIRE_OK);
+  memcpy(datagram + QLINQ_WIRE_FEC_HEADER_SIZE, record_buf, sizeof(record_buf));
+  receiver->receive_datagram.cb(&receiver->receive_datagram, conn->quic,
+                                ptls_iovec_init(datagram, sizeof(datagram)));
+  assert(f->seen[0] && !gap->recovery_windows[0].active);
+  assert(receiver->stats.recovery_checkpoint_acks_sent == 1);
+  /* once cumulatively ACKed, ancient duplicates before watermark are dropped */
+  assert(transport_recovery_is_terminal(gap, 0, 0));
+
+  /* advancing group_id must not mistake new group object 0 for old group */
+  f->seen[0] = false;
+  header.group_id = 1;
+  header.object_id = 0;
+  assert(!transport_recovery_is_terminal(gap, 1, 0));
+  assert(qlinq_wire_encode_fec_header(datagram, sizeof(datagram), &header) ==
+         QLINQ_WIRE_OK);
+  receiver->receive_datagram.cb(&receiver->receive_datagram, conn->quic,
+                                ptls_iovec_init(datagram, sizeof(datagram)));
+  assert(f->seen[0] && gap->group_id == 1 && gap->largest_delivered == 0);
+  destroy(f);
+}
+
 int main(void) {
   qlinq_repair_policy_t disabled = {.present = QLINQ_REPAIR_REACTIVE,
                                     .reactive_repair = false};
@@ -652,6 +719,7 @@ int main(void) {
   uncached_retirement_bounds();
   legacy_assembler_retry();
   checkpoint_window_pressure();
+  beyond_history_and_group_advance();
   tail(0, false, false, 1);
   tail(MOQ_TRACK_FLAG_RELIABLE, false, false, 1);
   tail(MOQ_TRACK_FLAG_FEC_RATELESS, false, true, 1);

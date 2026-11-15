@@ -1,10 +1,17 @@
 #ifndef QLINQ_TRANSPORT_POLICY_SCHEDULER_H
 #define QLINQ_TRANSPORT_POLICY_SCHEDULER_H
 
-#include "pathflow.h"
+#include "transport_paths.h"
 #include "transport_repair_policy.h"
+#include "transport_tracks.h"
 
 #define TRANSPORT_POLICY_PATHS 4U
+
+typedef struct {
+  path_t paths[TRANSPORT_MAX_PATHS];
+  size_t parity_symbols;
+  uint32_t reasons;
+} transport_schedule_t;
 
 typedef struct {
   path_t measurement;
@@ -35,6 +42,15 @@ bool transport_policy_schedule(const qlinq_effective_repair_policy_t *policy,
                                size_t path_count, size_t source_symbols,
                                size_t max_total_symbols, fp_t horizon_seconds,
                                transport_policy_schedule_t *schedule);
+
+/* build a unified multipath schedule from EWMA path states and track profile */
+bool transport_policy_build_schedule(const transport_track_profile_t *profile,
+                                     const path_state_t *states,
+                                     const size_t *capacities, size_t num_paths,
+                                     size_t data_symbols,
+                                     size_t max_total_symbols, uint8_t priority,
+                                     fp_t horizon, size_t *round_robin,
+                                     transport_schedule_t *schedule);
 
 /* convert a millisecond deadline budget into fixed-point seconds */
 static inline fp_t transport_policy_horizon_seconds(uint64_t remaining_ms) {

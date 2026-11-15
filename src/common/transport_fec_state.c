@@ -58,6 +58,94 @@ static size_t cache_capacity(const transport_sent_cache_t *cache) {
   return cache && cache->capacity ? cache->capacity : TRANSPORT_SENT_CACHE_SIZE;
 }
 
+#define SENT_CACHE_TOMBSTONE UINT32_MAX
+
+static uint64_t sent_cache_hash(const moq_track_id_t *track, uint64_t group_id,
+                                uint64_t object_id) {
+  uint64_t h = 1469598103934665603ULL;
+  h ^= (uint64_t)track->type;
+  h *= 1099511628211ULL;
+  h ^= (uint64_t)track->flags;
+  h *= 1099511628211ULL;
+  for (const unsigned char *p = (const unsigned char *)track->name; *p; p++) {
+    h ^= *p;
+    h *= 1099511628211ULL;
+  }
+  h ^= group_id;
+  h *= 1099511628211ULL;
+  h ^= object_id;
+  h *= 1099511628211ULL;
+  h ^= h >> 33;
+  h *= 0xff51afd7ed558ccdULL;
+  h ^= h >> 33;
+  return h;
+}
+
+static void sent_cache_hash_insert(transport_sent_cache_t *cache,
+                                   size_t entry_index) {
+  if (!cache->hash_slots || cache->hash_capacity == 0)
+    return;
+  const sent_object_cache_t *entry = &cache->entries[entry_index];
+  size_t mask = cache->hash_capacity - 1U;
+  size_t slot = (size_t)sent_cache_hash(&entry->track_id, entry->group_id,
+                                        entry->object_id) &
+                mask;
+  for (size_t step = 0; step < cache->hash_capacity; step++) {
+    uint32_t value = cache->hash_slots[slot];
+    if (value == 0 || value == SENT_CACHE_TOMBSTONE) {
+      if (value == SENT_CACHE_TOMBSTONE)
+        cache->hash_tombstones--;
+      cache->hash_slots[slot] = (uint32_t)(entry_index + 1U);
+      return;
+    }
+    slot = (slot + 1U) & mask;
+  }
+  assert(false);
+}
+
+static void sent_cache_hash_rebuild(transport_sent_cache_t *cache) {
+  if (!cache->hash_slots || cache->hash_capacity == 0)
+    return;
+  memset(cache->hash_slots, 0,
+         cache->hash_capacity * sizeof(*cache->hash_slots));
+  cache->hash_tombstones = 0;
+  if (cache->count == 0)
+    return;
+  size_t cap = cache_capacity(cache);
+  for (size_t i = 0; i < cap; i++) {
+    if (cache->entries[i].data)
+      sent_cache_hash_insert(cache, i);
+  }
+}
+
+static void sent_cache_hash_remove(transport_sent_cache_t *cache,
+                                   size_t entry_index) {
+  if (!cache->hash_slots || cache->hash_capacity == 0)
+    return;
+  const sent_object_cache_t *entry = &cache->entries[entry_index];
+  size_t mask = cache->hash_capacity - 1U;
+  size_t slot = (size_t)sent_cache_hash(&entry->track_id, entry->group_id,
+                                        entry->object_id) &
+                mask;
+  uint32_t target = (uint32_t)(entry_index + 1U);
+  for (size_t step = 0; step < cache->hash_capacity; step++) {
+    uint32_t value = cache->hash_slots[slot];
+    if (value == 0)
+      return;
+    if (value == target) {
+      size_t next = (slot + 1U) & mask;
+      if (cache->hash_slots[next] == 0) {
+        cache->hash_slots[slot] = 0;
+      } else {
+        cache->hash_slots[slot] = SENT_CACHE_TOMBSTONE;
+        cache->hash_tombstones++;
+      }
+      return;
+    }
+    slot = (slot + 1U) & mask;
+  }
+}
+
 bool transport_sent_cache_init(transport_sent_cache_t *cache,
                                size_t max_payload_bytes,
                                size_t max_object_bytes) {
@@ -75,12 +163,24 @@ bool transport_sent_cache_init(transport_sent_cache_t *cache,
     capacity = TRANSPORT_SENT_CACHE_SIZE;
   if (capacity > TRANSPORT_SENT_CACHE_MAX_SIZE)
     capacity = TRANSPORT_SENT_CACHE_MAX_SIZE;
-  if (capacity > SIZE_MAX / sizeof(*cache->entries))
+  if (capacity > SIZE_MAX / sizeof(*cache->entries) ||
+      capacity > (SIZE_MAX / 2U) / sizeof(*cache->hash_slots))
     return false;
+  size_t hash_capacity = 1U;
+  while (hash_capacity < capacity * 2U)
+    hash_capacity <<= 1U;
   cache->entries = calloc(capacity, sizeof(*cache->entries));
-  if (!cache->entries)
+  cache->hash_slots = calloc(hash_capacity, sizeof(*cache->hash_slots));
+  if (!cache->entries || !cache->hash_slots) {
+    free(cache->entries);
+    free(cache->hash_slots);
+    cache->entries = NULL;
+    cache->hash_slots = NULL;
     return false;
+  }
   cache->capacity = capacity;
+  cache->hash_capacity = hash_capacity;
+  cache->hash_tombstones = 0;
   cache->max_payload_bytes = byte_limit;
   cache->object_id_upper_bound = 0;
   return true;
@@ -90,17 +190,31 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,
                                                uint64_t group_id,
                                                uint64_t object_id) {
-  if (!cache || !track)
-    return NULL;
-  if (!cache->entries)
+  if (!cache || !track || !cache->entries || cache->count == 0)
     return NULL;
   if (object_id > cache->object_id_upper_bound)
     return NULL;
+  if (cache->hash_slots && cache->hash_capacity != 0) {
+    size_t mask = cache->hash_capacity - 1U;
+    size_t slot = (size_t)sent_cache_hash(track, group_id, object_id) & mask;
+    for (size_t step = 0; step < cache->hash_capacity; step++) {
+      uint32_t value = cache->hash_slots[slot];
+      if (value == 0)
+        return NULL;
+      if (value != SENT_CACHE_TOMBSTONE) {
+        sent_object_cache_t *entry = &cache->entries[value - 1U];
+        if (entry->data && entry->group_id == group_id &&
+            entry->object_id == object_id &&
+            transport_track_id_equal(&entry->track_id, track))
+          return entry;
+      }
+      slot = (slot + 1U) & mask;
+    }
+    return NULL;
+  }
   size_t capacity = cache_capacity(cache), remaining = cache->count;
   size_t index = cache->next_entry;
   assert(remaining <= capacity && index < capacity);
-  /* Recent unacknowledged objects usually occupy the tail before next_entry.
-   * Count live entries so a missing identity need not scan the empty rest. */
   for (size_t scanned = 0; remaining != 0 && scanned < capacity; scanned++) {
     index = index != 0 ? index - 1U : capacity - 1U;
     sent_object_cache_t *entry = &cache->entries[index];
@@ -141,25 +255,25 @@ bool transport_sent_cache_can_store(const transport_sent_cache_t *cache,
    * reserved for a full cache, byte pressure, retries, or eviction. */
   if (cache->count < cache_capacity(cache) && object->size <= available)
     return true;
-  /* A newer ID cannot be an existing retained retry. If protected entries
-   * cannot be evicted, neither a full slot budget nor byte pressure needs a
-   * scan merely to reject this new object. Lower/equal IDs still validate the
-   * exact identity and payload below. */
-  if (!allow_evict && object->object_id > cache->object_id_upper_bound)
+  const sent_object_cache_t *existing = transport_sent_cache_find(
+      (transport_sent_cache_t *)cache, &object->track_id, object->group_id,
+      object->object_id);
+  if (existing) {
+    return existing->size == object->size &&
+           memcmp(existing->data, object->data, object->size) == 0;
+  }
+  if (!allow_evict)
     return false;
   for (size_t i = 0; i < cache_capacity(cache); i++) {
     const sent_object_cache_t *entry = &cache->entries[i];
     if (!entry->data) {
       slot_available = true;
-    } else if (entry->group_id == object->group_id &&
-               entry->object_id == object->object_id &&
-               transport_track_id_equal(&entry->track_id, &object->track_id)) {
-      return entry->size == object->size &&
-             memcmp(entry->data, object->data, object->size) == 0;
-    } else if (allow_evict && !entry->recovery_protected &&
+    } else if (!entry->recovery_protected &&
                !source_overlaps_entry(object, entry)) {
       available += entry->size;
       slot_available = true;
+      if (object->size <= available)
+        return true;
     }
   }
   return slot_available && object->size <= available;
@@ -169,10 +283,20 @@ static void release_entry(transport_sent_cache_t *cache,
                           sent_object_cache_t *entry) {
   free(entry->recipients);
   if (entry->data) {
+    size_t entry_index = (size_t)(entry - cache->entries);
+    sent_cache_hash_remove(cache, entry_index);
     cache->payload_bytes -= entry->size;
     cache->count--;
-    if (cache->count == 0)
+    if (cache->count == 0) {
       cache->object_id_upper_bound = 0;
+      if (cache->hash_slots && cache->hash_tombstones != 0) {
+        memset(cache->hash_slots, 0,
+               cache->hash_capacity * sizeof(*cache->hash_slots));
+        cache->hash_tombstones = 0;
+      }
+    } else if (cache->hash_tombstones > cache->hash_capacity / 4U) {
+      sent_cache_hash_rebuild(cache);
+    }
     free(entry->data);
   }
   memset(entry, 0, sizeof(*entry));
@@ -262,6 +386,7 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->policy_initialized = false;
   entry->recovery_protected = !allow_evict;
   entry->data = copy;
+  sent_cache_hash_insert(cache, (size_t)(entry - cache->entries));
   if (object->object_id > cache->object_id_upper_bound)
     cache->object_id_upper_bound = object->object_id;
   cache->payload_bytes += object->size;
@@ -344,6 +469,7 @@ void transport_sent_cache_destroy(transport_sent_cache_t *cache) {
     free(cache->entries[i].recipients);
   }
   free(cache->entries);
+  free(cache->hash_slots);
   memset(cache, 0, sizeof(*cache));
 }
 

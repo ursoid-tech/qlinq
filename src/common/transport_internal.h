@@ -1,7 +1,6 @@
 #ifndef QLINQ_TRANSPORT_INTERNAL_H
 #define QLINQ_TRANSPORT_INTERNAL_H
 
-#include "pathflow.h"
 #include "transport.h"
 #include "transport_drive.h"
 #include "transport_egress.h"
@@ -39,8 +38,8 @@ typedef struct {
   uint64_t next_object_id;
   bool active;
   bool has_objects;
+  bool finished;
   bool checkpoint_initialized;
-  uint64_t checkpoint_group_id;
   uint64_t last_checkpoint_object_id;
 } transport_fec_track_state_t;
 
@@ -198,6 +197,10 @@ struct transport_t {
 
   transport_fec_cache_t fec_cache;
   size_t assembler_memory_bytes;
+  size_t assembler_pool_bytes;
+  uint8_t *delivery_buffer;
+  size_t delivery_buffer_capacity;
+  uint64_t interface_generation;
   transport_flexicast_registry_t flexicast;
   uint64_t flexicast_retired_flow_ids[TRANSPORT_FLEXICAST_MAX_FLOWS];
   uint32_t flexicast_retired_flow_epochs[TRANSPORT_FLEXICAST_MAX_FLOWS];
@@ -210,6 +213,7 @@ struct transport_t {
   uint64_t flexicast_cc_aggregate_rate_limit;
   uint32_t flexicast_cc_feedback_timeout_ms;
   bool flexicast_native_source;
+  bool flexicast_interface_down;
   int flexicast_fds[2]; /* IPv4, IPv6 */
   uint16_t flexicast_receive_ports[2];
   struct sockaddr_storage flexicast_group_addr;
@@ -244,7 +248,7 @@ struct transport_conn_t {
   uint64_t stream_frames_received;
   uint64_t datagrams_received;
   uint64_t malformed_datagrams;
-  uint64_t telemetry_reply_at_ns[UINT8_MAX + 1U];
+  uint64_t telemetry_reply_at_ns[TRANSPORT_MAX_QUIC_PATHS];
 
   quicly_stream_t *stream;
   frame_assembler_t assemblers[TRANSPORT_HARD_MAX_ASSEMBLERS];
@@ -267,7 +271,7 @@ struct transport_conn_t {
   transport_conn_path_t paths[TRANSPORT_MAX_PATHS];
   transport_probe_state_t path_probes[TRANSPORT_MAX_QUIC_PATHS];
   uint64_t admission_retry_at_ns;
-  pathflow_context_t scheduler_context;
+  uint64_t abandoned_interface_generation;
   size_t round_robin_path;
   size_t feedback_path;
   /* Owned QUIC slots refreshed once per service pass, not per packet batch. */
@@ -363,7 +367,6 @@ void transport_engine_end_turn(transport_t *t);
 uint64_t transport_now_ns(const transport_t *t);
 int64_t transport_now_ms(const transport_t *t);
 void transport_drive_setup_clocks(transport_t *t);
-uint64_t transport_get_time_ns(void);
 uint64_t transport_get_monotonic_ns(void);
 bool transport_owner_ok(transport_t *t);
 void transport_emit_event(transport_t *t, const transport_event_t *event);
@@ -382,15 +385,19 @@ size_t transport_assembler_window(transport_conn_t *conn,
 void transport_assembler_observe_receive(transport_conn_t *conn,
                                          size_t payload_bytes);
 void transport_release_assembler(transport_t *t, frame_assembler_t *assembler);
+void transport_reset_assembler(transport_t *t, frame_assembler_t *assembler);
 bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
                               uint16_t symbols, uint16_t symbol_size);
-size_t transport_select_datagram_path(transport_conn_t *conn);
 size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
                                                size_t payload_size);
-/* Zero means unavailable (including a full queue), not a zero path MTU. */
+/* zero means unavailable (including a full queue), not a zero path MTU */
 size_t transport_datagram_payload_limit(transport_conn_t *conn,
                                         size_t path_index);
 size_t transport_connection_datagram_symbol_size(transport_conn_t *conn);
+bool transport_queue_datagram_on_quic_path(transport_conn_t *conn,
+                                           size_t path_index,
+                                           size_t payload_limit,
+                                           ptls_iovec_t datagram);
 bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
                               ptls_iovec_t datagram);
 transport_track_profile_t

@@ -61,9 +61,15 @@ static bool stream_can_accept_reserved(quicly_stream_t *stream,
   if (frame_limit > vector_limit)
     frame_limit = vector_limit;
   if (preserve_control_reserve) {
+    if (endpoint_limit <= TRANSPORT_STREAM_ENDPOINT_CONTROL_BYTE_RESERVE ||
+        vector_limit <= TRANSPORT_STREAM_ENDPOINT_CONTROL_VECTOR_RESERVE)
+      return false;
     endpoint_limit -= TRANSPORT_STREAM_ENDPOINT_CONTROL_BYTE_RESERVE;
     vector_limit -= TRANSPORT_STREAM_ENDPOINT_CONTROL_VECTOR_RESERVE;
     if (ctx->is_control) {
+      if (stream_limit <= TRANSPORT_STREAM_CONTROL_BYTE_RESERVE ||
+          frame_limit <= TRANSPORT_STREAM_CONTROL_FRAME_RESERVE)
+        return false;
       stream_limit -= TRANSPORT_STREAM_CONTROL_BYTE_RESERVE;
       frame_limit -= TRANSPORT_STREAM_CONTROL_FRAME_RESERVE;
     }

@@ -36,9 +36,7 @@ static void host_log(transport_poll_host_t *host, transport_log_level_t level,
                                    .path_index = path,
                                    .message = message};
     host->log_callback(host->log_user_data, &event);
-  } else if (level >= TRANSPORT_LOG_WARNING)
-    fprintf(stderr, "qlinq[%s] %s: %s\n", component,
-            level == TRANSPORT_LOG_ERROR ? "error" : "warning", message);
+  }
 }
 static socklen_t ifmon_socket_address(struct sockaddr_storage *out,
                                       const ifmon_addr_t *address,

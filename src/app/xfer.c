@@ -19,8 +19,8 @@
  * durable checkpoints. Queue storage remains bounded independently below. */
 #define X_WINDOW (128U * 1024U * 1024U)
 #define X_CHECKPOINT (1024U * 1024U)
-#define X_QUEUE_BYTES (64U * 1024U * 1024U)
-#define X_QUEUE_RECORDS 8192U
+#define X_QUEUE_RECORDS 16384U
+#define X_QUEUE_BYTES (X_WINDOW + X_QUEUE_RECORDS * X_HEADER)
 
 enum {
   X_OFFER = 1,
@@ -502,11 +502,9 @@ bool app_xfer_receive(app_xfer_t *x, const void *data, size_t size) {
     pthread_mutex_unlock(&x->mutex);
     return true;
   }
-  while (valid && x->connected && !x->failed && !x->done && !x->stopping &&
-         (size > X_QUEUE_BYTES - x->input.bytes ||
-          x->input.count >= X_QUEUE_RECORDS))
-    pthread_cond_wait(&x->changed, &x->mutex);
 
+  /* non-blocking admission; X_QUEUE_BYTES covers a full X_WINDOW plus headers
+   */
   bool ok = valid && x->connected && !x->failed && !x->stopping &&
             size <= X_QUEUE_BYTES - x->input.bytes &&
             x->input.count < X_QUEUE_RECORDS;

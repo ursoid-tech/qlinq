@@ -699,6 +699,68 @@ int main(int argc, char **argv) {
     goto Fail;
   }
 
+  if (base) {
+    transport_flexicast_flow_t *flow = NULL;
+    for (size_t i = 0; i < server->flexicast.capacity; i++) {
+      if (server->flexicast.flows[i].active &&
+          server->flexicast.flows[i].source &&
+          transport_track_id_equal(&server->flexicast.flows[i].track_id,
+                                   &track)) {
+        flow = &server->flexicast.flows[i];
+        break;
+      }
+    }
+    if (!flow || flow->listening_count != 2) {
+      fprintf(stderr, "replicated flow missing two active listeners\n");
+      goto Fail;
+    }
+    /* verify 1x logical pacing deduction across 2-member replicated unicast */
+    flow->pacing_tokens = flow->pacing_burst_bytes;
+    flow->pacing_last_refill_ms = transport_now_ms(server);
+    uint64_t tokens_before = flow->pacing_tokens;
+    static const uint8_t holdoff_payload[] = "nonblocking holdoff check";
+    size_t wire_len = QLINQ_WIRE_FEC_HEADER_SIZE + sizeof(holdoff_payload);
+    size_t expected_cost =
+        quicly_flexicast_datagram_size(flow->crypto, wire_len);
+    /* verify rekey holdoff does not stall active listening subscribers */
+    flow->rekey_pending = true;
+    flow->rekey_ready_at_ms = transport_now_ms(server) + 60000;
+    client_a_state.received = false;
+    client_b_state.received = false;
+    moq_object_t holdoff_obj = {.track_id = track,
+                                .group_id = 7,
+                                .object_id = 12,
+                                .data = holdoff_payload,
+                                .size = sizeof(holdoff_payload),
+                                .is_keyframe = false,
+                                .priority = 1};
+    if (!transport_publish(server, &holdoff_obj)) {
+      fprintf(stderr, "holdoff publication failed\n");
+      goto Fail;
+    }
+    uint64_t spent = tokens_before >= flow->pacing_tokens
+                         ? tokens_before - flow->pacing_tokens
+                         : UINT64_MAX;
+    if (expected_cost == 0 || spent != expected_cost) {
+      fprintf(stderr,
+              "replicated pacing charged %" PRIu64 " bytes instead of %zu\n",
+              spent, expected_cost);
+      goto Fail;
+    }
+    retries = 100;
+    while (retries-- > 0 &&
+           (!client_a_state.received || !client_b_state.received)) {
+      drive(server, client_a, client_b);
+      usleep(2000);
+    }
+    flow->rekey_pending = false;
+    flow->rekey_ready_at_ms = 0;
+    if (!client_a_state.received || !client_b_state.received) {
+      fprintf(stderr, "rekey_pending stalled active listening members\n");
+      goto Fail;
+    }
+  }
+
   if (ack_fallback) {
     client_a_state.received = false;
     client_b_state.received = false;
@@ -844,8 +906,16 @@ int main(int argc, char **argv) {
   }
 
   if (control_flood) {
-    transport_flexicast_flow_t *flow =
-        transport_flexicast_find_source(server, &track);
+    transport_flexicast_flow_t *flow = NULL;
+    for (size_t i = 0; i < server->flexicast.capacity; i++) {
+      transport_flexicast_flow_t *candidate = &server->flexicast.flows[i];
+      if (candidate->active && candidate->source &&
+          transport_track_id_equal(&candidate->track_id, &track) &&
+          transport_flexicast_listening_members(candidate) != 0) {
+        flow = candidate;
+        break;
+      }
+    }
     if (!flow || flow->member_count < 2) {
       fprintf(stderr, "control-throttle flow was not established\n");
       goto Fail;

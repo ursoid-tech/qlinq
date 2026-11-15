@@ -163,8 +163,6 @@ static int open_receive_socket(uint8_t ip_version, uint16_t port) {
         bind(fd, (struct sockaddr *)&bind_address, sizeof(bind_address)) == 0;
   }
   if (!configured || !set_multicast_fd_nonblocking(fd)) {
-    fprintf(stderr, "transport: unable to open Flexicast receive socket: %s\n",
-            strerror(SOCKET_ERROR_CODE));
     CLOSE_SOCKET(fd);
     return -1;
   }

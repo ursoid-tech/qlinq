@@ -1,6 +1,3 @@
-[submodule "deps/pathflow"]
-	path = deps/pathflow
-	url = https://github.com/sleepybishop/pathflow
 [submodule "deps/quicly"]
 	path = deps/quicly
 	url = https://github.com/sleepybishop/quicly

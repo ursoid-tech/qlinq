@@ -41,6 +41,7 @@ typedef struct {
   bool *missing_mask;
   uint16_t *missing_indices;
   uint8_t priority;
+  bool pooled;
   bool nack_sent;
   int64_t first_symbol_time_ms;
   int64_t last_activity_time_ms;

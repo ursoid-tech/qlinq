@@ -5,7 +5,11 @@
 #include <limits.h>
 #include <nanorq_core.h>
 #include <nanorq_ops.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <pthread.h>
+#endif
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,8 +25,11 @@ struct fec_t {
   uint8_t **shards;
   uint8_t *marks;
 
-  /* RaptorQ workspace is retained between calls and grows when decoding needs
-   * additional repair equations beyond the first K received symbols. */
+  /* raptorq workspace and cached encoder precode state */
+  uint32_t rq_stride;
+  nanorq_core rq_enc;
+  schedule rq_enc_sched;
+  bool rq_enc_cached;
   uint8_t *rq_prep_mem;
   uint8_t *rq_work_mem;
   sched_op *rq_ops;
@@ -32,6 +39,35 @@ struct fec_t {
   size_t rq_repair_capacity;
   struct nanorq_core_mem_reqs rq_capacity;
 };
+
+#ifdef _WIN32
+static INIT_ONCE fec_runtime_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK fec_runtime_init_win32(PINIT_ONCE once, PVOID param,
+                                            PVOID *ctx) {
+  (void)once;
+  (void)param;
+  (void)ctx;
+  reed_solomon_init();
+  nanorq_core_init();
+  return TRUE;
+}
+
+static void ensure_fec_runtime_initialized(void) {
+  InitOnceExecuteOnce(&fec_runtime_once, fec_runtime_init_win32, NULL, NULL);
+}
+#else
+static pthread_once_t fec_runtime_once = PTHREAD_ONCE_INIT;
+
+static void fec_runtime_init_posix(void) {
+  reed_solomon_init();
+  nanorq_core_init();
+}
+
+static void ensure_fec_runtime_initialized(void) {
+  pthread_once(&fec_runtime_once, fec_runtime_init_posix);
+}
+#endif
 
 fec_type_t fec_select_type(bool rateless, size_t total_symbols) {
   return rateless || total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
@@ -80,13 +116,19 @@ static bool workspace_bytes(const struct nanorq_core_mem_reqs *reqs,
 
 static bool reserve_raptorq_workspace(fec_t *f, uint32_t overhead,
                                       struct nanorq_core_mem_reqs *reqs) {
-  nanorq_core_get_memory_reqs(f->data_symbols, overhead, f->symbol_size, reqs);
-  /* The core estimate uses K only; extra equations also generate operations. */
+  nanorq_core_get_memory_reqs((uint32_t)f->data_symbols, overhead, f->rq_stride,
+                              reqs);
+  /* extra equations also generate schedule operations */
   reqs->schedule_bytes =
-      ops_estimate_schedule_bytes(f->data_symbols + overhead);
+      ops_estimate_schedule_bytes((uint32_t)f->data_symbols + overhead);
   if (!reqs->prepare_bytes || !reqs->work_bytes || !reqs->matrix_bytes ||
       !reqs->schedule_bytes)
     return false;
+  if (f->rq_stride != f->symbol_size) {
+    if (f->rq_stride > SIZE_MAX - reqs->matrix_bytes)
+      return false;
+    reqs->matrix_bytes += f->rq_stride;
+  }
   if (reqs->prepare_bytes <= f->rq_capacity.prepare_bytes &&
       reqs->work_bytes <= f->rq_capacity.work_bytes &&
       reqs->matrix_bytes <= f->rq_capacity.matrix_bytes &&
@@ -105,6 +147,7 @@ static bool reserve_raptorq_workspace(fec_t *f, uint32_t overhead,
   free(f->rq_D);
   f->rq_prep_mem = f->rq_work_mem = f->rq_D = NULL;
   f->rq_ops = NULL;
+  f->rq_enc_cached = false;
   memset(&f->rq_capacity, 0, sizeof(f->rq_capacity));
   f->memory_bytes -= previous;
   memory_return(f->budget, previous);
@@ -134,6 +177,17 @@ static bool reserve_raptorq_workspace(fec_t *f, uint32_t overhead,
   return true;
 }
 
+static void mix_symbol(fec_t *f, nanorq_core *rq, uint8_t *D, uint32_t esi,
+                       uint8_t *dst) {
+  if (f->rq_stride == f->symbol_size) {
+    ops_mix(rq, D, f->rq_stride, esi, dst);
+    return;
+  }
+  uint8_t *scratch = D + f->rq_capacity.matrix_bytes - f->rq_stride;
+  ops_mix(rq, D, f->rq_stride, esi, scratch);
+  memcpy(dst, scratch, f->symbol_size);
+}
+
 fec_t *fec_create_bounded(fec_type_t type, size_t data_symbols,
                           size_t parity_symbols, size_t symbol_size,
                           fec_memory_budget_t *budget) {
@@ -151,19 +205,11 @@ fec_t *fec_create_bounded(fec_type_t type, size_t data_symbols,
       (type == FEC_REED_SOLOMON && data_symbols + parity_symbols > 255))
     return NULL;
 
+  ensure_fec_runtime_initialized();
+
   size_t total = data_symbols + parity_symbols;
   size_t base = sizeof(fec_t);
   if (type == FEC_REED_SOLOMON) {
-#ifndef _WIN32
-    static pthread_once_t rs_once = PTHREAD_ONCE_INIT;
-    pthread_once(&rs_once, reed_solomon_init);
-#else
-    static bool rs_initialized = false;
-    if (!rs_initialized) {
-      reed_solomon_init();
-      rs_initialized = true;
-    }
-#endif
     base += (size_t)reed_solomon_padded_size(
         (int)reed_solomon_bufsize(data_symbols, parity_symbols));
     base += total * (sizeof(uint8_t *) + sizeof(uint8_t));
@@ -212,6 +258,9 @@ fec_t *fec_create_bounded(fec_type_t type, size_t data_symbols,
       fec_destroy(f);
       return NULL;
     }
+    f->rq_stride = nanorq_core_recommended_stride((uint32_t)symbol_size);
+    if (f->rq_stride < symbol_size)
+      f->rq_stride = (uint32_t)symbol_size;
     f->rq_dropped_esi = malloc(data_symbols * sizeof(uint32_t));
     f->rq_repair_esi = malloc(parity_symbols * sizeof(uint32_t));
     f->rq_repair_capacity = parity_symbols;
@@ -317,44 +366,40 @@ bool fec_encode_symbols(fec_t *f, const uint8_t *const *data_blocks,
     }
     return true;
   } else if (f->type == FEC_RAPTORQ) {
-    /* dynamic raptorq core encoding using preallocated context buffers */
-    nanorq_core enc;
-    if (!nanorq_core_encoder_new(f->data_symbols, 0, &enc)) {
-      return false;
-    }
-
+    /* reuse cached precode matrix and inversion schedule across encodes */
     struct nanorq_core_mem_reqs reqs;
     if (!reserve_raptorq_workspace(f, 0, &reqs))
       return false;
 
-    if (!nanorq_core_prepare(&enc, f->rq_prep_mem, reqs.prepare_bytes)) {
-      return false;
+    if (!f->rq_enc_cached) {
+      if (!nanorq_core_encoder_new((uint32_t)f->data_symbols, 0, &f->rq_enc) ||
+          !nanorq_core_prepare(&f->rq_enc, f->rq_prep_mem,
+                               f->rq_capacity.prepare_bytes))
+        return false;
+
+      memset(&f->rq_enc_sched, 0, sizeof(f->rq_enc_sched));
+      f->rq_enc_sched.ops.a = f->rq_ops;
+      f->rq_enc_sched.ops.m = f->rq_capacity.schedule_bytes / sizeof(sched_op);
+      nanorq_core_set_op_callback(&f->rq_enc, &f->rq_enc_sched, ops_push);
+
+      if (!nanorq_core_precalculate(&f->rq_enc, f->rq_work_mem,
+                                    f->rq_capacity.work_bytes) ||
+          f->rq_enc_sched.overflowed || f->rq_enc_sched.cpidx != 2)
+        return false;
+      f->rq_enc_cached = true;
     }
 
     uint8_t *D = f->rq_D;
-    memset(D, 0, reqs.matrix_bytes);
-
-    uint32_t SH = nanorq_core_get_pc_genc_offset(&enc);
-
+    nanorq_core_init_matrix(&f->rq_enc, D, f->rq_stride);
     for (size_t i = 0; i < f->data_symbols; i++) {
-      memcpy(D + (SH + i) * f->symbol_size, data_blocks[i], f->symbol_size);
+      nanorq_core_place_symbol(&f->rq_enc, D, f->rq_stride, (uint32_t)i,
+                               data_blocks[i], (uint32_t)f->symbol_size);
     }
 
-    schedule S_enc = {0};
-    S_enc.ops.a = f->rq_ops;
-    S_enc.ops.m = reqs.schedule_bytes / sizeof(sched_op);
-
-    nanorq_core_set_op_callback(&enc, &S_enc, ops_push);
-
-    if (!nanorq_core_precalculate(&enc, f->rq_work_mem, reqs.work_bytes) ||
-        S_enc.overflowed || S_enc.cpidx != 2) {
-      return false;
-    }
-
-    ops_run(&enc, D, f->symbol_size, &S_enc);
+    ops_run(&f->rq_enc, D, f->rq_stride, &f->rq_enc_sched);
 
     for (size_t i = 0; i < count; i++) {
-      ops_mix(&enc, D, f->symbol_size, symbol_ids[i], outputs[i]);
+      mix_symbol(f, &f->rq_enc, D, symbol_ids[i], outputs[i]);
     }
     return true;
   }
@@ -446,7 +491,11 @@ bool fec_decode(fec_t *f, uint8_t *const *blocks, const bool *missing_mask) {
     if (!reserve_raptorq_workspace(f, overhead, &reqs))
       return false;
 
-    if (!nanorq_core_prepare(&dec, f->rq_prep_mem, reqs.prepare_bytes)) {
+    /* decoding reuses prep and schedule buffers, invalidating cached encoder */
+    f->rq_enc_cached = false;
+
+    if (!nanorq_core_prepare(&dec, f->rq_prep_mem,
+                             f->rq_capacity.prepare_bytes)) {
       return false;
     }
 
@@ -460,40 +509,42 @@ bool fec_decode(fec_t *f, uint8_t *const *blocks, const bool *missing_mask) {
 
     schedule S_dec = {0};
     S_dec.ops.a = f->rq_ops;
-    S_dec.ops.m = reqs.schedule_bytes / sizeof(sched_op);
+    S_dec.ops.m = f->rq_capacity.schedule_bytes / sizeof(sched_op);
 
     nanorq_core_set_op_callback(&dec, &S_dec, ops_push);
 
-    if (!nanorq_core_precalculate(&dec, f->rq_work_mem, reqs.work_bytes) ||
+    if (!nanorq_core_precalculate(&dec, f->rq_work_mem,
+                                  f->rq_capacity.work_bytes) ||
         S_dec.overflowed || S_dec.cpidx != 2) {
       return false;
     }
 
     uint8_t *D = f->rq_D;
-    memset(D, 0, reqs.matrix_bytes);
-
-    uint32_t SH = nanorq_core_get_pc_genc_offset(&dec);
+    nanorq_core_init_matrix(&dec, D, f->rq_stride);
 
     for (size_t i = 0; i < f->data_symbols; i++) {
       if (!missing_mask[i]) {
-        memcpy(D + (SH + i) * f->symbol_size, blocks[i], f->symbol_size);
+        nanorq_core_place_symbol(&dec, D, f->rq_stride, (uint32_t)i, blocks[i],
+                                 (uint32_t)f->symbol_size);
       }
     }
     for (size_t i = 0; i < drops; i++) {
       uint32_t src_esi = dropped_esi[i];
       uint32_t rep_esi = repair_esi[i];
-      memcpy(D + (SH + src_esi) * f->symbol_size, blocks[rep_esi],
-             f->symbol_size);
+      nanorq_core_place_symbol(&dec, D, f->rq_stride, src_esi, blocks[rep_esi],
+                               (uint32_t)f->symbol_size);
     }
-    for (size_t i = 0; i < overhead; ++i)
-      memcpy(D + (SH + dec.P.Kprime + i) * f->symbol_size,
-             blocks[repair_esi[drops + i]], f->symbol_size);
+    for (size_t i = 0; i < overhead; ++i) {
+      nanorq_core_place_symbol(&dec, D, f->rq_stride, dec.P.Kprime + i,
+                               blocks[repair_esi[drops + i]],
+                               (uint32_t)f->symbol_size);
+    }
 
-    ops_run(&dec, D, f->symbol_size, &S_dec);
+    ops_run(&dec, D, f->rq_stride, &S_dec);
 
     for (size_t i = 0; i < drops; i++) {
       uint32_t src_esi = dropped_esi[i];
-      ops_mix(&dec, D, f->symbol_size, src_esi, blocks[src_esi]);
+      mix_symbol(f, &dec, D, src_esi, blocks[src_esi]);
     }
 
     return true;

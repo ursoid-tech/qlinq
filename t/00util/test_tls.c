@@ -1,9 +1,12 @@
 /* Mutual-TLS acceptance and rejection integration test. */
 
 #include "transport.h"
+#include "transport_tls.h"
 
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 typedef struct {
@@ -160,6 +163,76 @@ int main(void) {
   }
   transport_destroy(rejected_client.transport);
   transport_destroy(rejected_server.transport);
+
+  /* verify allow_insecure_peer proves key possession and rejects bad sigs */
+  ptls_context_t tmp_tls = {0};
+  ptls_openssl_sign_certificate_t tmp_signer = {0};
+  if (transport_tls_load_certificate_and_key(&tmp_tls, &tmp_signer,
+                                             "t/assets/verified.crt",
+                                             "t/assets/untrusted.key") == 0 ||
+      tmp_tls.certificates.list != NULL || tmp_tls.certificates.count != 0) {
+    fprintf(stderr, "mismatched key leaked loaded certificates\n");
+    return 1;
+  }
+  if (transport_tls_load_certificate_and_key(&tmp_tls, &tmp_signer,
+                                             "t/assets/untrusted.crt",
+                                             "t/assets/untrusted.key") != 0 ||
+      tmp_tls.certificates.count == 0) {
+    fprintf(stderr, "unable to load valid untrusted certificate pair\n");
+    return 1;
+  }
+  ptls_openssl_verify_certificate_t insecure_verifier = {0};
+  transport_tls_init_insecure_verifier(&insecure_verifier);
+  int (*verify_sign)(void *, uint16_t, ptls_iovec_t, ptls_iovec_t) = NULL;
+  void *verify_data = NULL;
+  uint8_t bad_sig[64] = {0xde, 0xad, 0xbe, 0xef};
+  uint8_t msg_bytes[32] = {1, 2, 3, 4};
+  if (insecure_verifier.super.cb(&insecure_verifier.super, NULL, "localhost",
+                                 &verify_sign, &verify_data,
+                                 tmp_tls.certificates.list,
+                                 tmp_tls.certificates.count) != 0 ||
+      !verify_sign || !verify_data ||
+      verify_sign(verify_data, PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
+                  ptls_iovec_init(msg_bytes, sizeof(msg_bytes)),
+                  ptls_iovec_init(bad_sig, sizeof(bad_sig))) == 0) {
+    fprintf(stderr, "insecure verifier accepted a forged signature\n");
+    return 1;
+  }
+  ptls_openssl_dispose_sign_certificate(&tmp_signer);
+  for (size_t i = 0; i < tmp_tls.certificates.count; i++)
+    free(tmp_tls.certificates.list[i].base);
+  free(tmp_tls.certificates.list);
+
+  tls_state_t insecure_server = {.server = true};
+  tls_state_t insecure_client = {0};
+  transport_config_t srv_cfg = {.bind_hosts = {"127.0.0.1"},
+                                .num_bind_hosts = 1,
+                                .port = 10005,
+                                .cert_file = "t/assets/untrusted.crt",
+                                .key_file = "t/assets/untrusted.key",
+                                .verify_peer = false,
+                                .allow_insecure_peer = true,
+                                .quic_idle_timeout_ms = 500,
+                                .callback = on_event,
+                                .user_data = &insecure_server};
+  transport_config_t cli_cfg = srv_cfg;
+  cli_cfg.remote_hosts[0] = "127.0.0.1";
+  cli_cfg.num_remote_hosts = 1;
+  cli_cfg.cert_file = NULL;
+  cli_cfg.key_file = NULL;
+  cli_cfg.user_data = &insecure_client;
+  insecure_server.transport = transport_create(&srv_cfg);
+  insecure_client.transport = transport_create(&cli_cfg);
+  if (!insecure_server.transport || !insecure_client.transport ||
+      !drive(&insecure_server, &insecure_client, 500)) {
+    fprintf(stderr, "allow_insecure_peer session did not authenticate\n");
+    if (insecure_client.transport)
+      transport_destroy(insecure_client.transport);
+    if (insecure_server.transport)
+      transport_destroy(insecure_server.transport);
+    return 1;
+  }
+  drain_and_destroy(&insecure_server, &insecure_client);
 
   printf("===TLS OK===\n");
   return 0;

@@ -37,12 +37,6 @@ transport_subscriptions_count(const transport_subscription_table_t *table) {
   return count;
 }
 
-static bool ensure_initialized(transport_subscription_table_t *table) {
-  return table &&
-         (table->entries || transport_subscriptions_init(
-                                table, TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS));
-}
-
 static bool track_matches(const moq_track_id_t *track, moq_track_type_t type,
                           const char *name) {
   return track && name && track->type == type && strcmp(track->name, name) == 0;
@@ -107,7 +101,7 @@ bool transport_subscriptions_contains(
 bool transport_subscriptions_add(transport_subscription_table_t *table,
                                  moq_track_type_t type, uint8_t flags,
                                  const char *name, uint8_t alias) {
-  if (!ensure_initialized(table) || !name)
+  if (!table || !table->entries || !name)
     return false;
   size_t name_len = strnlen(name, sizeof(table->entries[0].track_id.name));
   if (name_len >= sizeof(table->entries[0].track_id.name))
@@ -132,6 +126,9 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
       table->alias_entry[entry->alias] = 0;
       table->alias_entry[alias] = (uint16_t)(i + 1U);
       entry->alias = alias;
+      if (alias >= 8U)
+        table->next_dynamic_alias =
+            alias == UINT8_MAX ? 8U : (uint8_t)(alias + 1U);
       return true;
     }
   }
@@ -150,6 +147,9 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
       entry->alias = alias;
       entry->active = true;
       table->alias_entry[alias] = (uint16_t)(i + 1U);
+      if (alias >= 8U)
+        table->next_dynamic_alias =
+            alias == UINT8_MAX ? 8U : (uint8_t)(alias + 1U);
       return true;
     }
   }
@@ -190,8 +190,26 @@ int transport_subscriptions_next_alias(
     const transport_subscription_table_t *table, int first_dynamic_alias) {
   if (!table || first_dynamic_alias < 0 || first_dynamic_alias > UINT8_MAX)
     return -1;
-  for (int alias = first_dynamic_alias; alias <= UINT8_MAX; alias++)
+  for (int alias = first_dynamic_alias; alias <= UINT8_MAX; alias++) {
     if (!table->states[alias])
       return alias;
+  }
+  return -1;
+}
+
+int transport_subscriptions_allocate_alias(
+    const transport_subscription_table_t *table, int first_dynamic_alias) {
+  if (!table || first_dynamic_alias < 0 || first_dynamic_alias > UINT8_MAX)
+    return -1;
+  int span = (UINT8_MAX + 1) - first_dynamic_alias;
+  int start = (int)table->next_dynamic_alias >= first_dynamic_alias
+                  ? (int)table->next_dynamic_alias
+                  : first_dynamic_alias;
+  for (int offset = 0; offset < span; offset++) {
+    int alias =
+        first_dynamic_alias + ((start - first_dynamic_alias + offset) % span);
+    if (!table->states[alias])
+      return alias;
+  }
   return -1;
 }

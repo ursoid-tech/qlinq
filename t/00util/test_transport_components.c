@@ -4,9 +4,10 @@
 #include "transport_internal.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
+#include "transport_policy_scheduler.h"
 #include "transport_repair.h"
-#include "transport_scheduler.h"
 #include "transport_subscriptions.h"
+#include "transport_tracks.h"
 #include "transport_wire.h"
 
 #include "transport_udp.h"
@@ -446,7 +447,8 @@ static int test_subscription_state_lifetime(void) {
   CHECK(transport_subscriptions_find_by_alias(&table, 9, &by_alias) != 0,
         "removed alias cannot resolve stale track");
   CHECK(!transport_subscriptions_get_state(&table, 9) &&
-            transport_subscriptions_next_alias(&table, 9) == 9,
+            transport_subscriptions_next_alias(&table, 9) == 9 &&
+            transport_subscriptions_allocate_alias(&table, 8) == 10,
         "unsubscribe releases recovery state");
   CHECK(transport_subscriptions_add(&table, MOQ_TRACK_DATA, 0, "two", 9) &&
             transport_subscriptions_get_state(&table, 9)
@@ -657,11 +659,13 @@ static int test_datagram_schedule(void) {
       {.b_ewma = FP_FROM_INT(100), .q_ewma = 5, .initialized = true},
       {.b_ewma = FP_FROM_INT(200), .q_ewma = 10, .initialized = true},
       {.b_ewma = FP_FROM_INT(400), .q_ewma = 20, .initialized = true}};
-  pathflow_context_t context = {0};
+  transport_track_profile_t dgram_profile =
+      transport_track_profile(&(moq_track_id_t){.type = MOQ_TRACK_VIDEO});
   transport_schedule_t schedule;
   size_t round_robin = 0;
-  CHECK(transport_schedule_build(&context, states, 3, 7, 1200, false, 1,
-                                 &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&dgram_profile, states, NULL, 3, 7,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].x == 1 && schedule.paths[1].x == 2 &&
             schedule.paths[2].x == 4 && schedule.parity_symbols == 0,
         "datagrams distribute every symbol by capacity without parity");
@@ -676,14 +680,16 @@ static int test_datagram_schedule(void) {
   CHECK(round_robin == 0, "datagrams preserve the FEC round-robin cursor");
 
   states[0].p_ewma = states[1].p_ewma = FP_ONE;
-  CHECK(transport_schedule_build(&context, states, 3, 7, 1200, false, 1,
-                                 &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&dgram_profile, states, NULL, 3, 7,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].x == 0 && schedule.paths[1].x == 0 &&
             schedule.paths[2].x == 7 && schedule.parity_symbols == 0,
         "datagrams skip paths without an effective delivery rate");
   states[2].p_ewma = FP_ONE;
-  CHECK(!transport_schedule_build(&context, states, 3, 7, 1200, false, 1,
-                                  &round_robin, &schedule) &&
+  CHECK(!transport_policy_build_schedule(&dgram_profile, states, NULL, 3, 7,
+                                         QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                         &round_robin, &schedule) &&
             schedule.paths[0].x == 0 && schedule.paths[1].x == 0 &&
             schedule.paths[2].x == 0 && schedule.parity_symbols == 0,
         "datagram scheduling fails when no path can deliver");
@@ -754,18 +760,22 @@ static int test_path_estimates(void) {
   path_state_t states[2] = {0};
   for (size_t i = 0; i < 2; i++)
     transport_path_update_state(&states[i], &samples[i], false);
-  pathflow_context_t context = {0};
+  transport_track_profile_t fec_profile =
+      transport_track_profile(&(moq_track_id_t){
+          .type = MOQ_TRACK_VIDEO, .flags = MOQ_TRACK_FLAG_FEC_ENABLED});
   transport_schedule_t schedule;
   size_t round_robin = 0;
-  CHECK(transport_schedule_build(&context, states, 2, 100, 1000, true, 1,
-                                 &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&fec_profile, states, NULL, 2, 100,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].m >= 90 && schedule.paths[1].m <= 10,
         "measured window asymmetry changes FEC allocation");
 
   samples[0] = transport_path_estimate(&fast, 1000, 0, 1000, 0);
   transport_path_update_state(&states[0], &samples[0], false);
-  CHECK(transport_schedule_build(&context, states, 2, 50, 1000, true, 1,
-                                 &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&fec_profile, states, NULL, 2, 50,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].m == 0 && schedule.paths[1].m == 50,
         "a queued fast path yields to an empty slow path before another tick");
   CHECK(schedule.parity_symbols == 1 && schedule.paths[0].x == 0 &&
@@ -776,8 +786,9 @@ static int test_path_estimates(void) {
   samples[0].q = 0;
   transport_path_update_state(&states[0], &samples[0], false);
   CHECK(states[0].q_ewma == 0 &&
-            transport_schedule_build(&context, states, 2, 100, 1000, true, 1,
-                                     &round_robin, &schedule) &&
+            transport_policy_build_schedule(&fec_profile, states, NULL, 2, 100,
+                                            QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1,
+                                            FP_MAX, &round_robin, &schedule) &&
             schedule.paths[0].m >= 90,
         "drained queue immediately restores fast-path allocation");
   samples[0].b = FP_FROM_INT(200);
@@ -830,8 +841,9 @@ static int test_path_estimates(void) {
             sample.l == FP_FROM_FLOAT(0.050f) + FP_ONE / 100,
         "missing path defaults and relative delay use consistent units");
   memset(states, 0, sizeof(states));
-  CHECK(transport_schedule_build(&context, states, 2, 10, 1000, true, 1,
-                                 &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&fec_profile, states, NULL, 2, 10,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].b == FP_FROM_INT(100) &&
             schedule.paths[1].l == FP_FROM_FLOAT(0.050f),
         "scheduler cold start uses the same independent defaults");
@@ -840,8 +852,9 @@ static int test_path_estimates(void) {
   states[1] = (path_state_t){.initialized = true,
                              .b_ewma = FP_FROM_INT(100),
                              .l_ewma = FP_FROM_FLOAT(0.05f)};
-  CHECK(transport_schedule_build(&context, states, 2, 4, 1000, true, 2,
-                                 &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&fec_profile, states, NULL, 2, 4,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 2, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].m == 0 && schedule.paths[0].x == 0 &&
             schedule.paths[1].x == 5,
         "minimum parity does not revive a fast path rejected for total loss");
@@ -983,6 +996,9 @@ int main(void) {
   CHECK(assembler.buffers == NULL, "assembler release");
 
   transport_subscription_table_t subscriptions = {0};
+  CHECK(transport_subscriptions_init(&subscriptions,
+                                     TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS),
+        "subscription init");
   moq_track_id_t track = {
       .type = MOQ_TRACK_DATA, .flags = MOQ_TRACK_FLAG_RELIABLE, .name = "data"};
   CHECK(transport_subscriptions_add(&subscriptions, track.type, track.flags,
@@ -1031,21 +1047,41 @@ int main(void) {
             transport_path_select_physical(NULL, 0, 0) == SIZE_MAX,
         "unallocated symbols cannot silently fall back to the first path");
 
-  path_state_t path_states[2] = {
-      {.b_ewma = FP_FROM_INT(100), .l_ewma = FP_FROM_FLOAT(0.01f)},
-      {.b_ewma = FP_FROM_INT(50), .l_ewma = FP_FROM_FLOAT(0.02f)}};
-  pathflow_context_t scheduler_context = {0};
+  path_state_t path_states[2] = {{.b_ewma = FP_FROM_INT(100),
+                                  .l_ewma = FP_FROM_FLOAT(0.01f),
+                                  .initialized = true},
+                                 {.b_ewma = FP_FROM_INT(50),
+                                  .l_ewma = FP_FROM_FLOAT(0.02f),
+                                  .initialized = true}};
+  transport_track_profile_t dgram_profile =
+      transport_track_profile(&(moq_track_id_t){.type = MOQ_TRACK_VIDEO});
+  transport_track_profile_t fec_profile =
+      transport_track_profile(&(moq_track_id_t){
+          .type = MOQ_TRACK_VIDEO, .flags = MOQ_TRACK_FLAG_FEC_ENABLED});
   size_t round_robin = 0;
   transport_schedule_t schedule;
-  CHECK(transport_schedule_build(&scheduler_context, path_states, 2, 5, 1100,
-                                 false, 1, &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&dgram_profile, path_states, NULL, 2, 5,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].x == 4 && schedule.paths[1].x == 1 &&
             schedule.parity_symbols == 0,
         "non-FEC schedule follows estimated completion time");
-  CHECK(transport_schedule_build(&scheduler_context, path_states, 2, 1, 1100,
-                                 true, 1, &round_robin, &schedule) &&
+  CHECK(transport_policy_build_schedule(&fec_profile, path_states, NULL, 2, 1,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
             schedule.paths[0].x == 1 && round_robin == 1,
-        "single-symbol round robin schedule");
+        "single-symbol schedule prefers faster path and advances cursor");
+  path_state_t equal_states[2] = {0};
+  round_robin = 0;
+  CHECK(transport_policy_build_schedule(&fec_profile, equal_states, NULL, 2, 1,
+                                        QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1, FP_MAX,
+                                        &round_robin, &schedule) &&
+            schedule.paths[0].x == 1 && round_robin == 1 &&
+            transport_policy_build_schedule(&fec_profile, equal_states, NULL, 2,
+                                            1, QLINQ_FEC_MAX_TOTAL_SYMBOLS, 1,
+                                            FP_MAX, &round_robin, &schedule) &&
+            schedule.paths[1].x == 1 && round_robin == 2,
+        "single-symbol equal-cost paths stripe round robin");
 
   const uint8_t object_data[] = {1, 2, 3, 4};
   moq_object_t object = {.track_id = track,
@@ -1438,6 +1474,35 @@ int main(void) {
         "codec can retry after a refused workspace allocation");
   transport_fec_cache_destroy(&fec_cache);
   CHECK(!fec_cache.memory.current, "all retained codec bytes released");
+
+  /* verify pooled assembler reset retains buffer storage across objects */
+  transport_t pool_transport = {0};
+  pool_transport.limits.max_assembler_memory_bytes = 1024U * 1024U;
+  frame_assembler_t pooled_asm = {0};
+  CHECK(transport_grow_assembler(&pool_transport, &pooled_asm, 4, 128),
+        "initial assembler allocation");
+  uint8_t *saved_storage = pooled_asm.buffer_storage;
+  uint8_t **saved_buffers = pooled_asm.buffers;
+  pooled_asm.total_symbols = 4;
+  pooled_asm.received_count = 3;
+  pooled_asm.received_mask[0] = true;
+  transport_reset_assembler(&pool_transport, &pooled_asm);
+  CHECK(pooled_asm.total_symbols == 0 && pooled_asm.pooled &&
+            pooled_asm.received_count == 0 &&
+            pool_transport.assembler_memory_bytes == 0 &&
+            pool_transport.assembler_pool_bytes > 0 &&
+            pooled_asm.buffer_storage == saved_storage &&
+            pooled_asm.buffers == saved_buffers,
+        "pooled assembler retains allocated symbol buffers");
+  CHECK(transport_grow_assembler(&pool_transport, &pooled_asm, 4, 128) &&
+            !pooled_asm.pooled && pool_transport.assembler_pool_bytes == 0 &&
+            pool_transport.assembler_memory_bytes > 0 &&
+            pooled_asm.buffer_storage == saved_storage,
+        "pooled assembler reactivates in place without reallocating");
+  transport_release_assembler(&pool_transport, &pooled_asm);
+  CHECK(!pooled_asm.pooled && !pooled_asm.buffer_storage &&
+            pool_transport.assembler_memory_bytes == 0,
+        "released assembler frees pooled storage");
 
   printf("===TRANSPORT COMPONENTS OK===\n");
   return 0;

@@ -156,14 +156,11 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
     return false;
 
   bool encoded = false;
-  const uint8_t **data_blocks =
-      calloc(object->data_symbols, sizeof(*data_blocks));
-  uint8_t *tail = NULL;
+  const uint8_t *data_blocks[QLINQ_FEC_MAX_TOTAL_SYMBOLS];
+  uint8_t tail[QLINQ_FEC_MAX_SYMBOL_SIZE];
   uint32_t parity_ids[TRANSPORT_REPAIR_MAX_SYMBOLS];
   uint8_t *parity_outputs[TRANSPORT_REPAIR_MAX_SYMBOLS];
   size_t parity_count = 0;
-  if (!data_blocks)
-    goto cleanup;
   for (size_t i = 0; i < object->data_symbols; i++) {
     size_t offset = i * object->symbol_size;
     size_t chunk = offset < object->size ? object->size - offset : 0;
@@ -173,11 +170,9 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
       /* valid geometry needs at most one padded tail, never a source copy */
       if (i + 1U != object->data_symbols)
         goto cleanup;
-      tail = calloc(1, object->symbol_size);
-      if (!tail)
-        goto cleanup;
       if (chunk != 0)
         memcpy(tail, object->data + offset, chunk);
+      memset(tail + chunk, 0, object->symbol_size - chunk);
       data_blocks[i] = tail;
     }
   }
@@ -201,8 +196,6 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
                                         parity_count, parity_outputs);
   }
 cleanup:
-  free(data_blocks);
-  free(tail);
   if (!encoded) {
     transport_repair_batch_destroy(batch);
     return false;

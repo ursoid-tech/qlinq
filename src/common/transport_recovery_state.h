@@ -26,6 +26,7 @@ typedef struct {
   bool seen_initialized;
   uint64_t pending_base;
   uint32_t pending_mask;
+  uint8_t pending_cursor;
   uint64_t group_id;
   int64_t detected_at_ms;
   int64_t first_missing_at_ms;
@@ -37,6 +38,12 @@ typedef struct {
   bool retired_initialized;
   bool checkpoint_initialized;
   uint64_t last_checkpoint_object_id;
+  bool acked_initialized;
+  uint64_t acked_group_id;
+  uint64_t acked_object_id;
+  bool ack_pending;
+  uint64_t pending_ack_group_id;
+  uint64_t pending_ack_object_id;
   transport_recovery_window_t recovery_windows[QLINQ_RECOVERY_MAX_WINDOWS];
 } transport_object_gap_state_t;
 

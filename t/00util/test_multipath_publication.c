@@ -327,7 +327,7 @@ static void check_feedback(transport_fixture_t *f,
   uint8_t alias;
   assert(transport_subscriptions_find_alias(&conn->receive_subscriptions, track,
                                             &alias) == 0);
-  size_t path = transport_select_datagram_path(conn);
+  size_t path = transport_select_datagram_path_for_size(conn, 1);
   assert(path != SIZE_MAX && path != 63);
   size_t before = quicly_get_num_datagram_frames_path(conn->quic, path);
   uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE + 3] = {0};
@@ -345,7 +345,7 @@ static void check_feedback(transport_fixture_t *f,
                          ptls_iovec_init(packet, sizeof(packet)));
   assert(quicly_get_num_datagram_frames_path(conn->quic, path) == before + 1);
   assert(quicly_get_num_datagram_frames_path(conn->quic, 63) == 0);
-  conn->telemetry_reply_at_ns[63] = transport_get_time_ns() + 1000000000U;
+  conn->telemetry_reply_at_ns[63] = transport_get_monotonic_ns() + 1000000000U;
   for (size_t i = 0; i < 100; i++)
     t->receive_datagram.cb(&t->receive_datagram, conn->quic,
                            ptls_iovec_init(packet, sizeof(packet)));
@@ -525,7 +525,7 @@ int main(void) {
            quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]);
        i < QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY; i++)
     assert(transport_queue_datagram(f.server.conn, paths[0], frame));
-  assert(transport_select_datagram_path(f.server.conn) == paths[1]);
+  assert(transport_select_datagram_path_for_size(f.server.conn, 1) == paths[1]);
   assert(transport_is_track_ready(f.server.transport, &track));
   uint8_t shared_payload[2000];
   memset(shared_payload, 0x24, sizeof(shared_payload));
@@ -595,7 +595,7 @@ int main(void) {
   assert(transport_path_get_eligible_by_local(
              f.server.conn->quic, &f.server.transport->sockets[0].local_addr,
              &stats) == paths[1]);
-  assert(transport_select_datagram_path(f.server.conn) == paths[1]);
+  assert(transport_select_datagram_path_for_size(f.server.conn, 1) == paths[1]);
   assert(transport_is_track_ready(f.server.transport, &track));
   uint8_t payload[2000];
   memset(payload, 0x5a, sizeof(payload));

@@ -1,7 +1,6 @@
 /* transport_quicly.c */
 
 #include "fec.h"
-#include "pathflow.h"
 #include "portable_sockets.h"
 #include "transport.h"
 #include "transport_config.h"
@@ -14,7 +13,6 @@
 #include "transport_recovery.h"
 #include "transport_publish.h"
 #include "transport_repair.h"
-#include "transport_scheduler.h"
 #include "transport_stream.h"
 #include "transport_subscriptions.h"
 #include "transport_tls.h"
@@ -195,18 +193,100 @@ void transport_release_assembler(transport_t *t, frame_assembler_t *assembler) {
     return;
   transport_unindex_assembler(assembler);
   size_t bytes = transport_assembler_capacity_bytes(assembler);
-  if (bytes <= t->assembler_memory_bytes)
-    t->assembler_memory_bytes -= bytes;
-  else
-    t->assembler_memory_bytes = 0;
+  if (assembler->pooled) {
+    if (bytes <= t->assembler_pool_bytes)
+      t->assembler_pool_bytes -= bytes;
+    else
+      t->assembler_pool_bytes = 0;
+  } else {
+    if (bytes <= t->assembler_memory_bytes)
+      t->assembler_memory_bytes -= bytes;
+    else
+      t->assembler_memory_bytes = 0;
+  }
   transport_assembler_release(assembler);
+}
+
+void transport_reset_assembler(transport_t *t, frame_assembler_t *assembler) {
+  if (!t || !assembler)
+    return;
+  transport_unindex_assembler(assembler);
+  size_t bytes = transport_assembler_capacity_bytes(assembler);
+  if (!assembler->pooled && assembler->buffers) {
+    if (bytes <= t->assembler_memory_bytes)
+      t->assembler_memory_bytes -= bytes;
+    else
+      t->assembler_memory_bytes = 0;
+    t->assembler_pool_bytes += bytes;
+    assembler->pooled = true;
+  }
+  assembler->track_id = 0;
+  assembler->group_id = 0;
+  assembler->object_id = 0;
+  assembler->total_symbols = 0;
+  assembler->data_symbols = 0;
+  assembler->symbol_size = 0;
+  assembler->original_size = 0;
+  assembler->received_count = 0;
+  assembler->priority = 0;
+  assembler->nack_sent = false;
+  assembler->first_symbol_time_ms = 0;
+  assembler->last_activity_time_ms = 0;
+  assembler->last_nack_time_ms = 0;
+}
+
+static void reclaim_pooled_assemblers(transport_t *t,
+                                      const frame_assembler_t *keep,
+                                      size_t additional_bytes) {
+  size_t limit = t->limits.max_assembler_memory_bytes;
+  if (t->assembler_pool_bytes == 0)
+    return;
+  size_t conn_count = transport_connection_count(t);
+  for (size_t c = 0; c < conn_count && t->assembler_pool_bytes != 0; c++) {
+    if (t->assembler_memory_bytes <= limit &&
+        t->assembler_pool_bytes <= limit - t->assembler_memory_bytes &&
+        additional_bytes <=
+            limit - t->assembler_memory_bytes - t->assembler_pool_bytes)
+      return;
+    transport_conn_t *conn = transport_connection_at(t, c);
+    if (!conn)
+      continue;
+    for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+      frame_assembler_t *slot = &conn->assemblers[i];
+      if (slot == keep || !slot->pooled)
+        continue;
+      transport_release_assembler(t, slot);
+      if (t->assembler_memory_bytes <= limit &&
+          t->assembler_pool_bytes <= limit - t->assembler_memory_bytes &&
+          additional_bytes <=
+              limit - t->assembler_memory_bytes - t->assembler_pool_bytes)
+        return;
+    }
+  }
 }
 
 bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
                               uint16_t symbols, uint16_t symbol_size) {
   if (!t || !assembler)
     return false;
+  bool needs_allocation = !assembler->buffers ||
+                          assembler->capacity_symbols < symbols ||
+                          assembler->capacity_symbol_size < symbol_size;
+  if (assembler->pooled && needs_allocation)
+    transport_release_assembler(t, assembler);
+
   size_t old_bytes = transport_assembler_capacity_bytes(assembler);
+  if (assembler->pooled) {
+    /* reactivate pooled slot capacity without touching the heap */
+    if (old_bytes <= t->assembler_pool_bytes)
+      t->assembler_pool_bytes -= old_bytes;
+    else
+      t->assembler_pool_bytes = 0;
+    t->assembler_memory_bytes += old_bytes;
+    assembler->pooled = false;
+    return true;
+  }
+
   size_t new_bytes = transport_assembler_required_bytes(symbols, symbol_size);
   if (assembler->capacity_symbols > symbols ||
       assembler->capacity_symbol_size > symbol_size) {
@@ -222,17 +302,19 @@ bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
   size_t used_without_old = old_bytes <= t->assembler_memory_bytes
                                 ? t->assembler_memory_bytes - old_bytes
                                 : t->assembler_memory_bytes;
-  /* Growth allocates replacement buffers before copying and freeing the old
-   * ones. Reserve that transient allocation too; rejecting growth must leave
-   * an incomplete object's symbols intact. Reusing capacity allocates nothing.
-   */
-  bool needs_allocation = !assembler->buffers ||
-                          assembler->capacity_symbols < symbols ||
-                          assembler->capacity_symbol_size < symbol_size;
+  /* reserve transient replacement bytes and reclaim idle pooled slots first */
   size_t additional_bytes = needs_allocation ? new_bytes : 0;
-  if (t->assembler_memory_bytes > t->limits.max_assembler_memory_bytes ||
+  size_t limit = t->limits.max_assembler_memory_bytes;
+  if (t->assembler_memory_bytes > limit ||
+      t->assembler_pool_bytes > limit - t->assembler_memory_bytes ||
       additional_bytes >
-          t->limits.max_assembler_memory_bytes - t->assembler_memory_bytes) {
+          limit - t->assembler_memory_bytes - t->assembler_pool_bytes) {
+    reclaim_pooled_assemblers(t, assembler, additional_bytes);
+  }
+  if (t->assembler_memory_bytes > limit ||
+      t->assembler_pool_bytes > limit - t->assembler_memory_bytes ||
+      additional_bytes >
+          limit - t->assembler_memory_bytes - t->assembler_pool_bytes) {
     t->stats.resource_limit_errors++;
     return false;
   }
@@ -285,20 +367,24 @@ void transport_log(transport_t *t, transport_log_level_t level,
     t->log_callback_active = true;
     t->log_callback(t->log_user_data, &event);
     t->log_callback_active = false;
-  } else if (level >= TRANSPORT_LOG_WARNING) {
-    const char *name = level == TRANSPORT_LOG_ERROR ? "error" : "warning";
-    if (connection_id != 0 && path_index != SIZE_MAX)
-      fprintf(stderr, "qlinq[%s] %s conn=%" PRIu32 " path=%zu: %s\n", component,
-              name, connection_id, path_index, message);
-    else if (connection_id != 0)
-      fprintf(stderr, "qlinq[%s] %s conn=%" PRIu32 ": %s\n", component, name,
-              connection_id, message);
-    else if (path_index != SIZE_MAX)
-      fprintf(stderr, "qlinq[%s] %s path=%zu: %s\n", component, name,
-              path_index, message);
-    else
-      fprintf(stderr, "qlinq[%s] %s: %s\n", component, name, message);
   }
+}
+
+static void log_config_error(const transport_config_t *config,
+                             const char *component, const char *format, ...) {
+  if (!config || !config->log_callback || !component || !format)
+    return;
+  char message[512];
+  va_list args;
+  va_start(args, format);
+  (void)vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+  transport_log_event_t event = {.level = TRANSPORT_LOG_ERROR,
+                                 .component = component,
+                                 .connection_id = 0,
+                                 .path_index = SIZE_MAX,
+                                 .message = message};
+  config->log_callback(config->log_user_data, &event);
 }
 
 static bool transport_has_connection(const transport_t *t,
@@ -375,19 +461,25 @@ size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
   return best;
 }
 
-size_t transport_select_datagram_path(transport_conn_t *conn) {
-  return transport_select_datagram_path_for_size(conn, 1);
-}
-
-bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
-                              ptls_iovec_t datagram) {
-  size_t limit = transport_datagram_payload_limit(conn, path_index);
-  if (limit == 0 || datagram.len > limit)
+bool transport_queue_datagram_on_quic_path(transport_conn_t *conn,
+                                           size_t path_index,
+                                           size_t payload_limit,
+                                           ptls_iovec_t datagram) {
+  if (!conn || !conn->quic || path_index >= TRANSPORT_MAX_QUIC_PATHS ||
+      payload_limit == 0 || datagram.len > payload_limit ||
+      !quicly_is_path_available(conn->quic, path_index))
     return false;
   size_t before = quicly_get_num_datagram_frames_path(conn->quic, path_index);
   quicly_send_datagram_frames_path(conn->quic, path_index, &datagram, 1);
   size_t after = quicly_get_num_datagram_frames_path(conn->quic, path_index);
   return after == before + 1U;
+}
+
+bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
+                              ptls_iovec_t datagram) {
+  return transport_queue_datagram_on_quic_path(
+      conn, path_index, transport_datagram_payload_limit(conn, path_index),
+      datagram);
 }
 
 static void copy_interface_name(char destination[64], const char *name) {
@@ -471,6 +563,11 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
           quicly_get_num_datagram_frames_path(quic, path) == 0 ||
           !quicly_is_path_available(quic, path))
         continue;
+      size_t datagram_physical = conn->scheduler_sockets[path];
+      if (datagram_physical < t->socket_count &&
+          !transport_egress_can_accept(&t->sockets[datagram_physical].egress,
+                                       64U, 64U * 1500U))
+        continue;
       quicly_path_stats_t stats;
       quicly_path_health_t health;
       if (quicly_get_path_stats(quic, path, &stats) != 0 ||
@@ -506,6 +603,10 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
     size_t path = (size_t)__builtin_ctzll(remaining);
     remaining &= remaining - 1U;
     size_t physical = conn->scheduler_sockets[path];
+    if (physical < t->socket_count &&
+        !transport_egress_can_accept(&t->sockets[physical].egress, 64U,
+                                     64U * 1500U))
+      continue;
     quicly_path_health_t health;
     if (!quicly_is_path_available(quic, path) ||
         (quicly_get_path_health(quic, path, &health) == 0 &&
@@ -970,9 +1071,9 @@ transport_t *transport_drive_create(const transport_config_t *config) {
         config->num_remote_hosts <= TRANSPORT_MAX_PATHS &&
         config->simulated_loss_rate <= 100 &&
         config->simulated_flexicast_feedback_loss_rate <= 100)
-      fprintf(stderr,
-              "transport: peer verification requires verify_peer or explicit "
-              "allow_insecure_peer\n");
+      log_config_error(config, "tls",
+                       "peer verification requires verify_peer or explicit "
+                       "allow_insecure_peer");
     return NULL;
   }
   for (size_t i = 0; i < config->num_bind_hosts; i++) {
@@ -994,15 +1095,23 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   char limits_error[160];
   if (!transport_limits_resolve(&config->limits, &limits, limits_error,
                                 sizeof(limits_error))) {
-    fprintf(stderr, "transport: invalid limits: %s\n", limits_error);
+    log_config_error(config, "config", "invalid limits: %s", limits_error);
     return NULL;
   }
 
   transport_t *t = calloc(1, sizeof(transport_t));
   if (!t) {
-    fprintf(stderr, "transport: failed to allocate transport state\n");
+    log_config_error(config, "memory", "failed to allocate transport state");
     return NULL;
   }
+
+  t->callback = config->callback;
+  t->user_data = config->user_data;
+  t->log_callback = config->log_callback;
+  t->log_user_data = config->log_user_data;
+  t->interface_callback = config->interface_callback;
+  t->interface_user_data = config->interface_user_data;
+  t->interface_generation = 1U;
 
   for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++) {
     t->sockets[i].egress_id = -1;
@@ -1043,8 +1152,8 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   if (!qlinq_repair_policy_resolve(&config->repair_policy, NULL,
                                    &t->repair_policy, repair_policy_error,
                                    sizeof(repair_policy_error))) {
-    fprintf(stderr, "transport: invalid repair policy: %s\n",
-            repair_policy_error);
+    transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, SIZE_MAX,
+                  "invalid repair policy: %s", repair_policy_error);
     goto Fail;
   }
   t->repair_policy_config = config->repair_policy;
@@ -1057,7 +1166,8 @@ transport_t *transport_drive_create(const transport_config_t *config) {
       (config->flexicast_cc_startup_rate != 0 &&
        config->flexicast_cc_maximum_rate != 0 &&
        config->flexicast_cc_startup_rate > config->flexicast_cc_maximum_rate)) {
-    fprintf(stderr, "transport: invalid Flexicast congestion-control rates\n");
+    transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, SIZE_MAX,
+                  "invalid Flexicast congestion-control rates");
     goto Fail;
   }
   t->flexicast_cc_startup_rate = config->flexicast_cc_startup_rate;
@@ -1076,18 +1186,20 @@ transport_t *transport_drive_create(const transport_config_t *config) {
                                   &t->flexicast, TRANSPORT_FLEXICAST_MAX_FLOWS,
                                   t->limits.max_connections))
     goto Fail;
-  if (!transport_arena_init(&t->arena, 16U * 1024U * 1024U)) {
+  size_t arena_capacity =
+      t->limits.max_fec_object_size > (SIZE_MAX - 65536U) / 2U
+          ? 16U * 1024U * 1024U
+          : 2U * t->limits.max_fec_object_size + 65536U;
+  if (arena_capacity < 128U * 1024U)
+    arena_capacity = 128U * 1024U;
+  if (arena_capacity > 16U * 1024U * 1024U)
+    arena_capacity = 16U * 1024U * 1024U;
+  if (!transport_arena_init(&t->arena, arena_capacity)) {
     transport_log(t, TRANSPORT_LOG_ERROR, "memory", 0, SIZE_MAX,
-                  "failed to allocate packet arena");
+                  "failed to initialize packet arena");
     goto Fail;
   }
 
-  t->callback = config->callback;
-  t->user_data = config->user_data;
-  t->log_callback = config->log_callback;
-  t->log_user_data = config->log_user_data;
-  t->interface_callback = config->interface_callback;
-  t->interface_user_data = config->interface_user_data;
   t->is_server = (config->num_remote_hosts == 0);
   t->bind_port = t->is_server ? config->port : 0;
   t->reconnect_enabled = !t->is_server && config->reconnect_enabled;
@@ -1226,15 +1338,20 @@ transport_t *transport_drive_create(const transport_config_t *config) {
       reliable_stream_window)
     t->quic_ctx.transport_params.max_stream_data.bidi_local =
         reliable_stream_window;
+  if (t->quic_ctx.transport_params.max_stream_data.bidi_remote <
+      reliable_stream_window)
+    t->quic_ctx.transport_params.max_stream_data.bidi_remote =
+        reliable_stream_window;
   if (t->quic_ctx.transport_params.max_data <
       t->limits.max_total_stream_egress_bytes)
     t->quic_ctx.transport_params.max_data =
         t->limits.max_total_stream_egress_bytes;
-  t->quic_ctx.transport_params.max_streams_uni = 100;
-  t->quic_ctx.transport_params.max_streams_bidi = 100;
+  t->quic_ctx.transport_params.max_streams_uni =
+      TRANSPORT_HARD_MAX_SUBSCRIPTIONS;
+  t->quic_ctx.transport_params.max_streams_bidi = 1;
 
   t->quic_ctx.transport_params.active_connection_id_limit = 8;
-  t->quic_ctx.transport_params.initial_max_path_id = TRANSPORT_MAX_PATHS;
+  t->quic_ctx.transport_params.initial_max_path_id = 16;
   t->quic_ctx.transport_params.flexicast_support.ipv4 = t->flexicast_enabled;
   t->quic_ctx.transport_params.flexicast_support.ipv6 = t->flexicast_enabled;
 
@@ -1259,6 +1376,7 @@ transport_t *transport_drive_create(const transport_config_t *config) {
       goto Fail;
     }
     t->socket_count++;
+    t->interface_generation++;
   }
 
   if (!transport_flexicast_configure(t, config->flexicast_group,
@@ -1282,11 +1400,13 @@ transport_t *transport_drive_create(const transport_config_t *config) {
     X509_STORE *store = NULL;
     if (config->ca_file) {
       store = X509_STORE_new();
-      if (X509_STORE_load_locations(store, config->ca_file, NULL) != 1) {
+      if (!store ||
+          X509_STORE_load_locations(store, config->ca_file, NULL) != 1) {
         transport_log(t, TRANSPORT_LOG_ERROR, "tls", 0, SIZE_MAX,
                       "failed to load CA certificates from %s",
                       config->ca_file);
-        X509_STORE_free(store);
+        if (store)
+          X509_STORE_free(store);
         goto Fail;
       }
     }
@@ -1436,6 +1556,7 @@ void transport_destroy(transport_t *t) {
   if (t->pending_group.data) {
     free(t->pending_group.data);
   }
+  free(t->delivery_buffer);
 
   if (t->verifier_initialized) {
     ptls_openssl_dispose_verify_certificate(&t->verifier);
@@ -1491,6 +1612,7 @@ static void add_interface(transport_t *t,
   if (transport_engine_open_path(t, socket))
     return;
   t->socket_count++;
+  t->interface_generation++;
 
   if (!t->is_server) {
     socket->remote_index =
@@ -1499,6 +1621,7 @@ static void add_interface(transport_t *t,
     if (socket->remote_index == SIZE_MAX) {
       close_local_path(socket);
       t->socket_count--;
+      t->interface_generation++;
       return;
     }
     socket->open_pending = true;
@@ -1530,6 +1653,7 @@ static void remove_interface(transport_t *t,
       t->sockets[j] = t->sockets[j + 1];
     t->sockets[--t->socket_count] =
         (transport_local_path_t){.egress_id = -1, .remote_index = SIZE_MAX};
+    t->interface_generation++;
     transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, i,
                   "removed socket for local IP");
     /* A returning client socket gets a new ephemeral port. With no surviving
@@ -1553,11 +1677,15 @@ void transport_drive_interface_event(transport_t *t, bool added,
                  : address->ss_family == AF_INET6 ? sizeof(struct sockaddr_in6)
                                                   : 0;
   copy_interface_name(msg.name, name);
-  uint8_t version = address->ss_family == AF_INET ? 4U : 6U;
+  uint8_t version = address->ss_family == AF_INET    ? 4U
+                    : address->ss_family == AF_INET6 ? 6U
+                                                     : 0U;
   const uint8_t *bytes =
       address->ss_family == AF_INET
           ? (const uint8_t *)&((const struct sockaddr_in *)address)->sin_addr
-          : (const uint8_t *)&((const struct sockaddr_in6 *)address)->sin6_addr;
+      : address->ss_family == AF_INET6
+          ? (const uint8_t *)&((const struct sockaddr_in6 *)address)->sin6_addr
+          : NULL;
   if (added)
     transport_flexicast_interface_added(t, version, bytes, index);
   else
@@ -1842,7 +1970,10 @@ static void service_connections(transport_t *t, uint64_t now) {
     }
     transport_tls_observe(conn);
     transport_protocol_resume_deferred(conn);
-    abandon_removed_paths(conn);
+    if (conn->abandoned_interface_generation != t->interface_generation) {
+      abandon_removed_paths(conn);
+      conn->abandoned_interface_generation = t->interface_generation;
+    }
     try_open_pending_paths(t, conn, now);
     if (conn->quic_ready)
       (void)transport_protocol_send_hello(conn);
@@ -1854,11 +1985,11 @@ static void service_connections(transport_t *t, uint64_t now) {
      * A fast path must not drain an entire stream window in this loop. */
     size_t remaining = quantum;
     while (remaining != 0) {
-      bool egress_has_room = true;
+      bool egress_has_room = t->socket_count == 0;
       for (size_t p = 0; p < t->socket_count; p++) {
-        if (!transport_egress_can_accept(&t->sockets[p].egress, 64U,
-                                         64U * 1500U)) {
-          egress_has_room = false;
+        if (transport_egress_can_accept(&t->sockets[p].egress, 64U,
+                                        64U * 1500U)) {
+          egress_has_room = true;
           break;
         }
       }
@@ -2064,6 +2195,11 @@ static bool subscribe_connection(transport_conn_t *conn,
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
+  size_t subscribe_len = QLINQ_WIRE_FRAME_HEADER_SIZE + 4U +
+                         strnlen(track_id->name, QLINQ_WIRE_MAX_TRACK_NAME);
+  if (!transport_stream_can_accept(conn->stream, subscribe_len, false))
+    return false;
+
   const track_subscription_t *existing = transport_subscriptions_find_const(
       &conn->receive_subscriptions, track_id);
   if (existing && existing->track_id.flags != track_id->flags)
@@ -2076,8 +2212,8 @@ static bool subscribe_connection(transport_conn_t *conn,
     if (track_id->name[0] == '\0') {
       alias = (uint8_t)track_id->type;
     } else {
-      int next_alias =
-          transport_subscriptions_next_alias(&conn->receive_subscriptions, 8);
+      int next_alias = transport_subscriptions_allocate_alias(
+          &conn->receive_subscriptions, 8);
       if (next_alias < 0)
         return false;
       alias = (uint8_t)next_alias;
@@ -2141,7 +2277,11 @@ static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
     return false;
   moq_track_id_t subscribed_track = subscription->track_id;
   uint8_t alias = subscription->alias;
-  if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_UNSUBSCRIBE,
+  size_t unsubscribe_len =
+      QLINQ_WIRE_FRAME_HEADER_SIZE + 4U +
+      strnlen(subscribed_track.name, QLINQ_WIRE_MAX_TRACK_NAME);
+  if (!transport_stream_can_accept(conn->stream, unsubscribe_len, false) ||
+      !transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_UNSUBSCRIBE,
                                           alias, &subscribed_track))
     return false;
 
@@ -2188,6 +2328,10 @@ bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
       !quicly_sendstate_is_open(&t->client_conn->stream->sendstate))
     return false;
 
+  size_t keyframe_len = QLINQ_WIRE_FRAME_HEADER_SIZE + 4U +
+                        strnlen(track_id.name, QLINQ_WIRE_MAX_TRACK_NAME);
+  if (!transport_stream_can_accept(t->client_conn->stream, keyframe_len, true))
+    return false;
   return transport_stream_write_track_frame(
       t->client_conn->stream, QLINQ_WIRE_KEYFRAME_REQUEST, 0, &track_id);
 }
@@ -2625,12 +2769,17 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
   if (!transport_publish_recovery_ready(t, track_id))
     return false;
 
+  bool any_socket_ready = t->socket_count == 0;
   for (size_t i = 0; i < t->socket_count; i++) {
     const transport_egress_t *egress = &t->sockets[i].egress;
-    if (egress->count >= egress->capacity * 3U / 4U ||
-        egress->bytes >= egress->max_bytes * 3U / 4U)
-      return false;
+    if (egress->count < egress->capacity * 3U / 4U &&
+        egress->bytes < egress->max_bytes * 3U / 4U) {
+      any_socket_ready = true;
+      break;
+    }
   }
+  if (!any_socket_ready)
+    return false;
 
   transport_track_profile_t profile = transport_get_track_profile(t, track_id);
 
@@ -2699,9 +2848,14 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
              health.state == QUICLY_PATH_SUSPECT))
           continue;
         bool owned = false;
-        for (size_t physical = 0; physical < t->socket_count; physical++)
-          owned |= transport_path_matches_local(
-              &stats, &t->sockets[physical].local_addr);
+        for (size_t physical = 0; physical < t->socket_count; physical++) {
+          const transport_egress_t *egress = &t->sockets[physical].egress;
+          if (egress->count < egress->capacity * 3U / 4U &&
+              egress->bytes < egress->max_bytes * 3U / 4U &&
+              transport_path_matches_local(&stats,
+                                           &t->sockets[physical].local_addr))
+            owned = true;
+        }
         size_t capacity = quicly_get_max_datagram_frames_path(conn->quic, path);
         if (owned &&
             quicly_get_datagram_payload_limit(conn->quic, path) >
@@ -2734,19 +2888,46 @@ int64_t transport_get_first_timeout(transport_t *t) {
                               ? t->aggregate_nack_retry_at_ms
                               : INT64_MAX;
   size_t active_conns = transport_connection_count(t);
+  bool needs_measurement_tick = t->pending_group.size != 0;
+  for (size_t p = 0; !needs_measurement_tick && p < t->socket_count; p++) {
+    if (t->sockets[p].egress.count != 0)
+      needs_measurement_tick = true;
+  }
   for (size_t c = 0; c < active_conns; c++) {
     transport_conn_t *conn = transport_connection_at(t, c);
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
+    if (!conn->quic_ready || conn->admission_retry_at_ns != 0 ||
+        quicly_has_datagram_frames(conn->quic))
+      needs_measurement_tick = true;
+    for (uint64_t mask = conn->scheduler_paths;
+         !needs_measurement_tick && mask != 0; mask &= mask - 1U) {
+      size_t path = (size_t)__builtin_ctzll(mask);
+      size_t physical = conn->scheduler_sockets[path];
+      if (physical < t->socket_count &&
+          !conn->paths[physical].state_overridden &&
+          !conn->paths[physical].state.initialized) {
+        needs_measurement_tick = true;
+        break;
+      }
+      quicly_path_stats_t stats;
+      if (quicly_get_path_stats(conn->quic, path, &stats) == 0 &&
+          stats.bytes_in_flight != 0) {
+        needs_measurement_tick = true;
+        break;
+      }
+    }
     if (conn->admission_retry_at_ns) {
       uint64_t monotonic_now = transport_now_ns(t);
+      int64_t timer_now = transport_now_ms(t);
       if (conn->admission_retry_at_ns <= monotonic_now) {
         conn->admission_retry_at_ns = 0;
+        if (timer_now < first_timeout)
+          first_timeout = timer_now;
       } else {
         uint64_t delta = conn->admission_retry_at_ns - monotonic_now;
         uint64_t delay_ms = delta / 1000000U + (delta % 1000000U != 0);
-        int64_t timer_now = transport_now_ms(t);
         int64_t retry_at = delay_ms > (uint64_t)(INT64_MAX - timer_now)
                                ? INT64_MAX
                                : timer_now + (int64_t)delay_ms;
@@ -2762,7 +2943,7 @@ int64_t transport_get_first_timeout(transport_t *t) {
       first_timeout = probe_at;
   }
 
-  if (active_conns != 0 &&
+  if (active_conns != 0 && needs_measurement_tick &&
       t->last_pathflow_update <= INT64_MAX - QLINQ_PATHFLOW_UPDATE_MS &&
       (int64_t)t->last_pathflow_update + QLINQ_PATHFLOW_UPDATE_MS <
           first_timeout)
@@ -2774,6 +2955,14 @@ int64_t transport_get_first_timeout(transport_t *t) {
   if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
       !t->shutting_down && t->reconnect_at_ms < first_timeout)
     first_timeout = t->reconnect_at_ms;
+  if (!t->is_server && t->client_conn && t->client_conn->quic_ready) {
+    for (size_t i = 0; i < t->socket_count; i++) {
+      if (t->sockets[i].open_pending &&
+          t->sockets[i].open_retry_at_ms <= (uint64_t)INT64_MAX &&
+          (int64_t)t->sockets[i].open_retry_at_ms < first_timeout)
+        first_timeout = (int64_t)t->sockets[i].open_retry_at_ms;
+    }
+  }
 
   for (size_t i = 0; i < active_conns; i++) {
     transport_conn_t *conn = transport_connection_at(t, i);

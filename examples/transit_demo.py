@@ -345,7 +345,7 @@ def main():
         out.mkdir(parents=True, exist_ok=True)
         identity = git_identity(ROOT) or {}
         dependency_git = {name: git_identity(ROOT / 'deps' / name)
-                          for name in ('quicly', 'pathflow', 'nanorq', 'nanors', 'quicly/deps/picotls')}
+                          for name in ('quicly', 'nanorq', 'nanors', 'quicly/deps/picotls')}
         metadata = {'arguments': vars(args), 'commit': identity.get('commit'),
                     'tracked_diff_sha256': identity.get('tracked_diff_sha256'),
                     'requested_netem_seeds': [

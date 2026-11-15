@@ -196,9 +196,90 @@ static void test_native_ecn(void) {
   transport_destroy(server);
 }
 
+static void auth_event(void *data, const transport_event_t *ev) {
+  transport_t *t = data;
+  if (ev->type == TRANSPORT_EVENT_CONNECTED && !t->is_server)
+    assert(transport_send_auth(t, ev->conn, (const uint8_t *)"ok", 2));
+  else if (ev->type == TRANSPORT_EVENT_AUTH && t->is_server)
+    assert(transport_respond_auth(t, ev->conn, true));
+}
+
+static void test_stream_reset_and_stop_sending(void) {
+  reset();
+  transport_config_t sc = config(true), cc = config(false);
+  sc.callback = auth_event;
+  cc.callback = auth_event;
+  transport_t *server = transport_create(&sc), *client = transport_create(&cc);
+  assert(server && client);
+  server->user_data = server;
+  client->user_data = client;
+  for (unsigned i = 0; i < 1000; i++) {
+    transport_tick(client);
+    transport_tick(server);
+    if (server->conn_count == 1 && server->conns[0]->authenticated &&
+        client->client_conn && client->client_conn->authenticated)
+      break;
+    usleep(1000);
+  }
+  assert(server->conn_count == 1 && server->conns[0]->authenticated &&
+         client->client_conn && client->client_conn->authenticated);
+
+  moq_track_id_t track = {.type = MOQ_TRACK_DATA,
+                          .flags = MOQ_TRACK_FLAG_RELIABLE,
+                          .name = "reset-test"};
+  assert(transport_subscribe(client, track));
+  for (unsigned i = 0; i < 200; i++) {
+    transport_tick(client);
+    transport_tick(server);
+    if (transport_subscriptions_contains(&server->conns[0]->send_subscriptions,
+                                         &track))
+      break;
+    usleep(1000);
+  }
+  const uint8_t payload[64] = {1, 2, 3, 4};
+  moq_object_t obj = {
+      .track_id = track, .data = payload, .size = sizeof(payload)};
+  assert(transport_publish(server, &obj));
+  quicly_stream_t *recv_stream = NULL;
+  for (unsigned i = 0; i < 200; i++) {
+    transport_tick(server);
+    transport_tick(client);
+    recv_stream = quicly_get_stream(client->client_conn->quic, 3);
+    if (recv_stream)
+      break;
+    usleep(1000);
+  }
+  assert(recv_stream);
+  /* peer sends STOP_SENDING on server's unidirectional track stream 3 */
+  quicly_request_stop(recv_stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0));
+  /* server also resets another unidirectional stream toward client */
+  quicly_stream_t *uni = NULL;
+  assert(quicly_open_stream(server->conns[0]->quic, &uni, 1) == 0 && uni);
+  quicly_reset_stream(uni, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0));
+  for (unsigned i = 0; i < 100; i++) {
+    transport_tick(client);
+    transport_tick(server);
+    usleep(1000);
+  }
+  assert(server->conn_count == 1 &&
+         quicly_get_state(server->conns[0]->quic) < QUICLY_STATE_CLOSING &&
+         quicly_get_state(client->client_conn->quic) < QUICLY_STATE_CLOSING);
+  /* server can still publish again on a fresh unidirectional track stream */
+  assert(transport_publish(server, &obj));
+  for (unsigned i = 0; i < 50; i++) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(1000);
+  }
+  assert(quicly_get_state(server->conns[0]->quic) < QUICLY_STATE_CLOSING);
+  transport_destroy(client);
+  transport_destroy(server);
+}
+
 int main(void) {
   test_native_ecn();
   test_fractional_rtt();
+  test_stream_reset_and_stop_sending();
   test_send_error(PTLS_ERROR_NO_MEMORY);
   test_send_error(QUICLY_TRANSPORT_ERROR_INTERNAL);
   test_send_error(QUICLY_ERROR_STATE_EXHAUSTION);

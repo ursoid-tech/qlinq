@@ -9,12 +9,18 @@
 #include "picotls/fusion.h"
 #endif
 
+#include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #if QLINQ_WITH_FUSION
@@ -81,12 +87,6 @@ bool transport_tls_configure_crypto_backend(transport_t *t) {
       SIZE_MAX,
       "backend=%s requested=%s fallback=%s aes_preference=AES-256-GCM",
       selected, requested, fallback ? fallback : "none");
-  /* Report an explicit selection even without a structured log consumer. */
-  if (!t->log_callback && !fallback && getenv("QLINQ_CRYPTO_BACKEND"))
-    fprintf(stderr,
-            "qlinq[crypto] backend=%s requested=%s fallback=none "
-            "aes_preference=AES-256-GCM\n",
-            selected, requested);
   return true;
 }
 
@@ -194,58 +194,206 @@ void transport_tls_free_cid_encryptor(quicly_cid_encryptor_t *encryptor) {
 }
 
 static const uint16_t insecure_verify_algorithms[] = {
-    PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256, PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
-    PTLS_SIGNATURE_RSA_PKCS1_SHA256, UINT16_MAX};
+#if PTLS_OPENSSL_HAVE_ED25519
+    PTLS_SIGNATURE_ED25519,
+#endif
+    PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256,
+#ifdef NID_secp384r1
+    PTLS_SIGNATURE_ECDSA_SECP384R1_SHA384,
+#endif
+#ifdef NID_secp521r1
+    PTLS_SIGNATURE_ECDSA_SECP521R1_SHA512,
+#endif
+    PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
+    PTLS_SIGNATURE_RSA_PSS_RSAE_SHA384,
+    PTLS_SIGNATURE_RSA_PSS_RSAE_SHA512,
+    PTLS_SIGNATURE_RSA_PKCS1_SHA256,
+    UINT16_MAX};
 
+static int verify_peer_signature(void *verify_ctx, uint16_t algo,
+                                 ptls_iovec_t data, ptls_iovec_t signature) {
+  EVP_PKEY *key = verify_ctx;
+  EVP_MD_CTX *ctx = NULL;
+  EVP_PKEY_CTX *pkey_ctx = NULL;
+  int ret = 0;
+
+  if (!data.base)
+    goto Exit;
+
+  const ptls_openssl_signature_scheme_t *scheme =
+      ptls_openssl_lookup_signature_schemes(key);
+  if (!scheme) {
+    ret = PTLS_ERROR_LIBRARY;
+    goto Exit;
+  }
+  for (; scheme->scheme_id != UINT16_MAX; ++scheme) {
+    if (scheme->scheme_id == algo)
+      break;
+  }
+  if (scheme->scheme_id == UINT16_MAX) {
+    ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+    goto Exit;
+  }
+  ctx = EVP_MD_CTX_create();
+  if (!ctx) {
+    ret = PTLS_ERROR_NO_MEMORY;
+    goto Exit;
+  }
+#if PTLS_OPENSSL_HAVE_ED25519
+  if (EVP_PKEY_id(key) == EVP_PKEY_ED25519) {
+    if (EVP_DigestVerifyInit(ctx, &pkey_ctx, NULL, NULL, key) != 1 ||
+        EVP_DigestVerify(ctx, signature.base, signature.len, data.base,
+                         data.len) != 1) {
+      ret = PTLS_ALERT_DECRYPT_ERROR;
+      goto Exit;
+    }
+  } else
+#endif
+  {
+    if (EVP_DigestVerifyInit(ctx, &pkey_ctx, scheme->scheme_md(), NULL, key) !=
+        1) {
+      ret = PTLS_ERROR_LIBRARY;
+      goto Exit;
+    }
+    if (EVP_PKEY_id(key) == EVP_PKEY_RSA) {
+      if (EVP_PKEY_CTX_set_rsa_padding(pkey_ctx, RSA_PKCS1_PSS_PADDING) != 1 ||
+          EVP_PKEY_CTX_set_rsa_pss_saltlen(pkey_ctx, -1) != 1 ||
+          EVP_PKEY_CTX_set_rsa_mgf1_md(pkey_ctx, scheme->scheme_md()) != 1) {
+        ret = PTLS_ERROR_LIBRARY;
+        goto Exit;
+      }
+    }
+    if (EVP_DigestVerifyUpdate(ctx, data.base, data.len) != 1) {
+      ret = PTLS_ERROR_LIBRARY;
+      goto Exit;
+    }
+    if (EVP_DigestVerifyFinal(ctx, signature.base, signature.len) != 1) {
+      ret = PTLS_ALERT_DECRYPT_ERROR;
+      goto Exit;
+    }
+  }
+
+Exit:
+  if (ret != 0)
+    ERR_clear_error();
+  if (ctx)
+    EVP_MD_CTX_destroy(ctx);
+  EVP_PKEY_free(key);
+  return ret;
+}
+
+/* verify proof-of-possession on presented certificates without CA trust */
 static int verify_any_certificate(
     ptls_verify_certificate_t *self, ptls_t *tls, const char *server_name,
     int (**verify_sign)(void *verify_ctx, uint16_t algorithm, ptls_iovec_t data,
                         ptls_iovec_t signature),
     void **verify_data, ptls_iovec_t *certificates, size_t certificate_count) {
   (void)self;
-  (void)tls;
   (void)server_name;
-  (void)verify_sign;
-  (void)verify_data;
-  (void)certificates;
-  (void)certificate_count;
+  if (certificate_count == 0)
+    return ptls_is_server(tls) ? 0 : PTLS_ALERT_CERTIFICATE_REQUIRED;
+  const unsigned char *der = certificates[0].base;
+  X509 *cert = d2i_X509(NULL, &der, (long)certificates[0].len);
+  if (!cert || der != certificates[0].base + certificates[0].len) {
+    X509_free(cert);
+    ERR_clear_error();
+    return PTLS_ALERT_BAD_CERTIFICATE;
+  }
+  EVP_PKEY *pubkey = X509_get_pubkey(cert);
+  X509_free(cert);
+  if (!pubkey) {
+    ERR_clear_error();
+    return PTLS_ALERT_BAD_CERTIFICATE;
+  }
+  *verify_data = pubkey;
+  *verify_sign = verify_peer_signature;
   return 0;
+}
+
+static void free_loaded_certificates(ptls_context_t *tls) {
+  for (size_t i = 0; i < tls->certificates.count; i++)
+    free(tls->certificates.list[i].base);
+  free(tls->certificates.list);
+  tls->certificates.list = NULL;
+  tls->certificates.count = 0;
+}
+
+static FILE *open_credential_file(const char *path, bool private_key) {
+#ifndef _WIN32
+  int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+  int fd = open(path, flags);
+  if (fd < 0)
+    return NULL;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+      (private_key && (st.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) != 0)) {
+    close(fd);
+    return NULL;
+  }
+  FILE *fp = fdopen(fd, "r");
+  if (!fp)
+    close(fd);
+  return fp;
+#else
+  (void)private_key;
+  return fopen(path, "rb");
+#endif
+}
+
+static int load_certificate_chain_fp(ptls_context_t *tls, FILE *fp) {
+  X509 *leaf = PEM_read_X509(fp, NULL, NULL, NULL);
+  if (!leaf) {
+    ERR_clear_error();
+    return -1;
+  }
+  STACK_OF(X509) *chain = sk_X509_new_null();
+  if (!chain) {
+    X509_free(leaf);
+    return -1;
+  }
+  X509 *cert = NULL;
+  while ((cert = PEM_read_X509(fp, NULL, NULL, NULL)) != NULL) {
+    if (!sk_X509_push(chain, cert)) {
+      X509_free(cert);
+      sk_X509_pop_free(chain, X509_free);
+      X509_free(leaf);
+      return -1;
+    }
+  }
+  ERR_clear_error();
+  int rc = ptls_openssl_load_certificates(tls, leaf, chain);
+  sk_X509_pop_free(chain, X509_free);
+  X509_free(leaf);
+  return rc == 0 ? 0 : -1;
 }
 
 int transport_tls_load_certificate_and_key(
     ptls_context_t *tls, ptls_openssl_sign_certificate_t *signer,
     const char *certificate_file, const char *key_file) {
-  if (!tls || !signer || !certificate_file || !key_file) {
-    fprintf(stderr, "certificate file and key file are required\n");
+  if (!tls || !signer || !certificate_file || !key_file)
     return -1;
-  }
-#ifndef _WIN32
-  struct stat key_stat;
-  if (stat(key_file, &key_stat) != 0) {
-    fprintf(stderr, "failed to inspect private key file\n");
-    return -1;
-  }
-  if ((key_stat.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) != 0) {
-    fprintf(stderr,
-            "private key permissions are unsafe; remove group write/execute "
-            "and all access for other users\n");
-    return -1;
-  }
-#endif
-  if (ptls_load_certificates(tls, (char *)certificate_file) != 0) {
-    fprintf(stderr, "failed to load certificates\n");
-    return -1;
-  }
 
-  FILE *file = fopen(key_file, "r");
-  if (!file) {
-    fprintf(stderr, "failed to open private key file\n");
+  FILE *cert_fp = open_credential_file(certificate_file, false);
+  if (!cert_fp)
+    return -1;
+  int cert_rc = load_certificate_chain_fp(tls, cert_fp);
+  fclose(cert_fp);
+  if (cert_rc != 0)
+    return -1;
+
+  FILE *key_fp = open_credential_file(key_file, true);
+  if (!key_fp) {
+    free_loaded_certificates(tls);
     return -1;
   }
-  EVP_PKEY *key = PEM_read_PrivateKey(file, NULL, NULL, NULL);
-  fclose(file);
+  EVP_PKEY *key = PEM_read_PrivateKey(key_fp, NULL, NULL, NULL);
+  fclose(key_fp);
   if (!key) {
-    fprintf(stderr, "failed to load private key\n");
+    ERR_clear_error();
+    free_loaded_certificates(tls);
     return -1;
   }
   const unsigned char *der =
@@ -254,13 +402,15 @@ int transport_tls_load_certificate_and_key(
   bool matches = leaf && X509_check_private_key(leaf, key) == 1;
   X509_free(leaf);
   if (!matches) {
+    ERR_clear_error();
     EVP_PKEY_free(key);
-    fprintf(stderr, "certificate and private key do not match\n");
+    free_loaded_certificates(tls);
     return -1;
   }
   if (ptls_openssl_init_sign_certificate(signer, key) != 0) {
+    ERR_clear_error();
     EVP_PKEY_free(key);
-    fprintf(stderr, "failed to initialize certificate signer\n");
+    free_loaded_certificates(tls);
     return -1;
   }
   EVP_PKEY_free(key);

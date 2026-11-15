@@ -17,6 +17,7 @@ typedef struct {
   track_subscription_t *entries;
   size_t capacity;
   uint64_t next_generation;
+  uint8_t next_dynamic_alias;
   uint16_t alias_entry[UINT8_MAX + 1U]; /* entry index plus one */
   transport_subscription_state_t *states[UINT8_MAX + 1U];
 } transport_subscription_table_t;
@@ -55,6 +56,8 @@ void transport_subscriptions_remove(transport_subscription_table_t *table,
 void transport_subscriptions_clear_stream(transport_subscription_table_t *table,
                                           quicly_stream_t *stream);
 int transport_subscriptions_next_alias(
+    const transport_subscription_table_t *table, int first_dynamic_alias);
+int transport_subscriptions_allocate_alias(
     const transport_subscription_table_t *table, int first_dynamic_alias);
 
 #endif

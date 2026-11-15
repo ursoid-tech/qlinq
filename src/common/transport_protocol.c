@@ -208,11 +208,19 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
         !already_same_alias)
       transport_publish_checkpoint_member_added(t, conn, &parsed_track, alias);
   } else if (type == QLINQ_WIRE_UNSUBSCRIBE) {
+    const track_subscription_t *existing = transport_subscriptions_find_const(
+        &conn->send_subscriptions, &parsed_track);
+    if (!existing)
+      return true;
+    if (existing->alias != alias)
+      return close_protocol_error(conn, "protocol error: track alias mismatch");
+    uint8_t existing_alias = existing->alias;
     transport_flexicast_remove_member(t, conn, &parsed_track);
-    transport_publish_checkpoint_member_removed(t, conn, &parsed_track, alias);
     transport_subscriptions_remove(&conn->send_subscriptions,
                                    (moq_track_type_t)track_type,
                                    wire_track.name);
+    transport_publish_checkpoint_member_removed(t, conn, &parsed_track,
+                                                existing_alias);
   }
 
   transport_event_type_t ev_type = TRANSPORT_EVENT_SUBSCRIBE;
@@ -329,8 +337,9 @@ static size_t queue_repairs(transport_conn_t *conn, uint8_t alias,
       break;
     memcpy(packet + QLINQ_WIRE_FEC_HEADER_SIZE,
            repair->symbols + i * repair->symbol_size, payload_size);
-    if (!transport_queue_datagram(conn, path,
-                                  ptls_iovec_init(packet, wire_len)))
+    if (!transport_queue_datagram_on_quic_path(
+            conn, path, plan->native[slot].payload_limit,
+            ptls_iovec_init(packet, wire_len)))
       break;
     plan->paths[slot].x++;
     size_t physical = plan->native[slot].physical;
@@ -694,7 +703,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                                    quicly_stream_t *stream) {
   if (!transport_tls_application_allowed(conn))
     return;
-  while (true) {
+  while (quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING) {
     ptls_iovec_t input = transport_stream_ingress_get(stream);
     if (input.len == 0)
       return;
@@ -753,7 +762,8 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
   transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
   ptls_iovec_t input = transport_stream_ingress_get(stream);
   size_t consumed = 0;
-  while (consumed < input.len) {
+  while (consumed < input.len &&
+         quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING) {
     qlinq_wire_frame_t frame;
     qlinq_wire_result_t result =
         qlinq_wire_decode_frame(input.base + consumed, input.len - consumed,
@@ -901,20 +911,28 @@ static void on_receive(quicly_stream_t *stream, size_t off, const void *src,
 }
 
 static void on_stop_sending(quicly_stream_t *stream, quicly_error_t err) {
+  (void)err;
   transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
+  transport_conn_t *conn = *quicly_get_data(stream->conn);
   if (ctx && ctx->is_control) {
     quicly_close(stream->conn, 0, "");
-  } else {
-    quicly_reset_stream(stream, err);
+  } else if (conn) {
+    /* quicly resets sendstate before invoking on_send_stop */
+    transport_subscriptions_clear_stream(&conn->send_subscriptions, stream);
   }
 }
 
 static void on_receive_reset(quicly_stream_t *stream, quicly_error_t err) {
+  (void)err;
   transport_stream_ctx_t *ctx = (transport_stream_ctx_t *)stream->data;
   if (ctx && ctx->is_control) {
     quicly_close(stream->conn, 0, "");
-  } else {
-    quicly_reset_stream(stream, err);
+  } else if (quicly_stream_has_send_side(quicly_is_client(stream->conn),
+                                         stream->stream_id) &&
+             !quicly_sendstate_transfer_complete(&stream->sendstate) &&
+             quicly_sendstate_eos_type(&stream->sendstate) !=
+                 QUICLY_SENDSTATE_EOS_TYPE_RESET) {
+    quicly_reset_stream(stream, QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0));
   }
 }
 
@@ -944,8 +962,19 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
   ctx->is_control = (stream->stream_id == 0);
   ctx->alias_bound = false;
 
-  /* client saves the stream pointer */
   transport_conn_t *conn = *quicly_get_data(stream->conn);
+  if (stream->stream_id != 0 &&
+      !quicly_stream_is_unidirectional(stream->stream_id) &&
+      quicly_stream_is_client_initiated(stream->stream_id) !=
+          quicly_is_client(stream->conn)) {
+    if (conn)
+      (void)close_protocol_error(
+          conn, "protocol error: unexpected bidirectional stream");
+    else
+      quicly_close(stream->conn, TRANSPORT_APP_ERROR_PROTOCOL,
+                   "protocol error: unexpected bidirectional stream");
+    return 0;
+  }
   if (conn && ctx->is_control) {
     conn->stream = stream;
   }
@@ -1144,8 +1173,7 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     return;
   }
   if (rateless_data &&
-      (transport_recovery_was_delivered(object_state, object_id) ||
-       transport_recovery_was_retired(object_state, object_id))) {
+      transport_recovery_is_terminal(object_state, group_id, object_id)) {
     t->stats.fec_duplicate_objects_suppressed++;
     return;
   }
@@ -1220,12 +1248,11 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     }
 
     if (!asm_slot->buffers || asm_slot->capacity_symbols < total_symbols ||
-        asm_slot->capacity_symbol_size < symbol_size) {
+        asm_slot->capacity_symbol_size < symbol_size)
       transport_release_assembler(t, asm_slot);
-      if (!transport_grow_assembler(t, asm_slot, total_symbols, symbol_size)) {
-        transport_release_assembler(t, asm_slot);
-        return;
-      }
+    if (!transport_grow_assembler(t, asm_slot, total_symbols, symbol_size)) {
+      transport_release_assembler(t, asm_slot);
+      return;
     }
 
     memset(asm_slot->received_mask, 0,
@@ -1301,20 +1328,35 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
     }
 
     if (success) {
-      /* Reused slots may have a wider stride. Compact toward the start;
-       * each destination ends before the next source block begins. */
-      uint8_t *full_data = asm_slot->buffer_storage;
+      /* copy completed payload into reusable delivery buffer so assembler
+       * slot storage stays pooled across objects without per-object malloc */
+      if (original_size > t->delivery_buffer_capacity) {
+        size_t next_cap =
+            t->delivery_buffer_capacity ? t->delivery_buffer_capacity : 4096U;
+        while (next_cap < original_size) {
+          if (next_cap > SIZE_MAX / 2U) {
+            next_cap = original_size;
+            break;
+          }
+          next_cap *= 2U;
+        }
+        uint8_t *grown = realloc(t->delivery_buffer, next_cap);
+        if (!grown)
+          return;
+        t->delivery_buffer = grown;
+        t->delivery_buffer_capacity = next_cap;
+      }
+      uint8_t *full_data = t->delivery_buffer;
       size_t bytes_left = original_size;
       for (size_t i = 0; i < data_symbols; i++) {
         size_t chunk = (bytes_left < symbol_size) ? bytes_left : symbol_size;
         if (chunk > 0) {
-          if (full_data + i * symbol_size != asm_slot->buffers[i])
-            memmove(full_data + i * symbol_size, asm_slot->buffers[i], chunk);
+          memcpy(full_data + i * symbol_size, asm_slot->buffers[i], chunk);
           bytes_left -= chunk;
         }
       }
 
-      /* Preserve the negotiated identity for every datagram delivery mode. */
+      /* preserve the negotiated identity for every datagram delivery mode */
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = tconn,
                               .track_id = resolved_track,
@@ -1325,11 +1367,9 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
                                          .size = original_size,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
-      /* Completing a recovery window can retire this assembler while queuing
-       * its checkpoint ACK. Detach the payload before that bookkeeping, and
-       * retain it through the callback (which may itself unsubscribe). */
-      asm_slot->buffer_storage = NULL;
-      transport_release_assembler(t, asm_slot);
+      uint8_t completed_priority = asm_slot->priority;
+      ev.object.priority = completed_priority;
+      transport_reset_assembler(t, asm_slot);
       completed_remember(tconn, track_id, generation, group_id, object_id);
       if (rateless_data) {
         transport_recovery_delivered(tconn, track_id, group_id, object_id);
@@ -1338,7 +1378,6 @@ void transport_protocol_receive_datagram(transport_conn_t *tconn,
       if (!got_all_data)
         t->stats.fec_objects_decoded++;
       transport_emit_event(t, &ev);
-      free(full_data);
     }
   }
   return;

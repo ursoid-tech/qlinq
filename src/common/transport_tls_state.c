@@ -18,23 +18,15 @@ static void log_result(transport_conn_t *conn) {
   transport_log(t,
                 s->policy_accepted ? TRANSPORT_LOG_INFO : TRANSPORT_LOG_WARNING,
                 "tls", conn->id, SIZE_MAX,
-                "policy=%s tls_complete=%d group=%u result=%s accepted=%d "
-                "handshake=%s verify_peer=%d reason=%s",
-                qlinq_tls_group_policy_name(t->tls_group_policy), s->complete,
-                s->selected_group, result, s->policy_accepted,
+                "policy=%s group=%u result=%s handshake=%s verify_peer=%d "
+                "tls_complete=%d accepted=%d reason=%s",
+                qlinq_tls_group_policy_name(t->tls_group_policy),
+                s->selected_group, result,
                 s->handshake == QLINQ_TLS_HANDSHAKE_FULL  ? "full"
                 : s->handshake == QLINQ_TLS_HANDSHAKE_PSK ? "psk"
                                                           : "pending",
-                t->verifier_initialized,
+                t->verifier_initialized, s->complete, s->policy_accepted,
                 s->rejection_reason[0] ? s->rejection_reason : "none");
-  if (!t->log_callback && s->policy_accepted)
-    fprintf(stderr,
-            "qlinq[tls] conn=%u policy=%s group=%u result=%s handshake=%s "
-            "verify_peer=%d\n",
-            conn->id, qlinq_tls_group_policy_name(t->tls_group_policy),
-            s->selected_group, result,
-            s->handshake == QLINQ_TLS_HANDSHAKE_FULL ? "full" : "psk",
-            t->verifier_initialized);
 }
 
 void transport_tls_observe(transport_conn_t *conn) {
@@ -90,10 +82,10 @@ void transport_tls_note_failure(transport_conn_t *conn) {
 }
 
 bool transport_tls_application_allowed(transport_conn_t *conn) {
-  if (!conn)
+  if (!conn || !conn->quic ||
+      quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
     return false;
-  /* Preserve classical application timing. Its telemetry still waits for TLS.
-   */
+  /* preserve classical application timing while gating closed connections */
   if (conn->transport->tls_group_policy == QLINQ_TLS_GROUP_CLASSICAL)
     return conn->tls.exchange != QLINQ_TLS_EXCHANGE_REJECTED;
   transport_tls_observe(conn);
