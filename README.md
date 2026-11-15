@@ -32,15 +32,13 @@ OpenSSL remains the runtime default. `make check-reports` runs both benchmark
 report validators without creating network namespaces.
 This produces the following tools and an embeddable transport library:
 
-- `qlinqd`: The background peer-to-peer network daemon.
-- `qlinq-app`: A direct `transport.h` file/stream sender and receiver that does
-  not use the daemon's Unix data socket.
-- `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
+- `qlinq-app`: Direct file/stream sender and receiver supporting unicast,
+  multipath, FEC, and Flexicast group delivery.
 - `qlinq-tun`: Single native executable for Linux tunnel management and the
   direct `qlinq.h` packet worker: local identities, pairing, saved profiles,
-  up/down, status, diagnostics and Prometheus text metrics. No Python runtime or
-  companion engine is required. Existing `--peer ...` and `--listen ...`
-  invocations remain supported.
+  up/down, status, diagnostics, optional TX GSO / RX GRO offloads, and
+  Prometheus text metrics. No Python runtime or companion engine is required.
+  Existing `--peer ...` and `--listen ...` invocations remain supported.
 - `libqlinq.a`: The in-process `transport.h` API used by `qlinq-app`, plus the
   [native application API](docs/application-api.md) in `qlinq.h` for named
   streams, owned events and endpoint management.
@@ -62,15 +60,15 @@ Receive it with:
 ```
 
 The app also supports reliable, plain datagram, fixedrate, and rateless modes,
-IPv6 bracketed peer endpoints, negotiated repair selection, an explicit QUIC
-idle timeout, machine-readable counter snapshots, and `--pv` for pv-style wire
-throughput per physical interface. Run `qlinq-app --help` for the complete
-interface.
+IPv6 bracketed peer endpoints, negotiated repair selection, congestion-control
+selection (`--cc reno|cubic|bbr`), TLS hybrid group policy (`--tls-group-policy`),
+an explicit QUIC idle timeout, machine-readable counter snapshots, and `--pv`
+for pv-style wire throughput per physical interface. Run `qlinq-app --help` for
+the complete interface.
 
-Delivery mode names are shared by `qlinq-app`, `qlinqd`, and `qlinq-tun`:
+Delivery mode names are shared by `qlinq-app` and `qlinq-tun`:
 `datagram`, `reliable`, `fixedrate` (also accepted as `fec`), and `rateless`.
-The daemon also retains its `--reliable` and `--rateless` aliases. Each tool
-keeps its existing default mode.
+Each tool keeps its existing default mode.
 
 ## Managed packet tunnel
 
@@ -114,22 +112,24 @@ The helper defaults to MTU 1400 (`--mtu` overrides it), bounds its receive queue
 and never retries a partially accepted record as a new packet. TUN readiness
 wakes the transport poller. Repeat `--bind` and `--uplink` to select paths;
 `--peer-ip` enables explicit point-to-point IPv4 addressing and `--route` adds
-subnet routes. `--stats-ms` emits JSON health snapshots. The managed workflow
-supplies these options from a saved profile. Retain `qlinqd` plus `qlinq-tund`
-for legacy mesh deployments.
+subnet routes. `--tx-gso` and `--rx-gro` enable optional Linux `IFF_VNET_HDR`
+TCP segmentation/coalescing offloads, and `--stats-ms` emits JSON health
+snapshots. The managed workflow supplies these options from a saved profile.
 `--mock --run-ms N` exercises the direct stream without a privileged TUN.
 
 ## Security
 
-`qlinqd` requires an application authentication token and verifies peer
-certificates by default. Supply the token through `QLINQ_AUTH_TOKEN` or
-`--auth-token`, and use `--ca` when peers are signed by a private CA. For local
-testing only, certificate verification can be disabled explicitly with
-`--insecure-no-verify`.
+`qlinq-app` and `qlinq-tun` verify peer certificates by default and support an
+application authentication token. Supply the token through `QLINQ_AUTH_TOKEN`
+or `--auth-token`, use `--ca` when peers are signed by a private CA, and use
+`--tls-group-policy` (`classical`, `prefer-hybrid`, or `require-hybrid`) to
+control hybrid post-quantum TLS key exchange. For local testing only,
+certificate verification can be disabled explicitly with `--insecure-no-verify`.
 
 ```bash
 QLINQ_AUTH_TOKEN='replace-with-a-secret' \
-  ./qlinqd --listen 8888 --cert peer.crt --key peer.key --ca mesh-ca.crt
+  ./qlinq-app --listen 8888 --bind 0.0.0.0 \
+  --cert peer.crt --key peer.key --ca mesh-ca.crt
 ```
 
 ## Testing

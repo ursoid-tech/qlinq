@@ -112,6 +112,7 @@ Important fields:
 | `routes` | Explicit remote IPv4 subnets, e.g. `["192.168.50.0/24"]` |
 | `queue_ms` | Maximum age of packets in the helper's userspace queues, default 100 ms |
 | `run_as` | Unprivileged transport user, default `qlinq` |
+| `tls_group_policy` | TLS key-exchange policy: `classical` (default), `prefer-hybrid`, or `require-hybrid` |
 
 The queue limit is **not an end-to-end delivery deadline**. FEC assembly,
 transport queues, the network and the application have separate timing behavior.
@@ -262,6 +263,7 @@ exporter. Remove the `.prom` file when permanently removing a tunnel/exporter.
 ```sh
 make check                    # existing suite plus management acceptance
 make check-tun-tool           # focused loopback management tests
+sudo make check-tun-offloads  # namespace kernel TUN TX GSO / RX GRO tests
 sudo make check-tun-real      # isolated real TUN/network namespace acceptance
 ```
 
@@ -285,5 +287,6 @@ validation.
 This release does not yet provide a browser dashboard, fleet management, NAT
 hole punching, DNS endpoint resolution, default-route VPN, IPv6 tunnel address
 setup, multi-peer routing, automatic credential renewal, or a transport-wide
-packet expiry deadline. It preserves the advanced transport flag interface and
-the separate legacy daemon/TUN controller.
+packet expiry deadline. It preserves the direct `--peer` / `--listen` transport
+flag interface, including optional `--tx-gso` and `--rx-gro` `IFF_VNET_HDR`
+offloads.

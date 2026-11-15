@@ -37,11 +37,13 @@ a 20-byte metadata header followed by application data.
 | 7 | Reliable track object | Object metadata followed by object bytes |
 | 8 | NACK | NACK descriptor |
 | 9 | HELLO | Capability and resource-limit advertisement |
-| 10 | Reserved | Experimental Flexicast branch; rejected here |
+| 10 | Flexicast bind | Alias, 64-bit flow ID, and 32-bit key epoch (16 bytes) |
 | 11 | Track completion | Alias, group ID, and final FEC object ID |
-| 12 | Recovery checkpoint | Alias, group ID, first and final FEC object IDs |
+| 12 | Recovery checkpoint | Alias, flags, group ID, first and final FEC object IDs |
 | 13 | Recovery checkpoint ACK | Alias, group ID, and final FEC object ID |
-| 14–255 | Reserved | Rejected by this version |
+| 14 | Object retire | Alias, group ID, and retired FEC object ID (17 bytes) |
+| 15 | Object retire ACK | Alias, group ID, and retired FEC object ID (17 bytes) |
+| 16–255 | Reserved | Rejected by this version |
 
 `HELLO` is the first frame on the bidirectional control stream in each
 direction. Application control frames and the public connected event are gated
@@ -63,8 +65,9 @@ The HELLO payload is 20 bytes:
 
 Defined capabilities are reliable objects (`0x01`), datagrams (`0x02`),
 Reed-Solomon FEC (`0x04`), rateless FEC (`0x08`), multipath (`0x10`),
-application authentication (`0x20`), rolling recovery checkpoints (`0x80`),
-and degree-of-freedom rateless repair (`0x100`). Unknown capability bits,
+application authentication (`0x20`), Flexicast datagrams (`0x40`), rolling
+recovery checkpoints (`0x80`), degree-of-freedom rateless repair (`0x100`),
+and individual object retirement (`0x200`). Unknown capability bits,
 duplicate HELLO frames, a peer with the
 wrong role, or an application frame before HELLO are protocol errors. Each
 connection uses the lower local/peer object, subscription, and UDP-payload

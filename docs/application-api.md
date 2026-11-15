@@ -35,8 +35,10 @@ selects content type and datagram, reliable, fixedrate or rateless delivery.
 Subscriptions created before authentication activate when peers become ready,
 and reactivate after a configured client reconnect. Send and receive streams
 with the same name are independent. Stream names are nonempty and at most
-63 bytes. `qlinq_stream_close` stops use of the handle and unsubscribes receive
-streams; it does not define a finite-transfer completion protocol.
+63 bytes. `qlinq_stream_finish` flushes grouped records and emits end-of-track
+checkpoint metadata for finite transfers; `qlinq_endpoint_flush` flushes
+buffered grouped records and pending recovery checkpoints across the endpoint.
+`qlinq_stream_close` stops use of the handle and unsubscribes receive streams.
 
 FEC streams accept an endpoint `repair_policy` and a per-stream override.
 Presence bits select the fields to override; omitted fields retain the delivery
@@ -116,8 +118,10 @@ The endpoint snapshot includes:
   connection/track states and their maximum age without ACK progress.
 - UDP send pressure/errors, dropped queued packets, socket queue peaks, and
   publication outcomes, including buffering, partial acceptance and backpressure.
-- Receive assembler memory, resource-limit errors, malformed datagrams, received
-  datagrams/stream frames and FEC-assisted completions.
+- Receive assembler and codec memory (`assembler_memory_bytes`,
+  `codec_memory_bytes`, bounded by `limits.max_assembler_memory_bytes` and
+  `limits.max_codec_memory_bytes`), resource-limit errors, malformed datagrams,
+  received datagrams/stream frames and FEC-assisted completions.
 
 Counters accumulate for the endpoint's lifetime. Occupancy, pending counts and
 ages are gauges; peak fields are high-water marks. `egress_peak_packets` and
@@ -149,21 +153,27 @@ individual units and scopes. In particular:
   `publish_delivered` means accepted for sending to eligible recipients, not
   remote application delivery.
 
-`qlinq_endpoint_get_path_stats` exposes active/validated state, interface/address,
-wire byte counters, packet-loss counters and RTT in milliseconds for each path.
-Slots can move when interfaces disappear; use interface/address as identity.
-`qlinq_endpoint_get_path` adds lifecycle, ACK counts, congestion window,
-bytes in flight and delay estimates. Both queries read the same underlying
-snapshot. Wire byte counters belong to the physical socket; on listeners,
-connection fields describe the first connected peer. Congestion window and
-in-flight values count QUIC packet bytes; timing fields use milliseconds.
+`qlinq_endpoint_get_path` exposes `interface_name`, `local_address`, lifecycle
+state (`QLINQ_PATH_DISCOVERED` through `QLINQ_PATH_FAILED`), wire byte counters,
+packet-sent/ACK/loss counters, RTT in milliseconds, congestion window, bytes in
+flight, and one-way/EWMA delay estimates for each path. Slots can move when
+interfaces disappear; use `interface_name` and `local_address` as identity.
+Wire byte counters belong to the physical socket; on listeners, connection
+fields describe the first connected peer. Congestion window and in-flight
+values count QUIC packet bytes; timing fields use milliseconds.
 
-`congestion_control` selects the default, Reno, Pico or Cubic controller;
-`pacing` selects the default, disabled or enabled policy. Zero-initialized
-configuration retains the transport defaults (Reno with pacing disabled).
-These endpoint settings are fixed at creation and need not match the peer.
-To use the explicit CUBIC and pacing configuration measured in the
-[MPTCP comparison](mtcp-performance-progress.md), set these fields on the
+`congestion_control` selects the default, Reno, Pico, Cubic or BBR controller;
+`pacing` selects the default, disabled or enabled policy (`QLINQ_CC_BBR`
+enables pacing automatically and rejects `QLINQ_PACING_DISABLED`).
+Zero-initialized configuration retains the transport defaults (Reno with pacing
+disabled). `security.tls_group_policy` selects classical (`QLINQ_TLS_GROUP_CLASSICAL`),
+hybrid-preferred (`QLINQ_TLS_GROUP_PREFER_HYBRID`), or hybrid-required
+(`QLINQ_TLS_GROUP_REQUIRE_HYBRID`) TLS key agreement, and `group_delivery`
+(`qlinq_group_delivery_config_t`) configures optional Flexicast multicast or
+replicated-unicast group delivery.
+These endpoint settings are fixed at creation and congestion control need not
+match the peer. To use the explicit CUBIC and pacing configuration measured in
+the [MPTCP comparison](mtcp-performance-progress.md), set these fields on the
 endpoint configuration before calling `qlinq_listen` or `qlinq_connect`:
 
 ```c
@@ -259,6 +269,7 @@ Cross-thread access and calls through the delivering context from either
 callback are rejected. An independently owned, popped event can be transferred
 to another thread for consumption and release.
 
-This interface covers unicast use. It does not expose multicast configuration,
-listener-initiated mesh connections, or finite-transfer finish/drain/abort
-stream states. The separate Quicly keepalive patches remain separate work.
+This interface covers unicast, multipath, and optional `group_delivery`
+Flexicast endpoints, plus finite-transfer completion via `qlinq_stream_finish`
+and `qlinq_endpoint_flush`. It does not expose listener-initiated mesh
+connections. The separate Quicly keepalive patches remain separate work.

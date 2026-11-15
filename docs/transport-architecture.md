@@ -14,22 +14,30 @@ recovery, path scheduling, and bounded storage.
 | `transport_drive.c` | Explicit host input, time and engine turn boundary |
 | `transport_time.c` | Standalone platform clock helpers for compatibility APIs |
 | `transport_internal.h` | Private shared transport and connection state |
-| `cli_parse.c` | Shared bounded numeric and endpoint parsing for app and daemon |
+| `transport_fp.h` | Internal Q46.17 fixed-point arithmetic helpers |
+| `cli_parse.c` | Shared bounded numeric and endpoint parsing for CLI tools |
 | `transport_config.c` | Default resolution and validation of resource limits |
 | `transport_protocol.c` | HELLO negotiation, stream dispatch, datagram receive, and FEC decoding |
 | `transport_publish.c` | Reliable/datagram publication, FEC generation, and grouped data flushes |
 | `transport_recovery.c` | Receive gaps, checkpoint acknowledgements, recovery requests, and assembler expiration |
+| `transport_repair_policy.c` | Endpoint and per-track FEC repair policy configuration and evaluation |
+| `transport_policy_scheduler.c` | Unified multipath and proactive FEC allocation scheduler |
 | `transport_tracks.c` | Small delivery-class validation and profile derivation |
 | `transport_wire.c` | Versioned, bounded byte-level encoding and decoding |
 | `transport_stream.c` | Bounded retained stream frames and QUIC acknowledgement accounting |
 | `transport_subscriptions.c` | Track/alias lookup, allocation, and stream binding |
-| `transport_memory.c` | Packet arena and FEC assembler allocation ownership |
+| `transport_memory.c` | Packet arena and pooled FEC assembler allocation ownership |
 | `transport_fec_state.c` | Reusable FEC contexts and sent-object repair cache |
 | `fec.c` | Codec selection and Reed-Solomon/RaptorQ encode/decode operations |
-| `transport_paths.c` | QUIC-path mapping and physical-path selection |
+| `transport_paths.c` | QUIC-path mapping, EWMA smoothing, and physical-path selection |
+| `transport_probe.c` | Idle path probing and multipath liveness tracking |
 | `transport_repair.c` | Bounded NACK symbol reconstruction |
-| `transport_scheduler.c` | Per-connection path and redundancy planning |
+| `transport_flexicast.c` | Flexicast group state, key rotation, pacing, and replicated-unicast fallback |
+| `transport_flexicast_dispatch.c` | Flexicast control frames and packet dispatch |
+| `transport_flexicast_host.c` | Multicast socket binding, group membership, and send/receive integration |
 | `transport_tls.c` | Certificate loading and verifier initialization |
+| `transport_tls_groups.c` | Classical and hybrid PQ TLS key-exchange group policy selection |
+| `transport_tls_state.c` | Post-handshake TLS group inspection and policy enforcement |
 | `transport_egress.c` | Owned, bounded queues for packets awaiting host acceptance |
 | `transport_udp.c` | Portable UDP batch system calls and Linux GSO acceleration |
 
@@ -157,12 +165,13 @@ the scope ID.
   path identity, object identity, symbol size, raw and used bandwidth/latency/
   loss/queue inputs, and planned data/total symbol allocation. `source` identifies
   `cwnd_rtt`, a cold-start `default`, or a test `override`; `mode` distinguishes
-  pathflow, non-FEC earliest-completion placement, and single-symbol FEC
-  round-robin placement. These events
+  weighted multipath/FEC policy scheduling, non-FEC earliest-completion
+  placement, and single-symbol FEC round-robin placement. These events
   describe scheduling decisions, including plans subsequently backpressured.
-- Incoming FEC assemblers share a 64 MiB transport-wide memory budget. Each
-  connection starts with a small receive window, with an eight-object floor
-  when the configured cap permits it, and grows according to observed receive
+- Incoming FEC assemblers share a 64 MiB transport-wide memory budget and retain
+  recently released symbol arrays in a bounded pool to avoid per-object heap
+  churn. Each connection starts with a small receive window, with an eight-object
+  floor when the configured cap permits it, and grows according to observed receive
   rate and RTT up to its configured cap (1,024 objects by default). Growth must
   fit both the old buffers and their replacements within that budget until
   copying completes.
@@ -280,8 +289,8 @@ corresponds to `QLINQ_DELIVERY_DATAGRAM`, `--fixedrate` to
 rateless only. `--all-modes` builds once and runs the four modes sequentially,
 each in a fresh user/network namespace, continuing after a failed mode.
 
-Default builds use `-O2`. Run `make clean` before rebuilding after changing
-compiler flags, because Make does not track flag changes as dependencies.
+Default builds use `-O2` and track compiler, codec, and crypto flag changes
+through `.build-config`.
 The benchmark explicitly configures bounded retained stream budgets of
 32 MiB per stream and 64 MiB per transport. The UDP ceiling and stream budgets
 are benchmark settings, reported or configured explicitly for this profile.
