@@ -156,6 +156,12 @@ static bool send_all(int fd, const char *data, size_t size) {
     ssize_t n = send(fd, data, size, MSG_NOSIGNAL);
     if (n < 0 && errno == EINTR)
       continue;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      struct pollfd p = {.fd = fd, .events = POLLOUT};
+      if (poll(&p, 1, 200) > 0)
+        continue;
+      return false;
+    }
     if (n <= 0)
       return false;
     data += n;
@@ -167,7 +173,8 @@ static bool send_all(int fd, const char *data, size_t size) {
 /* 0: stopped, 1: reply, -1: real control error (never mistake it for stopped)
  */
 static int control(const char *dir, const char *request,
-                   char reply[TJ_MAX_BYTES + 1]) {
+                   char reply[TJ_MAX_BYTES + 1], tj_doc *doc,
+                   bool quiet_disconnect) {
   struct sockaddr_un addr;
   if (!socket_address(dir, &addr)) {
     tc_error("profile path is too long for a control socket");
@@ -193,6 +200,8 @@ static int control(const char *dir, const char *request,
       !send_all(fd, message, (size_t)length)) {
     int error = errno;
     close(fd);
+    if (quiet_disconnect && (error == EPIPE || error == ECONNRESET))
+      return 0;
     tc_error("control request failed: %s", strerror(error));
     return -1;
   }
@@ -202,7 +211,10 @@ static int control(const char *dir, const char *request,
     if (n < 0 && errno == EINTR)
       continue;
     if (n < 0 || used == TJ_MAX_BYTES) {
+      int error = errno;
       close(fd);
+      if (quiet_disconnect && n < 0 && error == ECONNRESET)
+        return 0;
       tc_error("control reply failed or too large");
       return -1;
     }
@@ -212,9 +224,9 @@ static int control(const char *dir, const char *request,
   }
   close(fd);
   reply[used] = 0;
-  tj_doc *doc = calloc(1, sizeof(*doc));
+  if (quiet_disconnect && used == 0)
+    return 0;
   bool ok = doc && tj_parse(doc, reply) && doc->nodes[0].type == TJ_OBJECT;
-  free(doc);
   if (!ok) {
     tc_error("invalid control reply");
     return -1;
@@ -224,11 +236,12 @@ static int control(const char *dir, const char *request,
 
 /* separate foreground exporter reports stopped tunnels without touching
  * transport state */
-static int export_metrics(const tc_args *a, const char *dir, char *reply) {
+static int export_metrics(const tc_args *a, const char *dir, char *reply,
+                          tj_doc *doc) {
   signal(SIGTERM, stop_handler);
   signal(SIGINT, stop_handler);
   do {
-    int status = control(dir, "status", reply);
+    int status = control(dir, "status", reply, doc, false);
     if (stop_requested)
       return 0;
     if (status < 0)
@@ -300,53 +313,41 @@ static void log_line(const char *runtime, const char *line, const char *token) {
 
 static int worker(const tc_args *a, const char *dir, const tc_config *c,
                   pid_t parent) {
-  char cert[PATH_MAX], key[PATH_MAX], ca[PATH_MAX], remote[48], port[16],
-      mtu[16], queue[16], parent_text[32], track[64];
-  tc_path(cert, dir, "identity.crt");
-  tc_path(key, dir, "identity.key");
-  tc_path(ca, dir, "peer.crt");
-  snprintf(remote, sizeof(remote), "%s:%u", c->endpoint, c->port);
-  snprintf(port, sizeof(port), "%u", c->port);
-  snprintf(mtu, sizeof(mtu), "%u", c->mtu);
-  snprintf(queue, sizeof(queue), "%u", c->queue_ms);
-  snprintf(parent_text, sizeof(parent_text), "%ld", (long)parent);
+  char cert[PATH_MAX], key[PATH_MAX], ca[PATH_MAX], track[64];
+  if (!tc_path(cert, dir, "identity.crt") ||
+      !tc_path(key, dir, "identity.key") || !tc_path(ca, dir, "peer.crt"))
+    return 1;
   snprintf(track, sizeof(track), "tun/%s", c->id);
-  char *argv[128];
-  int argc = 0;
-#define ARG(v) argv[argc++] = (char *)(v)
-#define OPT(k, v)                                                              \
-  do {                                                                         \
-    ARG(k);                                                                    \
-    ARG(v);                                                                    \
-  } while (0)
-  ARG("qlinq-tun");
-  if (!strcmp(c->role, "listen"))
-    OPT("--listen", port);
-  else
-    OPT("--peer", remote);
-  OPT("--interface", c->interface);
-  OPT("--ip", c->local_ip);
-  OPT("--peer-ip", c->peer_ip);
-  OPT("--track", track);
-  OPT("--mode", c->mode);
-  OPT("--tls-group-policy", qlinq_tls_group_policy_name(c->tls_group_policy));
-  OPT("--mtu", mtu);
-  OPT("--queue-ms", queue);
-  if (a->tx_gso)
-    ARG("--tx-gso");
-  if (a->rx_gro)
-    ARG("--rx-gro");
-  OPT("--stats-ms", "500");
-  OPT("--cert", cert);
-  OPT("--key", key);
-  OPT("--ca", ca);
-  OPT("--parent-pid", parent_text);
+  qlinq_delivery_t delivery = QLINQ_DELIVERY_FIXEDRATE;
+  if (!cli_parse_delivery(c->mode, &delivery))
+    return 1;
+  tun_worker_config_t wcfg = {.listen = !strcmp(c->role, "listen"),
+                              .mock = a->mock,
+                              .tx_gso = a->tx_gso,
+                              .rx_gro = a->rx_gro,
+                              .interface_name = c->interface,
+                              .ip = c->local_ip,
+                              .peer_ip = c->peer_ip,
+                              .track = track,
+                              .token = c->token,
+                              .cert = cert,
+                              .key = key,
+                              .ca = ca,
+                              .peer = c->endpoint,
+                              .port = (uint16_t)c->port,
+                              .mtu = c->mtu,
+                              .stats_ms = 500,
+                              .queue_ms = c->queue_ms,
+                              .parent_pid = (uint64_t)parent,
+                              .delivery = delivery,
+                              .tls_group_policy = c->tls_group_policy};
   char addresses[4][16];
   bool found[4];
   if (a->mock) {
-    ARG("--mock");
-    OPT("--bind", "127.0.0.1");
-    OPT("--uplink", "lo");
+    wcfg.binds[0] = "127.0.0.1";
+    wcfg.bind_count = 1;
+    wcfg.uplinks[0] = "lo";
+    wcfg.uplink_count = 1;
   } else {
     unsigned count = tc_addresses(c, addresses, found);
     if (!count) {
@@ -354,25 +355,75 @@ static int worker(const tc_args *a, const char *dir, const tc_config *c,
       return 1;
     }
     for (unsigned i = 0; i < count; i++)
-      OPT("--bind", addresses[i]);
+      wcfg.binds[wcfg.bind_count++] = addresses[i];
     for (unsigned i = 0; i < c->uplink_count; i++)
-      OPT("--uplink", c->uplinks[i]);
+      wcfg.uplinks[wcfg.uplink_count++] = c->uplinks[i];
     for (unsigned i = 0; i < c->route_count; i++)
-      OPT("--route", c->routes[i]);
-    OPT("--run-as", c->run_as);
+      wcfg.routes[wcfg.route_count++] = c->routes[i];
+    wcfg.run_as = c->run_as;
   }
-  argv[argc] = NULL;
-  if (setenv("QLINQ_AUTH_TOKEN", c->token, 1))
-    return 1;
-  return tun_worker_main(argc, argv);
-#undef ARG
-#undef OPT
+  return tun_worker_run(&wcfg);
 }
 
 static uint64_t counter(const tj_doc *d, const char *name) {
   uint64_t v = 0;
   tj_u64(tj_get(d, &d->nodes[0], name), &v);
   return v;
+}
+
+static void drain_worker_output(int *output, char *pending, size_t *used,
+                                size_t capacity, tj_doc *doc, char *snapshot,
+                                size_t snapshot_size, uint64_t *updated,
+                                uint64_t *tx, uint64_t *rx, double *tx_rate,
+                                double *rx_rate, const char *runtime,
+                                const char *token) {
+  while (*output >= 0) {
+    ssize_t n = read(*output, pending + *used, capacity - 1 - *used);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    if (n == 0) {
+      if (*used > 0) {
+        pending[*used] = 0;
+        log_line(runtime, pending, token);
+        *used = 0;
+      }
+      close(*output);
+      *output = -1;
+      break;
+    }
+    *used += (size_t)n;
+    pending[*used] = 0;
+    char *line = pending, *end;
+    while ((end = strchr(line, '\n'))) {
+      *end = 0;
+      if (!strncmp(line, "QLINQ_STATUS ", 13)) {
+        const char *text = line + 13;
+        if (strlen(text) < snapshot_size && tj_parse(doc, text) &&
+            doc->nodes[0].type == TJ_OBJECT &&
+            tj_string(doc, &doc->nodes[0], "state")) {
+          uint64_t now = tc_now_ms(), next_tx = counter(doc, "tx_bytes"),
+                   next_rx = counter(doc, "rx_bytes");
+          double elapsed = now > *updated ? (double)(now - *updated) : 1.0;
+          *tx_rate = next_tx >= *tx ? (next_tx - *tx) * 0.008 / elapsed : 0;
+          *rx_rate = next_rx >= *rx ? (next_rx - *rx) * 0.008 / elapsed : 0;
+          *tx = next_tx;
+          *rx = next_rx;
+          *updated = now;
+          strcpy(snapshot, text);
+        }
+      } else {
+        log_line(runtime, line, token);
+      }
+      line = end + 1;
+    }
+    *used -= (size_t)(line - pending);
+    memmove(pending, line, *used);
+    if (*used == capacity - 1)
+      *used = 0;
+  }
 }
 
 static int serve(const tc_args *a, const char *dir, const tc_config *c) {
@@ -427,7 +478,8 @@ static int serve(const tc_args *a, const char *dir, const tc_config *c) {
     close(pipes[0]);
     if (dup2(pipes[1], STDOUT_FILENO) < 0 || dup2(pipes[1], STDERR_FILENO) < 0)
       _exit(1);
-    close(pipes[1]);
+    if (pipes[1] > STDERR_FILENO)
+      close(pipes[1]);
     free(doc);
     int code = worker(a, dir, c, supervisor);
     fflush(NULL);
@@ -453,6 +505,9 @@ static int serve(const tc_args *a, const char *dir, const tc_config *c) {
     pid_t waited = waitpid(child, &child_status, WNOHANG);
     if (waited == child) {
       reaped = true;
+      drain_worker_output(&output, pending, &used, sizeof(pending), doc,
+                          snapshot, sizeof(snapshot), &updated, &tx, &rx,
+                          &tx_rate, &rx_rate, runtime, c->token);
       break;
     }
     if (waited < 0 && errno != EINTR)
@@ -471,48 +526,32 @@ static int serve(const tc_args *a, const char *dir, const tc_config *c) {
       goto done;
     if (ready <= 0)
       continue;
-    if (fds[1].revents & (POLLIN | POLLHUP)) {
-      ssize_t n = read(output, pending + used, sizeof(pending) - 1 - used);
-      if (n > 0) {
-        used += n;
-        pending[used] = 0;
-        char *line = pending, *end;
-        while ((end = strchr(line, '\n'))) {
-          *end = 0;
-          if (!strncmp(line, "QLINQ_STATUS ", 13)) {
-            const char *text = line + 13;
-            if (strlen(text) < sizeof(snapshot) && tj_parse(doc, text) &&
-                doc->nodes[0].type == TJ_OBJECT &&
-                tj_string(doc, &doc->nodes[0], "state")) {
-              uint64_t now = tc_now_ms(), next_tx = counter(doc, "tx_bytes"),
-                       next_rx = counter(doc, "rx_bytes");
-              double elapsed = now > updated ? (double)(now - updated) : 1.0;
-              tx_rate = next_tx >= tx ? (next_tx - tx) * 0.008 / elapsed : 0;
-              rx_rate = next_rx >= rx ? (next_rx - rx) * 0.008 / elapsed : 0;
-              tx = next_tx;
-              rx = next_rx;
-              updated = now;
-              strcpy(snapshot, text);
-            }
-          } else
-            log_line(runtime, line, c->token);
-          line = end + 1;
-        }
-        used -= (size_t)(line - pending);
-        memmove(pending, line, used);
-        if (used == sizeof(pending) - 1)
-          used = 0;
-      }
+    if (output >= 0 && (fds[1].revents & (POLLIN | POLLHUP))) {
+      drain_worker_output(&output, pending, &used, sizeof(pending), doc,
+                          snapshot, sizeof(snapshot), &updated, &tx, &rx,
+                          &tx_rate, &rx_rate, runtime, c->token);
     }
     if (fds[0].revents & POLLIN) {
+#ifdef __linux__
+      int fd = accept4(server, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
       int fd = accept(server, NULL, NULL);
+      if (fd >= 0) {
+        int fl = fcntl(fd, F_GETFL);
+        if (fl >= 0)
+          (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        int fdfl = fcntl(fd, F_GETFD);
+        if (fdfl >= 0)
+          (void)fcntl(fd, F_SETFD, fdfl | FD_CLOEXEC);
+      }
+#endif
       if (fd < 0)
         continue;
-      struct timeval timeout = {.tv_sec = 2};
-      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
       char request[128];
-      ssize_t length = recv(fd, request, sizeof(request) - 1, 0);
+      struct pollfd client_poll = {.fd = fd, .events = POLLIN};
+      ssize_t length = -1;
+      if (poll(&client_poll, 1, 200) > 0)
+        length = recv(fd, request, sizeof(request) - 1, 0);
       if (length > 0) {
         request[length] = 0;
         request[strcspn(request, "\r\n")] = 0;
@@ -574,8 +613,8 @@ done:
 }
 
 static int start(const tc_args *a, const char *dir, const tc_config *c,
-                 char *reply) {
-  int existing = control(dir, "status", reply);
+                 char *reply, tj_doc *d) {
+  int existing = control(dir, "status", reply, d, false);
   if (existing < 0)
     return 1;
   if (existing) {
@@ -597,33 +636,34 @@ static int start(const tc_args *a, const char *dir, const tc_config *c,
   if (!child) {
     if (setsid() < 0)
       _exit(1);
-    int null = open("/dev/null", O_RDONLY);
+    int null = open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (null >= 0) {
-      dup2(null, STDIN_FILENO);
-      close(null);
+      if (dup2(null, STDIN_FILENO) < 0)
+        _exit(1);
+      if (null > STDERR_FILENO)
+        close(null);
     }
-    dup2(log, STDOUT_FILENO);
-    dup2(log, STDERR_FILENO);
-    close(log);
+    if (dup2(log, STDOUT_FILENO) < 0 || dup2(log, STDERR_FILENO) < 0)
+      _exit(1);
+    if (log > STDERR_FILENO)
+      close(log);
+    free(d);
     int code = serve(a, dir, c);
     fflush(NULL);
     _exit(code);
   }
   close(log);
-  tj_doc *d = calloc(1, sizeof(*d));
   int status;
   for (unsigned i = 0; d && i < 100; i++) {
     if (waitpid(child, &status, WNOHANG) == child) {
       tc_error("startup failed; see %s/startup.log and tunnel.log", runtime);
-      free(d);
       return 1;
     }
-    if (control(dir, "status", reply) == 1 && tj_parse(d, reply)) {
+    if (control(dir, "status", reply, d, false) == 1) {
       const char *state = tj_string(d, &d->nodes[0], "state");
       if (state && strcmp(state, "starting")) {
         printf("%s: %s; use status to check peer connectivity\n", a->name,
                state);
-        free(d);
         return 0;
       }
     }
@@ -636,17 +676,13 @@ static int start(const tc_args *a, const char *dir, const tc_config *c,
       kill(child, SIGKILL);
     usleep(10000);
   }
-  free(d);
   tc_error("startup timed out; see %s/tunnel.log", runtime);
   return 1;
 }
 
-static void print_status(const char *name, const char *reply) {
-  tj_doc *d = calloc(1, sizeof(*d));
-  if (!d || !tj_parse(d, reply)) {
-    free(d);
+static void print_status(const char *name, const tj_doc *d) {
+  if (!d || d->nodes[0].type != TJ_OBJECT)
     return;
-  }
   const char *state = tj_string(d, &d->nodes[0], "state");
   printf("%s: %s\n", name, state ? state : "unknown");
   const char *policy = tj_string(d, &d->nodes[0], "tls_group_policy");
@@ -684,7 +720,6 @@ static void print_status(const char *name, const char *reply) {
              (unsigned long long)received);
     }
   }
-  free(d);
 }
 
 int tun_control_main(int argc, char **argv) {
@@ -709,39 +744,47 @@ int tun_control_main(int argc, char **argv) {
   tc_config config;
   if (!tc_load(dir, &config))
     return 1;
+  if (!strcmp(a.action, "run"))
+    return serve(&a, dir, &config);
   char *reply = calloc(TJ_MAX_BYTES + 1, 1);
-  if (!reply)
+  tj_doc *doc = calloc(1, sizeof(*doc));
+  if (!reply || !doc) {
+    free(reply);
+    free(doc);
     return 1;
+  }
   int result = 0;
   if (!strcmp(a.action, "metrics"))
-    result = export_metrics(&a, dir, reply);
-  else if (!strcmp(a.action, "run"))
-    result = serve(&a, dir, &config);
+    result = export_metrics(&a, dir, reply, doc);
   else if (!strcmp(a.action, "up"))
-    result = start(&a, dir, &config, reply);
+    result = start(&a, dir, &config, reply, doc);
   else {
-    int status =
-        control(dir, !strcmp(a.action, "down") ? "down" : "status", reply);
+    bool down = !strcmp(a.action, "down");
+    int status = control(dir, down ? "down" : "status", reply, doc, down);
     if (status < 0) {
+      free(doc);
       free(reply);
       return 1;
     }
-    if (!status)
+    if (!status) {
       sprintf(reply, "{\"state\":\"stopped\",\"tls_group_policy\":\"%s\"}",
               qlinq_tls_group_policy_name(config.tls_group_policy));
+      (void)tj_parse(doc, reply);
+    }
     if (!strcmp(a.action, "pair")) {
       if (status) {
         tc_error("stop the tunnel before changing its trusted peer");
         result = 1;
       } else
         result = tc_pair(&a, dir, &config);
-    } else if (!strcmp(a.action, "down")) {
-      for (unsigned i = 0; status && i < 150; i++) {
+    } else if (down) {
+      for (unsigned i = 0; status > 0 && i < 150; i++) {
         usleep(50000);
-        status = control(dir, "status", reply);
+        status = control(dir, "status", reply, doc, true);
       }
-      if (status) {
-        tc_error("shutdown failed or is taking too long");
+      if (status != 0) {
+        if (status > 0)
+          tc_error("shutdown failed or is taking too long");
         result = 1;
       } else
         printf("%s: stopped\n", a.name);
@@ -749,7 +792,7 @@ int tun_control_main(int argc, char **argv) {
       if (a.json)
         puts(reply);
       else
-        print_status(a.name, reply);
+        print_status(a.name, doc);
     } else if (!strcmp(a.action, "diagnose")) {
       fputs("{\"config\":", stdout);
       tc_write(stdout, &config, true);
@@ -783,6 +826,7 @@ int tun_control_main(int argc, char **argv) {
       }
     }
   }
+  free(doc);
   free(reply);
   return result;
 }

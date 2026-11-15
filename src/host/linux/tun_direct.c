@@ -22,7 +22,9 @@
 #include <time.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <linux/capability.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #endif
 
 #define DEFAULT_TUN_MTU 1400U
@@ -118,6 +120,8 @@ static void usage(FILE *out, const char *program) {
       "  --run-ms N              Stop mock mode after N milliseconds\n",
       program);
 }
+
+static bool validate_options(const options_t *options, bool have_role);
 
 static bool parse_options(int argc, char **argv, options_t *options) {
   *options = (options_t){.interface_name = "tun0",
@@ -230,6 +234,16 @@ static bool parse_options(int argc, char **argv, options_t *options) {
   }
   if (!options->token)
     options->token = getenv("QLINQ_AUTH_TOKEN");
+  return validate_options(options, have_role);
+}
+
+static bool validate_options(const options_t *options, bool have_role) {
+  if (!have_role || !options->interface_name || !options->ip ||
+      !options->track || !options->token)
+    return false;
+  if (options->mtu < 1280 || options->mtu > 2000 || options->queue_ms == 0 ||
+      options->queue_ms > 60000 || options->port == 0)
+    return false;
   if (options->peer_ip) {
     struct in_addr local, peer;
     if (inet_pton(AF_INET, options->ip, &local) != 1 ||
@@ -239,7 +253,8 @@ static bool parse_options(int argc, char **argv, options_t *options) {
   }
   for (size_t i = 0; i < options->route_count; i++) {
     char cidr[64];
-    if (!options->peer_ip || strlen(options->routes[i]) >= sizeof(cidr))
+    if (!options->peer_ip || !options->routes[i] ||
+        strlen(options->routes[i]) >= sizeof(cidr))
       return false;
     strcpy(cidr, options->routes[i]);
     char *slash = strchr(cidr, '/');
@@ -260,8 +275,7 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       return false;
     }
   }
-  return have_role && options->token && options->token[0] &&
-         strlen(options->token) <= UINT16_MAX &&
+  return options->token[0] && strlen(options->token) <= UINT16_MAX &&
          strlen(options->interface_name) < IFNAMSIZ &&
          strlen(options->track) > 0 &&
          strlen(options->track) < QLINQ_STREAM_NAME_CAPACITY &&
@@ -271,7 +285,7 @@ static bool parse_options(int argc, char **argv, options_t *options) {
          (!options->run_ms || options->mock);
 }
 
-static bool drop_privileges(const char *name) {
+static bool drop_privileges(const char *name, bool keep_net_raw) {
   struct passwd *account = getpwnam(name);
   if (!account) {
     fprintf(stderr, "unknown user: %s\n", name);
@@ -281,11 +295,38 @@ static bool drop_privileges(const char *name) {
     fprintf(stderr, "--run-as must name an unprivileged user\n");
     return false;
   }
+#ifdef __linux__
+  if (keep_net_raw && prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0) != 0) {
+    perror("keeping capabilities");
+    return false;
+  }
+#else
+  (void)keep_net_raw;
+#endif
   if (setgroups(0, NULL) != 0 || setgid(account->pw_gid) != 0 ||
       setuid(account->pw_uid) != 0) {
     perror("dropping privileges");
     return false;
   }
+#ifdef __linux__
+  if (keep_net_raw) {
+    (void)prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0);
+    struct __user_cap_header_struct hdr = {
+        .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0};
+    struct __user_cap_data_struct data[2] = {{0}};
+    if (syscall(SYS_capget, &hdr, data) == 0) {
+      uint32_t mask = (uint32_t)CAP_TO_MASK(CAP_NET_RAW);
+      uint32_t keep = data[CAP_TO_INDEX(CAP_NET_RAW)].permitted & mask;
+      memset(data, 0, sizeof(data));
+      data[CAP_TO_INDEX(CAP_NET_RAW)].permitted = keep;
+      data[CAP_TO_INDEX(CAP_NET_RAW)].effective = keep;
+      if (syscall(SYS_capset, &hdr, data) != 0) {
+        perror("retaining CAP_NET_RAW");
+        return false;
+      }
+    }
+  }
+#endif
   return true;
 }
 
@@ -301,7 +342,6 @@ typedef struct {
   size_t mtu, write_budget;
   uint64_t received, bytes;
   bool write_blocked, stopped, failed, vnet, coalesce;
-  uint8_t aggregate[TUN_RX_AGGREGATE_CAPACITY];
   uint64_t write_calls, written_packets, aggregates, coalesced_packets,
       copied_bytes;
 } tunnel_receiver_t;
@@ -331,6 +371,9 @@ static bool flush_packets(tunnel_receiver_t *receiver, uint64_t now_ms) {
          receiver->write_budget &&
          tun_rx_batch_peek(receiver->queue, now_ms, &view)) {
     receiver->write_budget--;
+    uint8_t header_scratch[TUN_COALESCE_HEADER_CAPACITY];
+    struct iovec iov[TUN_RX_BATCH_CAPACITY + 1];
+    size_t iov_count = 0;
     tun_coalesce_output_t output = {.packet = view.packet, .count = 1};
     if (receiver->coalesce) {
       tun_packet_view_t packets[TUN_RX_BATCH_CAPACITY];
@@ -348,15 +391,18 @@ static bool flush_packets(tunnel_receiver_t *receiver, uint64_t now_ms) {
         if (slot->end_of_batch)
           break;
       }
-      (void)tun_coalesce(packets, count, receiver->aggregate,
-                         sizeof(receiver->aggregate), &output);
+      if (count > 1) {
+        (void)tun_coalesce_iov(packets, count, header_scratch, iov,
+                               TUN_RX_BATCH_CAPACITY + 1,
+                               TUN_RX_AGGREGATE_CAPACITY, &output, &iov_count);
+      }
     }
     ssize_t written;
     if (output.count > 1) {
       receiver->write_calls++;
-      receiver->copied_bytes += output.packet.size;
-      written = tun_write_offload(receiver->fd, output.packet.data,
-                                  output.packet.size, &output.offload);
+      receiver->copied_bytes += iov[0].iov_len;
+      written = tun_write_offload_iov(receiver->fd, iov, iov_count,
+                                      output.packet.size, &output.offload);
     } else
       written = write_receive_packet(receiver, output.packet.data,
                                      output.packet.size);
@@ -432,10 +478,9 @@ static bool receive_packet(void *data, const qlinq_event_t *event) {
       return false;
     bool incompatible = false;
     size_t head_size = packet->size;
-    if (receiver->queue->count) {
+    if (receiver->queue->open_has_packets) {
       const tun_rx_slot_t *head =
-          &receiver->queue
-               ->slots[receiver->queue->head % TUN_RX_BATCH_CAPACITY];
+          &receiver->queue->slots[receiver->queue->open_head];
       const tun_rx_slot_t *tail =
           &receiver->queue
                ->slots[(receiver->queue->head + receiver->queue->count - 1) %
@@ -529,7 +574,8 @@ static ssize_t read_transmit(tunnel_transmitter_t *tx, int fd, uint8_t *frame,
                                          sizeof(packet->bytes), &metadata)
                          : tun_read(fd, packet->bytes, sizeof(packet->bytes));
     if (n > 0 && tx->vnet &&
-        (metadata.flags || metadata.gso_type || metadata.gso_size)) {
+        ((metadata.flags & ~TUN_CSUM_VALID) != 0 || metadata.gso_type ||
+         metadata.gso_size)) {
       tx->dropped++;
       errno = EBADMSG;
       return -1;
@@ -686,8 +732,9 @@ static void print_stats(qlinq_endpoint_t *endpoint, uint32_t peer_id,
     json_string(path.local_address);
     printf(",\"active\":%s,\"tx_bytes\":%llu,\"rx_bytes\":%llu,\"rtt_ms\":%u,"
            "\"packets_lost\":%llu}",
-           path.active ? "true" : "false", (unsigned long long)path.bytes_sent,
-           (unsigned long long)path.bytes_received, path.rtt_ms,
+           path.state == QLINQ_PATH_ACTIVE ? "true" : "false",
+           (unsigned long long)path.bytes_sent,
+           (unsigned long long)path.bytes_received, path.smoothed_rtt_ms,
            (unsigned long long)path.packets_lost);
     first = false;
   }
@@ -746,8 +793,7 @@ static int run_tunnel(const options_t *options) {
   tun_rx_limits_t receive_limits = {.packets = TUN_RX_BATCH_CAPACITY,
                                     .bytes =
                                         TUN_RX_BATCH_CAPACITY * options->mtu,
-                                    .max_age_ms = options->queue_ms,
-                                    .flush_delay_ms = 1};
+                                    .max_age_ms = options->queue_ms};
   if (!tun_rx_batch_init(&queue, &receive_limits)) {
     if (tun_fd >= 0)
       close(tun_fd);
@@ -821,7 +867,8 @@ static int run_tunnel(const options_t *options) {
   }
   /* load root-owned identity files and bind sockets before dropping uid;
    * no peer packets are serviced until privilege drop succeeds */
-  if (!options->mock && geteuid() == 0 && !drop_privileges(options->run_as)) {
+  if (!options->mock && geteuid() == 0 &&
+      !drop_privileges(options->run_as, options->uplink_count > 0)) {
     qlinq_context_destroy(context);
     close(tun_fd);
     return 1;
@@ -871,12 +918,12 @@ static int run_tunnel(const options_t *options) {
       if (left < (uint64_t)timeout_ms)
         timeout_ms = (int)left;
     }
+    short requested_events =
+        (tun_fd >= 0 && !pending.size && !tx.plan.pending ? POLLIN : 0) |
+        (tun_fd >= 0 && queue.count ? POLLOUT : 0);
     begin_receive_batch(&receiver);
-    qlinq_status_t status =
-        qlinq_service_fd(context, timeout_ms, tun_fd,
-                         (pending.size || tx.plan.pending ? 0 : POLLIN) |
-                             (queue.count ? POLLOUT : 0),
-                         &ready_events);
+    qlinq_status_t status = qlinq_service_fd(context, timeout_ms, tun_fd,
+                                             requested_events, &ready_events);
     if (status < QLINQ_STATUS_OK) {
       fprintf(stderr, "qlinq service failed: %d\n", status);
       tun_rx_batch_cancel(&queue);
@@ -933,11 +980,17 @@ static int run_tunnel(const options_t *options) {
       pending.size = 0;
       tx_dropped++;
     }
+    if ((requested_events & POLLOUT) != 0 && status == QLINQ_STATUS_OK &&
+        (ready_events & (POLLOUT | POLLERR | POLLHUP)) == 0)
+      receiver.write_blocked = true;
     if (!end_receive_batch(&receiver, now_ms)) {
       result = 1;
       break;
     }
-    for (size_t batch = 0; batch < 32; batch++) {
+    bool can_read_tun = options->mock || (requested_events & POLLIN) == 0 ||
+                        status != QLINQ_STATUS_OK ||
+                        (ready_events & (POLLIN | POLLERR | POLLHUP)) != 0;
+    for (size_t batch = 0; batch < 64; batch++) {
       uint64_t packet_now = monotonic_ms();
       expire_transmit(&tx, packet_now, options->queue_ms);
       if (pending.size == 0) {
@@ -949,6 +1002,8 @@ static int run_tunnel(const options_t *options) {
           pending.queued_ms = now;
           last_mock = now;
         } else {
+          if (!tx.plan.pending && !can_read_tun)
+            break;
           ssize_t count =
               read_transmit(&tx, tun_fd, tx_frame, &pending, &pending_output,
                             &packet_config, packet_now);
@@ -1069,6 +1124,56 @@ static int run_tunnel(const options_t *options) {
   if (tun_fd >= 0)
     close(tun_fd);
   return result;
+}
+
+int tun_worker_run(const tun_worker_config_t *config) {
+  if (!config || (!config->listen && (!config->peer || !config->peer[0])))
+    return 1;
+  options_t options = {.listen = config->listen,
+                       .mock = config->mock,
+                       .tx_gso = config->tx_gso,
+                       .rx_gro = config->rx_gro,
+                       .interface_name = config->interface_name,
+                       .ip = config->ip,
+                       .peer_ip = config->peer_ip,
+                       .track = config->track,
+                       .token = config->token,
+                       .cert = config->cert,
+                       .key = config->key,
+                       .ca = config->ca,
+                       .run_as = config->run_as,
+                       .port = config->port,
+                       .mtu = config->mtu ? config->mtu : DEFAULT_TUN_MTU,
+                       .stats_ms = config->stats_ms,
+                       .queue_ms = config->queue_ms ? config->queue_ms : 100,
+                       .parent_pid = config->parent_pid,
+                       .delivery = config->delivery,
+                       .tls_group_policy = config->tls_group_policy};
+  if (!config->listen) {
+    if (strlen(config->peer) >= sizeof(options.peer))
+      return 1;
+    strcpy(options.peer, config->peer);
+  }
+  if (config->bind_count > QLINQ_MAX_PATHS ||
+      config->uplink_count > QLINQ_MAX_PATHS || config->route_count > 16)
+    return 1;
+  options.bind_count = config->bind_count;
+  for (size_t i = 0; i < config->bind_count; i++) {
+    options.binds[i] = config->binds[i];
+    options.bind = config->binds[i];
+  }
+  options.uplink_count = config->uplink_count;
+  for (size_t i = 0; i < config->uplink_count; i++)
+    options.uplinks[i] = config->uplinks[i];
+  options.route_count = config->route_count;
+  for (size_t i = 0; i < config->route_count; i++)
+    options.routes[i] = config->routes[i];
+  if (!validate_options(&options, true))
+    return 1;
+  setvbuf(stdout, NULL, _IONBF, 0);
+  signal(SIGINT, stop_on_signal);
+  signal(SIGTERM, stop_on_signal);
+  return run_tunnel(&options);
 }
 
 int tun_worker_main(int argc, char **argv) {

@@ -174,7 +174,7 @@ int main(int argc, char **argv) {
   assert(inet_pton(family, local_text, local) == 1 &&
          inet_pton(family, remote_text, remote) == 1);
   char device[16] = "qgsotx0";
-  int fd = requested ? tun_alloc_tx_offload(device, &offload_active)
+  int fd = requested ? tun_alloc_vnet(device, true, &offload_active)
                      : tun_alloc(device);
   assert(fd >= 0 && offload_active == requested);
   assert(fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) == 0);
@@ -204,7 +204,6 @@ int main(int argc, char **argv) {
   while (received < PAYLOAD) {
     ssize_t n =
         read_transmit(&tx, fd, frame, &ordinary, &output, &config, now());
-    unsigned char *packet = ordinary.bytes;
     if (n < 0) {
       if (errno != EAGAIN && errno != EINTR) {
         perror("read_transmit");
@@ -215,6 +214,8 @@ int main(int argc, char **argv) {
       assert(poll(&p, 1, 10) >= 0);
       continue;
     }
+    const unsigned char *packet =
+        tx.offload ? output.packet.data : ordinary.bytes;
     assert(n > 0 && n <= 1400);
     normalized++;
     if (offload_active)
@@ -235,7 +236,7 @@ int main(int argc, char **argv) {
       assert(!memcmp(packet + 8, local, 16) &&
              !memcmp(packet + 24, remote, 16));
     }
-    unsigned char *tcp = packet + iplen;
+    const unsigned char *tcp = packet + iplen;
     size_t tcp_size = (size_t)n - iplen, header = (tcp[12] >> 4) * 4;
     assert(header >= 20 && header <= tcp_size && word(tcp) == 30100 &&
            word(tcp + 2) == 30101);

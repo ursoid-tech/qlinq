@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include "tun_segment.h"
 
 /* display name for a local numeric address: "lo" for loopback, the transport's
@@ -16,6 +17,8 @@ int tun_alloc(char *dev);
 int tun_alloc_vnet(char *dev, bool transmit, bool *active);
 ssize_t tun_write_offload(int fd, const void *data, size_t size,
                           const tun_offload_t *metadata);
+ssize_t tun_write_offload_iov(int fd, const struct iovec *iov, size_t iov_count,
+                              size_t total_size, const tun_offload_t *metadata);
 ssize_t tun_read_vnet(int fd, void *data, size_t capacity,
                       tun_offload_t *metadata);
 ssize_t tun_write_vnet(int fd, const void *data, size_t size);

@@ -28,6 +28,36 @@ typedef struct {
   unsigned error_count, warning_count;
 } tc_report;
 
+typedef struct {
+  bool listen;
+  bool mock;
+  bool tx_gso;
+  bool rx_gro;
+  const char *interface_name;
+  const char *ip;
+  const char *peer_ip;
+  const char *track;
+  const char *token;
+  const char *cert;
+  const char *key;
+  const char *ca;
+  const char *run_as;
+  const char *peer;
+  uint16_t port;
+  uint64_t mtu;
+  uint64_t stats_ms;
+  uint64_t queue_ms;
+  uint64_t parent_pid;
+  const char *binds[QLINQ_MAX_PATHS];
+  size_t bind_count;
+  const char *uplinks[QLINQ_MAX_PATHS];
+  size_t uplink_count;
+  const char *routes[16];
+  size_t route_count;
+  qlinq_delivery_t delivery;
+  qlinq_tls_group_policy_t tls_group_policy;
+} tun_worker_config_t;
+
 bool tc_error(const char *format, ...);
 bool tc_path(char out[PATH_MAX], const char *dir, const char *name);
 bool tc_secure_dir(const char *path, bool create);
@@ -37,14 +67,14 @@ bool tc_validate(const tc_config *c);
 bool tc_decode(const tj_doc *doc, const tj_node *obj, tc_config *config);
 bool tc_load(const char *directory, tc_config *config);
 void tc_write(FILE *out, const tc_config *config, bool redacted);
-int tc_init(const tc_args *args, const char *directory);
-int tc_pair(const tc_args *args, const char *directory,
-            const tc_config *config);
+int tc_init(const tc_args *args, const char *dir);
+int tc_pair(const tc_args *args, const char *dir, const tc_config *config);
 unsigned tc_addresses(const tc_config *config, char addresses[4][16],
                       bool found[4]);
 void tc_check(const char *directory, const tc_config *config, bool mock,
               bool running, tc_report *report);
 uint64_t tc_now_ms(void);
+int tun_worker_run(const tun_worker_config_t *config);
 int tun_worker_main(int argc, char **argv);
 int tun_control_main(int argc, char **argv);
 

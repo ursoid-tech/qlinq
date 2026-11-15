@@ -23,6 +23,18 @@ static void roundtrip(unsigned version, size_t payload, bool options) {
   tun_coalesce_output_t o;
   assert(tun_coalesce(views, 8, scratch, sizeof(scratch), &o) && o.count == 8);
   assert(o.offload.gso_size == payload && o.packet.data == scratch);
+  uint8_t header_scratch[TUN_COALESCE_HEADER_CAPACITY], sg_joined[65536];
+  struct iovec iov[9];
+  size_t iov_count = 0, sg_total = 0;
+  tun_coalesce_output_t sg_out;
+  assert(tun_coalesce_iov(views, 8, header_scratch, iov, 9, sizeof(scratch),
+                          &sg_out, &iov_count) &&
+         sg_out.count == 8 && iov_count == 9);
+  for (size_t i = 0; i < iov_count; i++) {
+    memcpy(sg_joined + sg_total, iov[i].iov_base, iov[i].iov_len);
+    sg_total += iov[i].iov_len;
+  }
+  assert(sg_total == o.packet.size && !memcmp(sg_joined, scratch, sg_total));
   tun_packet_config_t c = {.mtu = 2048, .max_packet_size = 2048};
   tun_packet_input_t in = {.data = o.packet.data,
                            .size = o.packet.size,

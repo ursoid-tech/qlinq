@@ -2,8 +2,10 @@
 #define QLINQ_TUN_COALESCE_H
 
 #include "tun_segment.h"
+#include <sys/uio.h>
 
 #define TUN_RX_AGGREGATE_CAPACITY 65535U
+#define TUN_COALESCE_HEADER_CAPACITY 128U
 
 typedef struct {
   tun_packet_view_t packet;
@@ -19,5 +21,9 @@ bool tun_coalesce_candidate(const tun_packet_view_t *packet);
 
 bool tun_coalesce(const tun_packet_view_t *packets, size_t count, void *scratch,
                   size_t capacity, tun_coalesce_output_t *output);
+bool tun_coalesce_iov(const tun_packet_view_t *packets, size_t count,
+                      uint8_t header_scratch[TUN_COALESCE_HEADER_CAPACITY],
+                      struct iovec *iov, size_t iov_capacity, size_t capacity,
+                      tun_coalesce_output_t *output, size_t *iov_count);
 
 #endif

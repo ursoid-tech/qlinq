@@ -240,7 +240,7 @@ int main(int argc, char **argv) {
       connected = true;
   }
   tun_rx_batch_t queue;
-  tun_rx_limits_t limits = {64, 64 * 1400, 100, 1};
+  tun_rx_limits_t limits = {64, 64 * 1400, 100};
   assert(tun_rx_batch_init(&queue, &limits));
   tunnel_receiver_t rx = {.queue = &queue,
                           .fd = fd,

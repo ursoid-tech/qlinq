@@ -147,7 +147,7 @@ static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name,
   int fd;
   int err;
 
-  fd = open("/dev/net/tun", O_RDWR);
+  fd = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
   if (fd == -1) {
     perror("opening /dev/net/tun");
     return -1;
@@ -203,7 +203,7 @@ static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name,
     for (id = 0; id < 32; id++) {
       snprintf(if_name, IFNAMSIZ, "tun%u", id);
       snprintf(path, sizeof(path), "/dev/%s", if_name);
-      if ((fd = open(path, O_RDWR)) != -1) {
+      if ((fd = open(path, O_RDWR | O_CLOEXEC)) != -1) {
         return fd;
       }
     }
@@ -211,7 +211,7 @@ static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name,
   }
   snprintf(if_name, IFNAMSIZ, "%s", wanted_name);
   snprintf(path, sizeof(path), "/dev/%s", wanted_name);
-  return open(path, O_RDWR);
+  return open(path, O_RDWR | O_CLOEXEC);
 
 #else
   char path[64];
@@ -222,7 +222,7 @@ static int tun_create(char if_name[IFNAMSIZ], const char *wanted_name,
   }
   snprintf(if_name, IFNAMSIZ, "%s", wanted_name);
   snprintf(path, sizeof(path), "/dev/%s", wanted_name);
-  return open(path, O_RDWR);
+  return open(path, O_RDWR | O_CLOEXEC);
 #endif
 }
 
@@ -301,16 +301,39 @@ ssize_t tun_write_offload(int fd, const void *data, size_t size,
   return written <= (ssize_t)sizeof(header) ? 0 : written - sizeof(header);
 }
 
+ssize_t tun_write_offload_iov(int fd, const struct iovec *iov, size_t iov_count,
+                              size_t total_size, const tun_offload_t *m) {
+  (void)total_size;
+  if (!iov || iov_count == 0 || iov_count > 66U) {
+    errno = EINVAL;
+    return -1;
+  }
+  uint8_t header[TUN_VNET_HEADER_SIZE] = {m->flags, m->gso_type};
+  const uint16_t fields[] = {m->header_length, m->gso_size, m->checksum_start,
+                             m->checksum_offset};
+  for (size_t i = 0; i < 4; i++) {
+    header[2 + 2 * i] = fields[i];
+    header[3 + 2 * i] = fields[i] >> 8;
+  }
+  struct iovec vectors[67];
+  vectors[0] = (struct iovec){header, sizeof(header)};
+  memcpy(&vectors[1], iov, iov_count * sizeof(*iov));
+  ssize_t written = writev(fd, vectors, (int)(iov_count + 1U));
+  if (written <= 0)
+    return written;
+  return written <= (ssize_t)sizeof(header) ? 0 : written - sizeof(header);
+}
+
 ssize_t tun_write_vnet(int fd, const void *data, size_t size) {
   const tun_offload_t metadata = {0};
   return tun_write_offload(fd, data, size, &metadata);
 }
 
 int tun_set_mtu(const char *if_name, int mtu) {
-  struct ifreq ifr;
+  struct ifreq ifr = {0};
   int fd;
 
-  if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+  if ((fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0)) == -1) {
     return -1;
   }
   ifr.ifr_mtu = mtu;
@@ -438,10 +461,11 @@ int configure_ip_and_up(const char *if_name, const char *ip_cidr) {
   strncpy(ip, ip_cidr, sizeof(ip) - 1);
   ip[sizeof(ip) - 1] = '\0';
   char *slash = strchr(ip, '/');
+  long prefix = -1;
   if (slash) {
     *slash = '\0';
     char *end = NULL;
-    long prefix = strtol(slash + 1, &end, 10);
+    prefix = strtol(slash + 1, &end, 10);
     if (!end || *end != '\0' || prefix < 0 || prefix > 32)
       return -1;
   }
@@ -464,10 +488,13 @@ int configure_ip_and_up(const char *if_name, const char *ip_cidr) {
   }
 
 #if defined(__linux__)
-  char *addr_argv[] = {"ip",    "addr", "add",           cidr, "peer",
+  char *subnet_argv[] = {"ip",  "addr",          "add", cidr,
+                         "dev", (char *)if_name, NULL};
+  char *peer_argv[] = {"ip",    "addr", "add",           ip,  "peer",
                        peer_ip, "dev",  (char *)if_name, NULL};
   char *link_argv[] = {"ip", "link", "set", "dev", (char *)if_name, "up", NULL};
-  if (run_command(addr_argv) != 0 || run_command(link_argv) != 0)
+  if (run_command(prefix >= 0 && prefix < 32 ? subnet_argv : peer_argv) != 0 ||
+      run_command(link_argv) != 0)
     return -1;
 #elif defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__) ||    \
     defined(__DragonFly__) || defined(__NetBSD__)

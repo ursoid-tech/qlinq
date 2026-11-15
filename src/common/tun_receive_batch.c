@@ -10,8 +10,7 @@ bool tun_rx_batch_init(tun_rx_batch_t *batch, const tun_rx_limits_t *limits) {
   if (!batch || !limits || !limits->packets ||
       limits->packets > TUN_RX_BATCH_CAPACITY || !limits->bytes ||
       limits->bytes > TUN_RX_BATCH_CAPACITY * TUN_RX_PACKET_CAPACITY ||
-      !limits->max_age_ms || !limits->flush_delay_ms ||
-      limits->flush_delay_ms > limits->max_age_ms)
+      !limits->max_age_ms)
     return false;
   *batch = (tun_rx_batch_t){.limits = *limits};
   return true;
@@ -23,6 +22,8 @@ bool tun_rx_batch_begin(tun_rx_batch_t *batch) {
   /* advance batch identity on each new batch */
   batch->batch_id++;
   batch->active = true;
+  batch->open_has_packets = false;
+  batch->open_head = 0;
   return true;
 }
 
@@ -35,14 +36,22 @@ void tun_rx_batch_end(tun_rx_batch_t *batch) {
       batch->slots[tail].end_of_batch = true;
   }
   batch->active = false;
+  batch->open_has_packets = false;
 }
 
 void tun_rx_batch_consume(tun_rx_batch_t *batch) {
   if (!batch->count)
     return;
+  size_t old_head = batch->head;
   batch->bytes -= batch->slots[batch->head].size;
   batch->head = (batch->head + 1) % TUN_RX_BATCH_CAPACITY;
   batch->count--;
+  if (batch->open_has_packets && old_head == batch->open_head) {
+    if (batch->count && batch->slots[batch->head].batch_id == batch->batch_id)
+      batch->open_head = batch->head;
+    else
+      batch->open_has_packets = false;
+  }
 }
 
 void tun_rx_batch_expire(tun_rx_batch_t *batch, uint64_t now_ms) {
@@ -72,6 +81,10 @@ bool tun_rx_batch_push(tun_rx_batch_t *batch, const tun_packet_view_t *packet,
   slot->queued_ms = now_ms;
   slot->batch_id = batch->batch_id;
   slot->end_of_batch = false;
+  if (!batch->open_has_packets) {
+    batch->open_head = tail;
+    batch->open_has_packets = true;
+  }
   batch->count++;
   batch->bytes += packet->size;
   return true;
@@ -85,7 +98,6 @@ bool tun_rx_batch_peek(tun_rx_batch_t *batch, uint64_t now_ms,
     return false;
   const tun_rx_slot_t *slot = &batch->slots[batch->head];
   if (batch->active && slot->batch_id == batch->batch_id &&
-      now_ms - slot->queued_ms < batch->limits.flush_delay_ms &&
       batch->count < batch->limits.packets &&
       batch->bytes < batch->limits.bytes)
     return false;
@@ -103,15 +115,12 @@ bool tun_rx_batch_deadline(const tun_rx_batch_t *batch, uint64_t *deadline_ms) {
   if (!batch->count)
     return false;
   const tun_rx_slot_t *slot = &batch->slots[batch->head];
-  uint64_t delay = batch->limits.max_age_ms;
-  if (batch->active && slot->batch_id == batch->batch_id)
-    delay = batch->limits.flush_delay_ms;
-  *deadline_ms = add_time(slot->queued_ms, delay);
+  *deadline_ms = add_time(slot->queued_ms, batch->limits.max_age_ms);
   return true;
 }
 
 void tun_rx_batch_cancel(tun_rx_batch_t *batch) {
   batch->dropped += batch->count;
-  batch->head = batch->count = batch->bytes = 0;
-  batch->active = false;
+  batch->head = batch->count = batch->bytes = batch->open_head = 0;
+  batch->active = batch->open_has_packets = false;
 }

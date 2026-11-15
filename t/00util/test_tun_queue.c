@@ -33,6 +33,7 @@ ssize_t __wrap_tun_write(int fd, const void *data, size_t size) {
 }
 static bool checking_coalesce;
 static unsigned accepted_coalesce, offload_attempts;
+static size_t coalesce_expected_sizes[4] = {141, 141, 141, 141};
 static uint8_t coalesce_records[4][160];
 ssize_t __wrap_tun_write_vnet(int fd, const void *data, size_t size) {
   if (!checking_coalesce)
@@ -42,7 +43,8 @@ ssize_t __wrap_tun_write_vnet(int fd, const void *data, size_t size) {
     errno = EAGAIN;
     return -1;
   }
-  assert(accepted_coalesce < 4 && size == 141);
+  assert(accepted_coalesce < 4 &&
+         size == coalesce_expected_sizes[accepted_coalesce]);
   assert(!memcmp(data, coalesce_records[accepted_coalesce++], size));
   return size;
 }
@@ -77,14 +79,30 @@ ssize_t __wrap_tun_write_offload(int fd, const void *data, size_t size,
     tun_packet_output_t o;
     assert(tun_segment_next(&plan, packet, sizeof(packet), &o).status ==
            TUN_PACKET_OK);
-    assert(accepted_coalesce < 4 && o.packet.size == 141);
-    assert(!memcmp(packet, coalesce_records[accepted_coalesce++], 141));
+    assert(accepted_coalesce < 4 &&
+           o.packet.size == coalesce_expected_sizes[accepted_coalesce]);
+    assert(!memcmp(packet, coalesce_records[accepted_coalesce],
+                   coalesce_expected_sizes[accepted_coalesce]));
+    accepted_coalesce++;
   }
   return size;
 }
+ssize_t __wrap_tun_write_offload_iov(int fd, const struct iovec *iov,
+                                     size_t iov_count, size_t total_size,
+                                     const tun_offload_t *metadata) {
+  uint8_t combined[4096];
+  size_t total = 0;
+  for (size_t i = 0; i < iov_count; i++) {
+    assert(total + iov[i].iov_len <= sizeof(combined));
+    memcpy(combined + total, iov[i].iov_base, iov[i].iov_len);
+    total += iov[i].iov_len;
+  }
+  assert(total == total_size);
+  return __wrap_tun_write_offload(fd, combined, total, metadata);
+}
 static void receive_coalescing(void) {
   tun_rx_batch_t queue;
-  tun_rx_limits_t limits = {64, 64 * 1400, 1000, 1};
+  tun_rx_limits_t limits = {64, 64 * 1400, 1000};
   assert(tun_rx_batch_init(&queue, &limits));
   tunnel_receiver_t rx = {
       .queue = &queue, .fd = 7, .mtu = 1400, .vnet = true, .coalesce = true};
@@ -146,19 +164,37 @@ static void receive_coalescing(void) {
   assert(flush_packets(&rx, monotonic_ms()));
   assert(end_receive_batch(&rx, monotonic_ms()));
   assert(accepted_coalesce == 4 && rx.aggregates == ag + 2);
-  /* an open batch's 1 ms deadline releases its prefix without batch end */
+  /* a new batch with smaller segments coalesces via open_head while an older
+   * larger batch remains blocked on EAGAIN */
   accepted_coalesce = 0;
+  coalesce_expected_sizes[2] = 100;
+  coalesce_expected_sizes[3] = 100;
+  fixture_packet(coalesce_records[2], 4, 60, 5202, 102, 0x10, false);
+  fixture_packet(coalesce_records[3], 4, 60, 5262, 103, 0x10, false);
+  blocked = true;
   begin_receive_batch(&rx);
   for (unsigned i = 0; i < 2; i++) {
-    tun_packet_view_t p = {.data = coalesce_records[i],
-                           .size = 141,
-                           .version = 4,
-                           .header_size = 20};
-    assert(tun_rx_batch_push(&queue, &p, monotonic_ms() - 1));
+    qlinq_event_t e = {.record = {.data = coalesce_records[i], .size = 141}};
+    assert(receive_packet(&rx, &e));
   }
-  assert(flush_packets(&rx, monotonic_ms()));
-  assert(accepted_coalesce == 2 && !queue.count);
   assert(end_receive_batch(&rx, monotonic_ms()));
+  begin_receive_batch(&rx);
+  for (unsigned i = 2; i < 4; i++) {
+    qlinq_event_t e = {.record = {.data = coalesce_records[i], .size = 100}};
+    assert(receive_packet(&rx, &e));
+  }
+  assert(end_receive_batch(&rx, monotonic_ms()));
+  blocked = false;
+  ag = rx.aggregates;
+  begin_receive_batch(&rx);
+  assert(flush_packets(&rx, monotonic_ms()));
+  assert(end_receive_batch(&rx, monotonic_ms()));
+  assert(accepted_coalesce == 4 && rx.aggregates == ag + 2 && !queue.count);
+  coalesce_expected_sizes[2] = 141;
+  coalesce_expected_sizes[3] = 141;
+  for (unsigned i = 2; i < 4; i++)
+    fixture_packet(coalesce_records[i], 4, 101, 5000 + i * 101, 100 + i, 0x10,
+                   false);
   /* an incompatible arrival flushes the prior prefix during its callback */
   accepted_coalesce = 0;
   coalesce_records[1][20 + 14]++;
@@ -218,7 +254,7 @@ static void receive_coalescing(void) {
 }
 
 static unsigned input_reads;
-static bool bad_input, plain_input;
+static bool bad_input, plain_input, csum_valid_input;
 ssize_t __wrap_tun_read_vnet(int fd, void *data, size_t capacity,
                              tun_offload_t *metadata) {
   (void)fd;
@@ -233,8 +269,8 @@ ssize_t __wrap_tun_read_vnet(int fd, void *data, size_t capacity,
   p[20 + 17] = 90; /* TCP pseudo-header seed: protocol + upper-layer length */
   for (unsigned i = 0; i < 64; i++)
     p[40 + i] = i;
-  if (plain_input) {
-    *metadata = (tun_offload_t){0};
+  if (plain_input || csum_valid_input) {
+    *metadata = (tun_offload_t){.flags = csum_valid_input ? TUN_CSUM_VALID : 0};
     input_reads++;
     return 104;
   }
@@ -291,15 +327,18 @@ static void transmit_lifetimes(void) {
          TUN_PACKET_OK);
   assert(output.packet.data == packet.bytes);
   plain_input = false;
-  assert(read_transmit(&tx, 7, frame, &packet, &output, &config, 115) == -1);
+  csum_valid_input = true;
+  assert(read_transmit(&tx, 7, frame, &packet, &output, &config, 115) == 104);
+  assert(tx.dropped == 0 && tx.frames == 2);
+  csum_valid_input = false;
+  assert(read_transmit(&tx, 7, frame, &packet, &output, &config, 116) == -1);
   assert(errno == EBADMSG && tx.dropped == 1 && !tx.plan.pending);
 }
 
 /* verify QUIC control traffic progresses while TUN stays unwritable */
 static void pressure_transport(bool coalesce) {
   tun_rx_batch_t queue;
-  tun_rx_limits_t limits = {
-      .packets = 4, .bytes = 256, .max_age_ms = 20, .flush_delay_ms = 1};
+  tun_rx_limits_t limits = {.packets = 4, .bytes = 256, .max_age_ms = 20};
   assert(tun_rx_batch_init(&queue, &limits));
   tunnel_receiver_t receiver = {.queue = &queue,
                                 .fd = 7,
@@ -377,8 +416,7 @@ int main(void) {
   tun_rx_batch_t queue;
   tun_rx_limits_t limits = {.packets = TUN_RX_BATCH_CAPACITY,
                             .bytes = TUN_RX_BATCH_CAPACITY * 1400,
-                            .max_age_ms = 1000,
-                            .flush_delay_ms = 1};
+                            .max_age_ms = 1000};
   assert(tun_rx_batch_init(&queue, &limits));
   tunnel_receiver_t receiver = {.queue = &queue, .fd = 7, .mtu = 1400};
   uint8_t packet[64] = {0x45, 0, 0, 64};

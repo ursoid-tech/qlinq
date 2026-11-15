@@ -8,7 +8,7 @@
 
 typedef struct {
   size_t packets, bytes;
-  uint64_t max_age_ms, flush_delay_ms;
+  uint64_t max_age_ms;
 } tun_rx_limits_t;
 
 typedef struct {
@@ -23,9 +23,9 @@ typedef struct {
 typedef struct {
   tun_rx_slot_t slots[TUN_RX_BATCH_CAPACITY];
   tun_rx_limits_t limits;
-  size_t head, count, bytes;
+  size_t head, count, bytes, open_head;
   uint64_t dropped, batch_id;
-  bool active;
+  bool active, open_has_packets;
 } tun_rx_batch_t;
 
 typedef struct {

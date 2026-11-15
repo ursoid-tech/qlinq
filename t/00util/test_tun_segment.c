@@ -241,12 +241,49 @@ static void generic_partial(void) {
   assert(!tun_segment_prepare(&plan, &config, &input, &meta));
 }
 
+static void tcp_zero_checksum_case(void) {
+  uint8_t frame[64] = {0}, out[64];
+  size_t ip = 20, length = ip + 22;
+  frame[0] = 0x45;
+  w16(frame + 2, length);
+  w16(frame + 6, 0x4000);
+  frame[8] = 64;
+  frame[9] = 6;
+  frame[12] = 10;
+  frame[15] = 1;
+  frame[16] = 10;
+  frame[19] = 2;
+  w16(frame + 10, ~fold(sum(frame, ip)));
+  uint8_t *t = frame + ip;
+  w16(t, 1234);
+  w16(t + 2, 443);
+  t[12] = 0x50;
+  t[13] = 0x10;
+  w16(t + 16, fold(pseudo(frame, 4, 22, 6)));
+  /* TCP preserves computed 0x0000 instead of applying UDP 0xffff substitution
+   */
+  w16(t + 20, ~fold(sum(t, 20)));
+  tun_packet_config_t config = {.mtu = 1400, .max_packet_size = 2048};
+  tun_packet_input_t input = {
+      .data = frame, .size = length, .origin = TUN_PACKET_FROM_DEVICE};
+  tun_offload_t meta = {
+      .flags = TUN_CSUM_PARTIAL, .checksum_start = ip, .checksum_offset = 16};
+  tun_segment_t plan;
+  tun_packet_output_t output;
+  assert(tun_segment_prepare(&plan, &config, &input, &meta));
+  assert(tun_segment_next(&plan, out, sizeof(out), &output).status ==
+         TUN_PACKET_OK);
+  assert(word(out + ip + 16) == 0);
+  assert(fold(pseudo(out, 4, 22, 6) + sum(out + ip, 22)) == 65535);
+}
+
 int main(void) {
   tcp_case(4, 0, 0, 60001, 1360, 0xd9);
   tcp_case(6, 0, 12, 60003, 1328, 0xd9);
   tcp_case(6, 0, 0, 65476, 1340, 0x19); /* full 64-KiB aggregate */
   tcp_case(4, 12, 12, 21, 3, 0xf9);
   tcp_case(6, 8, 0, 21, 3, 0xf9);
+  tcp_zero_checksum_case();
   udp_case(4);
   udp_case(6);
   generic_partial();

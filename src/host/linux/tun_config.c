@@ -98,7 +98,7 @@ static bool ipv4(const char *s, uint32_t *out) {
   if (inet_pton(AF_INET, s, &address) != 1)
     return false;
   *out = ntohl(address.s_addr);
-  return *out != 0 && (*out & 0xf0000000U) != 0xe0000000U;
+  return (*out >> 24) != 0 && (*out & 0xe0000000U) != 0xe0000000U;
 }
 
 static bool network(const char *s, uint32_t *ip, uint32_t *mask) {
@@ -291,6 +291,39 @@ static FILE *new_file(const char *dir, const char *name) {
 static bool finish(FILE *f) {
   bool ok = !ferror(f);
   return fclose(f) == 0 && ok;
+}
+
+static BIO *open_regular_bio(const char *path, bool private_mode,
+                             bool *mode_ok) {
+  if (mode_ok)
+    *mode_ok = false;
+  int flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+  int fd = open(path, flags);
+  if (fd < 0)
+    return NULL;
+  struct stat st;
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+      (private_mode && (st.st_mode & 077) != 0)) {
+    close(fd);
+    return NULL;
+  }
+  if (mode_ok)
+    *mode_ok = true;
+  int current = fcntl(fd, F_GETFL);
+  if (current >= 0)
+    (void)fcntl(fd, F_SETFL, current & ~O_NONBLOCK);
+  FILE *fp = fdopen(fd, "r");
+  if (!fp) {
+    close(fd);
+    return NULL;
+  }
+  BIO *b = BIO_new_fp(fp, BIO_CLOSE);
+  if (!b)
+    fclose(fp);
+  return b;
 }
 
 static X509 *parse_cert(const char *text) {
@@ -569,7 +602,7 @@ int tc_pair(const tc_args *a, const char *dir, const tc_config *c) {
   if (!f) {
     char path[PATH_MAX];
     tc_path(path, dir, "peer.crt");
-    BIO *b = BIO_new_file(path, "r");
+    BIO *b = open_regular_bio(path, false, NULL);
     X509 *old = b ? PEM_read_bio_X509(b, NULL, NULL, NULL) : NULL;
     if (old && X509_cmp(old, x) == 0) {
       puts("This peer is already paired.");
@@ -638,9 +671,10 @@ static bool route_check(const tc_config *c) {
   }
   if (!pid) {
     close(pipes[0]);
-    dup2(pipes[1], STDOUT_FILENO);
-    dup2(pipes[1], STDERR_FILENO);
-    close(pipes[1]);
+    if (dup2(pipes[1], STDOUT_FILENO) < 0 || dup2(pipes[1], STDERR_FILENO) < 0)
+      _exit(127);
+    if (pipes[1] > STDERR_FILENO)
+      close(pipes[1]);
     execlp("ip", "ip", "-j", "route", "get", c->endpoint, (char *)NULL);
     _exit(127);
   }
@@ -707,7 +741,7 @@ void tc_check(const char *dir, const tc_config *c, bool mock, bool running,
   const char *names[] = {"identity.crt", "peer.crt"};
   for (unsigned i = 0; i < 2; i++) {
     tc_path(path, dir, names[i]);
-    BIO *b = BIO_new_file(path, "r");
+    BIO *b = open_regular_bio(path, false, NULL);
     X509 *x = b ? PEM_read_bio_X509(b, NULL, NULL, NULL) : NULL;
     BIO_free(b);
     if (!x || X509_cmp_current_time(X509_get0_notAfter(x)) != 1 ||
@@ -720,10 +754,10 @@ void tc_check(const char *dir, const tc_config *c, bool mock, bool running,
       X509_free(x);
   }
   tc_path(path, dir, "identity.key");
-  struct stat st;
-  if (lstat(path, &st) || !S_ISREG(st.st_mode) || (st.st_mode & 077))
+  bool key_mode_ok = false;
+  BIO *b = open_regular_bio(path, true, &key_mode_ok);
+  if (!key_mode_ok)
     ERROR("identity.key must be a regular private file (mode 600)");
-  BIO *b = BIO_new_file(path, "r");
   EVP_PKEY *key =
       b ? PEM_read_bio_PrivateKey(b, NULL, no_password, NULL) : NULL;
   if (!key || !identity || X509_check_private_key(identity, key) != 1)

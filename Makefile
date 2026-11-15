@@ -240,13 +240,15 @@ DESTDIR ?=
 install-tun: qlinq-tun
 	install -d $(DESTDIR)$(PREFIX)/bin $(DESTDIR)$(PREFIX)/lib/systemd/system $(DESTDIR)$(PREFIX)/lib/sysusers.d
 	install -m 755 qlinq-tun $(DESTDIR)$(PREFIX)/bin/
-	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
+	sed 's|/usr/local/bin/qlinq-tun|$(PREFIX)/bin/qlinq-tun|' packaging/qlinq-tun@.service > $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service.tmp
+	install -m 644 $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service.tmp $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service
+	rm -f $(DESTDIR)$(PREFIX)/lib/systemd/system/qlinq-tun@.service.tmp
 	install -m 644 packaging/qlinq.conf $(DESTDIR)$(PREFIX)/lib/sysusers.d/qlinq.conf
 
 t/00util/test_tun_queue.o: src/host/linux/tun_direct.c
 
 t/00util/test_tun_queue: t/00util/test_tun_queue.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write,--wrap=tun_read_vnet,--wrap=tun_write_vnet,--wrap=tun_write_offload
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=tun_write,--wrap=tun_read_vnet,--wrap=tun_write_vnet,--wrap=tun_write_offload,--wrap=tun_write_offload_iov
 
 t/00util/test_tun_segment: t/00util/test_tun_segment.o src/common/tun_segment.o src/common/tun_packet.o
 	$(CC) -o $@ $^ $(LDFLAGS)

@@ -6,8 +6,7 @@
 
 int main(void) {
   tun_rx_batch_t batch;
-  tun_rx_limits_t limits = {
-      .packets = 3, .bytes = 128, .max_age_ms = 20, .flush_delay_ms = 5};
+  tun_rx_limits_t limits = {.packets = 3, .bytes = 128, .max_age_ms = 20};
   assert(tun_rx_batch_init(&batch, &limits));
   uint8_t bytes[64] = {0x45, 0, 0, 64};
   tun_packet_view_t packet = {
@@ -17,34 +16,41 @@ int main(void) {
   assert(!tun_rx_batch_deadline(&batch, &deadline));
   assert(tun_rx_batch_begin(&batch));
   assert(!tun_rx_batch_begin(&batch));
+  assert(!batch.open_has_packets);
   assert(tun_rx_batch_push(&batch, &packet, 100));
+  assert(batch.open_has_packets && batch.open_head == 0);
   bytes[20] = 99; /* callback storage may be reused immediately */
   assert(!tun_rx_batch_peek(&batch, 104, &view));
-  assert(tun_rx_batch_deadline(&batch, &deadline) && deadline == 105);
+  assert(tun_rx_batch_deadline(&batch, &deadline) && deadline == 120);
+  tun_rx_batch_end(&batch);
+  assert(!batch.open_has_packets);
   assert(tun_rx_batch_peek(&batch, 105, &view));
   assert(view.packet.data != bytes && view.packet.data[20] == 0);
   assert(view.packet.header_size == 20 && view.packet.version == 4);
-  assert(!view.end_of_batch && view.batch_id == 1 && view.queued_ms == 100);
+  assert(view.end_of_batch && view.batch_id == 1 && view.queued_ms == 100);
   tun_rx_batch_consume(&batch);
   assert(batch.count == 0 && batch.bytes == 0);
+  assert(tun_rx_batch_begin(&batch));
   assert(tun_rx_batch_push(&batch, &packet, 106));
+  assert(batch.open_has_packets && batch.open_head == 1);
   tun_rx_batch_end(&batch);
   assert(tun_rx_batch_deadline(&batch, &deadline) && deadline == 126);
   assert(
       tun_rx_batch_peek(&batch, 106, &view)); /* end flushes without waiting */
-  assert(view.end_of_batch && view.batch_id == 1 && view.packet.data[20] == 99);
+  assert(view.end_of_batch && view.batch_id == 2 && view.packet.data[20] == 99);
 
   assert(tun_rx_batch_begin(&batch));
   bytes[20] = 1;
   assert(tun_rx_batch_push(&batch, &packet, 107));
+  assert(batch.open_has_packets && batch.open_head == 2);
   bytes[20] = 2;
   assert(!tun_rx_batch_push(&batch, &packet, 107)); /* independent byte bound */
   assert(batch.count == 2 && batch.bytes == 128 && batch.dropped == 1);
-  assert(tun_rx_batch_peek(&batch, 107, &view) && view.batch_id == 1);
+  assert(tun_rx_batch_peek(&batch, 107, &view) && view.batch_id == 2);
   tun_rx_batch_consume(&batch);
   tun_rx_batch_end(&batch);
   assert(tun_rx_batch_peek(&batch, 107, &view));
-  assert(view.batch_id == 2 && view.end_of_batch && view.packet.data[20] == 1);
+  assert(view.batch_id == 3 && view.end_of_batch && view.packet.data[20] == 1);
   tun_rx_batch_consume(&batch);
 
   /* packet bound triggers early readiness before end or deadline */
@@ -101,11 +107,9 @@ int main(void) {
   limits.packets = TUN_RX_BATCH_CAPACITY + 1;
   assert(!tun_rx_batch_init(&batch, &limits));
   limits.packets = 2;
-  limits.flush_delay_ms = 21;
+  limits.max_age_ms = 0;
   assert(!tun_rx_batch_init(&batch, &limits));
-  limits.flush_delay_ms = 0;
-  assert(!tun_rx_batch_init(&batch, &limits));
-  limits.flush_delay_ms = 5;
+  limits.max_age_ms = 20;
   limits.bytes = 0;
   assert(!tun_rx_batch_init(&batch, &limits));
   puts("===TUN RECEIVE BATCH OK===");

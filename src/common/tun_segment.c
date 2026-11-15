@@ -30,9 +30,9 @@ static unsigned fold(uint32_t n) {
   return n;
 }
 
-/* locate TCP/UDP from IP headers instead of virtio hdr_len hint */
-static bool transport(const uint8_t *p, size_t size, uint8_t version,
-                      size_t *offset, unsigned *protocol) {
+/* locate upper-layer header from IP headers instead of virtio hdr_len hint */
+static bool transport_header(const uint8_t *p, size_t size, uint8_t version,
+                             size_t *offset, unsigned *protocol) {
   if (version == 4) {
     *offset = (size_t)(p[0] & 15U) * 4;
     *protocol = p[9];
@@ -40,9 +40,8 @@ static bool transport(const uint8_t *p, size_t size, uint8_t version,
   }
   *offset = 40;
   *protocol = p[6];
-  while (*protocol != 6 && *protocol != 17) {
-    if ((*protocol != 0 && *protocol != 43 && *protocol != 60) ||
-        size - *offset < 2)
+  while (*protocol == 0 || *protocol == 43 || *protocol == 60) {
+    if (size - *offset < 2)
       return false;
     size_t length = ((size_t)p[*offset + 1] + 1U) * 8;
     if (length > size - *offset)
@@ -87,30 +86,22 @@ bool tun_segment_prepare(tun_segment_t *plan, const tun_packet_config_t *config,
   }
   if (decoded.segmented) {
     unsigned protocol;
-    if (!transport(packet.data, packet.size, packet.version, &decoded.tcp,
-                   &protocol))
+    if (!transport_header(packet.data, packet.size, packet.version,
+                          &decoded.tcp, &protocol) ||
+        protocol != 6)
       return false;
     size_t length = packet.size - decoded.tcp;
-    if (protocol == 6) {
-      if (length < 20)
-        return false;
-      size_t tcp_length = (size_t)(packet.data[decoded.tcp + 12] >> 4) * 4;
-      if (tcp_length < 20 || tcp_length > length)
-        return false;
-      decoded.header = decoded.tcp + tcp_length;
-    } else if (protocol == 17) {
-      if (length < 8 || get16(packet.data + decoded.tcp + 4) != length)
-        return false;
-      decoded.header = decoded.tcp + 8;
-    } else
+    if (length < 20)
       return false;
-    if (decoded.partial &&
-        (offload->checksum_start != decoded.tcp ||
-         offload->checksum_offset != (protocol == 6 ? 16U : 6U)))
+    size_t tcp_length = (size_t)(packet.data[decoded.tcp + 12] >> 4) * 4;
+    if (tcp_length < 20 || tcp_length > length)
+      return false;
+    decoded.header = decoded.tcp + tcp_length;
+    if (decoded.partial && (offload->checksum_start != decoded.tcp ||
+                            offload->checksum_offset != 16U))
       return false;
     unsigned kind = offload->gso_type & ~TUN_GSO_ECN;
-    if (protocol != 6 || !decoded.partial ||
-        (kind != TUN_GSO_TCP4 && kind != TUN_GSO_TCP6) ||
+    if (!decoded.partial || (kind != TUN_GSO_TCP4 && kind != TUN_GSO_TCP6) ||
         packet.version != (kind == TUN_GSO_TCP4 ? 4 : 6) ||
         (packet.data[decoded.tcp + 13] & 6U) || decoded.header >= packet.size ||
         (offload->header_length && offload->header_length < decoded.header) ||
@@ -159,7 +150,15 @@ tun_packet_result_t tun_segment_next(tun_segment_t *plan, void *storage,
       unsigned check = (~fold(sum(out + plan->tcp, size - plan->tcp))) & 65535U;
       if ((plan->checksum_field - plan->tcp) & 1U)
         check = (check >> 8) | ((check & 255U) << 8);
-      put16(out + plan->checksum_field, check ? check : 65535U);
+      if (check == 0) {
+        size_t l4_offset = 0;
+        unsigned protocol = 0;
+        if (transport_header(out, size, plan->version, &l4_offset, &protocol) &&
+            (protocol == 17 || protocol == 136) &&
+            plan->checksum_field == l4_offset + 6U)
+          check = 65535U;
+      }
+      put16(out + plan->checksum_field, check);
     }
     plan->pending = false;
   } else {

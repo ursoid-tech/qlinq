@@ -170,3 +170,73 @@ bool tun_coalesce(const tun_packet_view_t *packets, size_t count, void *scratch,
       .count = used};
   return true;
 }
+
+bool tun_coalesce_iov(const tun_packet_view_t *packets, size_t count,
+                      uint8_t header_scratch[TUN_COALESCE_HEADER_CAPACITY],
+                      struct iovec *iov, size_t iov_capacity, size_t capacity,
+                      tun_coalesce_output_t *out, size_t *iov_count) {
+  if (!out || !iov_count)
+    return false;
+  *out = (tun_coalesce_output_t){0};
+  *iov_count = 0;
+  if (!packets || !count || !packets[0].data || !packets[0].size)
+    return false;
+  *out = (tun_coalesce_output_t){.packet = packets[0], .count = 1};
+  tcp_t first;
+  if (!header_scratch || !iov || iov_capacity < 2 || count < 2 ||
+      !decode(packets, &first, true) || (first.flags & 9) ||
+      first.header > TUN_COALESCE_HEADER_CAPACITY)
+    return true;
+  size_t used = 1, size = packets[0].size, payload = first.payload;
+  uint8_t flags = first.flags;
+  if (capacity > TUN_RX_AGGREGATE_CAPACITY)
+    capacity = TUN_RX_AGGREGATE_CAPACITY;
+  size_t max_packets = count < iov_capacity - 1U ? count : iov_capacity - 1U;
+  while (used < max_packets) {
+    tcp_t next;
+    if (!decode(packets + used, &next, true) || first.ip != next.ip ||
+        first.header != next.header || next.payload > first.payload ||
+        size > capacity || next.payload > capacity - size ||
+        !compatible(packets[0].data, packets[used].data, &first, payload, used))
+      break;
+    size += next.payload;
+    payload += next.payload;
+    flags = next.flags;
+    used++;
+    if ((flags & 9) || next.payload < first.payload)
+      break;
+  }
+  if (used == 1)
+    return true;
+  memcpy(header_scratch, packets[0].data, first.header);
+  if (first.ip == 20) {
+    put(header_scratch + 2, size);
+    put(header_scratch + 10, 0);
+    put(header_scratch + 10, ~fold(sum(header_scratch, 20)));
+  } else {
+    put(header_scratch + 4, size - 40);
+  }
+  header_scratch[first.ip + 13] = flags;
+  put(header_scratch + first.ip + 16,
+      fold(pseudo(header_scratch, size - first.ip)));
+  iov[0] = (struct iovec){.iov_base = header_scratch, .iov_len = first.header};
+  for (size_t i = 0; i < used; i++) {
+    iov[i + 1] =
+        (struct iovec){.iov_base = (void *)(packets[i].data + first.header),
+                       .iov_len = packets[i].size - first.header};
+  }
+  *iov_count = used + 1;
+  *out = (tun_coalesce_output_t){
+      .packet = {.data = header_scratch,
+                 .size = size,
+                 .header_size = first.ip,
+                 .version = first.ip == 20 ? 4 : 6},
+      .offload = {.flags = TUN_CSUM_PARTIAL,
+                  .gso_type = first.ip == 20 ? TUN_GSO_TCP4 : TUN_GSO_TCP6,
+                  .header_length = first.header,
+                  .gso_size = first.payload,
+                  .checksum_start = first.ip,
+                  .checksum_offset = 16},
+      .count = used};
+  return true;
+}
