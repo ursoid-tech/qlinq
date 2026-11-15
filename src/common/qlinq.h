@@ -126,6 +126,7 @@ typedef struct {
   size_t max_egress_packets_per_socket;
   size_t max_egress_bytes_per_socket;
   size_t max_receive_memory_bytes;
+  size_t max_codec_memory_bytes;
   size_t max_recovery_cache_bytes;
   size_t max_stream_egress_bytes;
   size_t max_total_stream_egress_bytes;
@@ -467,6 +468,7 @@ typedef struct {
   uint64_t publish_errors;
 
   size_t assembler_memory_bytes;
+  size_t codec_memory_bytes;
   uint64_t resource_limit_errors;
   uint64_t malformed_datagrams;
   uint64_t datagrams_received;
@@ -525,6 +527,8 @@ typedef enum {
  * and in-flight values are QUIC packet bytes; timing fields are milliseconds.
  */
 typedef struct {
+  char interface_name[64];
+  char local_address[64];
   qlinq_path_state_t state;
   uint64_t bytes_sent;
   uint64_t bytes_received;
@@ -541,6 +545,8 @@ typedef struct {
 
 bool qlinq_endpoint_get_path(qlinq_endpoint_t *endpoint, size_t path_index,
                              qlinq_path_info_t *info);
+/* flushes buffered grouped records and pending recovery checkpoints */
+qlinq_status_t qlinq_endpoint_flush(qlinq_endpoint_t *endpoint);
 /* Starts an orderly close while leaving the endpoint serviceable until its
  * QUIC close packets and socket queues drain. Automatic reconnect is stopped.
  */
@@ -580,6 +586,8 @@ bool qlinq_stream_get_repair_policy(qlinq_stream_t *stream,
                                     qlinq_effective_repair_policy_t *effective);
 qlinq_send_result_t qlinq_stream_send(qlinq_stream_t *stream,
                                       const qlinq_record_t *record);
+/* flushes grouped records and emits end-of-track checkpoint metadata */
+qlinq_status_t qlinq_stream_finish(qlinq_stream_t *stream);
 
 /* Drives network and timer progress for at most timeout_ms. A negative timeout
  * waits until network/timer activity. Pending events and synchronous record
@@ -592,20 +600,6 @@ qlinq_status_t qlinq_service(qlinq_context_t *context, int timeout_ms);
  * cause an immediate return with zero revents. pass fd=-1 to omit it. */
 qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
                                 int fd, short events, short *revents);
-
-typedef struct {
-  char interface_name[64];
-  char local_address[64];
-  bool active;
-  uint64_t bytes_sent;
-  uint64_t bytes_received;
-  uint64_t packets_sent;
-  uint64_t packets_lost;
-  uint32_t rtt_ms;
-} qlinq_path_stats_t;
-
-bool qlinq_endpoint_get_path_stats(qlinq_endpoint_t *endpoint, size_t index,
-                                   qlinq_path_stats_t *stats);
 
 /* Pops one event, transferring its allocation to the caller and releasing
  * queue capacity. Record bytes and strings survive context destruction until

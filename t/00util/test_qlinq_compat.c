@@ -53,14 +53,16 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   assert(legacy.transport);
   qlinq_context_t *ctx = qlinq_context_create(NULL);
   assert(ctx);
-  qlinq_endpoint_config_t config = {.bind_addresses = {"127.0.0.1"},
-                                    .bind_address_count = 1,
-                                    .remote_addresses = {"127.0.0.1"},
-                                    .remote_address_count = 1,
-                                    .port = 19937,
-                                    .security = {.shared_secret = "secret",
-                                                 .shared_secret_size = 6,
-                                                 .allow_insecure_peer = true}};
+  qlinq_endpoint_config_t config = {
+      .bind_addresses = {"127.0.0.1"},
+      .bind_address_count = 1,
+      .remote_addresses = {"127.0.0.1"},
+      .remote_address_count = 1,
+      .port = 19937,
+      .limits = {.max_codec_memory_bytes = 8U * 1024U * 1024U},
+      .security = {.shared_secret = "secret",
+                   .shared_secret_size = 6,
+                   .allow_insecure_peer = true}};
   qlinq_endpoint_t *ep = qlinq_connect(ctx, &config);
   assert(ep);
   qlinq_stream_config_t sc = {
@@ -116,27 +118,22 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   assert(read(application_pipe[0], &untouched, 1) == 1 && untouched == 'x');
   close(application_pipe[0]);
   close(application_pipe[1]);
-  qlinq_path_stats_t path;
-  assert(qlinq_endpoint_get_path_stats(ep, 0, &path));
-  assert(strcmp(path.local_address, "127.0.0.1") == 0);
   qlinq_path_info_t snapshot;
   assert(qlinq_endpoint_get_path(ep, 0, &snapshot));
-  assert(snapshot.bytes_sent == path.bytes_sent &&
-         snapshot.bytes_received == path.bytes_received &&
-         snapshot.packets_sent == path.packets_sent &&
-         snapshot.packets_lost == path.packets_lost &&
-         snapshot.smoothed_rtt_ms == path.rtt_ms &&
-         (snapshot.state == QLINQ_PATH_ACTIVE) == path.active);
+  assert(strcmp(snapshot.local_address, "127.0.0.1") == 0);
   assert(!qlinq_endpoint_get_path(ep, QLINQ_MAX_PATHS, &snapshot));
   assert(!qlinq_endpoint_get_path(NULL, 0, &snapshot));
   assert(!qlinq_endpoint_get_path(ep, 0, NULL));
-  assert(!qlinq_endpoint_get_path_stats(ep, QLINQ_MAX_PATHS, &path));
+  assert(qlinq_service(ctx, -2) == QLINQ_STATUS_INVALID &&
+         qlinq_context_last_status(ctx) == QLINQ_STATUS_INVALID);
   qlinq_record_t record = {.group_id = 1,
                            .sequence = 2,
                            .data = legacy.payload,
                            .size = sizeof(legacy.payload)};
   qlinq_send_result_t sent = qlinq_stream_send(pub, &record);
   assert(sent == QLINQ_SEND_SENT || sent == QLINQ_SEND_BUFFERED);
+  if (sent == QLINQ_SEND_BUFFERED)
+    assert(qlinq_endpoint_flush(ep) == QLINQ_STATUS_OK);
   moq_object_t object = {
       .track_id = {.type = MOQ_TRACK_DATA, .flags = flags, .name = "compat"},
       .group_id = 2,
@@ -147,6 +144,11 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   for (size_t i = 0; i < 2000 && (!held._private || !legacy.received); i++) {
     transport_tick(legacy.transport);
     assert(qlinq_service(ctx, 1) >= QLINQ_STATUS_OK);
+    if (qlinq_publish(ep, &invalid) == NULL) {
+      assert(qlinq_context_last_status(ctx) == QLINQ_STATUS_INVALID);
+      assert(qlinq_service(ctx, 0) == QLINQ_STATUS_OK);
+      assert(qlinq_context_last_status(ctx) == QLINQ_STATUS_OK);
+    }
     qlinq_event_t event;
     while (qlinq_next_event(ctx, &event)) {
       if (event.type == QLINQ_EVENT_RECORD) {
@@ -178,6 +180,17 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
       qlinq_event_release(&event);
   }
   assert(sent == QLINQ_SEND_SENT || sent == QLINQ_SEND_BUFFERED);
+  for (size_t i = 0; i < 2000; i++) {
+    qlinq_status_t fin = qlinq_stream_finish(pub);
+    assert(fin == QLINQ_STATUS_OK || fin == QLINQ_STATUS_AGAIN);
+    if (fin == QLINQ_STATUS_OK)
+      break;
+    transport_tick(legacy.transport);
+    assert(qlinq_service(ctx, 1) >= QLINQ_STATUS_OK);
+    qlinq_event_t event;
+    while (qlinq_next_event(ctx, &event))
+      qlinq_event_release(&event);
+  }
   for (size_t i = 0; i < 2000 && legacy.received < 2; i++) {
     transport_tick(legacy.transport);
     assert(qlinq_service(ctx, 1) >= QLINQ_STATUS_OK);
@@ -187,9 +200,14 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   }
   assert(legacy.received ==
          2); /* Removing the reverse subscription is independent. */
+  qlinq_endpoint_stats_t ep_stats = {0};
+  assert(qlinq_endpoint_get_stats(ep, &ep_stats));
+  if (mode == QLINQ_DELIVERY_FIXEDRATE || mode == QLINQ_DELIVERY_RATELESS)
+    assert(ep_stats.codec_memory_bytes <= 8U * 1024U * 1024U);
   qlinq_stream_close(pub);
   assert(!qlinq_stream_is_writable(pub) &&
-         qlinq_stream_send(pub, &record) == QLINQ_SEND_INVALID);
+         qlinq_stream_send(pub, &record) == QLINQ_SEND_INVALID &&
+         qlinq_stream_finish(pub) == QLINQ_STATUS_STATE);
   assert(qlinq_stream_get_stats(pub, &stats) &&
          stats.state == QLINQ_STREAM_CLOSED);
   assert(qlinq_endpoint_shutdown(ep, "done") == QLINQ_STATUS_OK);
@@ -203,7 +221,7 @@ static void run(qlinq_delivery_t mode, uint8_t flags) {
   assert(qlinq_endpoint_is_drained(ep));
   qlinq_endpoint_close(ep);
   assert(!qlinq_endpoint_get_path(ep, 0, &snapshot));
-  assert(!qlinq_endpoint_get_path_stats(ep, 0, &path));
+  assert(qlinq_endpoint_flush(ep) == QLINQ_STATUS_STATE);
   qlinq_context_destroy(ctx);
   assert(held.record.size == sizeof(legacy.payload) &&
          memcmp(held.record.data, legacy.payload, sizeof(legacy.payload)) == 0);

@@ -288,14 +288,14 @@ static void run_qlinq(int paths, const char *cert, const char *key) {
   require(paths_log != NULL, "paths log");
   fprintf(paths_log, "[");
   for (size_t i = 0; i < QLINQ_MAX_PATHS; i++) {
-    qlinq_path_stats_t ps = {0};
-    qlinq_endpoint_get_path_stats(ep, i, &ps);
+    qlinq_path_info_t ps = {0};
+    qlinq_endpoint_get_path(ep, i, &ps);
     fprintf(paths_log,
             "%s{\"slot\":%zu,\"active\":%s,\"sent_bytes\":%lu,\"received_"
             "bytes\":%lu,\"lost_packets\":%lu,\"rtt_ms\":%u}",
-            i ? "," : "", i, ps.active ? "true" : "false",
+            i ? "," : "", i, ps.state == QLINQ_PATH_ACTIVE ? "true" : "false",
             (unsigned long)ps.bytes_sent, (unsigned long)ps.bytes_received,
-            (unsigned long)ps.packets_lost, ps.rtt_ms);
+            (unsigned long)ps.packets_lost, ps.smoothed_rtt_ms);
   }
   fprintf(paths_log, "]\n");
   fclose(paths_log);

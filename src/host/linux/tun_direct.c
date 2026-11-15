@@ -636,8 +636,9 @@ static void print_stats(qlinq_endpoint_t *endpoint, uint32_t peer_id,
   qlinq_endpoint_get_stats(endpoint, &stats);
   bool have_active_path = false;
   for (size_t i = 0; i < QLINQ_MAX_PATHS; i++) {
-    qlinq_path_stats_t path;
-    if (qlinq_endpoint_get_path_stats(endpoint, i, &path) && path.active)
+    qlinq_path_info_t path;
+    if (qlinq_endpoint_get_path(endpoint, i, &path) &&
+        path.state == QLINQ_PATH_ACTIVE)
       have_active_path = true;
   }
   if (strcmp(state, "connected") == 0 && !have_active_path)
@@ -673,8 +674,8 @@ static void print_stats(qlinq_endpoint_t *endpoint, uint32_t peer_id,
          (unsigned long long)tx->checksums, tun_segment_remaining(&tx->plan));
   bool first = true;
   for (size_t i = 0; i < QLINQ_MAX_PATHS; i++) {
-    qlinq_path_stats_t path;
-    if (!qlinq_endpoint_get_path_stats(endpoint, i, &path))
+    qlinq_path_info_t path;
+    if (!qlinq_endpoint_get_path(endpoint, i, &path))
       continue;
     char interface_name[64];
     tun_resolve_interface_name(path.local_address, path.interface_name,

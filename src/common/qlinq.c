@@ -3,6 +3,7 @@
 #include "portable_sockets.h"
 #include "transport.h"
 #include "transport_internal.h"
+#include "transport_publish.h"
 #include "transport_tracks.h"
 #include "transport_wire.h"
 
@@ -55,6 +56,7 @@ struct qlinq_endpoint {
   qlinq_context_t *context;
   transport_t *transport;
   qlinq_stream_t *streams;
+  qlinq_stream_t *closed_streams;
   qlinq_peer_state_t *peers;
   uint8_t *shared_secret;
   size_t shared_secret_size;
@@ -82,7 +84,9 @@ struct qlinq_context {
   bool in_log;
   bool in_record_callback;
   bool in_interface_callback;
+  bool writable_pending;
   qlinq_endpoint_t *endpoints;
+  qlinq_endpoint_t *closed_endpoints;
   qlinq_event_node_t *event_head;
   qlinq_event_node_t *event_tail;
   size_t queued_events;
@@ -94,6 +98,7 @@ struct qlinq_context {
   qlinq_record_callback_t record_callback;
   void *record_user_data;
   qlinq_status_t last_status;
+  qlinq_status_t service_status;
   struct pollfd *poll_fds;
   qlinq_endpoint_poll_t *endpoint_polls;
   size_t poll_endpoint_capacity;
@@ -259,6 +264,7 @@ static bool queue_event(qlinq_context_t *context, const qlinq_event_t *source,
       context->queued_event_bytes > context->max_queued_event_bytes ||
       allocation_size >
           context->max_queued_event_bytes - context->queued_event_bytes) {
+    context->service_status = QLINQ_STATUS_RESOURCE_LIMIT;
     set_status(context, QLINQ_STATUS_RESOURCE_LIMIT);
     return false;
   }
@@ -266,6 +272,7 @@ static bool queue_event(qlinq_context_t *context, const qlinq_event_t *source,
   /* Payload and message storage are fully overwritten below. */
   qlinq_event_node_t *node = malloc(allocation_size);
   if (!node) {
+    context->service_status = QLINQ_STATUS_NO_MEMORY;
     set_status(context, QLINQ_STATUS_NO_MEMORY);
     return false;
   }
@@ -419,6 +426,7 @@ static void reject_received_record(qlinq_endpoint_t *endpoint,
   queue_error(endpoint, QLINQ_STATUS_RESOURCE_LIMIT, reason);
   /* Error-event admission can fail under the same pressure. The receiver's
    * rejection remains observable through this service call either way. */
+  endpoint->context->service_status = QLINQ_STATUS_RESOURCE_LIMIT;
   set_status(endpoint->context, QLINQ_STATUS_RESOURCE_LIMIT);
   if ((source->track_id.flags &
        (MOQ_TRACK_FLAG_RELIABLE | MOQ_TRACK_FLAG_FEC_ENABLED |
@@ -627,6 +635,7 @@ static void map_limits(const qlinq_limits_t *input,
   output->max_egress_packets_per_socket = input->max_egress_packets_per_socket;
   output->max_egress_bytes_per_socket = input->max_egress_bytes_per_socket;
   output->max_assembler_memory_bytes = input->max_receive_memory_bytes;
+  output->max_codec_memory_bytes = input->max_codec_memory_bytes;
   output->max_recovery_cache_bytes = input->max_recovery_cache_bytes;
   output->max_stream_egress_bytes = input->max_stream_egress_bytes;
   output->max_total_stream_egress_bytes = input->max_total_stream_egress_bytes;
@@ -843,6 +852,11 @@ static void free_endpoint(qlinq_endpoint_t *endpoint) {
     endpoint->streams = stream->next;
     free(stream);
   }
+  while (endpoint->closed_streams) {
+    qlinq_stream_t *stream = endpoint->closed_streams;
+    endpoint->closed_streams = stream->next;
+    free(stream);
+  }
   while (endpoint->peers) {
     qlinq_peer_state_t *peer = endpoint->peers;
     endpoint->peers = peer->next;
@@ -862,6 +876,11 @@ void qlinq_context_destroy(qlinq_context_t *context) {
   while (context->endpoints) {
     qlinq_endpoint_t *endpoint = context->endpoints;
     context->endpoints = endpoint->next;
+    free_endpoint(endpoint);
+  }
+  while (context->closed_endpoints) {
+    qlinq_endpoint_t *endpoint = context->closed_endpoints;
+    context->closed_endpoints = endpoint->next;
     free_endpoint(endpoint);
   }
   while (context->event_head) {
@@ -926,6 +945,9 @@ bool qlinq_endpoint_get_path(qlinq_endpoint_t *endpoint, size_t path_index,
   if (!info || !read_endpoint_path(endpoint, path_index, &stats))
     return false;
   memset(info, 0, sizeof(*info));
+  memcpy(info->interface_name, stats.interface_name,
+         sizeof(info->interface_name));
+  memcpy(info->local_address, stats.local_address, sizeof(info->local_address));
   info->state = (qlinq_path_state_t)stats.lifecycle;
   info->bytes_sent = stats.bytes_sent;
   info->bytes_received = stats.bytes_received;
@@ -939,6 +961,23 @@ bool qlinq_endpoint_get_path(qlinq_endpoint_t *endpoint, size_t path_index,
   info->relative_one_way_delay_ms = stats.relative_owd;
   info->ewma_latency_ms = stats.ewma_latency;
   return true;
+}
+
+qlinq_status_t qlinq_endpoint_flush(qlinq_endpoint_t *endpoint) {
+  if (!endpoint_access(endpoint))
+    return QLINQ_STATUS_STATE;
+
+  if (!endpoint->active || !endpoint->transport) {
+    set_status(endpoint->context, QLINQ_STATUS_STATE);
+    return QLINQ_STATUS_STATE;
+  }
+  endpoint->service_pending = true;
+  if (!transport_publish_flush(endpoint->transport)) {
+    set_status(endpoint->context, QLINQ_STATUS_AGAIN);
+    return QLINQ_STATUS_AGAIN;
+  }
+  set_status(endpoint->context, QLINQ_STATUS_OK);
+  return QLINQ_STATUS_OK;
 }
 
 qlinq_status_t qlinq_endpoint_shutdown(qlinq_endpoint_t *endpoint,
@@ -990,9 +1029,12 @@ void qlinq_endpoint_close(qlinq_endpoint_t *endpoint) {
   if (!endpoint->active)
     return;
   endpoint->active = false;
-  for (qlinq_stream_t *stream = endpoint->streams; stream;
-       stream = stream->next) {
+  while (endpoint->streams) {
+    qlinq_stream_t *stream = endpoint->streams;
+    endpoint->streams = stream->next;
     stream->state = QLINQ_STREAM_CLOSED;
+    stream->next = endpoint->closed_streams;
+    endpoint->closed_streams = stream;
   }
   if (endpoint->transport) {
     transport_destroy(endpoint->transport);
@@ -1002,6 +1044,22 @@ void qlinq_endpoint_close(qlinq_endpoint_t *endpoint) {
     qlinq_peer_state_t *peer = endpoint->peers;
     endpoint->peers = peer->next;
     free(peer);
+  }
+  if (endpoint->shared_secret) {
+    OPENSSL_cleanse(endpoint->shared_secret, endpoint->shared_secret_size);
+    free(endpoint->shared_secret);
+    endpoint->shared_secret = NULL;
+    endpoint->shared_secret_size = 0;
+  }
+  qlinq_endpoint_t **cursor = &endpoint->context->endpoints;
+  while (*cursor) {
+    if (*cursor == endpoint) {
+      *cursor = endpoint->next;
+      endpoint->next = endpoint->context->closed_endpoints;
+      endpoint->context->closed_endpoints = endpoint;
+      break;
+    }
+    cursor = &(*cursor)->next;
   }
 }
 
@@ -1067,6 +1125,8 @@ static qlinq_stream_t *open_stream(qlinq_endpoint_t *endpoint,
   stream->next = endpoint->streams;
   endpoint->streams = stream;
   endpoint->service_pending = true;
+  if (direction == QLINQ_STREAM_PUBLISH)
+    endpoint->context->writable_pending = true;
 
   bool activation_failed = false;
   if (direction == QLINQ_STREAM_SUBSCRIBE) {
@@ -1112,6 +1172,16 @@ void qlinq_stream_close(qlinq_stream_t *stream) {
                                                   : TRANSPORT_TRACK_RECEIVE);
   }
   stream->state = QLINQ_STREAM_CLOSED;
+  qlinq_stream_t **cursor = &stream->endpoint->streams;
+  while (*cursor) {
+    if (*cursor == stream) {
+      *cursor = stream->next;
+      stream->next = stream->endpoint->closed_streams;
+      stream->endpoint->closed_streams = stream;
+      break;
+    }
+    cursor = &(*cursor)->next;
+  }
 }
 
 bool qlinq_stream_is_writable(qlinq_stream_t *stream) {
@@ -1168,12 +1238,47 @@ qlinq_send_result_t qlinq_stream_send(qlinq_stream_t *stream,
   if (mapped == QLINQ_SEND_SENT || mapped == QLINQ_SEND_BUFFERED ||
       mapped == QLINQ_SEND_PARTIAL)
     stream->records_sent++;
-  if (mapped == QLINQ_SEND_WOULD_BLOCK)
+  if (mapped == QLINQ_SEND_WOULD_BLOCK) {
     stream->writable_announced = false;
+    stream->endpoint->context->writable_pending = true;
+  }
   return mapped;
 }
 
-static bool update_writable_events(qlinq_context_t *context, bool enqueue) {
+qlinq_status_t qlinq_stream_finish(qlinq_stream_t *stream) {
+  if (!stream_access(stream))
+    return QLINQ_STATUS_STATE;
+
+  if (stream->state != QLINQ_STREAM_OPEN ||
+      stream->direction != QLINQ_STREAM_PUBLISH || !stream->endpoint->active ||
+      !stream->endpoint->transport) {
+    set_status(stream->endpoint->context, QLINQ_STATUS_STATE);
+    return QLINQ_STATUS_STATE;
+  }
+  stream->endpoint->service_pending = true;
+  transport_track_profile_t profile =
+      transport_get_track_profile(stream->endpoint->transport, &stream->track);
+  bool ok = true;
+  if (profile.checkpoint_recovery) {
+    ok = transport_finish_track(stream->endpoint->transport, stream->track);
+  } else if (profile.grouped_records) {
+    uint64_t final_object_id = 0;
+    bool has_objects = false;
+    ok = transport_publish_finish_grouped(stream->endpoint->transport,
+                                          &stream->track, &final_object_id,
+                                          &has_objects);
+  }
+  if (!ok) {
+    stream->writable_announced = false;
+    stream->endpoint->context->writable_pending = true;
+    set_status(stream->endpoint->context, QLINQ_STATUS_AGAIN);
+    return QLINQ_STATUS_AGAIN;
+  }
+  set_status(stream->endpoint->context, QLINQ_STATUS_OK);
+  return QLINQ_STATUS_OK;
+}
+
+static void refresh_writable_events(qlinq_context_t *context) {
   bool pending = false;
   for (qlinq_endpoint_t *endpoint = context->endpoints; endpoint;
        endpoint = endpoint->next) {
@@ -1190,21 +1295,16 @@ static bool update_writable_events(qlinq_context_t *context, bool enqueue) {
         stream->writable_announced = false;
       if (!writable || stream->writable_announced)
         continue;
-      pending = true;
-      if (!enqueue)
-        continue;
       qlinq_event_t event = {.type = QLINQ_EVENT_STREAM_WRITABLE,
                              .endpoint = endpoint,
                              .status = QLINQ_STATUS_OK};
       fill_event_stream(&event, &stream->track, stream);
       stream->writable_announced = queue_event(context, &event, NULL, 0, NULL);
+      if (!stream->writable_announced)
+        pending = true;
     }
   }
-  return pending;
-}
-
-static void refresh_writable_events(qlinq_context_t *context) {
-  (void)update_writable_events(context, true);
+  context->writable_pending = pending;
 }
 
 static void service_endpoint(qlinq_endpoint_t *endpoint,
@@ -1328,10 +1428,15 @@ qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
   if (!context_access(context))
     return QLINQ_STATUS_STATE;
 
-  if (timeout_ms < -1)
+  if (timeout_ms < -1) {
+    set_status(context, QLINQ_STATUS_INVALID);
     return QLINQ_STATUS_INVALID;
-  if (context->event_head)
-    return context->last_status < 0 ? context->last_status : QLINQ_STATUS_OK;
+  }
+  if (context->event_head) {
+    set_status(context, context->service_status);
+    return context->service_status;
+  }
+  context->service_status = QLINQ_STATUS_OK;
   set_status(context, QLINQ_STATUS_OK);
 
   size_t endpoint_count = count_active_endpoints(context);
@@ -1340,14 +1445,11 @@ qlinq_status_t qlinq_service_fd(qlinq_context_t *context, int timeout_ms,
     return QLINQ_STATUS_STATE;
   }
 
-  /* Observe readiness before polling, but enqueue only after input is
-   * serviced. A writable notification must not occupy the last event slot
-   * before an incoming record, or repeatedly prevent ACK progress when an
-   * application retries a record larger than the currently available room. */
-  bool writable_pending = update_writable_events(context, false);
-  qlinq_status_t status =
-      poll_endpoints(context, endpoint_count, writable_pending ? 0 : timeout_ms,
-                     fd, events, revents);
+  /* Enqueue writable notifications only after input is serviced so a writable
+   * event never occupies the last slot ahead of an incoming record. */
+  qlinq_status_t status = poll_endpoints(
+      context, endpoint_count, context->writable_pending ? 0 : timeout_ms, fd,
+      events, revents);
   if (status != QLINQ_STATUS_OK)
     return status;
   refresh_writable_events(context);
@@ -1369,6 +1471,7 @@ bool qlinq_next_event(qlinq_context_t *context, qlinq_event_t *event) {
     context->event_tail = NULL;
   context->queued_events--;
   context->queued_event_bytes -= node->allocation_size;
+  context->service_status = QLINQ_STATUS_OK;
   node->next = NULL;
   *event = node->event;
   return true;
@@ -1492,29 +1595,11 @@ bool qlinq_endpoint_get_stats(qlinq_endpoint_t *endpoint,
       .publish_invalid = transport_stats.publish_invalid,
       .publish_errors = transport_stats.publish_errors,
       .assembler_memory_bytes = transport_stats.assembler_memory_bytes,
+      .codec_memory_bytes = transport_stats.codec_memory_bytes,
       .resource_limit_errors = transport_stats.resource_limit_errors,
       .malformed_datagrams = transport_stats.malformed_datagrams,
       .datagrams_received = transport_stats.datagrams_received,
       .stream_frames_received = transport_stats.stream_frames_received};
-  return true;
-}
-
-bool qlinq_endpoint_get_path_stats(qlinq_endpoint_t *endpoint, size_t index,
-                                   qlinq_path_stats_t *stats) {
-  transport_path_stats_t source;
-  if (!stats || !read_endpoint_path(endpoint, index, &source))
-    return false;
-  *stats =
-      (qlinq_path_stats_t){.bytes_sent = source.bytes_sent,
-                           .active = source.lifecycle == TRANSPORT_PATH_ACTIVE,
-                           .bytes_received = source.bytes_received,
-                           .packets_sent = source.sent,
-                           .packets_lost = source.lost,
-                           .rtt_ms = source.rtt};
-  memcpy(stats->interface_name, source.interface_name,
-         sizeof(stats->interface_name));
-  memcpy(stats->local_address, source.local_address,
-         sizeof(stats->local_address));
   return true;
 }
 

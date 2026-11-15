@@ -403,10 +403,10 @@ int main(void) {
       transport_drive_interface(filtered->transport, true, &cand, 42, "tun0"));
   assert(filter_state.valid && filter_state.calls == 2);
   assert(filtered->transport->socket_count == 2);
-  qlinq_path_stats_t path_stats = {0};
-  assert(qlinq_endpoint_get_path_stats(filtered, 1, &path_stats));
-  assert(strcmp(path_stats.interface_name, "tun0") == 0);
-  assert(strcmp(path_stats.local_address, "127.0.0.2") == 0);
+  qlinq_path_info_t path_info = {0};
+  assert(qlinq_endpoint_get_path(filtered, 1, &path_info));
+  assert(strcmp(path_info.interface_name, "tun0") == 0);
+  assert(strcmp(path_info.local_address, "127.0.0.2") == 0);
   qlinq_endpoint_close(filtered);
 
   /* test endpoint and stream repair policy configuration and inheritance */
