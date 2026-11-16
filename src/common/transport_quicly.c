@@ -20,6 +20,7 @@
 #include "transport_wire.h"
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -132,9 +133,11 @@ size_t transport_assembler_window(transport_conn_t *conn,
   if (conn->quic) {
     for (size_t i = 0; i < TRANSPORT_MAX_QUIC_PATHS; i++) {
       quicly_path_stats_t stats;
-      if (quicly_get_path_stats(conn->quic, i, &stats) == 0 &&
-          stats.rtt_smoothed > rtt_ms)
-        rtt_ms = stats.rtt_smoothed;
+      if (quicly_get_path_stats(conn->quic, i, &stats) == 0) {
+        uint32_t path_rtt = transport_path_rtt_ms(&stats);
+        if (path_rtt > rtt_ms)
+          rtt_ms = path_rtt;
+      }
     }
   }
   uint64_t bdp_bytes = conn->assembler_rx_rate > UINT64_MAX / rtt_ms
@@ -415,10 +418,8 @@ size_t transport_datagram_payload_limit(transport_conn_t *conn,
       !quicly_is_path_available(conn->quic, path_index))
     return 0;
   quicly_path_stats_t stats;
-  quicly_path_health_t health;
   if (quicly_get_path_stats(conn->quic, path_index, &stats) != 0 ||
-      (quicly_get_path_health(conn->quic, path_index, &health) == 0 &&
-       health.state == QUICLY_PATH_SUSPECT))
+      stats.health_state == QUICLY_PATH_SUSPECT)
     return 0;
   for (size_t p = 0; p < conn->transport->socket_count; p++)
     if (transport_path_matches_local(&stats,
@@ -432,15 +433,13 @@ size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
   if (!conn || !conn->quic)
     return SIZE_MAX;
   size_t best = SIZE_MAX, best_queued = SIZE_MAX;
-  uint32_t best_rtt = UINT32_MAX;
+  float best_rtt = INFINITY;
   transport_t *t = conn->transport;
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
     quicly_path_stats_t stats;
-    quicly_path_health_t health;
     if (!quicly_is_path_available(conn->quic, path) ||
         quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
-        (quicly_get_path_health(conn->quic, path, &health) == 0 &&
-         health.state == QUICLY_PATH_SUSPECT))
+        stats.health_state == QUICLY_PATH_SUSPECT)
       continue;
     bool owned = false;
     for (size_t physical = 0; physical < t->socket_count; physical++)
@@ -450,12 +449,14 @@ size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
       continue;
     size_t queued = quicly_get_num_datagram_frames_path(conn->quic, path);
     size_t limit = quicly_get_datagram_payload_limit(conn->quic, path);
+    float rtt = isfinite(stats.rtt.smoothed) && stats.rtt.smoothed >= 0.0f
+                    ? stats.rtt.smoothed
+                    : INFINITY;
     if (limit != 0 && payload_size <= limit &&
-        (queued < best_queued ||
-         (queued == best_queued && stats.rtt_smoothed < best_rtt))) {
+        (queued < best_queued || (queued == best_queued && rtt < best_rtt))) {
       best = path;
       best_queued = queued;
-      best_rtt = stats.rtt_smoothed;
+      best_rtt = rtt;
     }
   }
   return best;
@@ -507,14 +508,14 @@ static int qlinq_path_is_eligible(quicly_path_scheduler_t *scheduler,
 static void abandon_removed_paths(transport_conn_t *conn) {
   /* closing a socket must retire its QUIC paths and notify peer */
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
-    quicly_path_health_t health;
-    if (quicly_get_path_health(conn->quic, path, &health) != 0 ||
+    quicly_path_stats_t stats;
+    if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
         qlinq_path_is_eligible(NULL, conn->quic, path))
       continue;
     if (quicly_get_num_datagram_frames_path(conn->quic, path) != 0)
       quicly_discard_datagram_frames(conn->quic, path);
-    if (!health.abandoned)
-      (void)quicly_abandon_path(conn->quic, health.path_id,
+    if (!stats.abandoned)
+      (void)quicly_abandon_path(conn->quic, stats.path_id,
                                 QUICLY_PATH_ABANDON_ERROR_APPLICATION);
   }
 }
@@ -540,13 +541,10 @@ static void refresh_scheduler_paths(transport_conn_t *conn) {
     }
     /* discard stale datagrams on unowned, abandoned, or suspect paths */
     if (has_datagrams &&
-        quicly_get_num_datagram_frames_path(conn->quic, path) != 0) {
-      quicly_path_health_t health;
-      if (matched == SIZE_MAX ||
-          (quicly_get_path_health(conn->quic, path, &health) == 0 &&
-           (health.abandoned || health.state == QUICLY_PATH_SUSPECT)))
-        quicly_discard_datagram_frames(conn->quic, path);
-    }
+        (matched == SIZE_MAX || stats.abandoned ||
+         stats.health_state == QUICLY_PATH_SUSPECT) &&
+        quicly_get_num_datagram_frames_path(conn->quic, path) != 0)
+      quicly_discard_datagram_frames(conn->quic, path);
     if (matched != SIZE_MAX && quicly_is_path_available(conn->quic, path)) {
       conn->scheduler_paths |= UINT64_C(1) << path;
       conn->scheduler_sockets[path] = (uint8_t)matched;
@@ -581,11 +579,9 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
                                        64U, 64U * 1500U))
         continue;
       quicly_path_stats_t stats;
-      quicly_path_health_t health;
       if (quicly_get_path_stats(quic, path, &stats) != 0)
         continue;
-      if (quicly_get_path_health(quic, path, &health) == 0 &&
-          (health.abandoned || health.state == QUICLY_PATH_SUSPECT)) {
+      if (stats.abandoned || stats.health_state == QUICLY_PATH_SUSPECT) {
         quicly_discard_datagram_frames(quic, path);
         continue;
       }
@@ -622,28 +618,28 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
         !transport_egress_can_accept(&t->sockets[physical].egress, 64U,
                                      64U * 1500U))
       continue;
-    quicly_path_health_t health;
-    if (!quicly_is_path_available(quic, path) ||
-        (quicly_get_path_health(quic, path, &health) == 0 &&
-         health.state == QUICLY_PATH_SUSPECT))
+    if (!quicly_is_path_available(quic, path))
+      continue;
+    quicly_path_stats_t stats;
+    bool have_stats = quicly_get_path_stats(quic, path, &stats) == 0;
+    if (have_stats && stats.health_state == QUICLY_PATH_SUSPECT)
       continue;
     /* Feedback uses round-robin selection, so congestion-derived scores do
      * not influence its ordering. Keep the same owned, available, healthy
-     * candidates without copying path statistics or calculating estimates. */
+     * candidates without calculating estimates. */
     if (feedback_only) {
       quic_paths[count++] = path;
       continue;
     }
-    quicly_path_stats_t stats;
-    if (quicly_get_path_stats(quic, path, &stats) != 0)
+    if (!have_stats)
       continue;
     const transport_conn_path_t *physical_path = &conn->paths[physical];
     fp_t relative_owd =
         physical_path->owd_initialized && physical_path->telemetry_path == path
             ? physical_path->latest_owd_fp
             : 0;
-    path_t sample = transport_path_estimate_on_path(
-        quic, path, &stats, quicly_get_num_datagram_frames_path(quic, path),
+    path_t sample = transport_path_estimate(
+        &stats, quicly_get_num_datagram_frames_path(quic, path),
         t->sockets[physical].egress.bytes, symbol_size, relative_owd);
     sample.p = transport_path_recent_loss(&physical_path->measurement);
     const path_state_t *state = &physical_path->state;
@@ -1909,8 +1905,18 @@ void transport_drive_dispatch(transport_t *t, size_t fd_idx, uint8_t *buf,
       continue;
 
     if (target) {
-      quicly_error_t ret = quicly_receive(
-          target->quic, (struct sockaddr *)&effective_dest, psa, &decoded);
+      /* keep wildcard client tuple stable when path uses unbound source IP */
+      struct sockaddr *receive_dest = (struct sockaddr *)&effective_dest;
+      if (!t->is_server &&
+          transport_address_is_wildcard(
+              (const struct sockaddr *)&t->sockets[fd_idx].local_addr) &&
+          transport_path_find_by_addresses(
+              target->quic,
+              (const struct sockaddr *)&t->sockets[fd_idx].local_addr,
+              psa) != SIZE_MAX)
+        receive_dest = (struct sockaddr *)&t->sockets[fd_idx].local_addr;
+      quicly_error_t ret =
+          quicly_receive(target->quic, receive_dest, psa, &decoded);
       transport_tls_observe(target);
       if (ret != 0 && ret != QUICLY_ERROR_PACKET_IGNORED &&
           (ret != QUICLY_ERROR_STATE_EXHAUSTION ||
@@ -1965,9 +1971,9 @@ static void update_path_measurements(transport_t *t, uint64_t now) {
                                     target->paths[i].telemetry_path == mapped
                                 ? target->paths[i].latest_owd_fp
                                 : 0;
-        path_t sample = transport_path_estimate_on_path(
-            target->quic, mapped, &stats, queued, t->sockets[i].egress.bytes,
-            symbol_size, relative_owd);
+        path_t sample =
+            transport_path_estimate(&stats, queued, t->sockets[i].egress.bytes,
+                                    symbol_size, relative_owd);
         sample.p = transport_path_recent_loss(&target->paths[i].measurement);
         fp_t cap = transport_path_probe_cap(&target->paths[i].measurement,
                                             &stats, symbol_size, now);
@@ -2710,9 +2716,11 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
       stats->acked = path_stats.acked;
       stats->bytes_acked = path_stats.bytes_acked;
       stats->cwnd = path_stats.cwnd;
-      stats->bytes_in_flight = path_stats.bytes_in_flight;
+      stats->bytes_in_flight = path_stats.bytes_in_flight > UINT32_MAX
+                                   ? UINT32_MAX
+                                   : (uint32_t)path_stats.bytes_in_flight;
       stats->lost = path_stats.lost;
-      stats->rtt = path_stats.rtt_smoothed;
+      stats->rtt = transport_path_rtt_ms(&path_stats);
     }
   }
 
@@ -2868,11 +2876,9 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
       bool ready = false;
       for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
         quicly_path_stats_t stats;
-        quicly_path_health_t health;
         if (!quicly_is_path_available(conn->quic, path) ||
             quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
-            (quicly_get_path_health(conn->quic, path, &health) == 0 &&
-             health.state == QUICLY_PATH_SUSPECT))
+            stats.health_state == QUICLY_PATH_SUSPECT)
           continue;
         bool owned = false;
         for (size_t physical = 0; physical < t->socket_count; physical++) {

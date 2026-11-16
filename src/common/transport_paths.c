@@ -45,27 +45,20 @@ static path_t estimate_with_rtt(float rtt_ms, const quicly_path_stats_t *stats,
   return sample;
 }
 
+uint32_t transport_path_rtt_ms(const quicly_path_stats_t *stats) {
+  if (!stats || !isfinite(stats->rtt.smoothed) || stats->rtt.smoothed <= 0.0f)
+    return 0;
+  if (stats->rtt.smoothed >= (float)UINT32_MAX)
+    return UINT32_MAX;
+  return (uint32_t)stats->rtt.smoothed;
+}
+
 path_t transport_path_estimate(const quicly_path_stats_t *stats,
                                size_t queued_datagrams, size_t egress_bytes,
                                size_t symbol_size, fp_t relative_owd) {
-  return estimate_with_rtt(stats ? stats->rtt_smoothed : 0, stats,
+  return estimate_with_rtt(stats ? stats->rtt.smoothed : 0.0f, stats,
                            queued_datagrams, egress_bytes, symbol_size,
                            relative_owd);
-}
-
-path_t transport_path_estimate_on_path(quicly_conn_t *quic, size_t path_index,
-                                       const quicly_path_stats_t *stats,
-                                       size_t queued_datagrams,
-                                       size_t egress_bytes, size_t symbol_size,
-                                       fp_t relative_owd) {
-  float rtt_ms = stats ? stats->rtt_smoothed : 0;
-  quicly_path_health_t health;
-  if (quic && quicly_get_path_health(quic, path_index, &health) == 0 &&
-      health.rtt_is_sampled && isfinite(health.rtt_smoothed) &&
-      health.rtt_smoothed > 0)
-    rtt_ms = health.rtt_smoothed;
-  return estimate_with_rtt(rtt_ms, stats, queued_datagrams, egress_bytes,
-                           symbol_size, relative_owd);
 }
 
 void transport_path_update_state(path_state_t *state, const path_t *sample,
@@ -172,21 +165,21 @@ bool transport_path_measure(transport_path_measurement_t *m,
       stats->sent < m->baseline.sent || stats->lost < m->baseline.lost ||
       !transport_endpoint_equal(&stats->local.sa, &m->baseline.local.sa) ||
       !transport_endpoint_equal(&stats->remote.sa, &m->baseline.remote.sa);
+  uint32_t rtt_ms = transport_path_rtt_ms(stats);
   if (reset) {
     memset(m, 0, sizeof(*m));
     m->baseline = *stats;
     m->quic_path = quic_path;
     m->started_ms = now_ms;
-    m->minimum_rtt = stats->rtt_smoothed;
+    m->minimum_rtt = rtt_ms;
     m->busy = busy;
     m->initialized = true;
     return true;
   }
-  if (stats->rtt_smoothed &&
-      (!m->minimum_rtt || stats->rtt_smoothed < m->minimum_rtt))
-    m->minimum_rtt = stats->rtt_smoothed;
+  if (rtt_ms && (!m->minimum_rtt || rtt_ms < m->minimum_rtt))
+    m->minimum_rtt = rtt_ms;
   m->busy = m->busy && busy;
-  uint64_t window_ms = (uint64_t)stats->rtt_smoothed * 2;
+  uint64_t window_ms = (uint64_t)rtt_ms * 2;
   if (window_ms < 100)
     window_ms = 100;
   if (window_ms > 1000)
@@ -222,10 +215,8 @@ bool transport_path_measure_on_path(transport_path_measurement_t *m,
   if (!stats)
     return false;
   quicly_path_stats_t measured = *stats;
-  quicly_path_health_t health;
-  if (!quic || quicly_get_path_health(quic, quic_path, &health) != 0 ||
-      !health.rtt_is_sampled)
-    measured.rtt_smoothed = 0;
+  if (!quic || !(isfinite(stats->rtt.latest) && stats->rtt.latest > 0.0f))
+    measured.rtt.smoothed = 0.0f;
   return transport_path_measure(m, &measured, quic_path, queued_datagrams,
                                 now_ms);
 }
@@ -240,7 +231,8 @@ fp_t transport_path_probe_cap(const transport_path_measurement_t *m,
   fp_t ceiling = FP_FROM_INT(FP_SAFE_WHOLE);
   if (!m || !stats || !m->initialized || !symbol_size || now_ms < m->started_ms)
     return ceiling;
-  uint64_t lifetime = (uint64_t)stats->rtt_smoothed * 8;
+  uint32_t rtt_ms = transport_path_rtt_ms(stats);
+  uint64_t lifetime = (uint64_t)rtt_ms * 8;
   if (lifetime < 500)
     lifetime = 500;
   uint64_t peak = 0;
@@ -257,8 +249,7 @@ fp_t transport_path_probe_cap(const transport_path_measurement_t *m,
    * capacity ceiling only when the same busy path shows a sustained RTT
    * increase; otherwise preserve the cwnd / RTT estimate so the scheduler can
    * continue probing independent links. */
-  if (!m->busy || !m->minimum_rtt ||
-      (uint64_t)stats->rtt_smoothed <= m->minimum_rtt + slack)
+  if (!m->busy || !m->minimum_rtt || (uint64_t)rtt_ms <= m->minimum_rtt + slack)
     return ceiling;
   fp_wide_t cap = (fp_wide_t)peak * FP_ONE / ((fp_wide_t)symbol_size + 80U);
   return cap > ceiling ? ceiling : (cap > 0 ? (fp_t)cap : 1);
@@ -388,12 +379,10 @@ transport_path_get_eligible_by_local(quicly_conn_t *quic,
   if (!quic || !local || !stats)
     return SIZE_MAX;
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
-    quicly_path_health_t health;
     if (quicly_get_path_stats(quic, path, stats) == 0 &&
         transport_path_matches_local(stats, local) &&
         quicly_is_path_available(quic, path) &&
-        (quicly_get_path_health(quic, path, &health) != 0 ||
-         health.state != QUICLY_PATH_SUSPECT))
+        stats->health_state != QUICLY_PATH_SUSPECT)
       return path;
   }
   return SIZE_MAX;
@@ -433,18 +422,15 @@ size_t transport_path_select_peer_egress(
   quicly_path_stats_t fallback_stats;
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
     quicly_path_stats_t stats;
-    quicly_path_health_t health;
     if (!quicly_is_path_available(quic, path) ||
-        quicly_get_path_stats(quic, path, &stats) != 0)
-      continue;
-    bool has_health = quicly_get_path_health(quic, path, &health) == 0;
-    if (has_health && (health.abandoned || health.state == QUICLY_PATH_SUSPECT))
+        quicly_get_path_stats(quic, path, &stats) != 0 || stats.abandoned ||
+        stats.health_state == QUICLY_PATH_SUSPECT)
       continue;
     size_t socket = transport_path_socket_for_source(
         local_addrs, num_local_addrs, &stats.local.sa);
     if (socket == SIZE_MAX)
       continue;
-    if (!has_health || health.validated) {
+    if (stats.validated) {
       memset(destination, 0, sizeof(*destination));
       memcpy(destination, &stats.remote.sa,
              quicly_get_socklen(&stats.remote.sa));

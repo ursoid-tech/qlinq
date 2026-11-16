@@ -86,18 +86,15 @@ void transport_path_budget_charge(transport_path_budget_t *budget);
 uint64_t transport_path_budget_wait(const transport_path_budget_t *budget,
                                     size_t burst, size_t symbols);
 
+/* clamp smoothed float RTT in milliseconds into uint32_t */
+uint32_t transport_path_rtt_ms(const quicly_path_stats_t *stats);
+
 /* Rates are symbol-equivalents/second, latency is seconds, and q counts
  * unsent symbol-equivalents. Missing measurements use independent defaults.
  * The physical egress backlog is shared by all peers using that socket. */
 path_t transport_path_estimate(const quicly_path_stats_t *stats,
                                size_t queued_datagrams, size_t egress_bytes,
                                size_t symbol_size, fp_t relative_owd);
-/* estimate path using fractional RTT if sampled */
-path_t transport_path_estimate_on_path(quicly_conn_t *quic, size_t path_index,
-                                       const quicly_path_stats_t *stats,
-                                       size_t queued_datagrams,
-                                       size_t egress_bytes, size_t symbol_size,
-                                       fp_t relative_owd);
 /* Smooth rate, latency and loss only on periodic samples. Queue occupancy is
  * always current, including between ticks when another object is published. */
 void transport_path_update_state(path_state_t *state, const path_t *sample,

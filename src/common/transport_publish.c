@@ -13,6 +13,7 @@
 #include "quicly/sendstate.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -170,13 +171,11 @@ static size_t collect_publication_paths(transport_t *t, transport_conn_t *conn,
       if (all_native && (native_seen & (UINT64_C(1) << native)))
         continue;
       quicly_path_stats_t stats;
-      quicly_path_health_t health;
       if (quicly_get_path_stats(conn->quic, native, &stats) != 0 ||
           !transport_path_matches_local(&stats,
                                         &t->sockets[physical].local_addr) ||
           !quicly_is_path_available(conn->quic, native) ||
-          (quicly_get_path_health(conn->quic, native, &health) == 0 &&
-           health.state == QUICLY_PATH_SUSPECT))
+          stats.health_state == QUICLY_PATH_SUSPECT)
         continue;
       if (all_native &&
           transport_path_socket_for_source(local_addrs, t->socket_count,
@@ -210,8 +209,8 @@ static size_t collect_publication_paths(transport_t *t, transport_conn_t *conn,
       candidate->payload_limit = limit;
       candidate->available =
           quicly_get_max_datagram_frames_path(conn->quic, mapped) - queued;
-      candidate->sample = transport_path_estimate_on_path(
-          conn->quic, mapped, &stats, queued, t->sockets[physical].egress.bytes,
+      candidate->sample = transport_path_estimate(
+          &stats, queued, t->sockets[physical].egress.bytes,
           estimate_symbol_size, relative_owd);
       candidate->sample.p =
           transport_path_recent_loss(measured ? &path->measurement : NULL);
@@ -241,7 +240,8 @@ static size_t collect_publication_paths(transport_t *t, transport_conn_t *conn,
         if (reserved > candidate->sample.q)
           candidate->sample.q = reserved;
       }
-      candidate->rate_known = stats.cwnd > 0 && stats.rtt_smoothed > 0;
+      candidate->rate_known = stats.cwnd > 0 && isfinite(stats.rtt.smoothed) &&
+                              stats.rtt.smoothed > 0.0f;
       candidate->physical = physical;
       /* A healthy alternate can share the failed path's socket. Its native
        * measurements are independent; only the physical egress budget is
@@ -757,9 +757,8 @@ static transport_publish_result_t publish_datagram_to_flexicast(
       transport_conn_path_t *live = &member->paths[physical];
       path_state_t state = live->state;
       if (!live->state_overridden) {
-        path_t sample = transport_path_estimate_on_path(
-            member->quic, mapped, &stats,
-            quicly_get_num_datagram_frames_path(member->quic, mapped),
+        path_t sample = transport_path_estimate(
+            &stats, quicly_get_num_datagram_frames_path(member->quic, mapped),
             t->sockets[physical].egress.bytes, symbol_size,
             live->owd_initialized && live->telemetry_path == mapped
                 ? live->latest_owd_fp
@@ -768,7 +767,10 @@ static transport_publish_result_t publish_datagram_to_flexicast(
           memset(&state, 0, sizeof(state));
         transport_path_update_state(&state, &sample, false);
         if (horizon != FP_MAX)
-          state.l_ewma = stats.rtt_smoothed > 0 ? sample.l : 0;
+          state.l_ewma =
+              isfinite(stats.rtt.smoothed) && stats.rtt.smoothed > 0.0f
+                  ? sample.l
+                  : 0;
       }
       if (shared_loss > state.p_ewma)
         state.p_ewma = shared_loss;

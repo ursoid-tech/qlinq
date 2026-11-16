@@ -17,27 +17,21 @@ typedef struct {
  * Ordinary integration traffic below always delegates to the pinned library. */
 static struct {
   bool enabled;
-  uint64_t available, suspect, health_unavailable, sendable;
+  uint64_t available, suspect, stats_unavailable, sendable;
   size_t stats_queries, attempted[TRANSPORT_MAX_QUIC_PATHS], attempts;
 } scheduler_check;
 
 int test_quicly_get_path_stats(quicly_conn_t *conn, size_t path,
                                quicly_path_stats_t *stats) {
-  if (scheduler_check.enabled)
-    scheduler_check.stats_queries++;
-  return quicly_get_path_stats(conn, path, stats);
-}
-
-int test_quicly_get_path_health(quicly_conn_t *conn, size_t path,
-                                quicly_path_health_t *health) {
   if (!scheduler_check.enabled)
-    return quicly_get_path_health(conn, path, health);
-  if (scheduler_check.health_unavailable & (UINT64_C(1) << path))
+    return quicly_get_path_stats(conn, path, stats);
+  scheduler_check.stats_queries++;
+  if (scheduler_check.stats_unavailable & (UINT64_C(1) << path))
     return -1;
-  *health = (quicly_path_health_t){.state = scheduler_check.suspect &
-                                                    (UINT64_C(1) << path)
-                                                ? QUICLY_PATH_SUSPECT
-                                                : QUICLY_PATH_USABLE};
+  *stats = (quicly_path_stats_t){.health_state = scheduler_check.suspect &
+                                                         (UINT64_C(1) << path)
+                                                     ? QUICLY_PATH_SUSPECT
+                                                     : QUICLY_PATH_USABLE};
   return 0;
 }
 
@@ -76,10 +70,11 @@ static void check_feedback_selection(endpoint_t *server,
   scheduler_check.available = scheduler_check.sendable = UINT64_MAX;
   for (size_t i = 0; i < 4; i++) {
     scheduler_check.attempts = 0;
+    scheduler_check.stats_queries = 0;
     assert(scheduler->do_send(scheduler, conn->quic, NULL) == 0);
     assert(scheduler_check.attempts == 1);
     assert(scheduler_check.attempted[0] == paths[i % 2]);
-    assert(scheduler_check.stats_queries == 0);
+    assert(scheduler_check.stats_queries == 2);
   }
 
   /* A pacing/cwnd-blocked first choice must fall through to the other path. */
@@ -107,14 +102,15 @@ static void check_feedback_selection(endpoint_t *server,
 
   /* Preserve the existing fallback when health information is unavailable. */
   scheduler_check.suspect = 0;
-  scheduler_check.health_unavailable = owned;
+  scheduler_check.stats_unavailable = owned;
   scheduler_check.sendable = owned;
   scheduler_check.attempts = 0;
+  scheduler_check.stats_queries = 0;
   conn->feedback_path = 0;
   assert(scheduler->do_send(scheduler, conn->quic, NULL) == 0);
   assert(scheduler_check.attempts == 1);
   assert(scheduler_check.attempted[0] == paths[0]);
-  assert(scheduler_check.stats_queries == 0);
+  assert(scheduler_check.stats_queries == 2);
   memset(&scheduler_check, 0, sizeof(scheduler_check));
   conn->feedback_path = saved_cursor;
 }
@@ -226,10 +222,10 @@ int main(void) {
     if (server.authenticated && client.authenticated)
       for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS && count < 2;
            path++) {
-        quicly_path_health_t health;
-        if (quicly_get_path_health(server.conn->quic, path, &health) == 0 &&
-            health.validated && !health.abandoned && !health.probe_only &&
-            health.state == QUICLY_PATH_USABLE)
+        quicly_path_stats_t stats;
+        if (quicly_get_path_stats(server.conn->quic, path, &stats) == 0 &&
+            stats.validated && !stats.abandoned && !stats.probe_only &&
+            stats.health_state == QUICLY_PATH_USABLE)
           paths[count++] = path;
       }
     if (count == 2)

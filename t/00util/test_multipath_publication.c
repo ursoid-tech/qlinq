@@ -221,10 +221,10 @@ static void create_shared_socket(transport_fixture_t *f, size_t paths[2]) {
     if (f->server.authenticated && f->client.authenticated)
       for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS && count < 2;
            path++) {
-        quicly_path_health_t health;
-        if (quicly_get_path_health(f->server.conn->quic, path, &health) == 0 &&
-            health.validated && !health.abandoned && !health.probe_only &&
-            health.state == QUICLY_PATH_USABLE)
+        quicly_path_stats_t stats;
+        if (quicly_get_path_stats(f->server.conn->quic, path, &stats) == 0 &&
+            stats.validated && !stats.abandoned && !stats.probe_only &&
+            stats.health_state == QUICLY_PATH_USABLE)
           paths[count++] = path;
       }
     if (count == 2)
@@ -595,9 +595,8 @@ int main(void) {
       ptls_iovec_init(stale_dgram, sizeof(stale_dgram))));
   assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]) ==
          1);
-  quicly_path_health_t health;
-  assert(quicly_get_path_health(f.server.conn->quic, paths[0], &health) == 0);
-  assert(quicly_abandon_path(f.server.conn->quic, health.path_id, 0) == 0);
+  assert(quicly_get_path_stats(f.server.conn->quic, paths[0], &stats) == 0);
+  assert(quicly_abandon_path(f.server.conn->quic, stats.path_id, 0) == 0);
   assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]) ==
          1);
   assert(transport_path_get_eligible_by_local(

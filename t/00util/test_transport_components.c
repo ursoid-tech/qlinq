@@ -500,22 +500,25 @@ static int test_path_pacing_inputs(void) {
       "saturated receive BDP clamps to cap without wrapping the reorder floor");
 
   transport_path_measurement_t measurement = {0};
-  quicly_path_stats_t cold = {.cwnd = 1000000, .rtt_smoothed = 66};
+  quicly_path_stats_t cold = {.cwnd = 1000000, .rtt = {.smoothed = 66}};
   cold.local.sa.sa_family = cold.remote.sa.sa_family = AF_INET;
-  CHECK(transport_path_measure_on_path(&measurement, NULL, &cold, 0, 1, 1000) &&
+  CHECK(transport_path_measure_on_path(&measurement, (quicly_conn_t *)&cold,
+                                       &cold, 0, 1, 1000) &&
             measurement.minimum_rtt == 0,
         "an unverified initial RTT cannot establish a queueing baseline");
-  cold.rtt_smoothed = 100;
+  cold.rtt.smoothed = 100;
+  cold.rtt.latest = 100;
   cold.acked = cold.sent = 100;
   cold.bytes_acked = 100000;
-  transport_path_measure(&measurement, &cold, 0, 1, 1200);
+  transport_path_measure_on_path(&measurement, (quicly_conn_t *)&cold, &cold, 0,
+                                 1, 1200);
   CHECK(measurement.minimum_rtt == 100 &&
             transport_path_probe_cap(&measurement, &cold, 1120, 1200) ==
                 FP_FROM_INT(FP_SAFE_WHOLE),
         "first measured 100 ms RTT is not queue growth from a 66 ms estimate");
   memset(&measurement, 0, sizeof(measurement));
 
-  quicly_path_stats_t stats = {.cwnd = 1000000, .rtt_smoothed = 40};
+  quicly_path_stats_t stats = {.cwnd = 1000000, .rtt = {.smoothed = 40}};
   stats.local.sa.sa_family = stats.remote.sa.sa_family = AF_INET;
   CHECK(transport_path_measure(&measurement, &stats, 0, 1, 1000),
         "initialize path measurement");
@@ -526,7 +529,7 @@ static int test_path_pacing_inputs(void) {
   CHECK(transport_path_probe_cap(&measurement, &stats, 1120, 1100) ==
             FP_FROM_INT(FP_SAFE_WHOLE),
         "clean RTT leaves an underused path's capacity estimate unbounded");
-  stats.rtt_smoothed = 46;
+  stats.rtt.smoothed = 46;
   CHECK(transport_path_probe_cap(&measurement, &stats, 1120, 1100) ==
             FP_FROM_INT(750),
         "queue-induced RTT growth removes probe gain");
@@ -749,7 +752,7 @@ static int test_address_identity(void) {
 
 static int test_path_estimates(void) {
   quicly_path_stats_t fast = {
-      .cwnd = 100000, .rtt_smoothed = 100, .sent = 100, .lost = 0};
+      .cwnd = 100000, .rtt = {.smoothed = 100}, .sent = 100, .lost = 0};
   quicly_path_stats_t slow = fast;
   slow.cwnd = 10000;
   path_t samples[2] = {transport_path_estimate(&fast, 0, 0, 1000, 0),
@@ -812,7 +815,7 @@ static int test_path_estimates(void) {
         "large queue inputs saturate without overflow");
 
   quicly_path_stats_t fractional = {.cwnd = 1500,
-                                    .rtt_smoothed = 3000,
+                                    .rtt = {.smoothed = 3000},
                                     .sent = UINT64_MAX,
                                     .lost = UINT64_MAX / 2};
   path_t sample = transport_path_estimate(&fractional, 0, 0, 1000, 0);
@@ -824,14 +827,16 @@ static int test_path_estimates(void) {
   sample = transport_path_estimate(&fractional, 0, 0, 1000, 0);
   CHECK(sample.p == FP_ONE, "loss probability is bounded");
   fractional.cwnd = UINT32_MAX;
-  fractional.rtt_smoothed = 1;
+  fractional.rtt.smoothed = 1;
   sample = transport_path_estimate(&fractional, 0, 0, 1, 0);
   CHECK(sample.b == FP_FROM_INT(FP_SAFE_WHOLE), "large rates are bounded");
   fractional.cwnd = 1;
-  fractional.rtt_smoothed = UINT32_MAX;
+  fractional.rtt.smoothed = (float)UINT32_MAX;
+  CHECK(transport_path_rtt_ms(&fractional) == UINT32_MAX,
+        "clamped millisecond RTT helper avoids float cast overflow");
   sample = transport_path_estimate(&fractional, 0, 0, SIZE_MAX, 0);
   CHECK(sample.b > 0, "very slow paths retain positive optimizer throughput");
-  fractional.rtt_smoothed = 0;
+  fractional.rtt.smoothed = 0;
   sample = transport_path_estimate(&fractional, 0, 0, 1000, 0);
   CHECK(sample.b == FP_FROM_INT(100) && sample.l == FP_FROM_FLOAT(0.050f),
         "unmeasured RTT uses independent defaults rather than a fictitious "

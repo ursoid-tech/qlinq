@@ -128,16 +128,14 @@ static bool removed_paths_retired(transport_conn_t *conn) {
   transport_t *t = conn->transport;
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
     quicly_path_stats_t stats;
-    quicly_path_health_t health;
-    if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
-        quicly_get_path_health(conn->quic, path, &health) != 0)
+    if (quicly_get_path_stats(conn->quic, path, &stats) != 0)
       continue;
     bool has_socket = false;
     for (size_t i = 0; i < t->socket_count; i++)
       has_socket |=
           transport_path_matches_local(&stats, &t->sockets[i].local_addr);
     if (!has_socket &&
-        (!health.abandoned || !t->quic_ctx.path_scheduler->is_path_eligible ||
+        (!stats.abandoned || !t->quic_ctx.path_scheduler->is_path_eligible ||
          t->quic_ctx.path_scheduler->is_path_eligible(
              t->quic_ctx.path_scheduler, conn->quic, path))) {
       fprintf(stderr, "removed path %zu remained eligible or unretired\n",
@@ -281,9 +279,8 @@ static bool test_live_path_inputs(test_state_t *server, test_state_t *client,
         ok = false;
         break;
       }
-      path_t expected = transport_path_estimate_on_path(
-          conn->quic, mapped, &stats,
-          quicly_get_num_datagram_frames_path(conn->quic, mapped),
+      path_t expected = transport_path_estimate(
+          &stats, quicly_get_num_datagram_frames_path(conn->quic, mapped),
           t->sockets[i].egress.bytes, symbol_size,
           conn->paths[i].latest_owd_fp);
       expected.q += stats.bytes_in_flight / symbol_size +

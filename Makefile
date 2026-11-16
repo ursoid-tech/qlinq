@@ -23,7 +23,7 @@ endif
 
 # Default CFLAGS for our code
 CFLAGS ?= -O2
-CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DQUICLY_HAVE_FLEXICAST=1
+CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DQUICLY_HAVE_FLEXICAST=1 -DQUICLY_LOCAL_ACTIVE_CONNECTION_ID_LIMIT=8
 # CODEC_TARGET=portable disables native nanorq/shared OBL targeting.
 # Keep explicit FEC_NATIVE_CFLAGS and NANORQ_NATIVE_CFLAGS overrides supported.
 CODEC_TARGET ?= native
@@ -365,7 +365,7 @@ ifeq ($(UNAME_S),Linux)
 QUICLY_INTEGRATION_TEST = t/00util/test_quicly_integration
 TRANSPORT_TESTS += $(QUICLY_INTEGRATION_TEST)
 t/00util/test_quicly_integration: t/00util/test_quicly_integration.o $(COMMON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=quicly_send,--wrap=quicly_receive,--wrap=quicly_close,--wrap=quicly_get_path_health
+	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=quicly_send,--wrap=quicly_receive,--wrap=quicly_close
 endif
 
 $(filter-out $(QUICLY_INTEGRATION_TEST) t/00util/test_multipath_failover t/00util/test_multipath_feedback t/00util/test_publication_limits,$(TRANSPORT_TESTS)): %: %.o $(COMMON_OBJS)
@@ -523,7 +523,6 @@ t/00util/test_publication_limits: t/00util/test_publication_limits.o t/00util/tr
 t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) \
 		-Dquicly_get_path_stats=test_quicly_get_path_stats \
-		-Dquicly_get_path_health=test_quicly_get_path_health \
 		-Dquicly_is_path_available=test_quicly_is_path_available \
 		-Dquicly_send_on_path=test_quicly_send_on_path -c $< -o $@
 

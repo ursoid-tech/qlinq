@@ -1759,10 +1759,8 @@ bool transport_flexicast_receive_unicast_ecn(
       flow->control_conn && flow->control_conn->quic) {
     for (size_t i = 0; i < TRANSPORT_MAX_QUIC_PATHS; i++) {
       quicly_path_stats_t path;
-      quicly_path_health_t health;
       if (quicly_get_path_stats(flow->control_conn->quic, i, &path) != 0 ||
-          quicly_get_path_health(flow->control_conn->quic, i, &health) != 0 ||
-          health.abandoned || !health.validated ||
+          path.abandoned || !path.validated ||
           peer->sa_family != path.remote.sa.sa_family)
         continue;
       if (peer->sa_family == AF_INET) {

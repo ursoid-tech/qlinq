@@ -7,7 +7,6 @@
 /* Controlled native snapshots exercise states that cannot be held stable by
  * a real peer, without altering the production library or native dependency. */
 static struct {
-  quicly_path_health_t health;
   quicly_path_stats_t stats;
   bool exists, available, eligible;
   unsigned requests;
@@ -19,12 +18,6 @@ static int sample_stats(quicly_conn_t *quic, quicly_stats_t *stats) {
   *stats =
       (quicly_stats_t){.handshake_confirmed_msec = confirmed ? 0 : UINT64_MAX};
   return 0;
-}
-static int sample_health(quicly_conn_t *quic, size_t path,
-                         quicly_path_health_t *health) {
-  (void)quic;
-  *health = samples[path].health;
-  return samples[path].exists ? 0 : -1;
 }
 static int sample_path_stats(quicly_conn_t *quic, size_t path,
                              quicly_path_stats_t *stats) {
@@ -48,7 +41,6 @@ static int sample_request(quicly_conn_t *quic, size_t path) {
   return request_result;
 }
 #define quicly_get_stats sample_stats
-#define quicly_get_path_health sample_health
 #define quicly_get_path_stats sample_path_stats
 #define quicly_is_path_available sample_available
 #define quicly_request_path_probe sample_request
@@ -60,7 +52,6 @@ static int sample_request(quicly_conn_t *quic, size_t path) {
 #undef quicly_request_path_probe
 #undef quicly_is_path_available
 #undef quicly_get_path_stats
-#undef quicly_get_path_health
 #undef quicly_get_stats
 
 static void test_probe_policy(void) {
@@ -74,7 +65,7 @@ static void test_probe_policy(void) {
   conn->quic = (quicly_conn_t *)&quic;
   conn->quic_ready = true;
   samples[0].exists = samples[0].available = samples[0].eligible = true;
-  samples[0].health.validated = true;
+  samples[0].stats.validated = 1;
   samples[0].stats.local.sin.sin_family = AF_INET;
   samples[0].stats.remote.sin.sin_family = AF_INET;
 
@@ -107,13 +98,13 @@ static void test_probe_policy(void) {
   sample_probe_tick(conn, 300);
   assert(sample_probe_deadline(conn, 300) == INT64_MAX);
   samples[0].stats.bytes_in_flight = 0;
-  samples[0].health.pto_count = 2;
+  samples[0].stats.pto_count = 2;
   assert(sample_probe_deadline(conn, 350) == INT64_MAX);
-  samples[0].health.pto_count = -1;
+  samples[0].stats.pto_count = -1;
   sample_probe_tick(conn, 400);
   assert(sample_probe_deadline(conn, 400) == 450);
   assert(samples[0].requests == 2);
-  samples[0].health.pto_count = 0;
+  samples[0].stats.pto_count = 0;
   samples[0].stats.bytes_acked = 1000;
   assert(sample_probe_deadline(conn, 450) == 550);
   sample_probe_tick(conn, 549);
@@ -123,7 +114,7 @@ static void test_probe_policy(void) {
 
   /* An independently idle path is not postponed by traffic on path zero. */
   samples[1] = samples[0];
-  samples[1].health.path_id = 1;
+  samples[1].stats.path_id = 1;
   samples[1].requests = 0;
   assert(sample_probe_deadline(conn, 600) == 650);
   samples[0].stats.bytes_in_flight = 100;
@@ -134,7 +125,7 @@ static void test_probe_policy(void) {
   samples[0].stats.bytes_in_flight = 0;
 
   /* Slot reuse and migration both discard the previous path's timer. */
-  samples[0].health.path_id++;
+  samples[0].stats.path_id++;
   assert(sample_probe_deadline(conn, 900) == 1000);
   samples[0].stats.remote.sin.sin_port = htons(1234);
   assert(sample_probe_deadline(conn, 950) == 1050);
@@ -143,12 +134,12 @@ static void test_probe_policy(void) {
   samples[0].exists = true;
   assert(sample_probe_deadline(conn, 1100) == 1200);
 
-  samples[0].health.state = QUICLY_PATH_SUSPECT;
+  samples[0].stats.health_state = QUICLY_PATH_SUSPECT;
   sample_probe_tick(conn, 1200);
   assert(sample_probe_deadline(conn, 1200) == INT64_MAX);
-  samples[0].health.state = QUICLY_PATH_RECOVERING;
+  samples[0].stats.health_state = QUICLY_PATH_RECOVERING;
   assert(sample_probe_deadline(conn, 1200) == INT64_MAX);
-  samples[0].health.state = QUICLY_PATH_USABLE;
+  samples[0].stats.health_state = QUICLY_PATH_USABLE;
   assert(sample_probe_deadline(conn, 1300) == 1400);
   samples[0].eligible = false;
   assert(sample_probe_deadline(conn, 1400) == INT64_MAX);
@@ -156,15 +147,15 @@ static void test_probe_policy(void) {
   samples[0].available = false;
   assert(sample_probe_deadline(conn, 1400) == INT64_MAX);
   samples[0].available = true;
-  samples[0].health.abandoned = true;
+  samples[0].stats.abandoned = 1;
   assert(sample_probe_deadline(conn, 1400) == INT64_MAX);
-  samples[0].health.abandoned = false;
-  samples[0].health.probe_only = true;
+  samples[0].stats.abandoned = 0;
+  samples[0].stats.probe_only = 1;
   assert(sample_probe_deadline(conn, 1400) == INT64_MAX);
-  samples[0].health.probe_only = false;
-  samples[0].health.validated = false;
+  samples[0].stats.probe_only = 0;
+  samples[0].stats.validated = 0;
   assert(sample_probe_deadline(conn, 1400) == INT64_MAX);
-  samples[0].health.validated = true;
+  samples[0].stats.validated = 1;
   assert(sample_probe_deadline(conn, INT64_MAX - 20) == INT64_MAX);
   sample_probe_tick(conn, INT64_MAX);
   assert(samples[0].requests == 3);

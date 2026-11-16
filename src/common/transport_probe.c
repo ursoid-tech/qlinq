@@ -26,22 +26,20 @@ static int64_t probe_paths(transport_conn_t *conn, int64_t now, bool request) {
   quicly_path_scheduler_t *scheduler = t->quic_ctx.path_scheduler;
   for (size_t path = 0; path < TRANSPORT_MAX_QUIC_PATHS; path++) {
     transport_probe_state_t *state = &conn->path_probes[path];
-    quicly_path_health_t health;
     quicly_path_stats_t stats;
-    if (quicly_get_path_health(conn->quic, path, &health) != 0 ||
-        !health.validated || health.probe_only || health.abandoned ||
-        health.state != QUICLY_PATH_USABLE ||
+    if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
+        !stats.validated || stats.probe_only || stats.abandoned ||
+        stats.health_state != QUICLY_PATH_USABLE ||
         !quicly_is_path_available(conn->quic, path) ||
         (scheduler && scheduler->is_path_eligible &&
-         !scheduler->is_path_eligible(scheduler, conn->quic, path)) ||
-        quicly_get_path_stats(conn->quic, path, &stats) != 0) {
+         !scheduler->is_path_eligible(scheduler, conn->quic, path))) {
       state->active = false;
       continue;
     }
 
     /* A native index may be reused, or its address candidate may migrate.
      * Each incarnation receives a full idle interval before its first probe. */
-    if (!state->active || state->path_id != health.path_id ||
+    if (!state->active || state->path_id != stats.path_id ||
         !transport_endpoint_equal(&state->local.sa, &stats.local.sa) ||
         !transport_endpoint_equal(&state->remote.sa, &stats.remote.sa)) {
       *state =
@@ -49,7 +47,7 @@ static int64_t probe_paths(transport_conn_t *conn, int64_t now, bool request) {
                                     .remote = stats.remote,
                                     .bytes_acked = stats.bytes_acked,
                                     .next_at_ms = next_probe_at(now, interval),
-                                    .path_id = health.path_id,
+                                    .path_id = stats.path_id,
                                     .active = true};
     }
 
@@ -57,11 +55,11 @@ static int64_t probe_paths(transport_conn_t *conn, int64_t now, bool request) {
      * packet counters include ACK-only replies, which cannot prove liveness.
      * An outstanding flight or native PTO recovery owns its own timer.
      * A negative speculative count can survive a fully ACKed flight. */
-    if (stats.bytes_in_flight != 0 || health.pto_count > 0 ||
+    if (stats.bytes_in_flight != 0 || stats.pto_count > 0 ||
         stats.bytes_acked != state->bytes_acked) {
       state->bytes_acked = stats.bytes_acked;
       state->next_at_ms = next_probe_at(now, interval);
-      if (stats.bytes_in_flight != 0 || health.pto_count > 0)
+      if (stats.bytes_in_flight != 0 || stats.pto_count > 0)
         continue;
     }
 

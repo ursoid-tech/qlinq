@@ -10,8 +10,6 @@
 static quicly_error_t send_error, receive_error;
 static unsigned close_calls, receive_calls, disconnects;
 static quicly_error_t last_error;
-static quicly_conn_t *sample_path;
-static quicly_path_health_t sample_health;
 
 quicly_error_t __real_quicly_send(quicly_conn_t *, quicly_address_t *,
                                   quicly_address_t *, struct iovec *, size_t *,
@@ -48,16 +46,6 @@ quicly_error_t __wrap_quicly_close(quicly_conn_t *conn, quicly_error_t err,
                                    const char *reason) {
   close_calls++;
   return __real_quicly_close(conn, err, reason);
-}
-int __real_quicly_get_path_health(quicly_conn_t *, size_t,
-                                  quicly_path_health_t *);
-int __wrap_quicly_get_path_health(quicly_conn_t *conn, size_t path,
-                                  quicly_path_health_t *health) {
-  if (conn == sample_path && path == 0) {
-    *health = sample_health;
-    return 0;
-  }
-  return __real_quicly_get_path_health(conn, path, health);
 }
 static void event(void *data, const transport_event_t *ev) {
   (void)data;
@@ -140,33 +128,24 @@ static void test_fractional_rtt(void) {
   transport_config_t c = config(false);
   transport_t *client = transport_create(&c);
   assert(client);
-  sample_path = client->client_conn->quic;
-  quicly_path_stats_t stats = {.cwnd = 12000};
-  sample_health =
-      (quicly_path_health_t){.rtt_is_sampled = 1, .rtt_smoothed = 0.25f};
-  path_t fast =
-      transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);
-  sample_health.rtt_smoothed = 0.75f;
-  path_t slow =
-      transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);
+  quicly_path_stats_t live;
+  assert(quicly_get_path_stats(client->client_conn->quic, 0, &live) == 0);
+  assert(live.rtt.latest == 0.0f && live.rtt.smoothed > 0.0f);
+  quicly_path_stats_t stats = {.cwnd = 12000,
+                               .rtt = {.smoothed = 0.25f, .latest = 0.25f}};
+  path_t fast = transport_path_estimate(&stats, 0, 0, 1000, 0);
+  stats.rtt.smoothed = 0.75f;
+  path_t slow = transport_path_estimate(&stats, 0, 0, 1000, 0);
   assert(fast.b == FP_FROM_INT(48000) && slow.b == FP_FROM_INT(16000));
   assert(fast.l > 0 && fast.l < slow.l && slow.l < FP_ONE / 1000);
-  sample_health.rtt_smoothed = 0.01f;
-  path_t ultra_fast =
-      transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);
+  stats.rtt.smoothed = 0.01f;
+  path_t ultra_fast = transport_path_estimate(&stats, 0, 0, 1000, 0);
   assert(ultra_fast.l == 1);
-  sample_health.rtt_is_sampled = 0;
-  path_t cold =
-      transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);
+  stats.rtt = (quicly_rtt_t){0};
+  path_t cold = transport_path_estimate(&stats, 0, 0, 1000, 0);
   assert(cold.b == FP_FROM_INT(100) && cold.l == FP_FROM_FLOAT(0.050f));
-  stats.rtt_smoothed = 333;
-  cold = transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0);
-  assert(cold.b == transport_path_estimate(&stats, 0, 0, 1000, 0).b);
-  sample_health.rtt_is_sampled = 1;
-  sample_health.rtt_smoothed = NAN;
-  assert(transport_path_estimate_on_path(sample_path, 0, &stats, 0, 0, 1000, 0)
-             .b == cold.b);
-  sample_path = NULL;
+  stats.rtt.smoothed = NAN;
+  assert(transport_path_estimate(&stats, 0, 0, 1000, 0).b == cold.b);
   transport_destroy(client);
 }
 static void test_native_ecn(void) {

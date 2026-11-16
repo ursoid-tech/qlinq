@@ -212,9 +212,7 @@ static bool run_startup(bool delay_primary) {
     if (secondary.cwnd < minimum_cwnd)
       minimum_cwnd = secondary.cwnd;
     losses = secondary.lost;
-    quicly_path_health_t health;
-    assert(quicly_get_path_health(client.conn->quic, path, &health) == 0);
-    validated = health.validated && !health.probe_only;
+    validated = secondary.validated && !secondary.probe_only;
     if (validated && server.authenticated && client.authenticated &&
         ++settled == 250)
       break;
@@ -252,10 +250,8 @@ static quicly_path_health_state_t path_health(endpoint_t *ep, size_t physical) {
   quicly_path_stats_t stats;
   size_t path = transport_path_get_stats_by_local(
       ep->conn->quic, &ep->transport->sockets[physical].local_addr, &stats);
-  quicly_path_health_t health;
-  assert(path != SIZE_MAX &&
-         quicly_get_path_health(ep->conn->quic, path, &health) == 0);
-  return health.state;
+  assert(path != SIZE_MAX);
+  return stats.health_state;
 }
 
 static void publish(endpoint_t *ep, moq_track_id_t track, size_t *offered) {
@@ -352,7 +348,7 @@ static void run(size_t failed_path, bool bidirectional) {
     quicly_path_stats_t warm = path_stats(&client, p);
     if (warm.acked <= 10 || path_health(&client, p) != QUICLY_PATH_USABLE)
       fprintf(stderr,
-              "warm p%zu sent=%llu acked=%llu health=%d cwnd=%u flight=%u "
+              "warm p%zu sent=%llu acked=%llu health=%d cwnd=%u flight=%zu "
               "received=%zu offered=%zu\n",
               p, (unsigned long long)warm.sent, (unsigned long long)warm.acked,
               path_health(&client, p), warm.cwnd, warm.bytes_in_flight,
@@ -391,7 +387,7 @@ static void run(size_t failed_path, bool bidirectional) {
         failed_path, dropped_packets, before, server.received, offered);
     for (size_t p = 0; p < 2; p++) {
       quicly_path_stats_t s = path_stats(&client, p);
-      fprintf(stderr, "p%zu state=%d sent=%llu acked=%llu flight=%u cwnd=%u\n",
+      fprintf(stderr, "p%zu state=%d sent=%llu acked=%llu flight=%zu cwnd=%u\n",
               p, path_health(&client, p), (unsigned long long)s.sent,
               (unsigned long long)s.acked, s.bytes_in_flight, s.cwnd);
     }
