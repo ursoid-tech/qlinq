@@ -922,7 +922,7 @@ int main(int argc, char **argv) {
     }
     transport_flexicast_member_t *member = &flow->members[0];
     quicly_flexicast_frame_t frame = {.type = QUICLY_FRAME_TYPE_FC_STATE};
-    frame.data.state.flow_id.len = QUICLY_FLEXICAST_FLOW_ID_SIZE;
+    frame.data.state.flow_id.len = TRANSPORT_FLEXICAST_FLOW_ID_SIZE;
     quicly_encode64(frame.data.state.flow_id.bytes, flow->flow_id);
     frame.data.state.sequence = flow->key_epoch;
     for (size_t i = 0;

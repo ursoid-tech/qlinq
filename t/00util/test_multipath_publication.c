@@ -224,7 +224,7 @@ static void create_shared_socket(transport_fixture_t *f, size_t paths[2]) {
         quicly_path_stats_t stats;
         if (quicly_get_path_stats(f->server.conn->quic, path, &stats) == 0 &&
             stats.validated && !stats.abandoned && !stats.probe_only &&
-            stats.health_state == QUICLY_PATH_USABLE)
+            !transport_path_is_suspect(&stats))
           paths[count++] = path;
       }
     if (count == 2)
@@ -598,7 +598,7 @@ int main(void) {
   assert(quicly_get_path_stats(f.server.conn->quic, paths[0], &stats) == 0);
   assert(quicly_abandon_path(f.server.conn->quic, stats.path_id, 0) == 0);
   assert(quicly_get_num_datagram_frames_path(f.server.conn->quic, paths[0]) ==
-         1);
+         0);
   assert(transport_path_get_eligible_by_local(
              f.server.conn->quic, &f.server.transport->sockets[0].local_addr,
              &stats) == paths[1]);

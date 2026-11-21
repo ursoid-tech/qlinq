@@ -8,6 +8,7 @@
 #include "quicly/flexicast.h"
 
 #define TRANSPORT_FLEXICAST_MAX_FLOWS 256U
+#define TRANSPORT_FLEXICAST_FLOW_ID_SIZE 8U
 #define TRANSPORT_FLEXICAST_SECRET_SIZE 32U
 #define TRANSPORT_FLEXICAST_MISSED_FEEDBACK_WINDOWS 3U
 #define TRANSPORT_FLEXICAST_QUEUE_CAPACITY 256U
@@ -95,6 +96,7 @@ typedef struct transport_flexicast_flow_t {
   uint64_t flow_id;
   moq_track_id_t track_id;
   uint8_t secret[TRANSPORT_FLEXICAST_SECRET_SIZE];
+  quicly_flexicast_cc_t *cc;
   quicly_flexicast_flow_t *crypto;
   transport_conn_t *control_conn;
   uint8_t source_ip[16];
@@ -175,10 +177,9 @@ void transport_flexicast_interface_added(transport_t *t, uint8_t ip_version,
 
 bool transport_flexicast_receive_bind(transport_t *t, transport_conn_t *conn,
                                       const qlinq_wire_flexicast_bind_t *bind);
-bool transport_flexicast_receive_path_ack(transport_t *t,
-                                          transport_conn_t *conn,
-                                          uint64_t flow_id,
-                                          const quicly_ack_frame_t *ack);
+bool transport_flexicast_receive_path_ack(
+    transport_t *t, transport_conn_t *conn,
+    const quicly_flexicast_flow_id_t *flow_id, const quicly_ack_frame_t *ack);
 bool transport_flexicast_receive_quic_frame(
     transport_t *t, transport_conn_t *conn,
     const quicly_flexicast_frame_t *frame);

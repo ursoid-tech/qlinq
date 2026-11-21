@@ -135,8 +135,7 @@ static int check_cid_protection(transport_t *transport) {
     for (size_t path = 0; path <= 255; path += 17) {
       quicly_cid_plaintext_t original = {.master_id = 0x12340000u + path,
                                          .path_id = path,
-                                         .sequence = 255 - path,
-                                         .thread_id = 0xa531,
+                                         .thread_id = 0xa53100u + (255 - path),
                                          .node_id = 0};
       quicly_cid_t encoded[2];
       uint8_t tokens[2][QUICLY_STATELESS_RESET_TOKEN_LEN],
@@ -153,7 +152,6 @@ static int check_cid_protection(transport_t *transport) {
                                     length) == 8);
           CHECK(decoded.master_id == original.master_id &&
                 decoded.path_id == original.path_id &&
-                decoded.sequence == original.sequence &&
                 decoded.thread_id == original.thread_id &&
                 decoded.node_id == original.node_id);
         }
@@ -174,8 +172,7 @@ static int check_cid_protection(transport_t *transport) {
 static bool same_cid_plaintext(const quicly_cid_plaintext_t *a,
                                const quicly_cid_plaintext_t *b) {
   return a->master_id == b->master_id && a->path_id == b->path_id &&
-         a->sequence == b->sequence && a->thread_id == b->thread_id &&
-         a->node_id == b->node_id;
+         a->thread_id == b->thread_id && a->node_id == b->node_id;
 }
 
 static quicly_cid_encryptor_t *counted_cid_delegate;
@@ -219,8 +216,7 @@ static int check_cid_cache(void) {
   for (size_t i = 0; i < 10; i++) {
     original[i] = (quicly_cid_plaintext_t){.master_id = 0x739a0000u + i,
                                            .path_id = i,
-                                           .sequence = 255 - i,
-                                           .thread_id = 0xa531};
+                                           .thread_id = 0xa53100u + (255 - i)};
     quicly_cid_t expected;
     uint8_t token[QUICLY_STATELESS_RESET_TOKEN_LEN];
     cid->encrypt_cid(cid, &encoded[i], tokens[i], &original[i]);
@@ -353,8 +349,7 @@ static int check_cid_credential_reload(transport_t *t) {
   quicly_cid_encryptor_t *cid = t->quic_ctx.cid_encryptor;
   quicly_cid_plaintext_t original = {.master_id = 0x983ba52c,
                                      .path_id = 3,
-                                     .sequence = 27,
-                                     .thread_id = 0xffff},
+                                     .thread_id = 0x1bffff},
                          decoded;
   quicly_cid_t encoded;
   uint8_t token[QUICLY_STATELESS_RESET_TOKEN_LEN],

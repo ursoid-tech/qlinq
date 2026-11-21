@@ -382,7 +382,7 @@ transport_path_get_eligible_by_local(quicly_conn_t *quic,
     if (quicly_get_path_stats(quic, path, stats) == 0 &&
         transport_path_matches_local(stats, local) &&
         quicly_is_path_available(quic, path) &&
-        stats->health_state != QUICLY_PATH_SUSPECT)
+        !transport_path_is_suspect(stats))
       return path;
   }
   return SIZE_MAX;
@@ -424,7 +424,7 @@ size_t transport_path_select_peer_egress(
     quicly_path_stats_t stats;
     if (!quicly_is_path_available(quic, path) ||
         quicly_get_path_stats(quic, path, &stats) != 0 || stats.abandoned ||
-        stats.health_state == QUICLY_PATH_SUSPECT)
+        transport_path_is_suspect(&stats))
       continue;
     size_t socket = transport_path_socket_for_source(
         local_addrs, num_local_addrs, &stats.local.sa);

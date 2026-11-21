@@ -1408,9 +1408,11 @@ on_receive_flexicast_frame(quicly_receive_flexicast_frame_t *self,
 
 static quicly_error_t
 on_receive_flexicast_ack(quicly_receive_flexicast_ack_t *self,
-                         quicly_conn_t *conn, uint64_t flow_id,
+                         quicly_conn_t *conn, uint64_t ack_path_id,
+                         const quicly_flexicast_flow_id_t *flow_id,
                          const quicly_ack_frame_t *ack) {
   (void)self;
+  (void)ack_path_id;
   transport_conn_t *tconn = *quicly_get_data(conn);
   if (!tconn || !tconn->authenticated ||
       !transport_flexicast_receive_path_ack(tconn->transport, tconn, flow_id,

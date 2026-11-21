@@ -175,7 +175,7 @@ static size_t collect_publication_paths(transport_t *t, transport_conn_t *conn,
           !transport_path_matches_local(&stats,
                                         &t->sockets[physical].local_addr) ||
           !quicly_is_path_available(conn->quic, native) ||
-          stats.health_state == QUICLY_PATH_SUSPECT)
+          transport_path_is_suspect(&stats))
         continue;
       if (all_native &&
           transport_path_socket_for_source(local_addrs, t->socket_count,

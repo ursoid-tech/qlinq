@@ -29,7 +29,6 @@ static int64_t probe_paths(transport_conn_t *conn, int64_t now, bool request) {
     quicly_path_stats_t stats;
     if (quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
         !stats.validated || stats.probe_only || stats.abandoned ||
-        stats.health_state != QUICLY_PATH_USABLE ||
         !quicly_is_path_available(conn->quic, path) ||
         (scheduler && scheduler->is_path_eligible &&
          !scheduler->is_path_eligible(scheduler, conn->quic, path))) {

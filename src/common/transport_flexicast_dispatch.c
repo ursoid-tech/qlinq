@@ -218,12 +218,6 @@ static void refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
                 registry->pacing_burst, now);
   size_t active = active_sender_count(t, flow, now);
   uint64_t aggregate = t->flexicast_cc_aggregate_rate_limit;
-  quicly_flexicast_cc_hints_t hints = {
-      .active_senders = (uint32_t)active,
-      .delivery_rate_divisor = 1U,
-      .aggregate_rate_limit_bytes_per_second =
-          aggregate != 0 ? aggregate / active + (aggregate % active != 0) : 0};
-  quicly_flexicast_cc_set_flow_hints(flow->crypto, &hints, now);
   quicly_flexicast_cc_output_t cc_output;
   quicly_flexicast_cc_get_flow_output(flow->crypto, &cc_output);
   if (flow->listening_count == 0)
@@ -401,9 +395,9 @@ account_protected_packet(transport_t *t, transport_flexicast_flow_t *flow,
       .physical_fanout = physical_fanout != 0 ? physical_fanout : 1U,
       .flags = QUICLY_FLEXICAST_SAMPLE_VALID |
                (app_limited ? QUICLY_FLEXICAST_SAMPLE_APP_LIMITED : 0U)};
-  (void)quicly_flexicast_mark_submitted_with_context(
-      flow->crypto, recipient ? recipient->conn->id : 0, queued->packet_number,
-      now, &ctx);
+  (void)quicly_flexicast_mark_submitted(flow->crypto,
+                                        recipient ? recipient->conn->id : 0,
+                                        queued->packet_number, now, &ctx);
   tf_record_delivery_submission(t, flow, recipient, !queued->counted);
   if (!queued->counted) {
     t->stats.flexicast_packets_sent++;
@@ -447,7 +441,7 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       return FLEXICAST_DISPATCH_FAILED;
     if (size > pacing_available(t, flow))
       return FLEXICAST_DISPATCH_BLOCKED;
-    int result = quicly_flexicast_send_datagram_at(
+    int result = quicly_flexicast_send_datagram(
         flow->crypto, ptls_iovec_init(queued->data, queued->size),
         queued->packet, size, &queued->packet_size, &queued->packet_number,
         now);

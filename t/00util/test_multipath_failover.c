@@ -246,12 +246,9 @@ static quicly_path_stats_t path_stats(endpoint_t *ep, size_t physical) {
   return stats;
 }
 
-static quicly_path_health_state_t path_health(endpoint_t *ep, size_t physical) {
-  quicly_path_stats_t stats;
-  size_t path = transport_path_get_stats_by_local(
-      ep->conn->quic, &ep->transport->sockets[physical].local_addr, &stats);
-  assert(path != SIZE_MAX);
-  return stats.health_state;
+static bool path_is_suspect(endpoint_t *ep, size_t physical) {
+  quicly_path_stats_t stats = path_stats(ep, physical);
+  return transport_path_is_suspect(&stats);
 }
 
 static void publish(endpoint_t *ep, moq_track_id_t track, size_t *offered) {
@@ -283,10 +280,6 @@ static void run(size_t failed_path, bool bidirectional) {
       .user_data = &server};
   server.transport = transport_create(&config);
   assert(server.transport);
-  /* Establish the fixture before testing the opt-in health policy. Sparse
-   * validation/control traffic alone need not keep an unused path progressing.
-   */
-  server.transport->quic_ctx.multipath_failover_pto_threshold = 0;
   config.bind_hosts[0] = "127.82.1.2";
   config.bind_hosts[1] = "127.82.2.2";
   config.remote_hosts[0] = "127.82.1.1";
@@ -295,7 +288,6 @@ static void run(size_t failed_path, bool bidirectional) {
   config.user_data = &client;
   client.transport = transport_create(&config);
   assert(client.transport);
-  client.transport->quic_ctx.multipath_failover_pto_threshold = 0;
   for (size_t i = 0; i < 2000; i++) {
     tick(&server, &client);
     transport_conn_stats_t stats;
@@ -339,24 +331,21 @@ static void run(size_t failed_path, bool bidirectional) {
     publish(&client, track, &offered);
     tick(&server, &client);
     if (path_stats(&client, 0).acked > 10 &&
-        path_stats(&client, 1).acked > 10 &&
-        path_health(&client, 0) == QUICLY_PATH_USABLE &&
-        path_health(&client, 1) == QUICLY_PATH_USABLE)
+        path_stats(&client, 1).acked > 10 && !path_is_suspect(&client, 0) &&
+        !path_is_suspect(&client, 1))
       break;
   }
   for (size_t p = 0; p < 2; p++) {
     quicly_path_stats_t warm = path_stats(&client, p);
-    if (warm.acked <= 10 || path_health(&client, p) != QUICLY_PATH_USABLE)
+    if (warm.acked <= 10 || transport_path_is_suspect(&warm))
       fprintf(stderr,
-              "warm p%zu sent=%llu acked=%llu health=%d cwnd=%u flight=%zu "
+              "warm p%zu sent=%llu acked=%llu pto=%d cwnd=%u flight=%zu "
               "received=%zu offered=%zu\n",
               p, (unsigned long long)warm.sent, (unsigned long long)warm.acked,
-              path_health(&client, p), warm.cwnd, warm.bytes_in_flight,
-              server.received, offered);
-    assert(warm.acked > 10 && path_health(&client, p) == QUICLY_PATH_USABLE);
+              warm.pto_count, warm.cwnd, warm.bytes_in_flight, server.received,
+              offered);
+    assert(warm.acked > 10 && !transport_path_is_suspect(&warm));
   }
-  client.transport->quic_ctx.multipath_failover_pto_threshold = 2;
-  server.transport->quic_ctx.multipath_failover_pto_threshold = 2;
   dropped_fds[0] =
       transport_poll_host(client.transport)->sockets[failed_path].fd;
   dropped_fds[1] =
@@ -376,7 +365,7 @@ static void run(size_t failed_path, bool bidirectional) {
   for (size_t i = 0; i < 1000; i++) {
     publish(&client, track, &offered);
     tick(&server, &client);
-    suspected |= path_health(&client, failed_path) == QUICLY_PATH_SUSPECT;
+    suspected |= path_is_suspect(&client, failed_path);
     if (i == 500)
       received_mid_fault = server.received;
   }
@@ -387,8 +376,8 @@ static void run(size_t failed_path, bool bidirectional) {
         failed_path, dropped_packets, before, server.received, offered);
     for (size_t p = 0; p < 2; p++) {
       quicly_path_stats_t s = path_stats(&client, p);
-      fprintf(stderr, "p%zu state=%d sent=%llu acked=%llu flight=%zu cwnd=%u\n",
-              p, path_health(&client, p), (unsigned long long)s.sent,
+      fprintf(stderr, "p%zu pto=%d sent=%llu acked=%llu flight=%zu cwnd=%u\n",
+              p, s.pto_count, (unsigned long long)s.sent,
               (unsigned long long)s.acked, s.bytes_in_flight, s.cwnd);
     }
   }
@@ -403,7 +392,7 @@ static void run(size_t failed_path, bool bidirectional) {
   for (size_t i = 0; i < 5000; i++) {
     publish(&client, track, &offered);
     tick(&server, &client);
-    if (path_health(&client, failed_path) == QUICLY_PATH_USABLE) {
+    if (!path_is_suspect(&client, failed_path)) {
       recovered = true;
       break;
     }

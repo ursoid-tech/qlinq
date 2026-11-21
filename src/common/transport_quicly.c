@@ -419,7 +419,7 @@ size_t transport_datagram_payload_limit(transport_conn_t *conn,
     return 0;
   quicly_path_stats_t stats;
   if (quicly_get_path_stats(conn->quic, path_index, &stats) != 0 ||
-      stats.health_state == QUICLY_PATH_SUSPECT)
+      transport_path_is_suspect(&stats))
     return 0;
   for (size_t p = 0; p < conn->transport->socket_count; p++)
     if (transport_path_matches_local(&stats,
@@ -439,7 +439,7 @@ size_t transport_select_datagram_path_for_size(transport_conn_t *conn,
     quicly_path_stats_t stats;
     if (!quicly_is_path_available(conn->quic, path) ||
         quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
-        stats.health_state == QUICLY_PATH_SUSPECT)
+        transport_path_is_suspect(&stats))
       continue;
     bool owned = false;
     for (size_t physical = 0; physical < t->socket_count; physical++)
@@ -493,12 +493,11 @@ static int qlinq_path_is_eligible(quicly_path_scheduler_t *scheduler,
                                   quicly_conn_t *quic, size_t path_index) {
   (void)scheduler;
   transport_conn_t *conn = *(transport_conn_t **)quicly_get_data(quic);
-  quicly_tuple_t tuple;
+  quicly_path_stats_t stats;
   if (!conn || !conn->transport ||
-      quicly_get_path_tuple(quic, path_index, &tuple) != 0)
+      quicly_get_path_stats(quic, path_index, &stats) != 0)
     return 0;
   transport_t *t = conn->transport;
-  quicly_path_stats_t stats = {.local = tuple.address.local};
   for (size_t i = 0; i < t->socket_count; i++)
     if (transport_path_matches_local(&stats, &t->sockets[i].local_addr))
       return 1;
@@ -542,7 +541,7 @@ static void refresh_scheduler_paths(transport_conn_t *conn) {
     /* discard stale datagrams on unowned, abandoned, or suspect paths */
     if (has_datagrams &&
         (matched == SIZE_MAX || stats.abandoned ||
-         stats.health_state == QUICLY_PATH_SUSPECT) &&
+         transport_path_is_suspect(&stats)) &&
         quicly_get_num_datagram_frames_path(conn->quic, path) != 0)
       quicly_discard_datagram_frames(conn->quic, path);
     if (matched != SIZE_MAX && quicly_is_path_available(conn->quic, path)) {
@@ -581,7 +580,7 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
       quicly_path_stats_t stats;
       if (quicly_get_path_stats(quic, path, &stats) != 0)
         continue;
-      if (stats.abandoned || stats.health_state == QUICLY_PATH_SUSPECT) {
+      if (stats.abandoned || transport_path_is_suspect(&stats)) {
         quicly_discard_datagram_frames(quic, path);
         continue;
       }
@@ -622,7 +621,7 @@ qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
       continue;
     quicly_path_stats_t stats;
     bool have_stats = quicly_get_path_stats(quic, path, &stats) == 0;
-    if (have_stats && stats.health_state == QUICLY_PATH_SUSPECT)
+    if (have_stats && transport_path_is_suspect(&stats))
       continue;
     /* Feedback uses round-robin selection, so congestion-derived scores do
      * not influence its ordering. Keep the same owned, available, healthy
@@ -1316,9 +1315,6 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   /* Never select a validated QUIC path after its owning physical socket has
    * been removed. Datagram scheduling applies the same invariant. */
   t->quic_ctx.path_scheduler = &qlinq_path_scheduler;
-  /* QLINQ selects the failover policy; Quicly owns the sent ranges, PTOs and
-   * fresh-ACK recovery. Zero remains the native library's opt-out default. */
-  t->quic_ctx.multipath_failover_pto_threshold = 2;
   t->path_probe_interval_ms = config->path_probe_interval_ms;
 
   t->quic_ctx.egress[0].cc.initcwnd_packets =
@@ -2878,7 +2874,7 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
         quicly_path_stats_t stats;
         if (!quicly_is_path_available(conn->quic, path) ||
             quicly_get_path_stats(conn->quic, path, &stats) != 0 ||
-            stats.health_state == QUICLY_PATH_SUSPECT)
+            transport_path_is_suspect(&stats))
           continue;
         bool owned = false;
         for (size_t physical = 0; physical < t->socket_count; physical++) {

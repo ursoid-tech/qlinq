@@ -62,7 +62,6 @@ INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/inclu
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/flexicast.c \
-              deps/quicly/lib/flexicast_cc.c \
               deps/quicly/lib/flexicast_cc_multicast.c \
               deps/quicly/lib/bplus_ranges.c \
               deps/quicly/lib/defaults.c \

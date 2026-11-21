@@ -28,10 +28,10 @@ int test_quicly_get_path_stats(quicly_conn_t *conn, size_t path,
   scheduler_check.stats_queries++;
   if (scheduler_check.stats_unavailable & (UINT64_C(1) << path))
     return -1;
-  *stats = (quicly_path_stats_t){.health_state = scheduler_check.suspect &
-                                                         (UINT64_C(1) << path)
-                                                     ? QUICLY_PATH_SUSPECT
-                                                     : QUICLY_PATH_USABLE};
+  *stats = (quicly_path_stats_t){
+      .pto_count = (scheduler_check.suspect & (UINT64_C(1) << path))
+                       ? TRANSPORT_PATH_FAILOVER_PTO_THRESHOLD
+                       : 0};
   return 0;
 }
 
@@ -225,7 +225,7 @@ int main(void) {
         quicly_path_stats_t stats;
         if (quicly_get_path_stats(server.conn->quic, path, &stats) == 0 &&
             stats.validated && !stats.abandoned && !stats.probe_only &&
-            stats.health_state == QUICLY_PATH_USABLE)
+            !transport_path_is_suspect(&stats))
           paths[count++] = path;
       }
     if (count == 2)

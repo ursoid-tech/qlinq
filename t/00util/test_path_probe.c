@@ -133,14 +133,6 @@ static void test_probe_policy(void) {
   assert(sample_probe_deadline(conn, 1000) == INT64_MAX);
   samples[0].exists = true;
   assert(sample_probe_deadline(conn, 1100) == 1200);
-
-  samples[0].stats.health_state = QUICLY_PATH_SUSPECT;
-  sample_probe_tick(conn, 1200);
-  assert(sample_probe_deadline(conn, 1200) == INT64_MAX);
-  samples[0].stats.health_state = QUICLY_PATH_RECOVERING;
-  assert(sample_probe_deadline(conn, 1200) == INT64_MAX);
-  samples[0].stats.health_state = QUICLY_PATH_USABLE;
-  assert(sample_probe_deadline(conn, 1300) == 1400);
   samples[0].eligible = false;
   assert(sample_probe_deadline(conn, 1400) == INT64_MAX);
   samples[0].eligible = true;

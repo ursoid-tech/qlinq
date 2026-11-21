@@ -35,9 +35,15 @@ static inline path_t transport_path_default_sample(void) {
 }
 
 #define TRANSPORT_MAX_QUIC_PATHS 64U
+#define TRANSPORT_PATH_FAILOVER_PTO_THRESHOLD 2
 #ifndef TRANSPORT_PATH_BURST_MAX
 #define TRANSPORT_PATH_BURST_MAX 64U
 #endif
+
+/* true once repeated PTOs indicate a stalled multipath path */
+static inline bool transport_path_is_suspect(const quicly_path_stats_t *stats) {
+  return stats && stats->pto_count >= TRANSPORT_PATH_FAILOVER_PTO_THRESHOLD;
+}
 
 /* Counter windows belong to one QUIC path, rather than its physical socket.
  * They provide recent loss and a per-path ACK-rate lower bound for probing. */

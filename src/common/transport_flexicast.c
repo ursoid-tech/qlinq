@@ -199,12 +199,15 @@ static void retire_flow_id(transport_t *t, uint64_t flow_id, uint32_t epoch) {
     t->flexicast_retired_flow_count++;
 }
 
+static quicly_flexicast_flow_id_t flexicast_wire_id(uint64_t flow_id);
+
 static void dispose_flow(transport_flexicast_flow_t *flow) {
   if (!flow)
     return;
   (void)tf_clear_flow_queue(flow);
   tf_queue_dispose(&flow->data_queue);
   quicly_flexicast_flow_free(flow->crypto);
+  quicly_flexicast_cc_free_multicast(flow->cc);
   free(flow->members);
   free(flow->member_map);
   ptls_clear_memory(flow->secret, sizeof(flow->secret));
@@ -216,8 +219,20 @@ static bool create_crypto_with_secret(transport_t *t,
                                       const uint8_t *secret,
                                       uint64_t first_packet_number,
                                       quicly_flexicast_flow_t **crypto) {
+  int64_t now = transport_now_ms(t);
+  quicly_flexicast_flow_id_t wire_id = flexicast_wire_id(flow->flow_id);
+  quicly_flexicast_cc_t *cc = NULL;
+  if (flow->source) {
+    cc = quicly_flexicast_cc_new_multicast(&flow->cc_config, now);
+    if (!cc)
+      return false;
+  } else if (flow->control_conn && flow->control_conn->quic &&
+             quicly_flexicast_bind_ack_path(flow->control_conn->quic,
+                                            flow->flow_id, &wire_id) != 0) {
+    return false;
+  }
   quicly_flexicast_config_t config = {
-      .flow_id = flow->flow_id,
+      .flow_id = wire_id,
       .max_packet_size = flow->cc_config.maximum_datagram_size != 0
                              ? flow->cc_config.maximum_datagram_size
                              : QUICLY_FLEXICAST_MAX_PACKET_SIZE,
@@ -228,13 +243,19 @@ static bool create_crypto_with_secret(transport_t *t,
       .traffic_secret =
           ptls_iovec_init(secret, TRANSPORT_FLEXICAST_SECRET_SIZE),
       .max_members = flow->source ? flow->member_capacity : 1,
-      .cc_type = flow->source ? &quicly_flexicast_cc_type_multicast : NULL,
-      .cc_config = flow->cc_config,
+      .cc = cc,
       .ack_delay_msec = flow->ack_delay_msec != 0
                             ? flow->ack_delay_msec
                             : QUICLY_DEFAULT_MAX_ACK_DELAY,
-      .now = transport_now_ms(t)};
-  return quicly_flexicast_flow_create(crypto, &config) == QUICLY_FLEXICAST_OK;
+      .packet_reordering_threshold = 3,
+      .now = now};
+  if (quicly_flexicast_flow_create(crypto, &config) != QUICLY_FLEXICAST_OK) {
+    quicly_flexicast_cc_free_multicast(cc);
+    return false;
+  }
+  if (flow->source)
+    flow->cc = cc;
+  return true;
 }
 
 static bool create_crypto(transport_t *t, transport_flexicast_flow_t *flow,
@@ -893,24 +914,25 @@ static bool send_control(transport_conn_t *conn, uint8_t type,
 }
 
 static quicly_flexicast_flow_id_t flexicast_wire_id(uint64_t flow_id) {
-  quicly_flexicast_flow_id_t wire = {.len = QUICLY_FLEXICAST_FLOW_ID_SIZE};
+  quicly_flexicast_flow_id_t wire = {.len = TRANSPORT_FLEXICAST_FLOW_ID_SIZE};
   quicly_encode64(wire.bytes, flow_id);
   return wire;
 }
 
 static bool flexicast_host_id(const quicly_flexicast_flow_id_t *wire,
                               uint64_t *flow_id) {
-  if (!wire || !flow_id || wire->len != QUICLY_FLEXICAST_FLOW_ID_SIZE)
+  if (!wire || !flow_id || wire->len != TRANSPORT_FLEXICAST_FLOW_ID_SIZE)
     return false;
   const uint8_t *src = wire->bytes;
   *flow_id = quicly_decode64(&src);
-  return *flow_id > TRANSPORT_MAX_PATHS && *flow_id <= PTLS_QUICINT_MAX;
+  return *flow_id > QUICLY_MAX_PATH_ID && *flow_id <= PTLS_QUICINT_MAX;
 }
 
-static int send_state_result(transport_conn_t *conn, uint64_t flow_id,
-                             uint64_t sequence, uint64_t action) {
+static quicly_error_t send_state_result(transport_conn_t *conn,
+                                        uint64_t flow_id, uint64_t sequence,
+                                        uint64_t action) {
   if (!conn || !conn->quic)
-    return QUICLY_FLEXICAST_ERROR_INVALID;
+    return QUICLY_TRANSPORT_ERROR_PROTOCOL_VIOLATION;
   quicly_flexicast_state_frame_t frame = {
       .flow_id = flexicast_wire_id(flow_id),
       .sequence = sequence,
@@ -921,8 +943,7 @@ static int send_state_result(transport_conn_t *conn, uint64_t flow_id,
 
 static bool send_state(transport_conn_t *conn, uint64_t flow_id,
                        uint64_t sequence, uint64_t action) {
-  return send_state_result(conn, flow_id, sequence, action) ==
-         QUICLY_FLEXICAST_OK;
+  return send_state_result(conn, flow_id, sequence, action) == 0;
 }
 
 static bool send_current_key(transport_flexicast_flow_t *flow,
@@ -977,8 +998,12 @@ static bool prepare_source_offer(transport_t *t,
   if (!peer || !local || (!use_native && peer->sa_family != local->sa_family))
     return false;
 
+  quicly_flexicast_flow_id_t wire_id = flexicast_wire_id(flow->flow_id);
+  if (quicly_flexicast_bind_ack_path(conn->quic, flow->flow_id, &wire_id) != 0)
+    return false;
+
   quicly_flexicast_announce_frame_t fc_announce = {
-      .flow_id = flexicast_wire_id(flow->flow_id),
+      .flow_id = wire_id,
       .sequence = flow->key_epoch,
       .ack_delay_msec = QUICLY_DEFAULT_MAX_ACK_DELAY,
   };
@@ -1082,8 +1107,8 @@ static void fallback_source_flow(transport_t *t,
       continue;
     (void)send_state(member->conn, flow->flow_id, flow->key_epoch,
                      QUICLY_FLEXICAST_STATE_LEAVE);
-    (void)quicly_flexicast_detach_at(flow->crypto, member->conn->id,
-                                     transport_now_ms(t));
+    (void)quicly_flexicast_detach(flow->crypto, member->conn->id,
+                                  transport_now_ms(t));
     member->join_epoch_floor =
         flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
     member->joined = false;
@@ -1127,11 +1152,12 @@ static bool maybe_send_join(transport_flexicast_flow_t *flow) {
   if (flow->source || flow->join_sent || !flow->binding_received ||
       !flow->announcement_received || !flow->control_conn)
     return flow->join_sent;
-  int ret = send_state_result(flow->control_conn, flow->flow_id,
-                              flow->key_epoch, QUICLY_FLEXICAST_STATE_JOIN);
-  if (ret == QUICLY_FLEXICAST_ERROR_SEND_WINDOW)
+  quicly_error_t ret =
+      send_state_result(flow->control_conn, flow->flow_id, flow->key_epoch,
+                        QUICLY_FLEXICAST_STATE_JOIN);
+  if (ret == QUICLY_ERROR_STATE_EXHAUSTION)
     return true; /* retry on local backpressure */
-  if (ret != QUICLY_FLEXICAST_OK)
+  if (ret != 0)
     return false;
   flow->join_sent = true;
   return true;
@@ -1271,12 +1297,11 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
         t->flexicast_cc_feedback_timeout_ms != 0
             ? t->flexicast_cc_feedback_timeout_ms
             : 1000U;
-    flow->cc_config.packet_reordering_threshold = 3;
     uint64_t candidate_id = 0;
     do {
       t->tls_ctx.random_bytes(&candidate_id, sizeof(candidate_id));
       candidate_id &= PTLS_QUICINT_MAX;
-    } while (candidate_id <= TRANSPORT_MAX_PATHS ||
+    } while (candidate_id <= QUICLY_MAX_PATH_ID ||
              find_flow(t, candidate_id) != NULL);
     index_flow(t, flow, candidate_id);
     t->tls_ctx.random_bytes(flow->secret, sizeof(flow->secret));
@@ -1294,8 +1319,7 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
     if (member->reoffer_pending ||
         !admit_member_transition(t, flow, member, transport_now_ms(t)))
       return true;
-    (void)quicly_flexicast_detach_at(flow->crypto, conn->id,
-                                     transport_now_ms(t));
+    (void)quicly_flexicast_detach(flow->crypto, conn->id, transport_now_ms(t));
     member->join_epoch_floor =
         flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
     member->joined = false;
@@ -1322,9 +1346,13 @@ static void remove_source_member(transport_t *t,
   if (!member)
     return;
   bool needs_rekey = member->joined || member->listening;
-  (void)quicly_flexicast_detach_at(flow->crypto, conn->id, transport_now_ms(t));
+  (void)quicly_flexicast_detach(flow->crypto, conn->id, transport_now_ms(t));
   (void)member_remove(flow, member);
   if (flow->member_count == 0) {
+    if (conn->quic) {
+      quicly_flexicast_flow_id_t wire_id = flexicast_wire_id(flow->flow_id);
+      (void)quicly_flexicast_unbind_ack_path(conn->quic, &wire_id);
+    }
     retire_flow_id(t, flow->flow_id, flow->key_epoch);
     release_flow(t, flow);
   } else if (needs_rekey) {
@@ -1432,11 +1460,13 @@ bool transport_flexicast_receive_bind(transport_t *t, transport_conn_t *conn,
   return !flow->announcement_received || maybe_send_join(flow);
 }
 
-bool transport_flexicast_receive_path_ack(transport_t *t,
-                                          transport_conn_t *conn,
-                                          uint64_t flow_id,
-                                          const quicly_ack_frame_t *ack) {
-  if (!t || !conn || !ack || !t->is_server)
+bool transport_flexicast_receive_path_ack(
+    transport_t *t, transport_conn_t *conn,
+    const quicly_flexicast_flow_id_t *wire_flow_id,
+    const quicly_ack_frame_t *ack) {
+  uint64_t flow_id;
+  if (!t || !conn || !ack || !t->is_server ||
+      !flexicast_host_id(wire_flow_id, &flow_id))
     return false;
   transport_flexicast_flow_t *flow = find_flow(t, flow_id);
   /* ignore stale feedback for abandoned or demoted flows */
@@ -1448,9 +1478,9 @@ bool transport_flexicast_receive_path_ack(transport_t *t,
   if (!member || !member->listening)
     return true;
   size_t num_acked = 0, num_completed = 0, num_lost = 0;
-  int ret = quicly_flexicast_ack_frame_at(flow->crypto, conn->id, ack,
-                                          &num_acked, &num_lost, &num_completed,
-                                          transport_now_ms(t));
+  int ret = quicly_flexicast_ack_frame(flow->crypto, conn->id, ack, 0,
+                                       &num_acked, &num_lost, &num_completed,
+                                       transport_now_ms(t));
   (void)num_lost;
   (void)num_completed;
   if (ret != QUICLY_FLEXICAST_OK)
@@ -1531,7 +1561,7 @@ static bool admit_member_transition(transport_t *t,
 
   t->stats.flexicast_control_frames_throttled++;
   if (member->joined || member->listening) {
-    (void)quicly_flexicast_detach_at(flow->crypto, member->conn->id, now);
+    (void)quicly_flexicast_detach(flow->crypto, member->conn->id, now);
     member->join_epoch_floor =
         flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
     member->joined = false;
@@ -1579,7 +1609,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     return false;
   transport_flexicast_member_t *member = member_find(flow, conn);
   if (!member)
-    return state->action == QUICLY_FLEXICAST_STATE_READY ||
+    return state->action == QUICLY_FLEXICAST_STATE_LISTEN ||
            state->action == QUICLY_FLEXICAST_STATE_LEAVE;
   if (state->action == QUICLY_FLEXICAST_STATE_JOIN) {
     if (state->sequence < member->join_epoch_floor) {
@@ -1602,7 +1632,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     member->join_sequence = (uint32_t)state->sequence;
     member->recovery_baseline_pending = !member->rejoining;
     schedule_source_rekey(t, flow, transport_now_ms(t));
-  } else if (state->action == QUICLY_FLEXICAST_STATE_READY) {
+  } else if (state->action == QUICLY_FLEXICAST_STATE_LISTEN) {
     uint8_t alias = 0;
     if (!member->joined)
       return member->join_sequence != 0;
@@ -1610,8 +1640,8 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
       return true;
     member->key_pending = false;
     if (!member->listening &&
-        quicly_flexicast_attach_at(flow->crypto, conn->id,
-                                   transport_now_ms(t)) != QUICLY_FLEXICAST_OK)
+        quicly_flexicast_attach(flow->crypto, conn->id, transport_now_ms(t)) !=
+            QUICLY_FLEXICAST_OK)
       return false;
     set_member_listening(flow, member, true);
     member->ready_deadline_ms = 0;
@@ -1632,8 +1662,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     if (needs_rekey &&
         !admit_member_transition(t, flow, member, transport_now_ms(t)))
       return true;
-    (void)quicly_flexicast_detach_at(flow->crypto, conn->id,
-                                     transport_now_ms(t));
+    (void)quicly_flexicast_detach(flow->crypto, conn->id, transport_now_ms(t));
     member->join_epoch_floor =
         flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
     member->joined = false;
@@ -1688,13 +1717,13 @@ static bool receive_quic_key(transport_t *t, transport_conn_t *conn,
     flow->key_epoch = (uint32_t)key->sequence;
     flow->ready_pending = false;
   }
-  int state_ret = send_state_result(conn, flow->flow_id, flow->key_epoch,
-                                    QUICLY_FLEXICAST_STATE_READY);
-  if (state_ret == QUICLY_FLEXICAST_OK) {
+  quicly_error_t state_ret = send_state_result(
+      conn, flow->flow_id, flow->key_epoch, QUICLY_FLEXICAST_STATE_LISTEN);
+  if (state_ret == 0) {
     flow->ready_pending = false;
     return true;
   }
-  if (state_ret == QUICLY_FLEXICAST_ERROR_SEND_WINDOW) {
+  if (state_ret == QUICLY_ERROR_STATE_EXHAUSTION) {
     flow->ready_pending = true;
     return true;
   }
@@ -1802,8 +1831,8 @@ bool transport_flexicast_receive_packet_ecn(transport_t *t, uint8_t *packet,
   *payload = ptls_iovec_init(NULL, 0);
   uint64_t packet_number = 0;
   int64_t now = transport_now_ms(t);
-  int ret = quicly_flexicast_receive_datagram_ecn_at(
-      flow->crypto, packet, packet_size, payload, &packet_number, now, ecn);
+  int ret = quicly_flexicast_receive_datagram(
+      flow->crypto, packet, packet_size, payload, &packet_number, ecn, now);
   if (ret == QUICLY_FLEXICAST_OK) {
     /* rewrite header alias to subscriber-local alias in place */
     uint8_t type = 0;
@@ -1851,7 +1880,7 @@ void transport_flexicast_tick(transport_t *t) {
       (void)maybe_send_join(flow);
     if (flow->ready_pending && flow->crypto &&
         send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
-                   QUICLY_FLEXICAST_STATE_READY))
+                   QUICLY_FLEXICAST_STATE_LISTEN))
       flow->ready_pending = false;
     if (!flow->crypto || !quicly_flexicast_ack_is_due(flow->crypto, now) ||
         transport_simulated_loss(t, t->simulated_flexicast_feedback_loss_rate))
@@ -1901,7 +1930,7 @@ void transport_flexicast_tick(transport_t *t) {
         continue;
       (void)send_state(member->conn, flow->flow_id, flow->key_epoch,
                        QUICLY_FLEXICAST_STATE_LEAVE);
-      (void)quicly_flexicast_detach_at(flow->crypto, member->conn->id, now);
+      (void)quicly_flexicast_detach(flow->crypto, member->conn->id, now);
       member->join_epoch_floor =
           flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
       member->joined = false;
