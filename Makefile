@@ -604,7 +604,7 @@ t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=ptls_handshake_is_complete,--wrap=ptls_get_negotiated_group,--wrap=ptls_is_psk_handshake,--wrap=transport_stream_write_frame,--wrap=quicly_receive
 .PHONY: check-tun-offloads
 
-t/00util/test_group_cc: t/00util/test_group_cc.o src/common/transport_group_cc.o
+t/00util/test_group_cc: t/00util/test_group_cc.o t/00util/test_group_cc_fifo.o src/common/transport_group_cc.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)

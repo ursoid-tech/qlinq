@@ -44,7 +44,8 @@ typedef struct transport_flexicast_member_t {
   uint16_t transitions_in_window;
   uint64_t acknowledged_delivery_epoch;
   int64_t first_unacknowledged_ms; /* zero when no active delivery debt */
-  uint64_t payload_delivery_id;
+  /* queue slots owed to this subscriber, including during key negotiation */
+  uint64_t pending_payloads[(TRANSPORT_FLEXICAST_QUEUE_CAPACITY + 63U) / 64U];
   int64_t ready_deadline_ms;
 } transport_flexicast_member_t;
 
@@ -65,14 +66,14 @@ typedef struct transport_flexicast_queued_payload_t {
   size_t packet_size;
   uint64_t packet_number;
   uint32_t packet_epoch;
-  uint64_t delivery_id;
   size_t next_member;
   bool packet_ready;
   bool replicated;
   bool counted;
+  bool waiting_for_members;
   uint32_t cc_sample_flags;
-  uint32_t cc_packet_fanout;
-  uint64_t cc_packet_membership_epoch;
+  uint32_t recipient_count;
+  uint64_t recipient_epoch;
 } transport_flexicast_queued_payload_t;
 
 typedef struct transport_flexicast_queue_t {
@@ -117,13 +118,10 @@ typedef struct transport_flexicast_flow_t {
   uint64_t pacing_remainder;
   int64_t pacing_last_refill_ms;
   int64_t dispatch_retry_at_ms;
-  uint64_t next_payload_delivery_id;
   int64_t last_payload_sent_ms;
   quicly_flexicast_cc_config_t cc_config;
   uint64_t cc_membership_epoch;
   int64_t cc_idle_ready_at_ms;
-  uint64_t cc_idle_credit_epoch;
-  bool cc_last_submission_replicated;
   transport_flexicast_member_t *members;
   transport_flexicast_member_map_entry_t *member_map;
   size_t member_count;
@@ -159,7 +157,10 @@ typedef struct transport_flexicast_registry_t {
   uint64_t pacing_burst;
   uint64_t pacing_remainder;
   int64_t pacing_last_refill_ms;
-  uint64_t pacing_credit_epoch;
+  int64_t shared_credit_ready_at_ms;
+  int64_t cohort_at_ms;
+  size_t cohort_count;
+  uint64_t cohort_median_rate;
 } transport_flexicast_registry_t;
 
 bool transport_flexicast_registry_init(transport_flexicast_registry_t *registry,
@@ -233,6 +234,7 @@ void tf_record_delivery_submission(transport_t *, transport_flexicast_flow_t *,
                                    bool first_submission);
 int64_t tf_member_feedback_deadline(const transport_flexicast_flow_t *,
                                     const transport_flexicast_member_t *);
+int64_t tf_cc_deadline(const transport_flexicast_flow_t *flow);
 size_t tf_clear_flow_queue(transport_flexicast_flow_t *flow);
 void tf_queue_dispose(transport_flexicast_queue_t *queue);
 bool tf_reserve_queue_slots(transport_flexicast_flow_t *flow, size_t count,

@@ -172,7 +172,9 @@ hybrid-preferred (`QLINQ_TLS_GROUP_PREFER_HYBRID`), or hybrid-required
 (`qlinq_group_delivery_config_t`) configures optional Flexicast multicast or
 replicated-unicast group delivery. On a publisher with group delivery enabled,
 set `group_delivery.congestion_control` to `QLINQ_GROUP_CC_MCBBR` to pace
-group traffic using receiver feedback. Its zero-initialized default is
+group traffic using receiver feedback. Tracks on the same publisher share
+pacing information. Independent publishers each use their own receiver
+reports. The zero-initialized default is
 `QLINQ_GROUP_CC_CONSERVATIVE`.
 These endpoint settings are fixed at creation and congestion control need not
 match the peer. To use the explicit CUBIC and pacing configuration measured in

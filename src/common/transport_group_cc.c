@@ -8,7 +8,7 @@
 
 #define PPM 1000000U
 #define DELAY_POINTS 4
-/* Preserve the response horizon when feedback spans rounds. */
+/* preserve response horizon when feedback spans rounds */
 #define FEEDBACK_ENTRIES_PER_ROUND 16U
 #define DRAIN_IDLE 0U
 #define DRAIN_OBSERVING 1U
@@ -36,16 +36,19 @@ typedef struct {
 
 typedef struct {
   uint64_t id, feedback_epoch, rtt_epoch, delivery_epoch;
-  int64_t feedback_at, rtt_at, stable_at;
+  uint64_t feedback_acked, feedback_lost;
+  int64_t feedback_at, rtt_at, stable_at, flat_loss_valid_until;
   uint32_t rtt, raw_rtt, flight_rtt, minimum_rtt, reference, stable_rtt, rising;
   uint32_t recent_ratio, supports_streak;
-  uint64_t recent_delivery, expected_delivery;
+  uint64_t recent_delivery;
   delay_point_t win_min[3];
   delay_point_t points[DELAY_POINTS];
   unsigned point_count, point_next;
   uint32_t clean_ratio, candidate_ratio, candidate_count, degraded;
   uint32_t loss_baseline, loss_candidate, loss_epochs;
-  uint64_t ceiling, bw_hi, bw_lo;
+  uint64_t ceiling;
+  uint64_t loss_probe_delivery, loss_probe_rate, policer_rate;
+  uint32_t loss_probe_samples, radio_ratio, policer_clear_samples;
   bool active, feedback_seen, capacity_eligible, capacity_post_cut,
       window_stable, bloated_last;
 } mcbbr_peer_t;
@@ -56,16 +59,18 @@ typedef struct {
   transport_group_cc_hints_t hints;
   transport_group_cc_stats_t stats;
   mcbbr_peer_t *peers;
-  size_t active;
-  uint64_t rate, bw_hi, bw_lo, leader_id, startup_bw_anchor, prev_output_rate,
-      burst_bytes;
+  size_t active, occupied, peer_capacity;
+  uint64_t rate, bw_hi, leader_id, startup_bw_anchor, burst_bytes;
   int64_t last_cut, last_growth, blocked_until, next_timeout, last_timeout;
-  int64_t phase_at, leader_at, startup_round_at;
+  int64_t phase_at, startup_round_at;
+  int64_t service_sample_at, service_round;
+  uint64_t service_rate, service_peak;
+  uint32_t service_fraction, peak_fraction;
   uint32_t unanswered, clear_load_epochs, bbr_phase, startup_probes,
       startup_flat_rounds;
   uint64_t load_epoch;
   bool load_seen, cut_seen, congestion_seen, last_cut_was_timeout, growth_seen,
-      at_floor;
+      delivery_outstanding;
   mcbbr_drain_t drain;
 } group_mcbbr_t;
 
@@ -91,6 +96,32 @@ static uint32_t ratio(uint64_t n, uint64_t d) {
   return (uint32_t)(n * PPM / d);
 }
 
+static uint64_t add_sat(uint64_t a, uint64_t b) {
+  return UINT64_MAX - a < b ? UINT64_MAX : a + b;
+}
+
+static uint64_t clamp_u64(uint64_t v, uint64_t lo, uint64_t hi) {
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+static uint32_t active_senders(const group_mcbbr_t *s) {
+  return s->hints.active_senders ? s->hints.active_senders : 1;
+}
+
+static uint64_t datagram_size(const group_mcbbr_t *s) {
+  return s->config.maximum_datagram_size ? s->config.maximum_datagram_size
+                                         : 1200;
+}
+
+static uint32_t peer_flight_rtt(const mcbbr_peer_t *m) {
+  return m->flight_rtt ? m->flight_rtt : m->raw_rtt;
+}
+
+static bool rtt_post_cut(const group_mcbbr_t *s, int64_t rtt_at,
+                         uint32_t raw_rtt) {
+  return !s->cut_seen || rtt_at - (int64_t)raw_rtt >= s->last_cut;
+}
+
 static uint64_t interval(const group_mcbbr_t *s) {
   uint64_t n = s->config.feedback_timeout_msec / 4;
   return n < 25 ? 25 : n;
@@ -99,7 +130,16 @@ static uint64_t interval(const group_mcbbr_t *s) {
 static mcbbr_peer_t *find(group_mcbbr_t *s, uint64_t id) {
   if (!id)
     return NULL;
-  for (size_t i = 0; i < s->config.maximum_members; i++)
+  for (size_t i = 0; i < s->occupied; i++)
+    if (s->peers[i].id == id)
+      return &s->peers[i];
+  return NULL;
+}
+
+static const mcbbr_peer_t *find_const(const group_mcbbr_t *s, uint64_t id) {
+  if (!id)
+    return NULL;
+  for (size_t i = 0; i < s->occupied; i++)
     if (s->peers[i].id == id)
       return &s->peers[i];
   return NULL;
@@ -107,18 +147,18 @@ static mcbbr_peer_t *find(group_mcbbr_t *s, uint64_t id) {
 
 /* sender-wide cuts use the slowest active member's response horizon */
 static uint64_t control_flight(const group_mcbbr_t *s, int64_t now) {
-  uint32_t senders = s->hints.active_senders ? s->hints.active_senders : 1;
+  uint32_t senders = active_senders(s);
   uint64_t drr_span =
       senders > FEEDBACK_ENTRIES_PER_ROUND
-          ? ((uint64_t)(senders + FEEDBACK_ENTRIES_PER_ROUND - 1U) /
+          ? (((uint64_t)senders + FEEDBACK_ENTRIES_PER_ROUND - 1U) /
              FEEDBACK_ENTRIES_PER_ROUND) *
                 interval(s)
           : 0;
   uint64_t flight = s->config.feedback_timeout_msec + drr_span;
-  for (size_t i = 0; i < s->config.maximum_members; i++) {
+  for (size_t i = 0; i < s->active; i++) {
     const mcbbr_peer_t *m = &s->peers[i];
-    uint32_t frtt = m->flight_rtt ? m->flight_rtt : m->raw_rtt;
-    if (m->active && m->rtt_at > 0 && now >= m->rtt_at &&
+    uint32_t frtt = peer_flight_rtt(m);
+    if (m->rtt_at > 0 && now >= m->rtt_at &&
         (uint64_t)(now - m->rtt_at) <=
             6 * (uint64_t)frtt + s->config.feedback_timeout_msec &&
         frtt > flight)
@@ -131,11 +171,10 @@ static uint64_t control_flight(const group_mcbbr_t *s, int64_t now) {
 static uint64_t channel_share_rate(const group_mcbbr_t *s) {
   if (s->hints.aggregate_rate_limit_bytes_per_second)
     return s->hints.aggregate_rate_limit_bytes_per_second;
-  uint32_t senders = s->hints.active_senders ? s->hints.active_senders : 1;
+  uint32_t senders = active_senders(s);
   uint64_t divisor = senders + 19ULL;
   uint64_t startup = s->config.startup_rate_bytes_per_second;
-  uint64_t base =
-      startup / divisor * 20U + startup % divisor * 20U / divisor;
+  uint64_t base = startup / divisor * 20U + startup % divisor * 20U / divisor;
   if (!base)
     base = s->config.minimum_rate_bytes_per_second;
   return base;
@@ -145,10 +184,10 @@ static bool any_other_rising(const group_mcbbr_t *s, const mcbbr_peer_t *self,
                              int64_t now) {
   size_t count = 0;
   size_t need = s->active >= 16 ? 3 : (s->active >= 6 ? 2 : 1);
-  for (size_t i = 0; i < s->config.maximum_members; i++) {
+  for (size_t i = 0; i < s->active; i++) {
     const mcbbr_peer_t *m = &s->peers[i];
-    uint32_t frtt = m->flight_rtt ? m->flight_rtt : m->raw_rtt;
-    if (m == self || !m->active || m->rtt_at <= 0 || now < m->rtt_at)
+    uint32_t frtt = peer_flight_rtt(m);
+    if (m == self || m->rtt_at <= 0 || now < m->rtt_at)
       continue;
     if ((uint64_t)(now - m->rtt_at) <=
             6 * (uint64_t)frtt + s->config.feedback_timeout_msec &&
@@ -170,22 +209,17 @@ static void update_ack_leader(group_mcbbr_t *s, const mcbbr_peer_t *cand,
   }
   if (!leader) {
     s->leader_id = cand->id;
-    s->leader_at = now;
     return;
   }
-  if (leader->id == cand->id) {
-    s->leader_at = now;
+  if (leader->id == cand->id)
     return;
-  }
   bool worse_loss_or_cap = (cand->degraded >= 2 && leader->degraded == 0) ||
                            (cand->ceiling && leader->ceiling &&
                             cand->ceiling < scale(leader->ceiling, 9, 10));
   bool worse_delay =
       cand->bloated_last && !leader->bloated_last && leader->rising == 0;
-  if (worse_loss_or_cap || worse_delay) {
+  if (worse_loss_or_cap || worse_delay)
     s->leader_id = cand->id;
-    s->leader_at = now;
-  }
 }
 
 static bool external(const group_mcbbr_t *s) {
@@ -225,96 +259,72 @@ static uint32_t expire_drain(group_mcbbr_t *s, int64_t now) {
              : 0;
 }
 
-static void record_stats(group_mcbbr_t *s, uint64_t prev_rate,
-                         uint64_t next_rate, uint32_t reason) {
-  uint64_t floor_rate = s->config.minimum_rate_bytes_per_second;
-  bool now_floor = next_rate <= floor_rate;
-  if (next_rate > prev_rate) {
-    s->stats.rate_increase_events++;
-    if (reason & QUICLY_FLEXICAST_CC_REASON_ACK)
-      s->stats.ack_growth_events++;
-    else
-      s->stats.other_growth_events++;
-  } else if (next_rate < prev_rate) {
-    s->stats.rate_reduction_events++;
-    if (reason & QUICLY_FLEXICAST_CC_REASON_ECN)
-      s->stats.ecn_reduction_events++;
-    else if (reason & QUICLY_FLEXICAST_CC_REASON_TIMEOUT)
-      s->stats.timeout_reduction_events++;
-    else if (reason & TRANSPORT_GROUP_CC_REASON_RATE_LIMIT)
-      s->stats.rate_limit_reduction_events++;
-    else if (reason & QUICLY_FLEXICAST_CC_REASON_LOSS)
-      s->stats.loss_reduction_events++;
-    else if (reason & QUICLY_FLEXICAST_CC_REASON_RTT)
-      s->stats.rtt_reduction_events++;
-    else
-      s->stats.other_reduction_events++;
-  }
-  if (!s->at_floor && now_floor)
-    s->stats.floor_entry_events++;
-  else if (s->at_floor && !now_floor)
-    s->stats.floor_exit_events++;
-  s->at_floor = now_floor;
-  if ((reason & (TRANSPORT_GROUP_CC_REASON_EXTERNAL_LOAD |
-                 TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN)) ==
-      (TRANSPORT_GROUP_CC_REASON_EXTERNAL_LOAD |
-       TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN))
-    s->stats.external_load_growth_freeze_events++;
+static void output_timeout(group_mcbbr_t *s) {
+  int64_t deadline = s->delivery_outstanding ? s->next_timeout : INT64_MAX;
+  if (s->drain.phase != DRAIN_IDLE && deadline > s->drain.deadline)
+    deadline = s->drain.deadline;
+  s->super.output.next_timeout = deadline;
 }
 
-static void output(group_mcbbr_t *s, uint64_t member, uint32_t reason,
-                   bool track_stats) {
+static void output(group_mcbbr_t *s, uint64_t member, uint32_t reason) {
   quicly_flexicast_cc_output_t *o = &s->super.output;
-  uint32_t senders = s->hints.active_senders ? s->hints.active_senders : 1;
+  uint32_t senders = active_senders(s);
   s->rate = bound_config(s, s->rate);
   uint64_t bounded = bound(s, s->rate);
   if (s->hints.aggregate_rate_limit_bytes_per_second &&
       s->rate > s->hints.aggregate_rate_limit_bytes_per_second)
     reason |= TRANSPORT_GROUP_CC_REASON_RATE_LIMIT;
-  if (track_stats)
-    record_stats(s, s->prev_output_rate, bounded, reason);
-  else
-    s->at_floor = bounded <= s->config.minimum_rate_bytes_per_second;
-  s->prev_output_rate = bounded;
-  uint64_t mss =
-      s->config.maximum_datagram_size ? s->config.maximum_datagram_size : 1200;
-  uint64_t burst = bounded / 20, low = senders >= 16 ? mss * 2 : mss * 4,
-           high = mss * 10;
+  if (bounded < o->rate_bytes_per_second &&
+      (reason & QUICLY_FLEXICAST_CC_REASON_RTT) &&
+      !(reason &
+        (QUICLY_FLEXICAST_CC_REASON_ECN | QUICLY_FLEXICAST_CC_REASON_TIMEOUT |
+         TRANSPORT_GROUP_CC_REASON_RATE_LIMIT |
+         QUICLY_FLEXICAST_CC_REASON_LOSS)))
+    s->stats.rtt_reduction_events++;
+  uint64_t mss = datagram_size(s);
+  uint64_t low = senders >= 16 ? mss * 2 : mss * 4;
   o->rate_bytes_per_second = bounded;
-  o->burst_bytes = burst < low ? low : burst > high ? high : burst;
+  o->burst_bytes = clamp_u64(bounded / 20, low, mss * 10);
   s->burst_bytes = o->burst_bytes;
   o->inflight_bytes = o->burst_bytes;
   uint64_t lim_id = (s->active > 1 && s->leader_id) ? s->leader_id : member;
   if (!lim_id && s->leader_id)
     lim_id = s->leader_id;
   o->limiting_member_id = s->active ? lim_id : 0;
-  o->next_timeout = s->active ? s->next_timeout : INT64_MAX;
-  if (s->drain.phase != DRAIN_IDLE && o->next_timeout > s->drain.deadline)
-    o->next_timeout = s->drain.deadline;
+  output_timeout(s);
   o->reason = reason;
 }
 
+/* active peers occupy the prefix of the occupied peers */
 static int added(quicly_flexicast_cc_t *cc, uint64_t id, int64_t now) {
   group_mcbbr_t *s = (group_mcbbr_t *)cc;
   uint32_t reason = expire_drain(s, now);
   mcbbr_peer_t *m = find(s, id);
-  if (!m && id)
-    for (size_t i = 0; i < s->config.maximum_members; i++)
-      if (!s->peers[i].id) {
-        m = &s->peers[i];
-        m->id = id;
-        break;
-      }
-  if (!m)
-    return -1;
-  if (!m->active) {
-    m->active = true;
-    if (!s->active++) {
-      s->next_timeout = after(now, s->config.feedback_timeout_msec);
-      s->unanswered = 0;
+  if (!m) {
+    if (!id || s->occupied == s->config.maximum_members)
+      return -1;
+    if (s->occupied == s->peer_capacity) {
+      size_t capacity = s->peer_capacity ? s->peer_capacity * 2 : 8;
+      if (capacity > s->config.maximum_members)
+        capacity = s->config.maximum_members;
+      mcbbr_peer_t *peers = realloc(s->peers, capacity * sizeof(*peers));
+      if (!peers)
+        return -1;
+      s->peers = peers;
+      s->peer_capacity = capacity;
     }
+    m = &s->peers[s->occupied++];
+    *m = (mcbbr_peer_t){.id = id};
   }
-  output(s, id, reason, true);
+  if (!m->active) {
+    s->service_sample_at = 0;
+    m->active = true;
+    mcbbr_peer_t *first_suspended = &s->peers[s->active++];
+    mcbbr_peer_t temp = *first_suspended;
+    *first_suspended = *m;
+    *m = temp;
+  }
+  output(s, id, reason);
   return 0;
 }
 
@@ -327,27 +337,32 @@ static void suspended(quicly_flexicast_cc_t *cc, uint64_t id, int64_t now) {
     s->leader_id = 0;
   mcbbr_peer_t *m = find(s, id);
   if (m && m->active) {
+    s->service_sample_at = 0;
     m->active = false;
-    --s->active;
+    m->feedback_acked = m->feedback_lost = 0;
     m->stable_at = 0;
     m->point_count = 0;
     m->window_stable = false;
     m->bloated_last = false;
+    mcbbr_peer_t *last_active = &s->peers[--s->active];
+    mcbbr_peer_t temp = *last_active;
+    *last_active = *m;
+    *m = temp;
   }
   if (!s->active) {
+    s->delivery_outstanding = false;
     s->unanswered = 0;
     s->leader_id = 0;
   } else if (!s->leader_id) {
     uint32_t worst_rtt = 0;
-    for (size_t i = 0; i < s->config.maximum_members; i++) {
-      if (s->peers[i].active && s->peers[i].rtt >= worst_rtt) {
+    for (size_t i = 0; i < s->active; i++) {
+      if (s->peers[i].rtt >= worst_rtt) {
         worst_rtt = s->peers[i].rtt;
         s->leader_id = s->peers[i].id;
-        s->leader_at = now;
       }
     }
   }
-  output(s, s->leader_id, reason, true);
+  output(s, s->leader_id, reason);
 }
 
 static void removed(quicly_flexicast_cc_t *cc, uint64_t id, int64_t now) {
@@ -355,7 +370,7 @@ static void removed(quicly_flexicast_cc_t *cc, uint64_t id, int64_t now) {
   group_mcbbr_t *s = (group_mcbbr_t *)cc;
   mcbbr_peer_t *m = find(s, id);
   if (m)
-    memset(m, 0, sizeof(*m));
+    *m = s->peers[--s->occupied];
 }
 
 static void epoch_reset(quicly_flexicast_cc_t *cc, int64_t now) {
@@ -363,9 +378,9 @@ static void epoch_reset(quicly_flexicast_cc_t *cc, int64_t now) {
   uint32_t reason =
       s->drain.phase != DRAIN_IDLE ? TRANSPORT_GROUP_CC_REASON_DRAIN_CLEAR : 0;
   memset(&s->drain, 0, sizeof(s->drain));
-  for (size_t i = 0; i < s->config.maximum_members; i++) {
+  for (size_t i = 0; i < s->occupied; i++) {
     mcbbr_peer_t *m = &s->peers[i];
-    uint64_t id = m->id, bw_hi = m->bw_hi;
+    uint64_t id = m->id;
     bool active = m->active;
     uint32_t clean = m->clean_ratio, loss = m->loss_baseline;
     memset(m, 0, sizeof(*m));
@@ -373,12 +388,10 @@ static void epoch_reset(quicly_flexicast_cc_t *cc, int64_t now) {
     m->active = active;
     m->clean_ratio = clean;
     m->loss_baseline = loss;
-    m->bw_hi = bw_hi;
   }
   s->last_cut = s->last_growth = s->blocked_until = 0;
-  s->bw_lo = 0;
+  s->service_sample_at = 0;
   s->leader_id = 0;
-  s->leader_at = 0;
   s->startup_bw_anchor = s->bw_hi;
   s->startup_round_at = now;
   s->startup_flat_rounds = 0;
@@ -388,31 +401,30 @@ static void epoch_reset(quicly_flexicast_cc_t *cc, int64_t now) {
   s->unanswered = 0;
   s->cut_seen = s->congestion_seen = s->last_cut_was_timeout = s->growth_seen =
       false;
-  s->last_timeout = now;
-  s->next_timeout = after(now, s->config.feedback_timeout_msec);
-  output(s, 0, reason, true);
+  s->delivery_outstanding = false;
+  output(s, 0, reason);
 }
 
-static void apply_cut_peers(group_mcbbr_t *s, uint64_t next) {
-  for (size_t i = 0; i < s->config.maximum_members; i++) {
+static void apply_cut_peers(group_mcbbr_t *s) {
+  for (size_t i = 0; i < s->occupied; i++) {
     mcbbr_peer_t *m = &s->peers[i];
     if (m->rtt > m->reference)
       m->reference = m->rtt;
     m->rising = 0;
     m->supports_streak = 0;
-    m->bw_lo = next;
   }
 }
 
-/* congestion cut records bw_hi/bw_lo bounds and enters cruise recovery */
+/* congestion cut updates the bandwidth estimate and enters cruise */
 static void congestion_cut(group_mcbbr_t *s, uint64_t member_id, uint64_t next,
                            uint64_t ceiling_hint, int64_t now,
                            uint64_t flight) {
   s->startup_probes = 5;
-  next = bound_config(s, next);
+  uint64_t pacing_rate = bound(s, s->rate);
+  next = bound(s, next);
   if (flight < interval(s))
     flight = interval(s);
-  if (next >= s->rate) {
+  if (next >= pacing_rate) {
     int64_t short_blk = after(now, interval(s));
     if (short_blk > s->blocked_until)
       s->blocked_until = short_blk;
@@ -422,38 +434,34 @@ static void congestion_cut(group_mcbbr_t *s, uint64_t member_id, uint64_t next,
   int64_t blocked = after(now, hold_mult * flight);
   if (blocked > s->blocked_until)
     s->blocked_until = blocked;
-  if (member_id) {
+  if (member_id)
     s->leader_id = member_id;
-    s->leader_at = now;
-  }
-  uint64_t hi = ceiling_hint && ceiling_hint < s->rate ? ceiling_hint : s->rate;
+  uint64_t hi =
+      ceiling_hint && ceiling_hint < pacing_rate ? ceiling_hint : pacing_rate;
   if (hi < next)
     hi = next;
   s->bw_hi = hi;
   s->rate = next;
-  s->bw_lo = next;
   s->bbr_phase = BBR_CRUISE;
   s->phase_at = now;
   s->last_cut = now;
   s->cut_seen = true;
   s->congestion_seen = true;
   s->last_cut_was_timeout = false;
-  apply_cut_peers(s, next);
+  apply_cut_peers(s);
 }
 
 /* silence cut backs off rate without overwriting proven bandwidth ceiling */
-static void timeout_cut(group_mcbbr_t *s, uint64_t next, int64_t now,
-                        uint64_t flight) {
-  (void)flight;
+static void timeout_cut(group_mcbbr_t *s, int64_t now) {
   s->startup_probes = 5;
-  next = bound_config(s, next);
-  if (next >= s->rate)
+  uint64_t pacing_rate = bound(s, s->rate);
+  uint64_t next = bound(s, pacing_rate / 2);
+  if (next >= pacing_rate)
     return;
   int64_t blocked = after(now, interval(s));
   if (blocked > s->blocked_until)
     s->blocked_until = blocked;
   s->rate = next;
-  s->bw_lo = next;
   if (s->bw_hi) {
     s->bbr_phase = BBR_CRUISE;
     s->phase_at = now;
@@ -461,15 +469,14 @@ static void timeout_cut(group_mcbbr_t *s, uint64_t next, int64_t now,
   s->last_cut = now;
   s->cut_seen = true;
   s->last_cut_was_timeout = true;
-  apply_cut_peers(s, next);
+  apply_cut_peers(s);
 }
 
 /* extract path wire RTT, recovering samples flagged by unsubtracted min_rtt */
-static bool extract_rtt(const group_mcbbr_t *s, const mcbbr_peer_t *m,
+static bool extract_rtt(const group_mcbbr_t *s,
                         const quicly_flexicast_feedback_t *f,
                         uint32_t *wire_out, uint32_t *raw_out,
                         uint32_t *flight_out) {
-  (void)m;
   if (!(f->rtt_sample_flags & QUICLY_FLEXICAST_RTT_VALID) ||
       !f->rtt_sample_epoch || f->latest_rtt_msec > f->raw_rtt_msec ||
       f->rtt_sample_at <= 0 || f->rtt_sample_at > f->now ||
@@ -501,14 +508,12 @@ static bool extract_rtt(const group_mcbbr_t *s, const mcbbr_peer_t *m,
   return true;
 }
 
-static bool capacity_sample(const group_mcbbr_t *s, const mcbbr_peer_t *m,
+static bool delivery_sample(const group_mcbbr_t *s, const mcbbr_peer_t *m,
                             const quicly_flexicast_feedback_t *f) {
-  uint32_t rtt = f->raw_rtt_msec ? f->raw_rtt_msec
-                                 : (m->flight_rtt ? m->flight_rtt : m->raw_rtt);
+  uint32_t rtt = f->raw_rtt_msec ? f->raw_rtt_msec : peer_flight_rtt(m);
   uint64_t horizon = s->config.feedback_timeout_msec + 6 * (uint64_t)rtt;
   return (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_VALID) != 0 &&
          !(f->delivery_sample_flags & (QUICLY_FLEXICAST_SAMPLE_APP_LIMITED |
-                                       QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED |
                                        QUICLY_FLEXICAST_SAMPLE_MIXED)) &&
          f->delivery_rate_sample_epoch && f->delivery_sample_fanout &&
          f->delivery_sample_bytes &&
@@ -523,10 +528,60 @@ static bool capacity_sample(const group_mcbbr_t *s, const mcbbr_peer_t *m,
          (uint64_t)(f->now - f->delivery_sample_acked_at_end) <= horizon;
 }
 
+/* flat RTT with poor delivery ratio cannot separate RF loss from a shallow
+ * unmarked bottleneck; probe with a small cut to test whether ratio improves */
+static uint64_t observe_flat_loss(mcbbr_peer_t *m, uint64_t ref,
+                                  uint32_t delivery_ratio, uint32_t loss) {
+  uint64_t delivered = scale(ref, delivery_ratio, PPM);
+  if (m->policer_rate) {
+    if (loss < PPM / 10 && delivery_ratio >= PPM * 9 / 10) {
+      if (++m->policer_clear_samples >= 3) {
+        m->policer_rate = 0;
+        m->policer_clear_samples = 0;
+      }
+    } else {
+      m->policer_clear_samples = 0;
+    }
+    return m->policer_rate;
+  }
+  if (m->loss_probe_rate) {
+    if (ref > scale(m->loss_probe_rate, 9, 10))
+      return 0;
+    uint64_t previous_delivery = m->loss_probe_delivery;
+    uint32_t previous_ratio = ratio(previous_delivery, m->loss_probe_rate);
+    m->loss_probe_rate = 0;
+    if (delivered >= scale(previous_delivery, 19, 20) &&
+        delivery_ratio >= previous_ratio + previous_ratio / 8) {
+      /* keep probe headroom bounded to actual offered rate */
+      uint64_t headroom = delivered / 8;
+      m->policer_rate =
+          delivered + (headroom < ref - delivered ? headroom : ref - delivered);
+      return m->policer_rate;
+    }
+    m->radio_ratio = delivery_ratio;
+  }
+  uint32_t gap = delivery_ratio > m->radio_ratio
+                     ? delivery_ratio - m->radio_ratio
+                     : m->radio_ratio - delivery_ratio;
+  uint32_t accounted = delivery_ratio + loss;
+  if (loss < PPM / 2 || delivery_ratio > PPM / 2 ||
+      accounted < PPM * 85 / 100 || accounted > PPM * 115 / 100 ||
+      (m->radio_ratio && gap <= m->radio_ratio / 8)) {
+    m->loss_probe_samples = 0;
+    return 0;
+  }
+  if (++m->loss_probe_samples < 3)
+    return 0;
+  m->loss_probe_samples = 0;
+  m->loss_probe_rate = ref;
+  m->loss_probe_delivery = delivered;
+  return scale(ref, 85, 100);
+}
+
 /* three-slot windowed min-RTT filter */
 static void update_win_min(const group_mcbbr_t *s, mcbbr_peer_t *m,
                            uint32_t rtt, uint32_t flight_rtt, int64_t rtt_at) {
-  uint32_t senders = s->hints.active_senders ? s->hints.active_senders : 1;
+  uint32_t senders = active_senders(s);
   uint64_t win_len = 10 * (uint64_t)s->config.feedback_timeout_msec;
   uint64_t span = 8 * (uint64_t)(senders >= 4 ? rtt : flight_rtt);
   uint64_t cap = 26000ULL + 120000ULL / (senders + 3ULL);
@@ -664,12 +719,12 @@ static uint64_t severe_bloat_slack(const group_mcbbr_t *s, uint32_t base_rtt) {
 static bool cohort_severe_bloat(const group_mcbbr_t *s, int64_t now) {
   size_t seen = 0, bloated = 0;
   uint64_t iv_lim = interval(s) * 10U;
-  for (size_t i = 0; i < s->config.maximum_members; i++) {
+  for (size_t i = 0; i < s->active; i++) {
     const mcbbr_peer_t *p = &s->peers[i];
     uint64_t fresh_lim = (uint64_t)p->win_min[0].rtt * 8U > iv_lim
                              ? (uint64_t)p->win_min[0].rtt * 8U
                              : iv_lim;
-    if (!p->active || p->rtt_at <= 0 || now < p->rtt_at ||
+    if (p->rtt_at <= 0 || now < p->rtt_at ||
         (uint64_t)(now - p->rtt_at) > fresh_lim || !p->win_min[0].rtt ||
         step_up_pending(p, p->rtt))
       continue;
@@ -695,8 +750,8 @@ static bool observe(group_mcbbr_t *s, mcbbr_peer_t *m,
                     uint32_t latest_rtt, uint32_t raw_rtt, uint32_t flight_rtt,
                     uint64_t rtt_epoch, bool other_up, bool *bloated_out) {
   update_win_min(s, m, latest_rtt, flight_rtt, rtt_at);
-  bool post_cut_rtt = !s->cut_seen || rtt_at - (int64_t)raw_rtt >= s->last_cut;
-  uint32_t senders = s->hints.active_senders ? s->hints.active_senders : 1;
+  bool post_cut_rtt = rtt_post_cut(s, rtt_at, raw_rtt);
+  uint32_t senders = active_senders(s);
   bool sample_app_lim =
       (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) != 0;
   bool shared_sched = senders > 1U || sample_app_lim;
@@ -786,15 +841,15 @@ static uint32_t update_drain(group_mcbbr_t *s, const mcbbr_peer_t *m,
                              bool fresh_rtt, bool growing, bool congested_del,
                              uint64_t group_flight) {
   mcbbr_drain_t *d = &s->drain;
-  int64_t rtt_at = f->rtt_sample_at ? f->rtt_sample_at : f->now;
+  int64_t rtt_at = f->rtt_sample_at;
+  uint64_t pacing_rate = bound(s, s->rate);
   if (d->phase != DRAIN_IDLE && d->member_id == f->member_id && fresh_rtt &&
       rtt_at >= d->started_at && !growing && !f->ecn_ce_count &&
       (d->phase == DRAIN_OBSERVING || f->now >= s->blocked_until))
     return end_drain(s, f->now, TRANSPORT_GROUP_CC_REASON_DRAIN_CLEAR);
   uint64_t d_med = s->hints.median_sender_rate_bytes_per_second;
-  bool below_cohort =
-      s->hints.active_senders >= 8 && d_med > 0 &&
-      s->rate <= scale(d_med, 4, 5);
+  bool below_cohort = s->hints.active_senders >= 8 && d_med > 0 &&
+                      pacing_rate <= scale(d_med, 4, 5);
   bool eligible = m->capacity_eligible && fresh_rtt && growing &&
                   !below_cohort && !f->ecn_ce_count && !external(s) &&
                   (!d->ended_at || rtt_at >= s->last_growth);
@@ -811,7 +866,7 @@ static uint32_t update_drain(group_mcbbr_t *s, const mcbbr_peer_t *m,
              f->now >= after(d->started_at, interval(s)) &&
              (!s->cut_seen || f->now >= after(s->last_cut, interval(s)))) {
     uint64_t target = bound(s, scale(m->ceiling, 80, 100));
-    if (target < s->rate) {
+    if (target < pacing_rate) {
       d->phase = DRAIN_ACTIVE;
       d->member_id = f->member_id;
       d->ceiling = m->ceiling;
@@ -824,282 +879,270 @@ static uint32_t update_drain(group_mcbbr_t *s, const mcbbr_peer_t *m,
   return 0;
 }
 
-static void feedback_received(quicly_flexicast_cc_t *cc,
-                              const quicly_flexicast_feedback_t *f) {
-  group_mcbbr_t *s = (group_mcbbr_t *)cc;
-  uint32_t reason = expire_drain(s, f->now);
-  mcbbr_peer_t *m = find(s, f->member_id);
-  if (!m || !m->active || f->now < 0 || f->now < m->feedback_at ||
-      ((f->epoch && f->epoch <= m->feedback_epoch) ||
-       (!f->epoch && m->feedback_seen && f->now <= m->feedback_at))) {
-    output(s, 0, reason, true);
-    return;
+/* use best service rate and offer fraction across two half-flights;
+ * separate peaks allow a fully served lower offer to clear pressure */
+static uint64_t group_service_limit(group_mcbbr_t *s,
+                                    const quicly_flexicast_feedback_t *f,
+                                    bool measured, uint64_t acked,
+                                    uint64_t lost, uint64_t pacing_rate,
+                                    uint64_t flight) {
+  if (s->active < 2)
+    return 0;
+  bool recent = s->service_sample_at > 0 && f->now >= s->service_sample_at &&
+                (uint64_t)(f->now - s->service_sample_at) <= 6 * flight;
+  if (measured && acked && (__uint128_t)acked + lost >= 4 &&
+      f->delivery_sample_sent_at_end > f->delivery_sample_sent_at_start) {
+    uint64_t offered = f->delivery_sample_pacing_rate_bytes_per_second;
+    uint32_t fanout = f->delivery_sample_fanout;
+    uint64_t send_span =
+        f->delivery_sample_sent_at_end - f->delivery_sample_sent_at_start;
+    uint64_t ack_span =
+        f->delivery_sample_acked_at_end - f->delivery_sample_acked_at_start;
+    __uint128_t delivered =
+        (__uint128_t)f->delivery_rate_bytes_per_second * fanout;
+    /* use packet send timing when ACK spacing stretches the bucket */
+    if (delivered < offered && ack_span > send_span)
+      delivered = delivered * ack_span / send_span;
+    /* copies sent separately can lose packets along independent paths */
+    if (delivered < offered && fanout > 1)
+      delivered += delivered * lost / acked;
+    uint64_t target = delivered < offered ? (uint64_t)delivered : offered;
+    uint32_t fraction = ratio(target, offered);
+    if (!recent || f->now >= after(s->service_round, flight / 2)) {
+      s->service_rate = recent ? s->service_peak : 0;
+      s->service_fraction = recent ? s->peak_fraction : 0;
+      s->service_peak = 0;
+      s->peak_fraction = 0;
+      s->service_round = f->now;
+    }
+    if (target > s->service_peak)
+      s->service_peak = target;
+    if (fraction > s->peak_fraction)
+      s->peak_fraction = fraction;
+    s->service_sample_at = f->now;
+    recent = true;
   }
-  if (f->epoch)
-    m->feedback_epoch = f->epoch;
-  m->feedback_at = f->now;
-  m->feedback_seen = true;
-  s->last_timeout = f->now;
-  s->unanswered = 0;
+  uint64_t best_rate =
+      s->service_peak > s->service_rate ? s->service_peak : s->service_rate;
+  return recent && s->peak_fraction < PPM * 96 / 100 &&
+                 s->service_fraction < PPM * 96 / 100 &&
+                 best_rate < scale(pacing_rate, 31, 32)
+             ? best_rate
+             : 0;
+}
 
-  bool explicit_rtt = (f->rtt_sample_flags != 0) || f->rtt_sample_epoch ||
-                      f->rtt_sample_at || f->raw_rtt_msec ||
-                      f->latest_rtt_msec == 0;
-  int64_t rtt_at = explicit_rtt ? f->rtt_sample_at : f->now;
-  uint32_t latest_rtt =
-      explicit_rtt && !f->latest_rtt_msec ? 1 : f->latest_rtt_msec;
-  uint32_t raw_rtt =
-      explicit_rtt ? (f->raw_rtt_msec ? f->raw_rtt_msec : 1) : latest_rtt;
-  if (raw_rtt < latest_rtt)
-    raw_rtt = latest_rtt;
-  uint32_t flight_rtt = raw_rtt;
-  uint64_t rtt_epoch = explicit_rtt
-                           ? f->rtt_sample_epoch
-                           : (f->now > 0 ? (uint64_t)f->now : f->epoch);
-  bool rtt_valid =
-      explicit_rtt ? extract_rtt(s, m, f, &latest_rtt, &raw_rtt, &flight_rtt)
-                   : (f->latest_rtt_msec > 0);
-  bool fresh_rtt = rtt_valid && rtt_epoch > m->rtt_epoch && rtt_at >= m->rtt_at;
-  /* observe only changes this member, which the corroboration scan excludes. */
-  bool other_up =
-      (fresh_rtt || s->active > 2) && any_other_rising(s, m, f->now);
-  bool bloated = false;
-  bool growing = fresh_rtt ? observe(s, m, f, rtt_at, latest_rtt, raw_rtt,
-                                     flight_rtt, rtt_epoch, other_up, &bloated)
-                           : false;
-  bool corroborated = s->active <= 2 || other_up;
-  bool session_unbloated = s->hints.aggregate_rate_limit_bytes_per_second > 0 &&
-                           !bloated && !m->degraded;
-  bool isolated_jitter =
-      s->active > 2 && !corroborated && !bloated && !m->degraded;
-  bool queued = !session_unbloated && !isolated_jitter && (growing || bloated);
-  /* Capture the flight after observe has installed the fresh RTT. */
-  uint64_t group_flight = control_flight(s, f->now);
-  s->next_timeout = after(f->now, group_flight);
-  bool rtt_calm = fresh_rtt && !queued && m->stable_at > 0 &&
-                  (uint64_t)(rtt_at - m->stable_at) >= latest_rtt &&
-                  (!s->cut_seen || rtt_at - (int64_t)raw_rtt >= s->last_cut);
-  bool stable = rtt_calm && m->window_stable;
+typedef struct {
+  int64_t rtt_at;
+  uint32_t latest_rtt, raw_rtt, flight_rtt, current_loss;
+  uint64_t pacing_rate, group_flight, flight, flat_loss_rate, service_limit;
+  bool fresh_rtt, growing, bloated, corroborated, queued, rtt_calm, stable;
+  bool fresh_delivery, measured, usable, supports, capacity_drop, new_loss;
+  bool due, post_cut, rf_loss_only, cohort_saturated;
+} feedback_ctx_t;
 
-  bool explicit_delivery =
-      (f->delivery_sample_flags != 0) || f->delivery_rate_sample_epoch ||
-      f->delivery_sample_fanout || f->delivery_sample_bytes ||
-      f->delivery_sample_pacing_rate_bytes_per_second ||
-      f->delivery_rate_bytes_per_second == 0;
-  uint64_t del_epoch = explicit_delivery
-                           ? f->delivery_rate_sample_epoch
-                           : (f->now > 0 ? (uint64_t)f->now : f->epoch);
-  bool fresh_delivery = del_epoch > m->delivery_epoch;
-  if (fresh_delivery)
-    m->delivery_epoch = del_epoch;
-
+static void evaluate_delivery(group_mcbbr_t *s, mcbbr_peer_t *m,
+                              const quicly_flexicast_feedback_t *f,
+                              feedback_ctx_t *ctx) {
   m->capacity_eligible = m->capacity_post_cut = false;
   m->ceiling = 0;
-  bool supports = false, capacity_drop = false,
-       usable = fresh_delivery &&
-                (explicit_delivery ? capacity_sample(s, m, f)
-                                   : f->delivery_rate_bytes_per_second > 0);
-
-  uint64_t total = UINT64_MAX - f->lost_packets < f->acked_packets
-                       ? UINT64_MAX
-                       : f->lost_packets + f->acked_packets;
-  uint32_t current_loss = ratio(f->lost_packets, total);
-  uint64_t loss_margin = 20000 + (uint64_t)m->loss_baseline / 3;
-  bool new_loss =
-      f->lost_packets && (!usable || f->lost_packets >= 2 || total >= 8) &&
-      (uint64_t)current_loss > (uint64_t)m->loss_baseline + loss_margin;
-
-  if (usable) {
-    uint64_t ref = explicit_delivery
-                       ? f->delivery_sample_pacing_rate_bytes_per_second
-                       : s->rate;
-    uint64_t fan = explicit_delivery ? f->delivery_sample_fanout
-                                     : (s->hints.delivery_rate_divisor
-                                            ? s->hints.delivery_rate_divisor
-                                            : 1);
-    uint32_t r =
-        f->delivery_rate_bytes_per_second >= ref / fan + (ref % fan != 0)
-            ? PPM
-            : ratio(f->delivery_rate_bytes_per_second * fan, ref);
-    m->capacity_eligible = true;
-    m->capacity_post_cut = !s->cut_seen || !explicit_delivery ||
-                           f->delivery_sample_sent_at_start >= s->last_cut;
-    if (m->clean_ratio || !explicit_delivery) {
-      uint32_t clean = m->clean_ratio ? m->clean_ratio : PPM;
-      m->ceiling = r < clean ? scale(ref, r, clean) : ref;
-    } else if (queued && r < (PPM * 3) / 4) {
-      /* startup overload before clean baseline: estimate conservatively */
-      m->ceiling = scale(ref, r, (PPM * 85) / 100);
-    }
-    if (m->capacity_post_cut) {
-      supports =
-          ref >= s->rate &&
-          (m->clean_ratio ? (uint64_t)r + m->clean_ratio / 10 >= m->clean_ratio
-                          : r >= (PPM * 9) / 10);
-      if (supports && !queued && !f->ecn_ce_count && !new_loss) {
-        if (m->supports_streak < 4)
-          ++m->supports_streak;
-        uint64_t proven = m->ceiling ? m->ceiling : ref;
-        if (proven > m->bw_hi)
-          m->bw_hi = proven;
-        if (proven > s->bw_hi)
-          s->bw_hi = proven;
-        m->bw_lo = 0;
-        s->bw_lo = 0;
-      } else {
-        m->supports_streak = 0;
-      }
-      uint32_t senders = s->hints.active_senders ? s->hints.active_senders : 1;
-      uint64_t fair_sh = channel_share_rate(s);
-      uint64_t med = s->hints.median_sender_rate_bytes_per_second;
-      bool cohort_over =
-          !is_slotted_schedule(s, m, 8U) &&
-          ((senders >= 4 && med > 0 && s->rate > (__uint128_t)med * 7 / 4 &&
-            r < (PPM * 3) / 4) ||
-           (senders >= 4 && s->rate > fair_sh && r < 250000));
-      bool drop_ratio = m->clean_ratio
-                            ? (uint64_t)r + m->clean_ratio / 10 < m->clean_ratio
-                            : ((queued || cohort_over) && r < (PPM * 3) / 4);
-      if (drop_ratio) {
-        if (m->degraded < 2)
-          ++m->degraded;
-        if (!m->ceiling && cohort_over)
-          m->ceiling = scale(ref, r, (PPM * 85) / 100);
-        capacity_drop = m->degraded >= 2 && m->ceiling && m->ceiling < s->rate;
-      } else {
-        m->degraded = 0;
-      }
-      /* BBRv3 startup full-pipe detection after 3 non-growing rounds */
-      bool ext_capped =
-          (s->hints.aggregate_rate_limit_bytes_per_second &&
-           s->rate >= s->hints.aggregate_rate_limit_bytes_per_second) ||
-          (f->delivery_sample_flags & (QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED |
-                                       QUICLY_FLEXICAST_SAMPLE_APP_LIMITED)) !=
-              0;
-      if (s->bbr_phase == BBR_STARTUP && s->bw_hi > 0 && !ext_capped) {
-        uint64_t r_flight =
-            flight_rtt ? flight_rtt : s->config.feedback_timeout_msec;
-        if (r_flight < interval(s))
-          r_flight = interval(s);
-        if (!s->startup_bw_anchor) {
-          s->startup_bw_anchor = s->bw_hi;
-          s->startup_round_at = f->now;
-        } else if (f->now >= after(s->startup_round_at, r_flight)) {
-          s->startup_round_at = f->now;
-          if (s->bw_hi >= (__uint128_t)s->startup_bw_anchor * 5 / 4) {
-            s->startup_bw_anchor = s->bw_hi;
-            s->startup_flat_rounds = 0;
-          } else if (++s->startup_flat_rounds >= 3) {
-            s->bbr_phase = BBR_CRUISE;
-            s->phase_at = f->now;
-          }
-        }
-      }
-      m->recent_ratio = r;
-      m->recent_delivery = f->delivery_rate_bytes_per_second;
-      m->expected_delivery = ref / fan;
-      bool first_calm =
-          fresh_rtt && !queued && m->rising == 0 &&
-          (!s->cut_seen || rtt_at - (int64_t)raw_rtt >= s->last_cut);
-      if ((stable || ((rtt_calm || first_calm) && !m->clean_ratio) ||
-           (!explicit_rtt && !queued)) &&
-          !queued && !f->ecn_ce_count && r && (senders < 8 || r >= 350000)) {
-        uint32_t delta = m->candidate_ratio > r ? m->candidate_ratio - r
-                                                : r - m->candidate_ratio;
-        if (!m->candidate_count || delta > m->candidate_ratio / 5 + 25000) {
-          m->candidate_ratio = r;
-          m->candidate_count = 1;
-          if (m->clean_ratio > r)
-            m->clean_ratio = (m->clean_ratio * 7 + r) / 8;
-        } else if (m->candidate_count < 4) {
-          ++m->candidate_count;
-        }
-        if (m->candidate_count >= 3)
-          m->clean_ratio = (m->candidate_ratio + r) / 2;
-      }
-    } else {
+  if (!ctx->usable) {
+    if (ctx->fresh_delivery)
       m->supports_streak = 0;
-    }
-  } else if (fresh_delivery) {
+    return;
+  }
+  uint64_t ref = f->delivery_sample_pacing_rate_bytes_per_second;
+  uint64_t fan = f->delivery_sample_fanout;
+  uint32_t r = f->delivery_rate_bytes_per_second >= ref / fan + (ref % fan != 0)
+                   ? PPM
+                   : ratio(f->delivery_rate_bytes_per_second * fan, ref);
+  m->capacity_eligible = true;
+  m->capacity_post_cut =
+      !s->cut_seen || f->delivery_sample_sent_at_start >= s->last_cut;
+  if (m->flat_loss_valid_until && f->now >= m->flat_loss_valid_until) {
+    m->flat_loss_valid_until = 0;
+    m->loss_probe_rate = m->policer_rate = 0;
+    m->loss_probe_samples = m->radio_ratio = m->policer_clear_samples = 0;
+  }
+  if (m->capacity_post_cut && ctx->fresh_rtt && !ctx->queued &&
+      m->rising == 0 && !f->ecn_ce_count &&
+      ctx->pacing_rate > s->super.config.minimum_rate_bytes_per_second &&
+      (!s->cut_seen || f->now >= after(s->last_cut, ctx->group_flight)) &&
+      ref >= scale(ctx->pacing_rate, 15, 16) &&
+      ctx->pacing_rate >= scale(ref, 15, 16)) {
+    ctx->flat_loss_rate = observe_flat_loss(m, ref, r, ctx->current_loss);
+    m->flat_loss_valid_until = after(f->now, 6 * ctx->group_flight);
+  }
+  if (m->clean_ratio) {
+    m->ceiling = r < m->clean_ratio ? scale(ref, r, m->clean_ratio) : ref;
+  } else if (ctx->queued && r < (PPM * 3) / 4) {
+    /* startup overload before clean baseline: estimate conservatively */
+    m->ceiling = scale(ref, r, (PPM * 85) / 100);
+  }
+  if (!m->capacity_post_cut) {
+    m->supports_streak = 0;
+    return;
+  }
+  ctx->supports =
+      ref >= ctx->pacing_rate &&
+      (m->clean_ratio ? (uint64_t)r + m->clean_ratio / 10 >= m->clean_ratio
+                      : r >= (PPM * 9) / 10);
+  if (ctx->supports && !ctx->queued && !f->ecn_ce_count && !ctx->new_loss) {
+    if (m->supports_streak < 4)
+      ++m->supports_streak;
+    uint64_t proven = m->ceiling ? m->ceiling : ref;
+    if (proven > s->bw_hi)
+      s->bw_hi = proven;
+  } else {
     m->supports_streak = 0;
   }
+  uint32_t senders = active_senders(s);
+  uint64_t fair_sh = channel_share_rate(s);
+  uint64_t med = s->hints.median_sender_rate_bytes_per_second;
+  bool cohort_over =
+      !is_slotted_schedule(s, m, 8U) &&
+      ((senders >= 4 && med > 0 &&
+        ctx->pacing_rate > (__uint128_t)med * 7 / 4 && r < (PPM * 3) / 4) ||
+       (senders >= 4 && ctx->pacing_rate > fair_sh && r < 250000));
+  bool drop_ratio = m->clean_ratio
+                        ? (uint64_t)r + m->clean_ratio / 10 < m->clean_ratio
+                        : ((ctx->queued || cohort_over) && r < (PPM * 3) / 4);
+  if (drop_ratio) {
+    if (m->degraded < 2)
+      ++m->degraded;
+    if (!m->ceiling && cohort_over)
+      m->ceiling = scale(ref, r, (PPM * 85) / 100);
+    ctx->capacity_drop =
+        m->degraded >= 2 && m->ceiling && m->ceiling < ctx->pacing_rate;
+  } else {
+    m->degraded = 0;
+  }
+  /* BBRv3 startup full-pipe detection after 3 non-growing rounds */
+  bool ext_capped =
+      s->hints.aggregate_rate_limit_bytes_per_second &&
+      ctx->pacing_rate >= s->hints.aggregate_rate_limit_bytes_per_second;
+  if (s->bbr_phase == BBR_STARTUP && s->bw_hi > 0 && !ext_capped) {
+    uint64_t r_flight =
+        ctx->flight_rtt ? ctx->flight_rtt : s->config.feedback_timeout_msec;
+    if (r_flight < interval(s))
+      r_flight = interval(s);
+    if (!s->startup_bw_anchor) {
+      s->startup_bw_anchor = s->bw_hi;
+      s->startup_round_at = f->now;
+    } else if (f->now >= after(s->startup_round_at, r_flight)) {
+      s->startup_round_at = f->now;
+      if (s->bw_hi >= (__uint128_t)s->startup_bw_anchor * 5 / 4) {
+        s->startup_bw_anchor = s->bw_hi;
+        s->startup_flat_rounds = 0;
+      } else if (++s->startup_flat_rounds >= 3) {
+        s->bbr_phase = BBR_CRUISE;
+        s->phase_at = f->now;
+      }
+    }
+  }
+  m->recent_ratio = r;
+  m->recent_delivery = f->delivery_rate_bytes_per_second;
+  bool first_calm = ctx->fresh_rtt && !ctx->queued && m->rising == 0 &&
+                    rtt_post_cut(s, ctx->rtt_at, ctx->raw_rtt);
+  if ((ctx->stable || ((ctx->rtt_calm || first_calm) && !m->clean_ratio)) &&
+      !ctx->queued && !f->ecn_ce_count && r && (senders < 8 || r >= 350000)) {
+    uint32_t delta = m->candidate_ratio > r ? m->candidate_ratio - r
+                                            : r - m->candidate_ratio;
+    if (!m->candidate_count || delta > m->candidate_ratio / 5 + 25000) {
+      m->candidate_ratio = r;
+      m->candidate_count = 1;
+      if (m->clean_ratio > r)
+        m->clean_ratio = (m->clean_ratio * 7 + r) / 8;
+    } else if (m->candidate_count < 4) {
+      ++m->candidate_count;
+    }
+    if (m->candidate_count >= 3)
+      m->clean_ratio = (m->candidate_ratio + r) / 2;
+  }
+}
 
-  uint64_t flight =
-      fresh_rtt ? flight_rtt : (m->flight_rtt ? m->flight_rtt : m->raw_rtt);
-  if (flight < group_flight)
-    flight = group_flight;
-  update_ack_leader(s, m, f->now, group_flight);
-  bool due = !s->cut_seen || f->now >= after(s->last_cut, flight);
-  bool post_cut =
-      fresh_rtt && (!s->cut_seen || rtt_at - (int64_t)raw_rtt >= s->last_cut);
-
-  reason |= update_drain(s, m, f, fresh_rtt, queued,
-                         m->degraded > 0 && m->ceiling < s->rate, group_flight);
-
-  uint32_t active_senders =
-      s->hints.active_senders ? s->hints.active_senders : 1;
-  bool multi_sender = active_senders > 1U;
+static bool apply_congestion_cut(group_mcbbr_t *s, mcbbr_peer_t *m,
+                                 const quicly_flexicast_feedback_t *f,
+                                 const feedback_ctx_t *ctx, uint32_t *reason) {
+  uint32_t senders = active_senders(s);
+  bool multi_sender = senders > 1U;
+  uint64_t pacing_rate = ctx->pacing_rate;
   uint64_t fair_share = channel_share_rate(s);
   uint64_t cohort_med = s->hints.median_sender_rate_bytes_per_second;
-  bool rf_loss_only = fresh_rtt && !queued && !bloated && m->rising == 0 &&
-                      !f->ecn_ce_count && current_loss <= (PPM * 3U) / 4U &&
-                      (m->loss_baseline > 0 || s->active > 2);
-  bool cohort_saturated = !is_slotted_schedule(s, m, 8U) &&
-                          ((multi_sender && cohort_med > 0 &&
-                            s->rate > (__uint128_t)cohort_med * 7 / 4) ||
-                           (multi_sender && s->rate > fair_share && usable &&
-                            m->recent_ratio < PPM / 4U));
   if (f->ecn_ce_count) {
-    reason |= QUICLY_FLEXICAST_CC_REASON_ECN;
+    *reason |= QUICLY_FLEXICAST_CC_REASON_ECN;
     if (!s->cut_seen || f->now >= after(s->last_cut, interval(s)))
-      congestion_cut(s, m->id, scale(s->rate, 85, 100), 0, f->now, flight);
-  } else if (s->drain.phase == DRAIN_ACTIVE && s->rate > s->drain.target &&
-             ((reason & TRANSPORT_GROUP_CC_REASON_DRAIN_ENTER) ||
-              !s->cut_seen || f->now >= after(s->last_cut, group_flight))) {
-    uint64_t next = s->drain.target, low = scale(s->rate, 1, 2),
-             high = scale(s->rate, 9, 10);
-    congestion_cut(s, s->drain.member_id ? s->drain.member_id : m->id,
-                   next < low    ? low
-                   : next > high ? high
-                                 : next,
-                   s->drain.ceiling, f->now, flight);
-    reason |= TRANSPORT_GROUP_CC_REASON_DRAIN_CUT;
-    if (capacity_drop && queued)
-      reason |=
+      congestion_cut(s, m->id, scale(pacing_rate, 85, 100), 0, f->now,
+                     ctx->flight);
+    return true;
+  }
+  if (ctx->service_limit && f->lost_packets && ctx->due && ctx->post_cut &&
+      pacing_rate > s->super.config.minimum_rate_bytes_per_second) {
+    uint64_t low_rtt = m->win_min[0].rtt;
+    bool standing_queue = low_rtt && m->rtt > low_rtt + low_rtt / 10 + 5 &&
+                          !step_up_pending(m, m->rtt);
+    uint64_t next = standing_queue ? scale(ctx->service_limit, 3, 4)
+                                   : scale(ctx->service_limit, 31, 32);
+    uint64_t discovery_floor = scale(pacing_rate, 7, 8);
+    if (!standing_queue && next < discovery_floor)
+      next = discovery_floor;
+    congestion_cut(s, m->id, next < pacing_rate / 2 ? pacing_rate / 2 : next, 0,
+                   f->now, ctx->flight);
+    int64_t blocked = after(f->now, (standing_queue ? 5 : 2) * ctx->flight);
+    if (blocked > s->blocked_until)
+      s->blocked_until = blocked;
+    *reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
+    return true;
+  }
+  if (ctx->flat_loss_rate && ctx->flat_loss_rate < pacing_rate && ctx->due) {
+    uint64_t half = pacing_rate / 2;
+    uint64_t next = ctx->flat_loss_rate < half ? half : ctx->flat_loss_rate;
+    congestion_cut(s, m->id, next, m->policer_rate, f->now, ctx->flight);
+    *reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
+    return true;
+  }
+  if (s->drain.phase == DRAIN_ACTIVE && pacing_rate > s->drain.target &&
+      ((*reason & TRANSPORT_GROUP_CC_REASON_DRAIN_ENTER) || !s->cut_seen ||
+       f->now >= after(s->last_cut, ctx->group_flight))) {
+    uint64_t next = clamp_u64(s->drain.target, scale(pacing_rate, 1, 2),
+                              scale(pacing_rate, 9, 10));
+    congestion_cut(s, s->drain.member_id ? s->drain.member_id : m->id, next,
+                   s->drain.ceiling, f->now, ctx->flight);
+    *reason |= TRANSPORT_GROUP_CC_REASON_DRAIN_CUT;
+    if (ctx->capacity_drop && ctx->queued)
+      *reason |=
           QUICLY_FLEXICAST_CC_REASON_RTT | QUICLY_FLEXICAST_CC_REASON_LOSS;
-  } else if (capacity_drop && !rf_loss_only && (queued || cohort_saturated) &&
-             due && (corroborated || m->id == s->leader_id || bloated) &&
-             !(multi_sender && cohort_med > 0 &&
-               s->rate <= scale(cohort_med, 4, 5))) {
-    uint64_t next = m->ceiling, low = scale(s->rate, 1, 2),
-             high = scale(s->rate, 9, 10);
+    return true;
+  }
+  if (ctx->capacity_drop && !ctx->rf_loss_only &&
+      (ctx->queued || ctx->cohort_saturated) && ctx->due &&
+      (ctx->corroborated || m->id == s->leader_id || ctx->bloated) &&
+      !(multi_sender && cohort_med > 0 &&
+        pacing_rate <= scale(cohort_med, 4, 5))) {
+    uint64_t low = scale(pacing_rate, 1, 2);
+    uint64_t high = scale(pacing_rate, 9, 10);
     if (multi_sender && cohort_med > 0) {
       uint64_t cfloor = scale(cohort_med, 4, 5);
       if (cfloor > low && cfloor < high)
         low = cfloor;
     }
-    congestion_cut(s, m->id,
-                   next < low    ? low
-                   : next > high ? high
-                                 : next,
-                   m->ceiling, f->now, flight);
-    reason |= QUICLY_FLEXICAST_CC_REASON_RTT | QUICLY_FLEXICAST_CC_REASON_LOSS;
-  } else if (queued && m->rising >= 2 && post_cut && due &&
-             (corroborated || bloated || m->id == s->leader_id) &&
-             !((f->delivery_sample_flags &
-                QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) &&
-               multi_sender && !bloated && !m->degraded) &&
-             !(multi_sender && cohort_med > 0 &&
-               !cohort_severe_bloat(s, f->now) &&
-               s->rate <= scale(cohort_med, 4, 5))) {
+    congestion_cut(s, m->id, clamp_u64(m->ceiling, low, high), m->ceiling,
+                   f->now, ctx->flight);
+    *reason |= QUICLY_FLEXICAST_CC_REASON_RTT | QUICLY_FLEXICAST_CC_REASON_LOSS;
+    return true;
+  }
+  if (ctx->queued && m->rising >= 2 && ctx->post_cut && ctx->due &&
+      (ctx->corroborated || ctx->bloated || m->id == s->leader_id) &&
+      !((f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) &&
+        multi_sender && !ctx->bloated && !m->degraded) &&
+      !(multi_sender && cohort_med > 0 && !cohort_severe_bloat(s, f->now) &&
+        pacing_rate <= scale(cohort_med, 4, 5))) {
     bool app_lim =
         (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) != 0;
-    bool harsh = bloated && multi_sender &&
-                 (growing || (!usable && !app_lim) || m->degraded);
-    uint32_t cut_num =
-        harsh ? 80U + (10U * (active_senders - 1U)) / (active_senders + 3U)
-              : 90U + (4U * (active_senders - 1U)) / (active_senders + 3U);
-    uint64_t next = scale(s->rate, cut_num, 100);
+    bool harsh = ctx->bloated && multi_sender &&
+                 (ctx->growing || (!ctx->usable && !app_lim) || m->degraded);
+    uint32_t cut_num = harsh ? 80U + (10U * (senders - 1U)) / (senders + 3U)
+                             : 90U + (4U * (senders - 1U)) / (senders + 3U);
+    uint64_t next = scale(pacing_rate, cut_num, 100);
     bool severe_bloat =
         (multi_sender || s->active > 2)
             ? cohort_severe_bloat(s, f->now)
@@ -1109,223 +1152,352 @@ static void feedback_received(quicly_flexicast_cc_t *cc,
     if (multi_sender && cohort_med > 0 && !severe_bloat) {
       uint64_t cfloor = scale(cohort_med, 4, 5);
       if (next < cfloor)
-        next = cfloor < s->rate ? cfloor : s->rate;
+        next = cfloor < pacing_rate ? cfloor : pacing_rate;
     } else if (multi_sender && !severe_bloat) {
       uint64_t sfloor = scale(fair_share, 3, 4);
       if (next < sfloor)
-        next = sfloor < s->rate ? sfloor : s->rate;
+        next = sfloor < pacing_rate ? sfloor : pacing_rate;
     }
-    congestion_cut(s, m->id, next, 0, f->now, flight);
-    reason |= QUICLY_FLEXICAST_CC_REASON_RTT;
-  } else if (f->acked_packets) {
-    reason |= QUICLY_FLEXICAST_CC_REASON_ACK;
-    bool sev_bloat = multi_sender && cohort_severe_bloat(s, f->now);
-    bool eff_loss = new_loss && !rf_loss_only;
-    bool clear =
-        f->now >= s->blocked_until && !queued && !f->ecn_ce_count && !eff_loss;
-    bool clear_catchup =
-        f->now >= s->blocked_until && !f->ecn_ce_count && !sev_bloat;
-    bool inconsistent_proof =
-        explicit_rtt &&
-        (f->rtt_sample_flags & QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT) &&
-        m->rtt_at == 0 && m->supports_streak >= 2;
-    bool rtt_ok =
-        !explicit_rtt || inconsistent_proof ||
-        (m->rtt_at > 0 && f->now >= m->rtt_at &&
-         (uint64_t)(f->now - m->rtt_at) <= group_flight &&
-         (!s->cut_seen || m->rtt_at - (int64_t)m->raw_rtt >= s->last_cut));
-    bool proof =
-        supports && m->capacity_post_cut && rtt_ok &&
-        (m->window_stable || inconsistent_proof || (!explicit_rtt && !queued) ||
-         (m->clean_ratio && m->stable_at > 0 &&
-          (uint64_t)(m->rtt_at - m->stable_at) >= 2 * (uint64_t)m->rtt));
-    bool host_limited =
-        (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED) != 0;
-    bool app_limited =
-        (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) != 0;
-    uint32_t senders = active_senders;
-    uint64_t fair_startup = s->config.startup_rate_bytes_per_second;
-    if (s->hints.aggregate_rate_limit_bytes_per_second &&
-        fair_startup > s->hints.aggregate_rate_limit_bytes_per_second)
-      fair_startup = s->hints.aggregate_rate_limit_bytes_per_second;
-    if (multi_sender && (__uint128_t)fair_share * 2 < fair_startup)
-      fair_startup = fair_share * 2;
-    uint64_t app_cap = s->bw_hi ? scale(s->bw_hi, 85, 100) : 0;
-    if (m->recent_delivery > app_cap)
-      app_cap = m->recent_delivery;
-    if (s->hints.median_sender_rate_bytes_per_second > app_cap)
-      app_cap = s->hints.median_sender_rate_bytes_per_second;
-    if (multi_sender &&
-        (!s->congestion_seen || s->last_cut_was_timeout ||
-         (clear && !capacity_drop)) &&
-        fair_startup > app_cap)
-      app_cap = fair_startup;
-    bool no_del_ok = !usable && !host_limited &&
-                     (!app_limited || !m->recent_delivery || s->rate < app_cap);
-    bool del_ok =
-        usable && m->capacity_post_cut &&
-        (m->clean_ratio
-             ? (uint64_t)m->recent_ratio + m->clean_ratio / 8 >= m->clean_ratio
-             : m->recent_ratio >= (PPM * 3) / 4);
-    bool post_timeout_recover =
-        s->cut_seen &&
-        (s->last_cut_was_timeout || !s->congestion_seen ||
-         s->rate <= fair_startup / 2 ||
-         (multi_sender && clear && !capacity_drop)) &&
-        s->rate < fair_startup;
-    bool calm_recover = post_timeout_recover && fresh_rtt && !queued &&
-                        m->rising == 0 &&
-                        (s->last_cut_was_timeout || !s->cut_seen ||
-                         rtt_at - (int64_t)raw_rtt >= s->last_cut);
-    bool median_catchup = cohort_med > s->rate && rtt_calm;
-    bool lagging_cohort =
-        multi_sender && cohort_med > 0 && s->rate < scale(cohort_med, 17, 20) &&
-        fresh_rtt &&
-        ((!queued && m->rising == 0) ||
-         (!sev_bloat && (!bloated || s->rate < scale(cohort_med, 3, 5)))) &&
-        (!s->cut_seen || rtt_at - (int64_t)raw_rtt >= s->last_cut);
-    bool probe =
-        !proof && !capacity_drop &&
-        s->rate < s->config.startup_rate_bytes_per_second &&
-        ((no_del_ok &&
-          (stable ||
-           (multi_sender && rtt_calm && s->rate < (__uint128_t)fair_startup * 2) ||
-           calm_recover || median_catchup) &&
-          !eff_loss) ||
-         (del_ok && (stable || rtt_calm) && !eff_loss) || lagging_cohort);
-    bool startup_probe = s->bbr_phase == BBR_STARTUP && !proof && !probe &&
-                         !s->cut_seen && s->startup_probes < 5 && !usable &&
-                         !capacity_drop &&
-                         (!explicit_delivery ||
-                          (f->delivery_rate_sample_epoch == 0 && fresh_rtt));
-    uint64_t half_flight = flight / 2 > interval(s) ? flight / 2 : interval(s);
-    uint64_t pace =
-        (proof || startup_probe || post_timeout_recover || lagging_cohort)
-            ? interval(s)
-            : (multi_sender && rtt_calm ? half_flight : flight);
-    /* BBRv3 ProbeBW cycle transitions: CRUISE -> REFILL -> UP -> CRUISE */
-    if (s->bbr_phase == BBR_UP &&
-        (queued || (!supports && s->bw_hi &&
-                    s->rate >= (__uint128_t)s->bw_hi * 5 / 4 &&
-                    f->now >= after(s->phase_at, 2 * group_flight)))) {
-      s->bbr_phase = BBR_CRUISE;
-      s->phase_at = f->now;
-      if (queued && s->congestion_seen && s->bw_hi && s->rate > s->bw_hi)
-        s->rate = s->bw_hi;
-    }
-    if (s->drain.phase == DRAIN_ACTIVE) {
-      reason |= TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN;
-    } else if (((clear && (proof || probe || startup_probe)) ||
-                (clear_catchup && lagging_cohort &&
-                 s->rate < s->config.startup_rate_bytes_per_second)) &&
-               (!s->growth_seen || f->now >= after(s->last_growth, pace))) {
-      if (external(s)) {
-        reason |= TRANSPORT_GROUP_CC_REASON_EXTERNAL_LOAD |
-                  TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN;
-      } else {
-        uint64_t median = s->hints.median_sender_rate_bytes_per_second;
-        uint64_t headroom = s->bw_hi ? scale(s->bw_hi, 85, 100) : 0;
-        if (s->bbr_phase == BBR_CRUISE &&
-            ((headroom && s->rate >= headroom) ||
-             f->now >= after(s->phase_at, 2 * group_flight))) {
-          s->bbr_phase = BBR_REFILL;
-          s->phase_at = f->now;
-        }
-        if (s->bbr_phase == BBR_REFILL &&
-            ((s->bw_hi && s->rate >= s->bw_hi) ||
-             f->now >= after(s->phase_at, flight))) {
-          s->bbr_phase = BBR_UP;
-          s->phase_at = f->now;
-        }
-        uint64_t div = 16;
-        if (s->bbr_phase == BBR_STARTUP || startup_probe ||
-            post_timeout_recover || median > s->rate ||
-            (multi_sender && rtt_calm && s->rate < fair_startup)) {
-          div = 8;
-        } else if (headroom && s->rate < headroom) {
-          div = 12;
-        } else if (s->bbr_phase == BBR_UP && s->cut_seen) {
-          div = 20;
-        }
-        uint64_t inc =
-            (uint64_t)((double)s->rate / (div * sqrt((double)senders)));
-        uint64_t mss = s->config.maximum_datagram_size
-                           ? s->config.maximum_datagram_size
-                           : 1200;
-        uint64_t floor_inc = (uint64_t)((double)mss / sqrt((double)senders));
-        if (s->rate < 4 * mss && floor_inc < mss / 2)
-          floor_inc = mss / 2;
-        if (!floor_inc)
-          floor_inc = 1;
-        if (inc < floor_inc)
-          inc = floor_inc;
-        if (lagging_cohort) {
-          uint64_t target_rate = scale(cohort_med, 17, 20);
-          uint64_t catchup = (target_rate - s->rate) / 3;
-          if (catchup > inc)
-            inc = catchup;
-        }
-        if (median > s->rate && inc > median - s->rate)
-          inc = median - s->rate;
-        uint64_t next = UINT64_MAX - s->rate < inc ? UINT64_MAX : s->rate + inc;
-        if (!proof && !startup_probe &&
-            next > s->config.startup_rate_bytes_per_second)
-          next = s->config.startup_rate_bytes_per_second;
-        if (next > s->rate) {
-          s->rate = next;
-          s->last_growth = f->now;
-          s->growth_seen = true;
-          if (startup_probe)
-            ++s->startup_probes;
-          if (s->drain.phase == DRAIN_OBSERVING)
-            reason |=
-                end_drain(s, f->now, TRANSPORT_GROUP_CC_REASON_DRAIN_CLEAR);
-          s->drain.needs_growth = false;
-        }
-      }
-    }
+    congestion_cut(s, m->id, next, 0, f->now, ctx->flight);
+    *reason |= QUICLY_FLEXICAST_CC_REASON_RTT;
+    return true;
   }
+  return false;
+}
+
+static void try_ack_growth(group_mcbbr_t *s, mcbbr_peer_t *m,
+                           const quicly_flexicast_feedback_t *f,
+                           const feedback_ctx_t *ctx, uint32_t *reason) {
+  *reason |= QUICLY_FLEXICAST_CC_REASON_ACK;
+  uint32_t senders = active_senders(s);
+  bool multi_sender = senders > 1U;
+  uint64_t pacing_rate = ctx->pacing_rate;
+  uint64_t fair_share = channel_share_rate(s);
+  uint64_t cohort_med = s->hints.median_sender_rate_bytes_per_second;
+  bool sev_bloat = multi_sender && cohort_severe_bloat(s, f->now);
+  bool eff_loss = ctx->new_loss && !ctx->rf_loss_only;
+  bool clear = f->now >= s->blocked_until && !ctx->queued && !f->ecn_ce_count &&
+               !eff_loss;
+  bool clear_catchup =
+      f->now >= s->blocked_until && !f->ecn_ce_count && !sev_bloat;
+  bool inconsistent_proof =
+      (f->rtt_sample_flags & QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT) &&
+      m->rtt_at == 0 && m->supports_streak >= 2;
+  bool rtt_ok = inconsistent_proof ||
+                (m->rtt_at > 0 && f->now >= m->rtt_at &&
+                 (uint64_t)(f->now - m->rtt_at) <= ctx->group_flight &&
+                 rtt_post_cut(s, m->rtt_at, m->raw_rtt));
+  bool proof = ctx->supports && m->capacity_post_cut && rtt_ok &&
+               (m->window_stable || inconsistent_proof ||
+                (m->clean_ratio && m->stable_at > 0 &&
+                 (uint64_t)(m->rtt_at - m->stable_at) >= 2 * (uint64_t)m->rtt));
+  bool host_limited =
+      (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED) != 0;
+  bool app_limited =
+      (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) != 0;
+  uint64_t fair_startup = s->config.startup_rate_bytes_per_second;
+  if (s->hints.aggregate_rate_limit_bytes_per_second &&
+      fair_startup > s->hints.aggregate_rate_limit_bytes_per_second)
+    fair_startup = s->hints.aggregate_rate_limit_bytes_per_second;
+  if (multi_sender && (__uint128_t)fair_share * 2 < fair_startup)
+    fair_startup = fair_share * 2;
+  uint64_t app_cap = s->bw_hi ? scale(s->bw_hi, 85, 100) : 0;
+  if (m->recent_delivery > app_cap)
+    app_cap = m->recent_delivery;
+  if (cohort_med > app_cap)
+    app_cap = cohort_med;
+  if (multi_sender &&
+      (!s->congestion_seen || s->last_cut_was_timeout ||
+       (clear && !ctx->capacity_drop)) &&
+      fair_startup > app_cap)
+    app_cap = fair_startup;
+  bool no_del_ok =
+      !ctx->usable && !host_limited &&
+      (!app_limited || !m->recent_delivery || pacing_rate < app_cap);
+  bool del_ok =
+      ctx->usable && m->capacity_post_cut &&
+      (m->clean_ratio
+           ? (uint64_t)m->recent_ratio + m->clean_ratio / 8 >= m->clean_ratio
+           : m->recent_ratio >= (PPM * 3) / 4);
+  bool post_timeout_recover =
+      s->cut_seen &&
+      (s->last_cut_was_timeout || !s->congestion_seen ||
+       pacing_rate <= fair_startup / 2 ||
+       (multi_sender && clear && !ctx->capacity_drop)) &&
+      pacing_rate < fair_startup;
+  bool calm_recover =
+      post_timeout_recover && ctx->fresh_rtt && !ctx->queued &&
+      m->rising == 0 &&
+      (s->last_cut_was_timeout || rtt_post_cut(s, ctx->rtt_at, ctx->raw_rtt));
+  bool median_catchup = cohort_med > pacing_rate && ctx->rtt_calm;
+  bool lagging_cohort =
+      multi_sender && cohort_med > 0 &&
+      pacing_rate < scale(cohort_med, 17, 20) && ctx->fresh_rtt &&
+      ((!ctx->queued && m->rising == 0) ||
+       (!sev_bloat &&
+        (!ctx->bloated || pacing_rate < scale(cohort_med, 3, 5)))) &&
+      rtt_post_cut(s, ctx->rtt_at, ctx->raw_rtt);
+  bool probe = !proof && !ctx->capacity_drop &&
+               pacing_rate < s->config.startup_rate_bytes_per_second &&
+               ((no_del_ok &&
+                 (ctx->stable ||
+                  (multi_sender && ctx->rtt_calm &&
+                   pacing_rate < (__uint128_t)fair_startup * 2) ||
+                  calm_recover || median_catchup) &&
+                 !eff_loss) ||
+                (del_ok && (ctx->stable || ctx->rtt_calm) && !eff_loss) ||
+                lagging_cohort);
+  bool startup_probe = s->bbr_phase == BBR_STARTUP && !proof && !probe &&
+                       !s->cut_seen && s->startup_probes < 5 && !ctx->usable &&
+                       !ctx->capacity_drop &&
+                       f->delivery_rate_sample_epoch == 0 && ctx->fresh_rtt;
+  uint64_t half_flight =
+      ctx->flight / 2 > interval(s) ? ctx->flight / 2 : interval(s);
+  uint64_t pace =
+      (proof || startup_probe || post_timeout_recover || lagging_cohort)
+          ? interval(s)
+          : (multi_sender && ctx->rtt_calm ? half_flight : ctx->flight);
+  /* BBRv3 ProbeBW cycle transitions: CRUISE -> REFILL -> UP -> CRUISE */
+  if (s->bbr_phase == BBR_UP &&
+      (ctx->queued || (!ctx->supports && s->bw_hi &&
+                       pacing_rate >= (__uint128_t)s->bw_hi * 5 / 4 &&
+                       f->now >= after(s->phase_at, 2 * ctx->group_flight)))) {
+    s->bbr_phase = BBR_CRUISE;
+    s->phase_at = f->now;
+    if (ctx->queued && s->congestion_seen && s->bw_hi && pacing_rate > s->bw_hi)
+      s->rate = pacing_rate = bound(s, s->bw_hi);
+  }
+  if (s->drain.phase == DRAIN_ACTIVE) {
+    *reason |= TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN;
+    return;
+  }
+  if (ctx->service_limit ||
+      !((clear && (proof || probe || startup_probe)) ||
+        (clear_catchup && lagging_cohort &&
+         pacing_rate < s->config.startup_rate_bytes_per_second)) ||
+      (s->growth_seen && f->now < after(s->last_growth, pace)))
+    return;
+  if (external(s)) {
+    *reason |= TRANSPORT_GROUP_CC_REASON_EXTERNAL_LOAD |
+               TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN;
+    return;
+  }
+  uint64_t headroom = s->bw_hi ? scale(s->bw_hi, 85, 100) : 0;
+  if (s->bbr_phase == BBR_CRUISE &&
+      ((headroom && pacing_rate >= headroom) ||
+       f->now >= after(s->phase_at, 2 * ctx->group_flight))) {
+    s->bbr_phase = BBR_REFILL;
+    s->phase_at = f->now;
+  }
+  if (s->bbr_phase == BBR_REFILL &&
+      ((s->bw_hi && pacing_rate >= s->bw_hi) ||
+       f->now >= after(s->phase_at, ctx->flight))) {
+    s->bbr_phase = BBR_UP;
+    s->phase_at = f->now;
+  }
+  uint64_t div = 16;
+  if (s->bbr_phase == BBR_STARTUP || startup_probe || post_timeout_recover ||
+      cohort_med > pacing_rate ||
+      (multi_sender && ctx->rtt_calm && pacing_rate < fair_startup)) {
+    div = 8;
+  } else if (headroom && pacing_rate < headroom) {
+    div = 12;
+  } else if (s->bbr_phase == BBR_UP && s->cut_seen) {
+    div = 20;
+  }
+  uint64_t inc =
+      (uint64_t)((double)pacing_rate / (div * sqrt((double)senders)));
+  uint64_t mss = datagram_size(s);
+  uint64_t floor_inc = (uint64_t)((double)mss / sqrt((double)senders));
+  if (pacing_rate < 4 * mss && floor_inc < mss / 2)
+    floor_inc = mss / 2;
+  if (!floor_inc)
+    floor_inc = 1;
+  if (inc < floor_inc)
+    inc = floor_inc;
+  if (lagging_cohort) {
+    uint64_t target_rate = scale(cohort_med, 17, 20);
+    uint64_t catchup = (target_rate - pacing_rate) / 3;
+    if (catchup > inc)
+      inc = catchup;
+  }
+  if (cohort_med > pacing_rate && inc > cohort_med - pacing_rate)
+    inc = cohort_med - pacing_rate;
+  uint64_t next = add_sat(pacing_rate, inc);
+  if (!proof && !startup_probe &&
+      next > s->config.startup_rate_bytes_per_second)
+    next = s->config.startup_rate_bytes_per_second;
+  for (size_t i = 0; i < s->active; i++) {
+    const mcbbr_peer_t *peer = &s->peers[i];
+    if (peer->policer_rate && f->now < peer->flat_loss_valid_until &&
+        next > peer->policer_rate)
+      next = peer->policer_rate;
+  }
+  next = bound(s, next);
+  if (next > pacing_rate) {
+    s->rate = next;
+    s->last_growth = f->now;
+    s->growth_seen = true;
+    if (startup_probe)
+      ++s->startup_probes;
+    if (s->drain.phase == DRAIN_OBSERVING)
+      *reason |= end_drain(s, f->now, TRANSPORT_GROUP_CC_REASON_DRAIN_CLEAR);
+    s->drain.needs_growth = false;
+  }
+}
+
+static void update_loss_baseline(mcbbr_peer_t *m,
+                                 const quicly_flexicast_feedback_t *f,
+                                 const feedback_ctx_t *ctx, uint32_t *reason) {
   if (f->lost_packets) {
-    reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
-    bool loss_calm = fresh_rtt && !queued && m->rising == 0 && post_cut;
-    if ((usable || !explicit_delivery ||
+    *reason |= QUICLY_FLEXICAST_CC_REASON_LOSS;
+    bool loss_calm =
+        ctx->fresh_rtt && !ctx->queued && m->rising == 0 && ctx->post_cut;
+    if ((ctx->usable ||
          (f->delivery_sample_flags & QUICLY_FLEXICAST_SAMPLE_MIXED)) &&
-        (stable || rtt_calm || loss_calm) && !queued && !f->ecn_ce_count &&
-        current_loss <= (PPM * 3U) / 4U) {
-      if (new_loss) {
+        (ctx->stable || ctx->rtt_calm || loss_calm) && !ctx->queued &&
+        !f->ecn_ce_count && ctx->current_loss <= (PPM * 3U) / 4U) {
+      if (ctx->new_loss) {
         m->loss_candidate =
             (uint32_t)(((uint64_t)m->loss_candidate * m->loss_epochs +
-                        current_loss) /
+                        ctx->current_loss) /
                        (m->loss_epochs + 1));
         if (++m->loss_epochs >= 3) {
           m->loss_baseline = m->loss_candidate;
           m->loss_epochs = 0;
         }
       } else {
-        m->loss_baseline = (m->loss_baseline * 7 + current_loss) / 8;
+        m->loss_baseline = (m->loss_baseline * 7 + ctx->current_loss) / 8;
         m->loss_epochs = 0;
       }
     }
-  } else if (usable && m->loss_baseline) {
+  } else if (ctx->usable && m->loss_baseline) {
     m->loss_baseline = m->loss_baseline * 15 / 16;
   }
-  output(s, f->member_id, reason, true);
+}
+
+static void feedback_received(quicly_flexicast_cc_t *cc,
+                              const quicly_flexicast_feedback_t *f) {
+  group_mcbbr_t *s = (group_mcbbr_t *)cc;
+  uint32_t reason = expire_drain(s, f->now);
+  mcbbr_peer_t *m = find(s, f->member_id);
+  if (!m || !m->active || f->now < 0 || f->now < m->feedback_at ||
+      ((f->epoch && f->epoch <= m->feedback_epoch) ||
+       (!f->epoch && m->feedback_seen && f->now <= m->feedback_at))) {
+    output(s, 0, reason);
+    return;
+  }
+  uint64_t bucket_acked = 0, bucket_lost = 0;
+  if (m->feedback_seen && m->feedback_at == f->delivery_sample_acked_at_end &&
+      m->feedback_at < f->now) {
+    bucket_acked = m->feedback_acked;
+    bucket_lost = m->feedback_lost;
+  }
+  if (!m->feedback_seen || m->feedback_at != f->now)
+    m->feedback_acked = m->feedback_lost = 0;
+  m->feedback_acked = add_sat(m->feedback_acked, f->acked_packets);
+  m->feedback_lost = add_sat(m->feedback_lost, f->lost_packets);
+  if (f->epoch)
+    m->feedback_epoch = f->epoch;
+  m->feedback_at = f->now;
+  m->feedback_seen = true;
+  s->last_timeout = f->now;
+  s->unanswered = 0;
+
+  feedback_ctx_t ctx = {.rtt_at = f->rtt_sample_at,
+                        .pacing_rate = bound(s, s->rate)};
+  bool rtt_valid =
+      extract_rtt(s, f, &ctx.latest_rtt, &ctx.raw_rtt, &ctx.flight_rtt);
+  ctx.fresh_rtt = rtt_valid && f->rtt_sample_epoch > m->rtt_epoch &&
+                  ctx.rtt_at >= m->rtt_at;
+  /* observe only changes this member, which corroboration scan excludes */
+  bool other_up =
+      (ctx.fresh_rtt || s->active > 2) && any_other_rising(s, m, f->now);
+  ctx.growing =
+      ctx.fresh_rtt
+          ? observe(s, m, f, ctx.rtt_at, ctx.latest_rtt, ctx.raw_rtt,
+                    ctx.flight_rtt, f->rtt_sample_epoch, other_up, &ctx.bloated)
+          : false;
+  ctx.corroborated = s->active <= 2 || other_up;
+  bool session_unbloated = s->hints.aggregate_rate_limit_bytes_per_second > 0 &&
+                           !ctx.bloated && !m->degraded;
+  bool isolated_jitter =
+      s->active > 2 && !ctx.corroborated && !ctx.bloated && !m->degraded;
+  ctx.queued =
+      !session_unbloated && !isolated_jitter && (ctx.growing || ctx.bloated);
+  /* capture flight after observe has installed the fresh RTT */
+  ctx.group_flight = control_flight(s, f->now);
+  if (s->delivery_outstanding)
+    s->next_timeout = after(f->now, ctx.group_flight);
+  ctx.rtt_calm = ctx.fresh_rtt && !ctx.queued && m->stable_at > 0 &&
+                 (uint64_t)(ctx.rtt_at - m->stable_at) >= ctx.latest_rtt &&
+                 rtt_post_cut(s, ctx.rtt_at, ctx.raw_rtt);
+  ctx.stable = ctx.rtt_calm && m->window_stable;
+
+  ctx.fresh_delivery = f->delivery_rate_sample_epoch > m->delivery_epoch;
+  if (ctx.fresh_delivery)
+    m->delivery_epoch = f->delivery_rate_sample_epoch;
+  ctx.measured = ctx.fresh_delivery && delivery_sample(s, m, f);
+  ctx.usable = ctx.measured && !(f->delivery_sample_flags &
+                                 QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED);
+
+  uint64_t total = add_sat(f->lost_packets, f->acked_packets);
+  ctx.current_loss = ratio(f->lost_packets, total);
+  uint64_t loss_margin = 20000 + (uint64_t)m->loss_baseline / 3;
+  ctx.new_loss =
+      f->lost_packets && (!ctx.usable || f->lost_packets >= 2 || total >= 8) &&
+      (uint64_t)ctx.current_loss > (uint64_t)m->loss_baseline + loss_margin;
+
+  evaluate_delivery(s, m, f, &ctx);
+
+  ctx.flight = ctx.fresh_rtt ? ctx.flight_rtt : peer_flight_rtt(m);
+  if (ctx.flight < ctx.group_flight)
+    ctx.flight = ctx.group_flight;
+  update_ack_leader(s, m, f->now, ctx.group_flight);
+  ctx.due = !s->cut_seen || f->now >= after(s->last_cut, ctx.flight);
+  ctx.post_cut = ctx.fresh_rtt && rtt_post_cut(s, ctx.rtt_at, ctx.raw_rtt);
+
+  reason |= update_drain(s, m, f, ctx.fresh_rtt, ctx.queued,
+                         m->degraded > 0 && m->ceiling < ctx.pacing_rate,
+                         ctx.group_flight);
+
+  bool multi_sender = active_senders(s) > 1U;
+  uint64_t fair_share = channel_share_rate(s);
+  uint64_t cohort_med = s->hints.median_sender_rate_bytes_per_second;
+  ctx.rf_loss_only = ctx.fresh_rtt && !ctx.queued && !ctx.bloated &&
+                     m->rising == 0 && !f->ecn_ce_count &&
+                     ctx.current_loss <= (PPM * 3U) / 4U &&
+                     (m->loss_baseline > 0 || s->active > 2);
+  ctx.cohort_saturated = !is_slotted_schedule(s, m, 8U) &&
+                         ((multi_sender && cohort_med > 0 &&
+                           ctx.pacing_rate > (__uint128_t)cohort_med * 7 / 4) ||
+                          (multi_sender && ctx.pacing_rate > fair_share &&
+                           ctx.usable && m->recent_ratio < PPM / 4U));
+  ctx.service_limit =
+      group_service_limit(s, f, ctx.measured, bucket_acked, bucket_lost,
+                          ctx.pacing_rate, ctx.group_flight);
+
+  if (!apply_congestion_cut(s, m, f, &ctx, &reason) && f->acked_packets)
+    try_ack_growth(s, m, f, &ctx, &reason);
+  update_loss_baseline(m, f, &ctx, &reason);
+  output(s, f->member_id, reason);
 }
 
 static void timed_out(quicly_flexicast_cc_t *cc, int64_t now) {
   group_mcbbr_t *s = (group_mcbbr_t *)cc;
   uint32_t reason = expire_drain(s, now);
-  if (s->active && now >= s->next_timeout && now > s->last_timeout) {
+  if (s->delivery_outstanding && now >= s->next_timeout &&
+      now > s->last_timeout) {
     uint64_t wait = control_flight(s, now);
     s->last_timeout = now;
     reason |= QUICLY_FLEXICAST_CC_REASON_TIMEOUT;
     if (++s->unanswered >= 3) {
-      timeout_cut(s, s->rate / 2, now, wait);
+      timeout_cut(s, now);
       s->unanswered = 0;
     }
     s->next_timeout = after(now, wait);
   }
-  output(s, 0, reason, true);
+  output(s, 0, reason);
 }
 
 quicly_flexicast_cc_type_t transport_group_cc_mcbbr = {
@@ -1339,6 +1511,29 @@ quicly_flexicast_cc_type_t transport_group_cc_mcbbr = {
 
 bool transport_group_cc_mcbbr_is(const quicly_flexicast_cc_t *cc) {
   return cc != NULL && cc->type == &transport_group_cc_mcbbr;
+}
+
+void transport_group_cc_mcbbr_on_submitted(quicly_flexicast_cc_t *cc,
+                                           int64_t now) {
+  if (!transport_group_cc_mcbbr_is(cc))
+    return;
+  group_mcbbr_t *s = (group_mcbbr_t *)cc;
+  if (!s->active)
+    return;
+  s->delivery_outstanding = true;
+  s->unanswered = 0;
+  s->last_timeout = now;
+  s->next_timeout = after(now, control_flight(s, now));
+  output_timeout(s);
+}
+
+void transport_group_cc_mcbbr_on_delivery_clear(quicly_flexicast_cc_t *cc) {
+  if (!transport_group_cc_mcbbr_is(cc))
+    return;
+  group_mcbbr_t *s = (group_mcbbr_t *)cc;
+  s->delivery_outstanding = false;
+  s->unanswered = 0;
+  output_timeout(s);
 }
 
 uint64_t transport_group_cc_mcbbr_burst_bytes(const quicly_flexicast_cc_t *cc) {
@@ -1361,14 +1556,9 @@ transport_group_cc_mcbbr_new(const quicly_flexicast_cc_config_t *config,
     return NULL;
   }
   s->config = s->super.config;
-  s->peers = calloc(s->config.maximum_members, sizeof(*s->peers));
-  if (!s->peers) {
-    free(s);
-    return NULL;
-  }
   s->rate = s->config.startup_rate_bytes_per_second;
-  s->next_timeout = after(now, s->config.feedback_timeout_msec);
-  output(s, 0, 0, false);
+  s->last_timeout = now;
+  output(s, 0, 0);
   quicly_flexicast_cc_normalize_output(&s->super);
   return &s->super;
 }
@@ -1435,7 +1625,7 @@ void transport_group_cc_mcbbr_set_hints(quicly_flexicast_cc_t *cc,
   }
   if (external(s))
     reason |= TRANSPORT_GROUP_CC_REASON_EXTERNAL_LOAD;
-  output(s, 0, reason, true);
+  output(s, 0, reason);
   quicly_flexicast_cc_normalize_output(&s->super);
 }
 
@@ -1449,56 +1639,32 @@ bool transport_group_cc_mcbbr_get_stats(const quicly_flexicast_cc_t *cc,
 }
 
 bool transport_group_cc_mcbbr_get_trace_state(
-    const quicly_flexicast_cc_t *cc, uint64_t id, int64_t now,
+    const quicly_flexicast_cc_t *cc, uint64_t id,
     transport_group_cc_trace_state_t *t) {
   if (!transport_group_cc_mcbbr_is(cc) || !t)
     return false;
   const group_mcbbr_t *s = (const group_mcbbr_t *)cc;
   memset(t, 0, sizeof(*t));
-  t->available = 1;
-  t->control_epoch = now < 0 ? 0 : (uint64_t)now / interval(s) + 1;
-  t->last_reduction_at = s->last_cut;
-  t->last_growth_at = s->last_growth;
   t->last_reduction_epoch =
       s->cut_seen ? (uint64_t)s->last_cut / interval(s) + 1 : 0;
-  t->last_growth_epoch =
-      s->growth_seen ? (uint64_t)s->last_growth / interval(s) + 1 : 0;
   t->growth_blocked_until = s->blocked_until;
-  t->next_timeout = s->next_timeout;
-  t->unanswered_probes = s->unanswered;
   t->external_load = external(s);
-  t->control_interval_msec = interval(s);
   t->drain_phase = s->drain.phase;
-  t->drain_member_id = s->drain.member_id;
-  t->drain_ceiling_bytes_per_second = s->drain.ceiling;
   t->drain_target_bytes_per_second = s->drain.target;
-  t->drain_started_at = s->drain.started_at;
-  t->drain_deadline = s->drain.deadline;
-  t->drain_ended_at = s->drain.ended_at;
   if (!id)
     return true;
-  for (size_t i = 0; i < s->config.maximum_members; i++)
-    if (s->peers[i].id == id) {
-      const mcbbr_peer_t *m = &s->peers[i];
-      t->member_present = 1;
-      t->last_feedback_epoch = m->feedback_epoch;
-      t->last_rtt_sample_epoch = m->rtt_epoch;
-      t->last_delivery_sample_epoch = m->delivery_epoch;
-      t->previous_rtt = m->rtt;
-      t->previous_rtt_at = m->rtt_at;
-      t->minimum_rtt = m->minimum_rtt;
-      t->rising_delay_epochs = m->rising;
-      t->baseline_delivery_ratio_ppm = m->clean_ratio;
-      t->recent_delivery_ratio_ppm = t->delivery_sample_ratio_ppm =
-          m->recent_ratio;
-      t->recent_delivery_rate = m->recent_delivery;
-      t->expected_delivery_rate = m->expected_delivery;
-      t->degraded_delivery_epochs = m->degraded;
-      t->baseline_loss_ppm = m->loss_baseline;
-      t->delivery_ceiling_bytes_per_second = m->ceiling;
-      t->delivery_ceiling_eligible = m->capacity_eligible;
-      t->delivery_sample_post_cut = m->capacity_post_cut;
-      break;
-    }
+  const mcbbr_peer_t *m = find_const(s, id);
+  if (m) {
+    t->member_present = 1;
+    t->last_rtt_sample_epoch = m->rtt_epoch;
+    t->last_delivery_sample_epoch = m->delivery_epoch;
+    t->previous_rtt = m->rtt;
+    t->minimum_rtt = m->minimum_rtt;
+    t->rising_delay_epochs = m->rising;
+    t->baseline_delivery_ratio_ppm = m->clean_ratio;
+    t->recent_delivery_ratio_ppm = m->recent_ratio;
+    t->delivery_ceiling_eligible = m->capacity_eligible;
+    t->delivery_sample_post_cut = m->capacity_post_cut;
+  }
   return true;
 }

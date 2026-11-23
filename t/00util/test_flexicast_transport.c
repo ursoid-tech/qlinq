@@ -678,6 +678,116 @@ static ssize_t fail_ipv6_multicast_send(
                                  max_gso_segments, datagrams, count);
 }
 
+static bool check_closing_recipient(transport_t *server,
+                                    transport_flexicast_flow_t *flow,
+                                    moq_object_t object) {
+  if (flow->data_queue.count || flow->listening_count != 2 ||
+      server->socket_count != 1 || server->sockets[0].egress.count != 0)
+    return false;
+  size_t cost = quicly_flexicast_datagram_size(
+      flow->crypto, QLINQ_WIRE_FEC_HEADER_SIZE + object.size);
+  flow->pacing_tokens = cost;
+  flow->pacing_last_refill_ms = INT64_MAX;
+  server->flexicast.pacing_tokens = server->flexicast.pacing_burst;
+  uint64_t native_before = server->stats.flexicast_native_packets_sent;
+  /* busy egress retains first ciphertext and queues second record as
+   * plaintext; closing connection stays in LISTEN member table */
+  server->sockets[0].egress.count = 1;
+  bool ok = false;
+  object.object_id += 2000;
+  if (!transport_publish(server, &object))
+    goto Exit;
+  object.object_id++;
+  if (!transport_publish(server, &object) || flow->data_queue.count != 2)
+    goto Exit;
+  transport_flexicast_queued_payload_t *head =
+      &flow->data_queue.entries[flow->data_queue.head];
+  size_t pending = 0;
+  if (!head->packet_ready ||
+      quicly_flexicast_get_pending_members(flow->crypto, head->packet_number,
+                                           &pending) ||
+      pending != 2 ||
+      quicly_close(flow->members[0].conn->quic, 0, "closing recipient test"))
+    goto Exit;
+  for (size_t i = 0; i < 2; ++i) {
+    head = &flow->data_queue.entries[flow->data_queue.head];
+    flow->pacing_tokens = cost;
+    flow->dispatch_retry_at_ms = 0;
+    server->sockets[0].egress.count = 1;
+    tf_drain_paced_payloads(server, flow);
+    if (!head->packet_ready || !head->replicated ||
+        !(head->cc_sample_flags & QUICLY_FLEXICAST_SAMPLE_MIXED) ||
+        quicly_flexicast_get_pending_members(flow->crypto, head->packet_number,
+                                             &pending) ||
+        pending != 1)
+      goto Exit;
+    flow->dispatch_retry_at_ms = 0;
+    server->sockets[0].egress.count = 0;
+    tf_drain_paced_payloads(server, flow);
+    if (flow->data_queue.count != 1 - i || flow->pacing_tokens != 0)
+      goto Exit;
+  }
+  ok = server->stats.flexicast_native_packets_sent == native_before;
+Exit:
+  server->sockets[0].egress.count = 0;
+  return ok;
+}
+
+static bool check_shared_credit(transport_t *server, transport_t *a,
+                                transport_t *b,
+                                transport_flexicast_flow_t *flow,
+                                moq_object_t object) {
+  moq_object_t sibling = object;
+  strcpy(sibling.track_id.name, "other-paced-track");
+  if (!transport_subscribe(a, sibling.track_id))
+    return false;
+  transport_stats_t stats = {0};
+  for (size_t i = 0; i < 300; i++) {
+    drive(server, a, b);
+    (void)transport_get_stats(server, &stats);
+    if (stats.flexicast_active_flows == 2 &&
+        stats.flexicast_active_members == 3)
+      break;
+    usleep(5000);
+  }
+  if (stats.flexicast_active_flows != 2 || stats.flexicast_active_members != 3)
+    return false;
+
+  object.object_id += 1000;
+  for (int starved = 0; starved <= 1; starved++) {
+    /* establish an idle interval with enough private and shared credit */
+    flow->pacing_tokens = flow->pacing_burst_bytes;
+    server->flexicast.pacing_tokens = server->flexicast.pacing_burst;
+    if (!transport_publish(server, &object) || flow->data_queue.count != 0)
+      return false;
+    ++object.object_id;
+    usleep(5000);
+    if (starved) {
+      /* enough for sibling's small record, too little for a full packet */
+      server->flexicast.pacing_tokens = server->limits.max_udp_payload_size / 2;
+      server->flexicast.pacing_last_refill_ms = INT64_MAX;
+    }
+    if (!transport_publish(server, &sibling))
+      return false;
+    ++sibling.object_id;
+
+    /* keep next record queued so we can inspect packet's sample flag */
+    flow->dispatch_retry_at_ms = INT64_MAX;
+    if (!transport_publish(server, &object) || flow->data_queue.count != 1)
+      return false;
+    const transport_flexicast_queued_payload_t *queued =
+        &flow->data_queue.entries[flow->data_queue.head];
+    bool app_limited =
+        (queued->cc_sample_flags & QUICLY_FLEXICAST_SAMPLE_APP_LIMITED) != 0;
+    if (app_limited == (starved != 0))
+      return false;
+    flow->dispatch_retry_at_ms = 0;
+    transport_flexicast_tick(server);
+    ++object.object_id;
+  }
+  return true;
+}
+
 int main(int argc, char **argv) {
   const char *mode = argc == 2 ? argv[1] : NULL;
   if (argc == 2 && strcmp(mode, "--membership") == 0)
@@ -758,6 +868,8 @@ int main(int argc, char **argv) {
     server_config.limits.max_connections =
         QUICLY_FLEXICAST_CC_DEFAULT_MAX_MEMBERS + 1;
   }
+  if (mcbbr_replicated)
+    server_config.flexicast_cc_aggregate_rate_limit = 32000;
   if (ipv6) {
     server_config.bind_hosts[0] = ipv6_address;
     client_a_config.bind_hosts[0] = ipv6_address;
@@ -975,8 +1087,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < flow->member_count; i++) {
       transport_group_cc_trace_state_t state = {0};
       uint64_t id = flow->members[i].conn->id;
-      if (!transport_group_cc_mcbbr_get_trace_state(
-              flow->cc, id, transport_now_ms(server), &state) ||
+      if (!transport_group_cc_mcbbr_get_trace_state(flow->cc, id, &state) ||
           !state.member_present || !state.last_rtt_sample_epoch ||
           !state.last_delivery_sample_epoch) {
         fprintf(
@@ -1014,6 +1125,29 @@ int main(int argc, char **argv) {
                                 .size = sizeof(holdoff_payload),
                                 .is_keyframe = false,
                                 .priority = 1};
+    size_t previous_a = client_a_state.objects_received;
+    size_t previous_b = client_b_state.objects_received;
+    if (mcbbr_replicated && (flow->feedback_outstanding_count != 0 ||
+                             flow->cc->output.next_timeout != INT64_MAX)) {
+      fprintf(stderr, "idle MCBBR source still has a feedback deadline\n");
+      goto Fail;
+    }
+    if (mcbbr_replicated) {
+      /* A finite controller deadline (e.g. drain expiry) must be polled
+       * and serviced independently of the transport's ACK debt. */
+      int64_t deadline = transport_now_ms(server);
+      flow->cc->output.next_timeout = deadline;
+      if (transport_flexicast_get_first_timeout(server) != deadline) {
+        fprintf(stderr, "idle controller deadline was absent from polling\n");
+        goto Fail;
+      }
+      transport_flexicast_tick(server);
+      if (flow->cc->output.next_timeout != INT64_MAX) {
+        fprintf(stderr, "idle controller deadline was not serviced\n");
+        goto Fail;
+      }
+    }
+    int64_t first_send = transport_now_ms(server);
     if (!transport_publish(server, &holdoff_obj)) {
       fprintf(stderr, "holdoff publication failed\n");
       goto Fail;
@@ -1027,10 +1161,100 @@ int main(int argc, char **argv) {
       goto Fail;
     }
     if (mcbbr_replicated) {
-      flow->pacing_tokens = expected_cost;
-      transport_flexicast_tick(server);
-      if (flow->pacing_tokens != 0 || flow->data_queue.count != 0) {
-        fprintf(stderr, "MCBBR failed to pace the remaining copy\n");
+      if (flow->feedback_outstanding_count != 1 ||
+          flow->cc->output.next_timeout == INT64_MAX ||
+          flow->cc->output.next_timeout <
+              first_send + (int64_t)flow->cc_config.feedback_timeout_msec) {
+        fprintf(
+            stderr,
+            "first physical replica did not start a fresh feedback window\n");
+        goto Fail;
+      }
+      /* Accept another publication before rekey. Its first replica has not
+       * been sent; both publications retain their original recipients. */
+      static const uint8_t followup_payload[] = "queued before rotation";
+      holdoff_obj.object_id++;
+      holdoff_obj.data = followup_payload;
+      holdoff_obj.size = sizeof(followup_payload);
+      if (!transport_publish(server, &holdoff_obj) ||
+          flow->data_queue.count != 2)
+        goto Fail;
+      retries = 100;
+      while (retries-- > 0 && !client_a_state.received &&
+             !client_b_state.received) {
+        drive(server, client_a, client_b);
+        usleep(2000);
+      }
+      if (client_a_state.received == client_b_state.received ||
+          !tf_rotate_source_flow(server, flow))
+        goto Fail;
+      transport_t *first = client_a_state.received ? client_a : client_b;
+      size_t followup_cost = quicly_flexicast_datagram_size(
+          flow->crypto, QLINQ_WIRE_FEC_HEADER_SIZE + sizeof(followup_payload));
+      flow->pacing_tokens = expected_cost + 2 * followup_cost;
+      retries = 100;
+      while (retries-- > 0 && !flow->listening_count) {
+        drive(server, first, NULL);
+        usleep(2000);
+      }
+      if (flow->listening_count != 1 || flow->data_queue.count != 2) {
+        fprintf(stderr,
+                "rekey discarded a publication owed to a slow rejoiner\n");
+        goto Fail;
+      }
+      transport_flexicast_member_t *slow =
+          flow->members[0].listening ? &flow->members[1] : &flow->members[0];
+      int64_t ready_deadline = slow->ready_deadline_ms;
+      if (ready_deadline == 0 || !tf_rotate_source_flow(server, flow) ||
+          slow->ready_deadline_ms != ready_deadline) {
+        fprintf(stderr,
+                "a second rotation extended the slow rejoin deadline\n");
+        goto Fail;
+      }
+      retries = 100;
+      while (retries-- > 0 && flow->listening_count == 0) {
+        drive(server, first, NULL);
+        usleep(2000);
+      }
+      if (flow->listening_count != 1 ||
+          !flow->data_queue.entries[flow->data_queue.head].waiting_for_members)
+        goto Fail;
+      /* model another flow consuming shared bucket while delayed LISTEN is
+       * in flight; its arrival must expose our refill deadline */
+      server->flexicast.pacing_tokens = 0;
+      server->flexicast.pacing_last_refill_ms = INT64_MAX;
+      retries = 100;
+      while (retries-- > 0 && flow->listening_count < 2) {
+        drive(server, client_a, client_b);
+        usleep(2000);
+      }
+      int64_t refill = transport_flexicast_get_first_timeout(server);
+      if (flow->listening_count != 2 || flow->data_queue.count != 2 ||
+          refill > transport_now_ms(server) + 100) {
+        fprintf(stderr,
+                "last LISTEN did not expose the shared pacing refill\n");
+        goto Fail;
+      }
+      server->flexicast.pacing_last_refill_ms = transport_now_ms(server);
+      retries = 300;
+      while (retries-- > 0 &&
+             (client_a_state.objects_received < previous_a + 2 ||
+              client_b_state.objects_received < previous_b + 2)) {
+        drive(server, client_a, client_b);
+        usleep(2000);
+      }
+      if (flow->data_queue.count || flow->pacing_tokens ||
+          client_a_state.objects_received != previous_a + 2 ||
+          client_b_state.objects_received != previous_b + 2 ||
+          client_a_state.payload_size != sizeof(followup_payload) ||
+          client_b_state.payload_size != sizeof(followup_payload) ||
+          memcmp(client_a_state.payload, followup_payload,
+                 sizeof(followup_payload)) ||
+          memcmp(client_b_state.payload, followup_payload,
+                 sizeof(followup_payload))) {
+        fprintf(
+            stderr,
+            "rekey failed to complete the original replica set exactly once\n");
         goto Fail;
       }
     }
@@ -1193,6 +1417,16 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (mcbbr_replicated &&
+      !check_shared_credit(server, client_a, client_b, flow, object)) {
+    fprintf(stderr, "sibling traffic misclassified unused pacing credit\n");
+    goto Fail;
+  }
+  if (mcbbr && !check_closing_recipient(server, flow, object)) {
+    fprintf(stderr,
+            "closing subscriber retained a pending delivery or sample\n");
+    goto Fail;
+  }
   if (control_flood) {
     if (flow->member_count < 2 ||
         !transport_flexicast_listening_members(flow)) {
