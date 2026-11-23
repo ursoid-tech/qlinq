@@ -355,6 +355,34 @@ static void group_service_drains_after_queue_evidence(void) {
   transport_group_cc_mcbbr_free(w.cc);
 }
 
+static void group_service_limited_queue_with_baseline_loss(void) {
+  for (unsigned baseline_loss = 0; baseline_loss <= 1; ++baseline_loss) {
+    fixture_t w = create();
+    for (unsigned id = 2; id <= 3; ++id)
+      assert(quicly_flexicast_cc_on_member_added(w.cc, id, w.now) == 0);
+    quicly_flexicast_feedback_t f;
+    for (unsigned i = 0; i < 6; ++i) {
+      f = input(&w, 1, 100, 1000);
+      uint64_t paced = rate(w.cc);
+      sample(&f, paced, paced * 3 / 4);
+      f.acked_packets = 8;
+      f.lost_packets = baseline_loss ? 2 : 0;
+      submit(&w, &f);
+    }
+    uint64_t before = rate(w.cc);
+    int64_t previous_at = f.now;
+    f = input(&w, 1, 140, 1000);
+    completed_sample(&f, before, before / 2, previous_at);
+    f.acked_packets = 8;
+    f.lost_packets = 4;
+    submit(&w, &f);
+    assert(rate(w.cc) == (baseline_loss ? before * 7 / 8 : before / 2));
+    assert(w.event.state_after.growth_blocked_until ==
+           f.now + (baseline_loss ? 2000 : 5000));
+    transport_group_cc_mcbbr_free(w.cc);
+  }
+}
+
 static void group_service_respects_a_fully_served_offer(void) {
   fixture_t w = create();
   assert(quicly_flexicast_cc_on_member_added(w.cc, 2, w.now) == 0);
@@ -772,6 +800,14 @@ static void drain_active_and_hint_isolation(void) {
   assert(rate(w.cc) == w.event.state_after.drain_target_bytes_per_second);
   assert(rate(w.cc) + 2 >= expected_target &&
          rate(w.cc) <= expected_target + 2);
+  uint64_t draining = rate(w.cc);
+  transport_group_cc_hints_t cohort = {
+      .active_senders = 4, .median_sender_rate_bytes_per_second = draining * 2};
+  transport_group_cc_mcbbr_set_hints(w.cc, &cohort, w.now);
+  f = input(&w, 1, 100, 1250);
+  submit(&w, &f);
+  assert(w.event.state_after.drain_phase == 2 && rate(w.cc) == draining);
+  assert(w.event.reason & TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN);
   transport_group_cc_mcbbr_on_delivery_clear(w.cc);
   int64_t drain_deadline = w.cc->output.next_timeout;
   assert(drain_deadline > w.now && drain_deadline != INT64_MAX);
@@ -1129,6 +1165,158 @@ static void bbrv3_startup_plateau_and_probebw(void) {
   transport_group_cc_mcbbr_free(cc);
 }
 
+static void probebw_queue_evidence_must_follow_probe(void) {
+  for (unsigned post_probe = 0; post_probe <= 1; ++post_probe) {
+    fixture_t w = create();
+    warm(&w, false);
+    ce(&w);
+    quicly_flexicast_feedback_t f = input(&w, 1, 100, 3000);
+    sample(&f, rate(w.cc), rate(w.cc));
+    submit(&w, &f);
+    int64_t probe_at = w.now + 1000;
+    uint64_t before_probe = 0;
+    for (unsigned i = 0; i < 4; ++i) {
+      f = input(&w, 1, 100, i ? 250 : 1000);
+      before_probe = rate(w.cc);
+      sample(&f, before_probe, before_probe);
+      submit(&w, &f);
+    }
+    uint64_t probe_rate = rate(w.cc);
+    assert(probe_rate > before_probe && before_probe >= 32000);
+
+    f = input(&w, 1, 140, 100);
+    if (!post_probe) {
+      f.raw_rtt_msec = (uint32_t)(f.now - probe_at + 1);
+      f.rtt_ack_delay_msec = f.applied_ack_delay_msec =
+          f.raw_rtt_msec - f.latest_rtt_msec;
+    }
+    submit(&w, &f);
+    assert(rate(w.cc) == (post_probe ? before_probe : probe_rate));
+    transport_group_cc_mcbbr_free(w.cc);
+  }
+}
+
+static void precut_delay_does_not_extend_growth_hold(void) {
+  fixture_t w = create();
+  warm(&w, false);
+  ce(&w);
+  int64_t hold = w.event.state_after.growth_blocked_until;
+  quicly_flexicast_feedback_t f = input(&w, 1, 4000, 3000);
+  submit(&w, &f);
+  assert(w.event.state_after.previous_rtt == 4000);
+  assert(w.event.state_after.growth_blocked_until == hold);
+
+  f = input(&w, 1, 4100, 2000);
+  submit(&w, &f);
+  assert(w.event.state_after.growth_blocked_until > hold);
+  transport_group_cc_mcbbr_free(w.cc);
+}
+
+static void speculative_growth_requires_probe_feedback(bool shared) {
+  for (unsigned post_growth = 0; post_growth <= 1; ++post_growth) {
+    fixture_t w = create();
+    for (unsigned id = 2; id <= 3; ++id)
+      assert(quicly_flexicast_cc_on_member_added(w.cc, id, w.now) == 0);
+    quicly_flexicast_feedback_t f;
+    for (unsigned i = 0; i < 5; ++i) {
+      f = input(&w, 1, 2000, 2500);
+      submit(&w, &f);
+    }
+    if (shared) {
+      transport_group_cc_hints_t hints = {
+          .active_senders = 8,
+          .aggregate_rate_limit_bytes_per_second = 5000,
+          .median_sender_rate_bytes_per_second = 3000};
+      transport_group_cc_mcbbr_set_hints(w.cc, &hints, w.now);
+      f = input(&w, 1, 2000, 2500);
+      f.ecn_ce_count = 1;
+      submit(&w, &f);
+    }
+    f = input(&w, 1, 2000, 2500);
+    f.ecn_ce_count = 1;
+    submit(&w, &f);
+    uint64_t reduced = rate(w.cc);
+    f = input(&w, 1, 2000, 8000);
+    sample(&f, reduced, reduced);
+    submit(&w, &f);
+    uint64_t trial_rate = rate(w.cc);
+    assert(trial_rate > reduced);
+    if (shared)
+      assert(trial_rate - reduced < w.cc->config.maximum_datagram_size / 2);
+
+    f = input(&w, 1, 2000, 3500);
+    if (!post_growth) {
+      f.raw_rtt_msec = 6000;
+      f.rtt_ack_delay_msec = f.applied_ack_delay_msec = 4000;
+    }
+    submit(&w, &f);
+    assert(post_growth ? rate(w.cc) > trial_rate : rate(w.cc) == trial_rate);
+    transport_group_cc_mcbbr_free(w.cc);
+  }
+}
+
+static void lagging_sender_recovers_on_current_feedback(void) {
+  enum { CLEAN, OLD_RTT, LOSS, EXTERNAL_LOAD, ECN };
+  for (unsigned mode = CLEAN; mode <= ECN; ++mode) {
+    fixture_t w = create();
+    warm(&w, false);
+    ce(&w);
+    int64_t hold = w.event.state_after.growth_blocked_until;
+    uint64_t reduced = rate(w.cc);
+    transport_group_cc_hints_t hints = {
+        .active_senders = 4, .median_sender_rate_bytes_per_second = 36000};
+    if (mode == EXTERNAL_LOAD) {
+      hints.external_load_epoch = 1;
+      hints.external_load_queued_bytes = 1000;
+    }
+    transport_group_cc_mcbbr_set_hints(w.cc, &hints, w.now);
+
+    quicly_flexicast_feedback_t f = input(&w, 1, 100, 1250);
+    assert(f.now < hold);
+    if (mode == OLD_RTT) {
+      f.raw_rtt_msec = 1400;
+      f.rtt_ack_delay_msec = f.applied_ack_delay_msec = 1300;
+    } else if (mode == LOSS) {
+      f.lost_packets = 4;
+    } else if (mode == ECN) {
+      f.ecn_ce_count = 1;
+    }
+    submit(&w, &f);
+    if (mode == CLEAN) {
+      uint64_t trial = rate(w.cc);
+      assert(trial > reduced &&
+             w.event.state_after.growth_blocked_until == hold);
+      f = input(&w, 1, 100, 500);
+      f.raw_rtt_msec = 700;
+      f.rtt_ack_delay_msec = f.applied_ack_delay_msec = 600;
+      submit(&w, &f);
+      assert(rate(w.cc) == trial);
+    } else if (mode == ECN) {
+      assert(rate(w.cc) < reduced);
+    } else {
+      assert(rate(w.cc) == reduced);
+    }
+    transport_group_cc_mcbbr_free(w.cc);
+  }
+}
+
+static void lagging_sender_respects_hold_before_first_cut(void) {
+  fixture_t w = create();
+  warm(&w, false);
+  transport_group_cc_hints_t hints = {
+      .active_senders = 4, .median_sender_rate_bytes_per_second = 36000};
+  transport_group_cc_mcbbr_set_hints(w.cc, &hints, w.now);
+  uint64_t before = rate(w.cc);
+  quicly_flexicast_feedback_t f = input(&w, 1, 220, 1000);
+  submit(&w, &f);
+  int64_t hold = w.event.state_after.growth_blocked_until;
+  f = input(&w, 1, 100, 200);
+  assert(f.now < hold);
+  submit(&w, &f);
+  assert(rate(w.cc) == before && w.event.state_after.last_reduction_epoch == 0);
+  transport_group_cc_mcbbr_free(w.cc);
+}
+
 static void tdma_long_cycle_slot_quantization(void) {
   /* multi-second TDMA slot phase jitter must not pin rate to floor */
   quicly_flexicast_cc_config_t c = {.startup_rate_bytes_per_second = 953,
@@ -1188,6 +1376,7 @@ int main(void) {
   stable_delay_loss_response(false);
   group_service_provenance();
   group_service_drains_after_queue_evidence();
+  group_service_limited_queue_with_baseline_loss();
   group_service_respects_a_fully_served_offer();
   group_service_holds_then_allows_growth(false);
   group_service_holds_then_allows_growth(true);
@@ -1213,6 +1402,12 @@ int main(void) {
   channel_share_large_startup_rate();
   sticky_ack_leader_and_outlier_fade();
   bbrv3_startup_plateau_and_probebw();
+  probebw_queue_evidence_must_follow_probe();
+  precut_delay_does_not_extend_growth_hold();
+  speculative_growth_requires_probe_feedback(false);
+  speculative_growth_requires_probe_feedback(true);
+  lagging_sender_recovers_on_current_feedback();
+  lagging_sender_respects_hold_before_first_cut();
   tdma_long_cycle_slot_quantization();
   test_fifty_writer_fifo();
   puts("===GROUP RECOVERY CC OK===");

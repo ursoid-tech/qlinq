@@ -1,6 +1,7 @@
 #include "transport_group_cc.h"
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +65,7 @@ typedef struct {
   entry_t queue[FIFO_PACKETS];
   size_t head, queued, max_queued;
   unsigned capacity;
+  bool radio_loss;
   uint64_t offered, overflow, departed, measured_departures;
   uint64_t channel_rng, report_rng;
   double tail_at, last_event, byte_msec;
@@ -142,7 +144,7 @@ static void send_packet(simulation_t *s, arrival_t a) {
     s->max_queued = s->queued;
   *e = (entry_t){.packet = p, .writer = a.writer};
   for (unsigned r = 0; r < RECEIVERS; ++r) {
-    if (p->departed >= RTT_STEP) {
+    if (s->radio_loss && p->departed >= RTT_STEP) {
       receiver_t *rx = &w->receivers[r];
       unsigned change = draw(&s->channel_rng) % 100;
       rx->in_bad_state = rx->in_bad_state ? change >= 2 : change < 1;
@@ -277,10 +279,12 @@ static void report(simulation_t *s, writer_t *w, unsigned member, int64_t now) {
   quicly_flexicast_cc_on_feedback(w->cc, &f);
 }
 
-static result_t run_fifo(bool shared, unsigned capacity, uint64_t seed) {
+static result_t run_fifo(bool shared, unsigned capacity, bool radio_loss,
+                         uint64_t seed) {
   simulation_t *s = calloc(1, sizeof(*s));
   assert(s);
   s->capacity = capacity;
+  s->radio_loss = radio_loss;
   s->channel_rng = seed;
   s->report_rng = seed ^ UINT64_C(0xc42fc09e6da52d19);
   quicly_flexicast_cc_config_t cfg = {.maximum_members = RECEIVERS,
@@ -348,6 +352,33 @@ static result_t run_fifo(bool shared, unsigned capacity, uint64_t seed) {
   return result;
 }
 
+static void check_fifo(bool shared, bool rf_only, uint64_t seed) {
+  unsigned capacity = rf_only ? 2500000 : 620000;
+  result_t r = run_fifo(shared, capacity, true, seed);
+  printf("50 writers (seed %" PRIu64
+         ", %s, %s) goodput %.0f B/s, link service %.0f B/s, "
+         "Jain %.3f, minimum/mean %.3f, median %.0f bit/s, mean queue %.0f B, "
+         "healthy %u, longest low %u ms\n",
+         seed, shared ? "shared endpoint" : "independent endpoints",
+         rf_only ? "RF loss only" : "bottleneck and RF loss", r.goodput,
+         r.service, r.jain, r.min_over_mean, r.median_bits_per_second,
+         r.mean_queue, r.healthy_writers, r.longest_low_ms);
+  fflush(stdout);
+  if (rf_only) {
+    /* even synchronized writers drain before their next packet */
+    assert(r.overflow == 0 && r.max_queued <= WRITERS);
+    double radio_survival = (2 * 0.99 + 0.50) / 3;
+    assert(r.goodput >= WRITERS * HOST_BYTES_PER_SEC * radio_survival * 0.85);
+  } else {
+    assert(r.goodput >= capacity * 0.5);
+    assert(r.median_bits_per_second >= 55000 &&
+           r.median_bits_per_second <= 125000);
+  }
+  assert(r.jain >= 0.85 && r.min_over_mean >= 0.50);
+  assert(r.healthy_writers == WRITERS && r.longest_low_ms < 22500);
+  assert(r.mean_queue < FIFO_PACKETS * PACKET_BYTES / 2);
+}
+
 void test_fifty_writer_fifo(void) {
   uint64_t seed = UINT64_C(0x17553461);
   const char *seed_text = getenv("QLINQ_TEST_FIFO_SEED");
@@ -359,31 +390,19 @@ void test_fifty_writer_fifo(void) {
   }
   for (unsigned shared = 0; shared <= 1; ++shared) {
     for (unsigned rf_only = 0; rf_only <= 1; ++rf_only) {
-      unsigned capacity = rf_only ? 2500000 : 620000;
-      result_t r = run_fifo(shared != 0, capacity, seed);
-      printf(
-          "50 writers (%s, %s) goodput %.0f B/s, link service %.0f B/s, "
-          "Jain %.3f, minimum/mean %.3f, median %.0f bit/s, mean queue %.0f B, "
-          "healthy %u, longest low %u ms\n",
-          shared ? "shared endpoint" : "independent endpoints",
-          rf_only ? "RF loss only" : "bottleneck and RF loss", r.goodput,
-          r.service, r.jain, r.min_over_mean, r.median_bits_per_second,
-          r.mean_queue, r.healthy_writers, r.longest_low_ms);
-      fflush(stdout);
-      if (rf_only) {
-        /* even synchronized writers drain before their next packet */
-        assert(r.overflow == 0 && r.max_queued <= WRITERS);
-        double radio_survival = (2 * 0.99 + 0.50) / 3;
-        assert(r.goodput >=
-               WRITERS * HOST_BYTES_PER_SEC * radio_survival * 0.85);
-      } else {
-        assert(r.goodput >= capacity * 0.5);
-        assert(r.median_bits_per_second >= 55000 &&
-               r.median_bits_per_second <= 125000);
-      }
-      assert(r.jain >= 0.85 && r.min_over_mean >= 0.50);
-      assert(r.healthy_writers == WRITERS && r.longest_low_ms < 22500);
-      assert(r.mean_queue < FIFO_PACKETS * PACKET_BYTES / 2);
+      check_fifo(shared != 0, rf_only != 0, seed);
     }
+  }
+
+  if (!seed_text) {
+    /* bottleneck runs that previously stranded a writer for 112 and 37 s */
+    check_fifo(false, false, 19);
+    check_fifo(true, false, 25);
+
+    /* with FIFO drops only, shared publishers must still drain a slow link */
+    unsigned capacity = 120000;
+    result_t r = run_fifo(true, capacity, false, 2);
+    assert(r.goodput >= capacity * 0.5);
+    assert(r.mean_queue < FIFO_PACKETS * PACKET_BYTES / 2);
   }
 }

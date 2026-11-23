@@ -117,9 +117,13 @@ static uint32_t peer_flight_rtt(const mcbbr_peer_t *m) {
   return m->flight_rtt ? m->flight_rtt : m->raw_rtt;
 }
 
+static int64_t rtt_sent_at(int64_t rtt_at, uint32_t raw_rtt) {
+  return rtt_at - (int64_t)raw_rtt;
+}
+
 static bool rtt_post_cut(const group_mcbbr_t *s, int64_t rtt_at,
                          uint32_t raw_rtt) {
-  return !s->cut_seen || rtt_at - (int64_t)raw_rtt >= s->last_cut;
+  return !s->cut_seen || rtt_sent_at(rtt_at, raw_rtt) >= s->last_cut;
 }
 
 static uint64_t interval(const group_mcbbr_t *s) {
@@ -711,6 +715,16 @@ static bool step_up_pending(const mcbbr_peer_t *m, uint32_t latest_rtt) {
   return false;
 }
 
+/* avoid deep cuts on lossy peers when sender queue share is under 4 MSS */
+static bool small_lossy_queue(const group_mcbbr_t *s, const mcbbr_peer_t *m,
+                              uint32_t rtt) {
+  uint32_t min_rtt = m->win_min[0].rtt;
+  return s->active > 2 && m->loss_baseline >= PPM / 50 && min_rtt &&
+         rtt > min_rtt &&
+         (__uint128_t)(rtt - min_rtt) * bound(s, s->rate) <
+             4 * datagram_size(s) * 1000;
+}
+
 static uint64_t severe_bloat_slack(const group_mcbbr_t *s, uint32_t base_rtt) {
   uint64_t iv_slack = interval(s) * 2U;
   return base_rtt > iv_slack ? base_rtt : iv_slack;
@@ -812,7 +826,8 @@ static bool observe(group_mcbbr_t *s, mcbbr_peer_t *m,
         wait = flight;
     }
     int64_t blocked = after(f->now, wait);
-    if (blocked > s->blocked_until)
+    if (post_cut_rtt && !small_lossy_queue(s, m, latest_rtt) &&
+        blocked > s->blocked_until)
       s->blocked_until = blocked;
   } else if (!m->stable_at) {
     m->stable_at = rtt_at;
@@ -1068,6 +1083,7 @@ static bool apply_congestion_cut(group_mcbbr_t *s, mcbbr_peer_t *m,
   uint64_t pacing_rate = ctx->pacing_rate;
   uint64_t fair_share = channel_share_rate(s);
   uint64_t cohort_med = s->hints.median_sender_rate_bytes_per_second;
+  bool small_queue = small_lossy_queue(s, m, m->rtt);
   if (f->ecn_ce_count) {
     *reason |= QUICLY_FLEXICAST_CC_REASON_ECN;
     if (!s->cut_seen || f->now >= after(s->last_cut, interval(s)))
@@ -1078,7 +1094,8 @@ static bool apply_congestion_cut(group_mcbbr_t *s, mcbbr_peer_t *m,
   if (ctx->service_limit && f->lost_packets && ctx->due && ctx->post_cut &&
       pacing_rate > s->super.config.minimum_rate_bytes_per_second) {
     uint64_t low_rtt = m->win_min[0].rtt;
-    bool standing_queue = low_rtt && m->rtt > low_rtt + low_rtt / 10 + 5 &&
+    bool standing_queue = low_rtt && !small_queue &&
+                          m->rtt > low_rtt + low_rtt / 10 + 5 &&
                           !step_up_pending(m, m->rtt);
     uint64_t next = standing_queue ? scale(ctx->service_limit, 3, 4)
                                    : scale(ctx->service_limit, 31, 32);
@@ -1114,7 +1131,7 @@ static bool apply_congestion_cut(group_mcbbr_t *s, mcbbr_peer_t *m,
     return true;
   }
   if (ctx->capacity_drop && !ctx->rf_loss_only &&
-      (ctx->queued || ctx->cohort_saturated) && ctx->due &&
+      (ctx->queued || ctx->cohort_saturated) && ctx->due && !small_queue &&
       (ctx->corroborated || m->id == s->leader_id || ctx->bloated) &&
       !(multi_sender && cohort_med > 0 &&
         pacing_rate <= scale(cohort_med, 4, 5))) {
@@ -1174,12 +1191,11 @@ static void try_ack_growth(group_mcbbr_t *s, mcbbr_peer_t *m,
   uint64_t pacing_rate = ctx->pacing_rate;
   uint64_t fair_share = channel_share_rate(s);
   uint64_t cohort_med = s->hints.median_sender_rate_bytes_per_second;
+  uint64_t mss = datagram_size(s);
   bool sev_bloat = multi_sender && cohort_severe_bloat(s, f->now);
   bool eff_loss = ctx->new_loss && !ctx->rf_loss_only;
   bool clear = f->now >= s->blocked_until && !ctx->queued && !f->ecn_ce_count &&
                !eff_loss;
-  bool clear_catchup =
-      f->now >= s->blocked_until && !f->ecn_ce_count && !sev_bloat;
   bool inconsistent_proof =
       (f->rtt_sample_flags & QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT) &&
       m->rtt_at == 0 && m->supports_streak >= 2;
@@ -1230,13 +1246,26 @@ static void try_ack_growth(group_mcbbr_t *s, mcbbr_peer_t *m,
       m->rising == 0 &&
       (s->last_cut_was_timeout || rtt_post_cut(s, ctx->rtt_at, ctx->raw_rtt));
   bool median_catchup = cohort_med > pacing_rate && ctx->rtt_calm;
+  uint64_t catchup_target = scale(cohort_med, 17, 20);
+  bool near_cohort =
+      multi_sender && cohort_med > 0 && pacing_rate >= catchup_target;
   bool lagging_cohort =
-      multi_sender && cohort_med > 0 &&
-      pacing_rate < scale(cohort_med, 17, 20) && ctx->fresh_rtt &&
+      multi_sender && cohort_med > 0 && !near_cohort && ctx->fresh_rtt &&
       ((!ctx->queued && m->rising == 0) ||
        (!sev_bloat &&
         (!ctx->bloated || pacing_rate < scale(cohort_med, 3, 5)))) &&
       rtt_post_cut(s, ctx->rtt_at, ctx->raw_rtt);
+  int64_t sample_sent_at =
+      ctx->fresh_rtt ? rtt_sent_at(ctx->rtt_at, ctx->raw_rtt) : 0;
+  /* let a lagging sender probe during a residual hold when current flight is
+   * clear, without clearing the hold for subsequent feedback */
+  bool recovered = lagging_cohort && s->congestion_seen &&
+                   !s->last_cut_was_timeout && !ctx->queued && m->rising == 0 &&
+                   !ctx->capacity_drop && !eff_loss &&
+                   f->now >= after(s->last_cut, ctx->group_flight) &&
+                   (!s->growth_seen || sample_sent_at >= s->last_growth);
+  bool clear_catchup = !f->ecn_ce_count && !sev_bloat &&
+                       (f->now >= s->blocked_until || recovered);
   bool probe = !proof && !ctx->capacity_drop &&
                pacing_rate < s->config.startup_rate_bytes_per_second &&
                ((no_del_ok &&
@@ -1257,14 +1286,18 @@ static void try_ack_growth(group_mcbbr_t *s, mcbbr_peer_t *m,
       (proof || startup_probe || post_timeout_recover || lagging_cohort)
           ? interval(s)
           : (multi_sender && ctx->rtt_calm ? half_flight : ctx->flight);
-  /* BBRv3 ProbeBW cycle transitions: CRUISE -> REFILL -> UP -> CRUISE */
+  /* BBRv3 ProbeBW cycle transitions: CRUISE -> REFILL -> UP -> CRUISE;
+   * feedback during UP may reflect a packet sent before the probe */
+  bool probe_queued =
+      ctx->queued && ctx->fresh_rtt && sample_sent_at >= s->phase_at;
   if (s->bbr_phase == BBR_UP &&
-      (ctx->queued || (!ctx->supports && s->bw_hi &&
-                       pacing_rate >= (__uint128_t)s->bw_hi * 5 / 4 &&
-                       f->now >= after(s->phase_at, 2 * ctx->group_flight)))) {
+      (probe_queued || (!ctx->supports && s->bw_hi &&
+                        pacing_rate >= (__uint128_t)s->bw_hi * 5 / 4 &&
+                        f->now >= after(s->phase_at, 2 * ctx->group_flight)))) {
     s->bbr_phase = BBR_CRUISE;
     s->phase_at = f->now;
-    if (ctx->queued && s->congestion_seen && s->bw_hi && pacing_rate > s->bw_hi)
+    if (probe_queued && !small_lossy_queue(s, m, m->rtt) &&
+        s->congestion_seen && s->bw_hi && pacing_rate > s->bw_hi)
       s->rate = pacing_rate = bound(s, s->bw_hi);
   }
   if (s->drain.phase == DRAIN_ACTIVE) {
@@ -1282,6 +1315,16 @@ static void try_ack_growth(group_mcbbr_t *s, mcbbr_peer_t *m,
                TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN;
     return;
   }
+  /* wait for feedback from last increase before another unsupported probe
+   * when an independent sender has a large flight or tracks its cohort */
+  bool large_flight =
+      (__uint128_t)pacing_rate * ctx->latest_rtt >= 16 * mss * 1000;
+  bool low_rate_cohort = pacing_rate < 4 * mss && near_cohort;
+  bool awaiting_probe = s->growth_seen && s->congestion_seen && s->active > 2 &&
+                        !proof && ctx->fresh_rtt &&
+                        sample_sent_at < s->last_growth;
+  if (awaiting_probe && ((!multi_sender && large_flight) || low_rate_cohort))
+    return;
   uint64_t headroom = s->bw_hi ? scale(s->bw_hi, 85, 100) : 0;
   if (s->bbr_phase == BBR_CRUISE &&
       ((headroom && pacing_rate >= headroom) ||
@@ -1307,17 +1350,18 @@ static void try_ack_growth(group_mcbbr_t *s, mcbbr_peer_t *m,
   }
   uint64_t inc =
       (uint64_t)((double)pacing_rate / (div * sqrt((double)senders)));
-  uint64_t mss = datagram_size(s);
   uint64_t floor_inc = (uint64_t)((double)mss / sqrt((double)senders));
-  if (pacing_rate < 4 * mss && floor_inc < mss / 2)
+  if (pacing_rate < 4 * mss && !near_cohort && floor_inc < mss / 2)
+    floor_inc = mss / 2;
+  if (s->congestion_seen && s->active > 2 && pacing_rate > 4 * mss &&
+      floor_inc > mss / 2)
     floor_inc = mss / 2;
   if (!floor_inc)
     floor_inc = 1;
   if (inc < floor_inc)
     inc = floor_inc;
   if (lagging_cohort) {
-    uint64_t target_rate = scale(cohort_med, 17, 20);
-    uint64_t catchup = (target_rate - pacing_rate) / 3;
+    uint64_t catchup = (catchup_target - pacing_rate) / 2;
     if (catchup > inc)
       inc = catchup;
   }
