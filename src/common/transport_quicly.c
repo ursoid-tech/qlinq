@@ -1172,6 +1172,13 @@ transport_t *transport_drive_create(const transport_config_t *config) {
     goto Fail;
   }
   t->repair_policy_config = config->repair_policy;
+  if (config->flexicast_cc_mode != TRANSPORT_FLEXICAST_CC_MULTICAST &&
+      config->flexicast_cc_mode != TRANSPORT_FLEXICAST_CC_MCBBR) {
+    transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, SIZE_MAX,
+                  "invalid Flexicast congestion controller");
+    goto Fail;
+  }
+  t->flexicast_cc_mode = config->flexicast_cc_mode;
   if ((config->flexicast_cc_minimum_rate != 0 &&
        config->flexicast_cc_maximum_rate != 0 &&
        config->flexicast_cc_minimum_rate > config->flexicast_cc_maximum_rate) ||

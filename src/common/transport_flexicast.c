@@ -1,6 +1,7 @@
 #include "transport_flexicast.h"
 
 #include "portable_sockets.h"
+#include "transport_group_cc.h"
 #include "transport_internal.h"
 #include "transport_publish.h"
 #include "transport_stream.h"
@@ -201,13 +202,20 @@ static void retire_flow_id(transport_t *t, uint64_t flow_id, uint32_t epoch) {
 
 static quicly_flexicast_flow_id_t flexicast_wire_id(uint64_t flow_id);
 
+static void free_flow_cc(quicly_flexicast_cc_t *cc) {
+  if (transport_group_cc_mcbbr_is(cc))
+    transport_group_cc_mcbbr_free(cc);
+  else
+    quicly_flexicast_cc_free_multicast(cc);
+}
+
 static void dispose_flow(transport_flexicast_flow_t *flow) {
   if (!flow)
     return;
   (void)tf_clear_flow_queue(flow);
   tf_queue_dispose(&flow->data_queue);
   quicly_flexicast_flow_free(flow->crypto);
-  quicly_flexicast_cc_free_multicast(flow->cc);
+  free_flow_cc(flow->cc);
   free(flow->members);
   free(flow->member_map);
   ptls_clear_memory(flow->secret, sizeof(flow->secret));
@@ -223,7 +231,9 @@ static bool create_crypto_with_secret(transport_t *t,
   quicly_flexicast_flow_id_t wire_id = flexicast_wire_id(flow->flow_id);
   quicly_flexicast_cc_t *cc = NULL;
   if (flow->source) {
-    cc = quicly_flexicast_cc_new_multicast(&flow->cc_config, now);
+    cc = t->flexicast_cc_mode == TRANSPORT_FLEXICAST_CC_MCBBR
+             ? transport_group_cc_mcbbr_new(&flow->cc_config, now)
+             : quicly_flexicast_cc_new_multicast(&flow->cc_config, now);
     if (!cc)
       return false;
   } else if (flow->control_conn && flow->control_conn->quic &&
@@ -250,7 +260,7 @@ static bool create_crypto_with_secret(transport_t *t,
       .packet_reordering_threshold = 3,
       .now = now};
   if (quicly_flexicast_flow_create(crypto, &config) != QUICLY_FLEXICAST_OK) {
-    quicly_flexicast_cc_free_multicast(cc);
+    free_flow_cc(cc);
     return false;
   }
   if (flow->source)
@@ -796,6 +806,8 @@ static void set_member_listening(transport_flexicast_flow_t *flow,
     member->first_unacknowledged_ms = 0;
   }
   member->listening = listening;
+  flow->cc_membership_epoch++;
+  flow->cc_idle_ready_at_ms = 0;
   if (inconsistent)
     recount_member_feedback(flow);
 }
@@ -892,19 +904,7 @@ static bool member_remove(transport_flexicast_flow_t *flow,
   if (slot >= flow->member_count)
     return false;
   size_t last = flow->member_count - 1U;
-  bool inconsistent = false;
-  if (member->listening) {
-    if (flow->listening_count == 0)
-      inconsistent = true;
-    else
-      flow->listening_count--;
-    if (member->acknowledged_delivery_epoch < flow->delivery_epoch) {
-      if (flow->feedback_outstanding_count == 0)
-        inconsistent = true;
-      else
-        flow->feedback_outstanding_count--;
-    }
-  }
+  set_member_listening(flow, member, false);
   member_map_remove(flow, member->conn);
   if (slot != last) {
     flow->members[slot] = flow->members[last];
@@ -912,8 +912,6 @@ static bool member_remove(transport_flexicast_flow_t *flow,
   }
   memset(&flow->members[last], 0, sizeof(flow->members[last]));
   flow->member_count--;
-  if (inconsistent)
-    recount_member_feedback(flow);
   return true;
 }
 
@@ -1287,12 +1285,15 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
     flow->source = true;
     flow->key_epoch = 1;
     flow->track_id = *track;
+    bool mcbbr = t->flexicast_cc_mode == TRANSPORT_FLEXICAST_CC_MCBBR;
+    if (mcbbr)
+      flow->cc_config.maximum_members = flow->member_capacity;
     flow->cc_config.startup_rate_bytes_per_second =
         t->flexicast_cc_startup_rate != 0 ? t->flexicast_cc_startup_rate
-                                          : 64U * 1024U;
+                                         : (mcbbr ? 1250U : 64U * 1024U);
     flow->cc_config.minimum_rate_bytes_per_second =
         t->flexicast_cc_minimum_rate != 0 ? t->flexicast_cc_minimum_rate
-                                          : 2U * 1024U;
+                                         : (mcbbr ? 250U : 2U * 1024U);
     flow->cc_config.maximum_rate_bytes_per_second =
         t->flexicast_cc_maximum_rate != 0 ? t->flexicast_cc_maximum_rate
                                           : 1024U * 1024U * 1024U;

@@ -22,6 +22,7 @@ t/assets/
 /t/00util/test_flexicast_regressions
 /t/00util/test_flexicast_scale
 /t/00util/test_flexicast_transport
+/t/00util/test_group_cc
 /t/00util/test_generic_ports
 /t/00util/test_ifmon
 /t/00util/test_interleaved_receive

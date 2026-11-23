@@ -1,5 +1,6 @@
 #include "portable_sockets.h"
 #include "transport.h"
+#include "transport_group_cc.h"
 #include "transport_internal.h"
 
 #include <assert.h>
@@ -122,7 +123,8 @@ static void test_mixed_group_retry(transport_t *server,
   assert(transport_publish_flush(server));
   assert(flow->data_queue.count == 0 &&
          server->stats.flexicast_packets_sent == sent);
-  for (size_t i = 0; i < 400 && (!shared->received || !unicast->received); i++) {
+  for (size_t i = 0; i < 400 && (!shared->received || !unicast->received);
+       i++) {
     drive(server, shared->transport, unicast->transport);
     usleep(5000);
   }
@@ -616,7 +618,7 @@ static const char *native_ipv6_unavailable(const char *address) {
     abort();
   struct group_source_req request = {.gsr_interface = ifindex};
   struct sockaddr_in6 group = {.sin6_family = AF_INET6,
-                                .sin6_addr = destination.sin6_addr};
+                               .sin6_addr = destination.sin6_addr};
   memcpy(&request.gsr_group, &group, sizeof(group));
   memcpy(&request.gsr_source, &source, sizeof(source));
   reason = "cannot join IPv6 source-specific multicast on the test interface";
@@ -628,9 +630,8 @@ static const char *native_ipv6_unavailable(const char *address) {
 
   const uint8_t probe = 0x42;
   reason = "cannot send IPv6 source-specific multicast on the test interface";
-  if (sendto(sender, &probe, sizeof(probe), 0,
-             (struct sockaddr *)&destination, sizeof(destination)) !=
-      sizeof(probe))
+  if (sendto(sender, &probe, sizeof(probe), 0, (struct sockaddr *)&destination,
+             sizeof(destination)) != sizeof(probe))
     goto Done;
 
   struct pollfd ready = {.fd = receiver, .events = POLLIN};
@@ -666,15 +667,15 @@ static ssize_t fail_ipv6_multicast_send(
     socklen_t destination_len, uint32_t interface_index, uint8_t ecn,
     size_t max_gso_segments, const struct iovec *datagrams, size_t count) {
   if (destination->sa_family == AF_INET6 &&
-      IN6_IS_ADDR_MULTICAST(&((const struct sockaddr_in6 *)destination)
-                                ->sin6_addr)) {
+      IN6_IS_ADDR_MULTICAST(
+          &((const struct sockaddr_in6 *)destination)->sin6_addr)) {
     ipv6_multicast_send_failures++;
     errno = ENETUNREACH;
     return -1;
   }
-  return ipv6_fallback_host.send(
-      context, path, source, destination, destination_len, interface_index,
-      ecn, max_gso_segments, datagrams, count);
+  return ipv6_fallback_host.send(context, path, source, destination,
+                                 destination_len, interface_index, ecn,
+                                 max_gso_segments, datagrams, count);
 }
 
 int main(int argc, char **argv) {
@@ -687,13 +688,16 @@ int main(int argc, char **argv) {
     return run_unsubscribe_lifecycle(false);
   if (argc == 2 && strcmp(mode, "--unsubscribe6") == 0)
     return run_unsubscribe_lifecycle(true);
+  bool mcbbr_native = argc == 2 && strcmp(mode, "--mcbbr") == 0;
+  bool mcbbr_replicated = argc == 2 && strcmp(mode, "--mcbbr-replicated") == 0;
+  bool mcbbr = mcbbr_native || mcbbr_replicated;
   bool native6 = argc == 2 && strcmp(mode, "--native6") == 0;
   bool native6_fallback = argc == 2 && strcmp(mode, "--native6-fallback") == 0;
   bool mixed_retry = argc == 2 && strcmp(mode, "--mixed-retry") == 0;
   bool native_multicast =
       argc == 2 &&
-      (strcmp(mode, "--native") == 0 || native6 || native6_fallback ||
-       strcmp(mode, "--join-fallback") == 0 ||
+      (mcbbr_native || strcmp(mode, "--native") == 0 || native6 ||
+       native6_fallback || strcmp(mode, "--join-fallback") == 0 ||
        strcmp(mode, "--ack-fallback") == 0 || strcmp(mode, "--pacing") == 0);
   bool join_fallback = argc == 2 && strcmp(mode, "--join-fallback") == 0;
   bool ack_fallback = argc == 2 && strcmp(mode, "--ack-fallback") == 0;
@@ -701,15 +705,15 @@ int main(int argc, char **argv) {
   bool control_flood = argc == 2 && strcmp(mode, "--control-flood") == 0;
   bool base = argc == 1 || (argc == 2 && strcmp(mode, "--base") == 0);
   bool ipv6 = native6 || native6_fallback;
-  if (argc > 2 ||
-      (!base && !native_multicast && !control_flood && !mixed_retry)) {
-    fprintf(
-        stderr,
-        "usage: %s "
-        "[--base|--native|--native6|--native6-fallback|--join-fallback|"
-        "--ack-fallback|--pacing|--control-flood|--membership|--membership6|"
-        "--unsubscribe|--unsubscribe6|--mixed-retry]\n",
-        argv[0]);
+  if (argc > 2 || (!base && !mcbbr && !native_multicast && !control_flood &&
+                   !mixed_retry)) {
+    fprintf(stderr,
+            "usage: %s "
+            "[--base|--mcbbr|--mcbbr-replicated|--native|--native6|"
+            "--native6-fallback|--join-fallback|--ack-fallback|--pacing|"
+            "--control-flood|--membership|--membership6|--unsubscribe|"
+            "--unsubscribe6|--mixed-retry]\n",
+            argv[0]);
     return 1;
   }
   const char *ipv6_address = "::1";
@@ -749,6 +753,11 @@ int main(int argc, char **argv) {
                                         .enable_flexicast = true,
                                         .callback = on_client,
                                         .user_data = &client_a_state};
+  if (mcbbr) {
+    server_config.flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_MCBBR;
+    server_config.limits.max_connections =
+        QUICLY_FLEXICAST_CC_DEFAULT_MAX_MEMBERS + 1;
+  }
   if (ipv6) {
     server_config.bind_hosts[0] = ipv6_address;
     client_a_config.bind_hosts[0] = ipv6_address;
@@ -758,8 +767,9 @@ int main(int argc, char **argv) {
     server_config.flexicast_group = ipv6 ? ipv6_group : "232.42.42.1";
     server_config.flexicast_group_port = 10002;
     server_config.flexicast_interface = ipv6 ? ipv6_address : "127.0.0.1";
-    client_a_config.flexicast_interface =
-        ipv6 ? ipv6_address : join_fallback ? "192.0.2.99" : "127.0.0.1";
+    client_a_config.flexicast_interface = ipv6            ? ipv6_address
+                                          : join_fallback ? "192.0.2.99"
+                                                          : "127.0.0.1";
   }
   if (mixed_retry) {
     server_config.limits.max_udp_payload_size = 1452;
@@ -834,7 +844,8 @@ int main(int argc, char **argv) {
 
   moq_track_id_t track = {
       .type = mixed_retry ? MOQ_TRACK_DATA : MOQ_TRACK_VIDEO,
-      .flags = ((ack_fallback || pacing) ? 0 : MOQ_TRACK_FLAG_FEC_ENABLED)};
+      .flags =
+          ((ack_fallback || pacing || mcbbr) ? 0 : MOQ_TRACK_FLAG_FEC_ENABLED)};
   strcpy(track.name, mixed_retry ? "mixed-retry" : "shared-video");
   if (!transport_subscribe(client_a, track) ||
       !transport_subscribe(client_b, track)) {
@@ -874,15 +885,32 @@ int main(int argc, char **argv) {
                          .size = sizeof(payload),
                          .is_keyframe = true,
                          .priority = 2};
-  if (!transport_publish(server, &object)) {
-    fprintf(stderr, "shared publication failed\n");
-    goto Fail;
-  }
-  retries = 300;
-  while (retries-- > 0 &&
-         (!client_a_state.received || !client_b_state.received)) {
-    drive(server, client_a, client_b);
-    usleep(5000);
+  /* Three distinct ACK rounds open and then publish a delivery-rate sample. */
+  size_t publications = mcbbr ? 3 : 1;
+  for (size_t n = 1; n <= publications; n++, object.object_id++) {
+    if (!transport_publish(server, &object)) {
+      fprintf(stderr, "shared publication failed\n");
+      goto Fail;
+    }
+    retries = 300;
+    while (retries-- > 0) {
+      drive(server, client_a, client_b);
+      usleep(5000);
+      if (mcbbr)
+        (void)transport_get_stats(server, &source_stats);
+      if (client_a_state.objects_received >= n &&
+          client_b_state.objects_received >= n &&
+          (!mcbbr || source_stats.flexicast_acks_received >= 2 * n))
+        break;
+    }
+    if (retries < 0) {
+      fprintf(
+          stderr,
+          "shared publication %zu timed out (a=%zu, b=%zu, acks=%" PRIu64 ")\n",
+          n, client_a_state.objects_received, client_b_state.objects_received,
+          source_stats.flexicast_acks_received);
+      goto Fail;
+    }
   }
   for (int i = 0; i < 10; i++)
     drive(server, client_a, client_b);
@@ -926,29 +954,54 @@ int main(int argc, char **argv) {
     goto Fail;
   }
 
-  if (base) {
-    transport_flexicast_flow_t *flow = NULL;
-    for (size_t i = 0; i < server->flexicast.capacity; i++) {
-      if (server->flexicast.flows[i].active &&
-          server->flexicast.flows[i].source &&
-          transport_track_id_equal(&server->flexicast.flows[i].track_id,
-                                   &track)) {
-        flow = &server->flexicast.flows[i];
-        break;
+  transport_flexicast_flow_t *flow = NULL;
+  for (size_t i = 0; i < server->flexicast.capacity; i++) {
+    transport_flexicast_flow_t *candidate = &server->flexicast.flows[i];
+    if (candidate->active && candidate->source &&
+        transport_track_id_equal(&candidate->track_id, &track)) {
+      flow = candidate;
+      break;
+    }
+  }
+  if (!flow || !flow->cc || transport_group_cc_mcbbr_is(flow->cc) != mcbbr) {
+    fprintf(stderr, "shared flow did not select the configured controller\n");
+    goto Fail;
+  }
+  if (mcbbr) {
+    if (flow->member_count != 2) {
+      fprintf(stderr, "MCBBR flow lost a subscriber\n");
+      goto Fail;
+    }
+    for (size_t i = 0; i < flow->member_count; i++) {
+      transport_group_cc_trace_state_t state = {0};
+      uint64_t id = flow->members[i].conn->id;
+      if (!transport_group_cc_mcbbr_get_trace_state(
+              flow->cc, id, transport_now_ms(server), &state) ||
+          !state.member_present || !state.last_rtt_sample_epoch ||
+          !state.last_delivery_sample_epoch) {
+        fprintf(
+            stderr,
+            "MCBBR member %" PRIu64 " missing feedback samples (rtt=%" PRIu64
+            ", delivery=%" PRIu64 ")\n",
+            id, state.last_rtt_sample_epoch, state.last_delivery_sample_epoch);
+        goto Fail;
       }
     }
-    if (!flow || flow->listening_count != 2) {
+  }
+
+  if (base || mcbbr_replicated) {
+    if (flow->listening_count != 2) {
       fprintf(stderr, "replicated flow missing two active listeners\n");
       goto Fail;
     }
-    /* verify 1x logical pacing deduction across 2-member replicated unicast */
-    flow->pacing_tokens = flow->pacing_burst_bytes;
-    flow->pacing_last_refill_ms = transport_now_ms(server);
-    uint64_t tokens_before = flow->pacing_tokens;
     static const uint8_t holdoff_payload[] = "nonblocking holdoff check";
     size_t wire_len = QLINQ_WIRE_FEC_HEADER_SIZE + sizeof(holdoff_payload);
     size_t expected_cost =
         quicly_flexicast_datagram_size(flow->crypto, wire_len);
+    /* Give the pacer one datagram and control the refill for the second copy.
+     */
+    flow->pacing_tokens = expected_cost;
+    flow->pacing_last_refill_ms = INT64_MAX;
     /* verify rekey holdoff does not stall active listening subscribers */
     flow->rekey_pending = true;
     flow->rekey_ready_at_ms = transport_now_ms(server) + 60000;
@@ -956,7 +1009,7 @@ int main(int argc, char **argv) {
     client_b_state.received = false;
     moq_object_t holdoff_obj = {.track_id = track,
                                 .group_id = 7,
-                                .object_id = 12,
+                                .object_id = object.object_id,
                                 .data = holdoff_payload,
                                 .size = sizeof(holdoff_payload),
                                 .is_keyframe = false,
@@ -965,15 +1018,23 @@ int main(int argc, char **argv) {
       fprintf(stderr, "holdoff publication failed\n");
       goto Fail;
     }
-    uint64_t spent = tokens_before >= flow->pacing_tokens
-                         ? tokens_before - flow->pacing_tokens
-                         : UINT64_MAX;
-    if (expected_cost == 0 || spent != expected_cost) {
+    if (expected_cost == 0 || flow->pacing_tokens != 0 ||
+        flow->data_queue.count != (mcbbr_replicated ? 1U : 0U)) {
       fprintf(stderr,
-              "replicated pacing charged %" PRIu64 " bytes instead of %zu\n",
-              spent, expected_cost);
+              "replicated pacing used the wrong first debit "
+              "(credit=%" PRIu64 ", queued=%zu)\n",
+              flow->pacing_tokens, flow->data_queue.count);
       goto Fail;
     }
+    if (mcbbr_replicated) {
+      flow->pacing_tokens = expected_cost;
+      transport_flexicast_tick(server);
+      if (flow->pacing_tokens != 0 || flow->data_queue.count != 0) {
+        fprintf(stderr, "MCBBR failed to pace the remaining copy\n");
+        goto Fail;
+      }
+    }
+    flow->pacing_last_refill_ms = transport_now_ms(server);
     retries = 100;
     while (retries-- > 0 &&
            (!client_a_state.received || !client_b_state.received)) {
@@ -1133,17 +1194,8 @@ int main(int argc, char **argv) {
   }
 
   if (control_flood) {
-    transport_flexicast_flow_t *flow = NULL;
-    for (size_t i = 0; i < server->flexicast.capacity; i++) {
-      transport_flexicast_flow_t *candidate = &server->flexicast.flows[i];
-      if (candidate->active && candidate->source &&
-          transport_track_id_equal(&candidate->track_id, &track) &&
-          transport_flexicast_listening_members(candidate) != 0) {
-        flow = candidate;
-        break;
-      }
-    }
-    if (!flow || flow->member_count < 2) {
+    if (flow->member_count < 2 ||
+        !transport_flexicast_listening_members(flow)) {
       fprintf(stderr, "control-throttle flow was not established\n");
       goto Fail;
     }
@@ -1181,6 +1233,8 @@ int main(int argc, char **argv) {
 
   printf(native6            ? "===FLEXICAST IPV6 MULTICAST OK===\n"
          : native6_fallback ? "===FLEXICAST IPV6 SEND FALLBACK OK===\n"
+         : mcbbr_replicated ? "===FLEXICAST REPLICATED MCBBR OK===\n"
+         : mcbbr_native     ? "===FLEXICAST MCBBR OK===\n"
          : pacing           ? "===FLEXICAST PACING OK===\n"
          : control_flood    ? "===FLEXICAST CONTROL THROTTLE OK===\n"
          : ack_fallback     ? "===FLEXICAST ACK FALLBACK OK===\n"

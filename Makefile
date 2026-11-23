@@ -113,6 +113,7 @@ IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 # I/O and the application polling loop are composed only into the public host.
 ENGINE_OBJS = src/common/transport_flexicast.o \
               src/common/transport_flexicast_dispatch.o \
+              src/common/transport_group_cc.o \
               src/common/transport_repair_policy.o \
               src/common/transport_policy_scheduler.o \
               src/common/cli_parse.o \
@@ -482,7 +483,7 @@ t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
 t/00util/test_publication_deadlines: t/00util/test_publication_deadlines.o $(ENGINE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-CHECK_BINARIES = t/00util/test_flexicast_transport $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
+CHECK_BINARIES = t/00util/test_group_cc t/00util/test_flexicast_transport $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
 	t/00util/test_publication_deadlines \
 	t/00util/test_datagram_mtu \
 	t/00util/test_path_probe \
@@ -602,6 +603,9 @@ t/00util/test_tls_groups: t/00util/test_tls_groups.o t/00util/transport_tls_grou
 t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS) -Wl,--wrap=ptls_handshake_is_complete,--wrap=ptls_get_negotiated_group,--wrap=ptls_is_psk_handshake,--wrap=transport_stream_write_frame,--wrap=quicly_receive
 .PHONY: check-tun-offloads
+
+t/00util/test_group_cc: t/00util/test_group_cc.o src/common/transport_group_cc.o
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)

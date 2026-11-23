@@ -3,8 +3,8 @@ use strict;
 use warnings;
 use Test::More;
 use t::Util;
-for my $mode ('--base', '--native', '--native6', '--native6-fallback',
-              '--mixed-retry', '--join-fallback',
+for my $mode ('--base', '--mcbbr', '--mcbbr-replicated', '--native', '--native6',
+              '--native6-fallback', '--mixed-retry', '--join-fallback',
               '--ack-fallback', '--pacing', '--control-flood',
               '--membership', '--membership6', '--unsubscribe', '--unsubscribe6') {
     subtest "Flexicast $mode" => sub {

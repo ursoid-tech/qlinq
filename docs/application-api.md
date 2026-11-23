@@ -170,7 +170,10 @@ disabled). `security.tls_group_policy` selects classical (`QLINQ_TLS_GROUP_CLASS
 hybrid-preferred (`QLINQ_TLS_GROUP_PREFER_HYBRID`), or hybrid-required
 (`QLINQ_TLS_GROUP_REQUIRE_HYBRID`) TLS key agreement, and `group_delivery`
 (`qlinq_group_delivery_config_t`) configures optional Flexicast multicast or
-replicated-unicast group delivery.
+replicated-unicast group delivery. On a publisher with group delivery enabled,
+set `group_delivery.congestion_control` to `QLINQ_GROUP_CC_MCBBR` to pace
+group traffic using receiver feedback. Its zero-initialized default is
+`QLINQ_GROUP_CC_CONSERVATIVE`.
 These endpoint settings are fixed at creation and congestion control need not
 match the peer. To use the explicit CUBIC and pacing configuration measured in
 the [MPTCP comparison](mtcp-performance-progress.md), set these fields on the

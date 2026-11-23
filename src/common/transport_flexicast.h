@@ -70,6 +70,9 @@ typedef struct transport_flexicast_queued_payload_t {
   bool packet_ready;
   bool replicated;
   bool counted;
+  uint32_t cc_sample_flags;
+  uint32_t cc_packet_fanout;
+  uint64_t cc_packet_membership_epoch;
 } transport_flexicast_queued_payload_t;
 
 typedef struct transport_flexicast_queue_t {
@@ -117,6 +120,10 @@ typedef struct transport_flexicast_flow_t {
   uint64_t next_payload_delivery_id;
   int64_t last_payload_sent_ms;
   quicly_flexicast_cc_config_t cc_config;
+  uint64_t cc_membership_epoch;
+  int64_t cc_idle_ready_at_ms;
+  uint64_t cc_idle_credit_epoch;
+  bool cc_last_submission_replicated;
   transport_flexicast_member_t *members;
   transport_flexicast_member_map_entry_t *member_map;
   size_t member_count;
@@ -152,6 +159,7 @@ typedef struct transport_flexicast_registry_t {
   uint64_t pacing_burst;
   uint64_t pacing_remainder;
   int64_t pacing_last_refill_ms;
+  uint64_t pacing_credit_epoch;
 } transport_flexicast_registry_t;
 
 bool transport_flexicast_registry_init(transport_flexicast_registry_t *registry,

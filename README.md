@@ -66,6 +66,11 @@ an explicit QUIC idle timeout, machine-readable counter snapshots, and `--pv`
 for pv-style wire throughput per physical interface. Run `qlinq-app --help` for
 the complete interface.
 
+For datagram-based modes, enable Flexicast on receivers with `--flexicast`.
+Start the publisher with `--flexicast-cc mcbbr` to use MCBBR once receivers
+join the group. A publisher started with `--flexicast` alone uses the
+conservative group controller.
+
 Delivery mode names are shared by `qlinq-app` and `qlinq-tun`:
 `datagram`, `reliable`, `fixedrate` (also accepted as `fec`), and `rateless`.
 Each tool keeps its existing default mode.
