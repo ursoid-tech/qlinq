@@ -676,12 +676,28 @@ enqueue_symbols(transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
   return TRANSPORT_PUBLISH_DELIVERED;
 }
 
+static bool flexicast_group_needs_admission(
+    const transport_t *t, const transport_flexicast_flow_t *flow,
+    const moq_track_id_t *track) {
+  for (size_t i = 0; i < flow->member_count; i++) {
+    const transport_flexicast_member_t *member = &flow->members[i];
+    if (member->listening &&
+        transport_publish_recipient_eligible(t, member->conn, track) &&
+        !member->conn->fec_group_delivered)
+      return true;
+  }
+  return false;
+}
+
 static transport_publish_result_t publish_datagram_to_flexicast(
     transport_t *t, transport_flexicast_flow_t *flow, const moq_object_t *obj,
     const transport_track_profile_t *profile, size_t symbol_size,
     size_t data_symbols, publication_symbols_t *cached,
     size_t *cached_total_symbols, uint16_t *sent_total_symbols, bool grouped) {
-  if (flow->listening_count == 0)
+  /* A blocked independent subscriber can keep a group pending after the
+   * entire listening cohort accepted it, including packets still paced. */
+  if (flow->listening_count == 0 ||
+      (grouped && !flexicast_group_needs_admission(t, flow, &obj->track_id)))
     return TRANSPORT_PUBLISH_NO_RECIPIENTS;
   size_t packet_size = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size;
   size_t protected_size =

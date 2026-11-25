@@ -2,6 +2,10 @@
 #include "transport.h"
 #include "transport_internal.h"
 
+#include <assert.h>
+#ifdef __linux__
+#include <ifaddrs.h>
+#endif
 #include <inttypes.h>
 #include <net/if.h>
 #include <stdio.h>
@@ -17,7 +21,7 @@ typedef struct {
   size_t auth_requests;
   bool received;
   size_t objects_received;
-  uint8_t payload[64];
+  uint8_t payload[2048];
   size_t payload_size;
 } flexicast_test_state_t;
 
@@ -59,6 +63,75 @@ static void drive(transport_t *server, transport_t *a, transport_t *b) {
     transport_tick(a);
   if (b)
     transport_tick(b);
+}
+
+static void test_mixed_group_retry(transport_t *server,
+                                   const flexicast_test_state_t *shared,
+                                   const flexicast_test_state_t *unicast,
+                                   const moq_track_id_t *track) {
+  transport_flexicast_flow_t *flow = NULL;
+  for (size_t i = 0; i < server->flexicast.capacity; i++) {
+    transport_flexicast_flow_t *candidate = &server->flexicast.flows[i];
+    if (candidate->active && candidate->source &&
+        transport_track_id_equal(&candidate->track_id, track)) {
+      flow = candidate;
+      break;
+    }
+  }
+  assert(flow && flow->listening_count == 1 && flow->data_queue.count == 0);
+  transport_conn_t *blocked = NULL;
+  for (size_t i = 0; i < server->conn_count; i++)
+    if (!transport_flexicast_member_is_listening(flow, server->conns[i]))
+      blocked = server->conns[i];
+  assert(blocked);
+
+  /* Leave the native datagram size query usable while blocking admission of
+   * this two-symbol group on the ordinary unicast connection. */
+  const size_t queue_limit = QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY - 1;
+  uint8_t filler = 0xff;
+  ptls_iovec_t frame = ptls_iovec_init(&filler, sizeof(filler));
+  for (size_t queued = quicly_get_num_datagram_frames_path(blocked->quic, 0);
+       queued < queue_limit; queued++) {
+    quicly_send_datagram_frames_path(blocked->quic, 0, &frame, 1);
+    assert(quicly_get_num_datagram_frames_path(blocked->quic, 0) == queued + 1);
+  }
+
+  static const uint8_t payload[2000] = {17, 23, 41};
+  moq_object_t object = {
+      .track_id = *track, .data = payload, .size = sizeof(payload)};
+  uint64_t sent_before = server->stats.flexicast_packets_sent;
+  flow->dispatch_retry_at_ms = INT64_MAX;
+  assert(transport_publish_ex(server, &object) == TRANSPORT_PUBLISH_BUFFERED);
+  assert(!transport_publish_flush(server));
+  size_t admitted = flow->data_queue.count;
+  assert(admitted > 0 && server->stats.flexicast_packets_sent == sent_before);
+  assert(!transport_publish_flush(server));
+  assert(flow->data_queue.count == admitted);
+  assert(quicly_get_num_datagram_frames_path(blocked->quic, 0) == queue_limit);
+
+  flow->dispatch_retry_at_ms = 0;
+  tf_drain_paced_payloads(server, flow);
+  assert(flow->data_queue.count == 0);
+  uint64_t sent = server->stats.flexicast_packets_sent;
+  assert(sent - sent_before == admitted);
+  assert(!transport_publish_flush(server));
+  assert(flow->data_queue.count == 0 &&
+         server->stats.flexicast_packets_sent == sent);
+
+  quicly_discard_datagram_frames(blocked->quic, 0);
+  assert(transport_publish_flush(server));
+  assert(flow->data_queue.count == 0 &&
+         server->stats.flexicast_packets_sent == sent);
+  for (size_t i = 0; i < 400 && (!shared->received || !unicast->received); i++) {
+    drive(server, shared->transport, unicast->transport);
+    usleep(5000);
+  }
+  const size_t framed_size = 2 + sizeof(payload);
+  assert(shared->objects_received == 1 && unicast->objects_received == 1);
+  assert(shared->payload_size == framed_size &&
+         unicast->payload_size == framed_size);
+  assert(memcmp(shared->payload + 2, payload, sizeof(payload)) == 0 &&
+         memcmp(unicast->payload + 2, payload, sizeof(payload)) == 0);
 }
 
 static int run_unsubscribe_lifecycle(bool ipv6) {
@@ -497,6 +570,113 @@ Fail:
   return 1;
 }
 
+static const char ipv6_group[] = "ff32::8000:1";
+
+/* Verify native SSM independently of the transport and its fallback. */
+static const char *native_ipv6_unavailable(const char *address) {
+#if defined(__linux__) && defined(MCAST_JOIN_SOURCE_GROUP)
+  struct sockaddr_in6 source = {.sin6_family = AF_INET6};
+  if (inet_pton(AF_INET6, address, &source.sin6_addr) != 1)
+    return "invalid IPv6 test address";
+  struct ifaddrs *interfaces = NULL;
+  unsigned int ifindex = 0;
+  if (getifaddrs(&interfaces) != 0)
+    return "cannot list IPv6 interfaces";
+  for (const struct ifaddrs *item = interfaces; item; item = item->ifa_next) {
+    if (item->ifa_addr && item->ifa_addr->sa_family == AF_INET6 &&
+        memcmp(&((const struct sockaddr_in6 *)item->ifa_addr)->sin6_addr,
+               &source.sin6_addr, sizeof(source.sin6_addr)) == 0) {
+      ifindex = if_nametoindex(item->ifa_name);
+      break;
+    }
+  }
+  freeifaddrs(interfaces);
+  if (ifindex == 0)
+    return "no interface has the IPv6 test address";
+
+  int receiver = socket(AF_INET6, SOCK_DGRAM, 0);
+  int sender = socket(AF_INET6, SOCK_DGRAM, 0);
+  const char *reason = "cannot open IPv6 UDP sockets";
+  if (receiver < 0 || sender < 0)
+    goto Done;
+
+  const int enabled = 1;
+  struct sockaddr_in6 local = {.sin6_family = AF_INET6};
+  socklen_t local_len = sizeof(local);
+  reason = "cannot bind IPv6 UDP sockets";
+  if (bind(receiver, (struct sockaddr *)&local, sizeof(local)) != 0 ||
+      getsockname(receiver, (struct sockaddr *)&local, &local_len) != 0 ||
+      bind(sender, (struct sockaddr *)&source, sizeof(source)) != 0)
+    goto Done;
+
+  struct sockaddr_in6 destination = {.sin6_family = AF_INET6,
+                                     .sin6_port = local.sin6_port,
+                                     .sin6_scope_id = ifindex};
+  if (inet_pton(AF_INET6, ipv6_group, &destination.sin6_addr) != 1)
+    abort();
+  struct group_source_req request = {.gsr_interface = ifindex};
+  struct sockaddr_in6 group = {.sin6_family = AF_INET6,
+                                .sin6_addr = destination.sin6_addr};
+  memcpy(&request.gsr_group, &group, sizeof(group));
+  memcpy(&request.gsr_source, &source, sizeof(source));
+  reason = "cannot join IPv6 source-specific multicast on the test interface";
+  if (setsockopt(receiver, IPPROTO_IPV6, IPV6_RECVPKTINFO, &enabled,
+                 sizeof(enabled)) != 0 ||
+      setsockopt(receiver, IPPROTO_IPV6, MCAST_JOIN_SOURCE_GROUP, &request,
+                 sizeof(request)) != 0)
+    goto Done;
+
+  const uint8_t probe = 0x42;
+  reason = "cannot send IPv6 source-specific multicast on the test interface";
+  if (sendto(sender, &probe, sizeof(probe), 0,
+             (struct sockaddr *)&destination, sizeof(destination)) !=
+      sizeof(probe))
+    goto Done;
+
+  struct pollfd ready = {.fd = receiver, .events = POLLIN};
+  uint8_t received = 0;
+  reason = "IPv6 source-specific multicast did not reach the test socket";
+  int result;
+  do {
+    result = poll(&ready, 1, 250);
+  } while (result < 0 && errno == EINTR);
+  if (result == 1 && (ready.revents & POLLIN) &&
+      recv(receiver, &received, sizeof(received), 0) == sizeof(received) &&
+      received == probe)
+    reason = NULL;
+
+Done:
+  if (receiver >= 0)
+    CLOSE_SOCKET(receiver);
+  if (sender >= 0)
+    CLOSE_SOCKET(sender);
+  return reason;
+#else
+  (void)address;
+  return "IPv6 source-specific multicast socket support is unavailable";
+#endif
+}
+
+static transport_drive_host_t ipv6_fallback_host;
+static size_t ipv6_multicast_send_failures;
+
+static ssize_t fail_ipv6_multicast_send(
+    void *context, const transport_drive_path_t *path,
+    const struct sockaddr *source, const struct sockaddr *destination,
+    socklen_t destination_len, uint32_t interface_index, uint8_t ecn,
+    size_t max_gso_segments, const struct iovec *datagrams, size_t count) {
+  if (destination->sa_family == AF_INET6 &&
+      IN6_IS_ADDR_MULTICAST(&((const struct sockaddr_in6 *)destination)
+                                ->sin6_addr)) {
+    ipv6_multicast_send_failures++;
+    errno = ENETUNREACH;
+    return -1;
+  }
+  return ipv6_fallback_host.send(
+      context, path, source, destination, destination_len, interface_index,
+      ecn, max_gso_segments, datagrams, count);
+}
+
 int main(int argc, char **argv) {
   const char *mode = argc == 2 ? argv[1] : NULL;
   if (argc == 2 && strcmp(mode, "--membership") == 0)
@@ -507,9 +687,12 @@ int main(int argc, char **argv) {
     return run_unsubscribe_lifecycle(false);
   if (argc == 2 && strcmp(mode, "--unsubscribe6") == 0)
     return run_unsubscribe_lifecycle(true);
+  bool native6 = argc == 2 && strcmp(mode, "--native6") == 0;
+  bool native6_fallback = argc == 2 && strcmp(mode, "--native6-fallback") == 0;
+  bool mixed_retry = argc == 2 && strcmp(mode, "--mixed-retry") == 0;
   bool native_multicast =
       argc == 2 &&
-      (strcmp(mode, "--native") == 0 || strcmp(mode, "--native6") == 0 ||
+      (strcmp(mode, "--native") == 0 || native6 || native6_fallback ||
        strcmp(mode, "--join-fallback") == 0 ||
        strcmp(mode, "--ack-fallback") == 0 || strcmp(mode, "--pacing") == 0);
   bool join_fallback = argc == 2 && strcmp(mode, "--join-fallback") == 0;
@@ -517,17 +700,34 @@ int main(int argc, char **argv) {
   bool pacing = argc == 2 && strcmp(mode, "--pacing") == 0;
   bool control_flood = argc == 2 && strcmp(mode, "--control-flood") == 0;
   bool base = argc == 1 || (argc == 2 && strcmp(mode, "--base") == 0);
-  bool ipv6 = argc == 2 && strcmp(mode, "--native6") == 0;
-  if (argc > 2 || (!base && !native_multicast && !control_flood)) {
+  bool ipv6 = native6 || native6_fallback;
+  if (argc > 2 ||
+      (!base && !native_multicast && !control_flood && !mixed_retry)) {
     fprintf(
         stderr,
         "usage: %s "
-        "[--base|--native|--native6|--join-fallback|--ack-fallback|--pacing|"
-        "--control-flood|--membership|--membership6|--unsubscribe|"
-        "--unsubscribe6]\n",
+        "[--base|--native|--native6|--native6-fallback|--join-fallback|"
+        "--ack-fallback|--pacing|--control-flood|--membership|--membership6|"
+        "--unsubscribe|--unsubscribe6|--mixed-retry]\n",
         argv[0]);
     return 1;
   }
+  const char *ipv6_address = "::1";
+  if (native6) {
+    const char *configured_address = getenv("QLINQ_TEST_NATIVE6_ADDRESS");
+    if (configured_address)
+      ipv6_address = configured_address;
+    const char *reason = native_ipv6_unavailable(ipv6_address);
+    if (reason) {
+      if (configured_address) {
+        fprintf(stderr, "IPv6 SSM on %s: %s\n", ipv6_address, reason);
+        return 1;
+      }
+      printf("SKIP %s\n", reason);
+      return 0;
+    }
+  }
+
   flexicast_test_state_t server_state = {0};
   flexicast_test_state_t client_a_state = {0};
   flexicast_test_state_t client_b_state = {0};
@@ -550,20 +750,24 @@ int main(int argc, char **argv) {
                                         .callback = on_client,
                                         .user_data = &client_a_state};
   if (ipv6) {
-    server_config.bind_hosts[0] = "::1";
-    client_a_config.bind_hosts[0] = "::1";
-    client_a_config.remote_hosts[0] = "::1";
+    server_config.bind_hosts[0] = ipv6_address;
+    client_a_config.bind_hosts[0] = ipv6_address;
+    client_a_config.remote_hosts[0] = ipv6_address;
   }
   if (native_multicast) {
-    server_config.flexicast_group = ipv6 ? "ff32::8000:1" : "232.42.42.1";
+    server_config.flexicast_group = ipv6 ? ipv6_group : "232.42.42.1";
     server_config.flexicast_group_port = 10002;
-    server_config.flexicast_interface = ipv6 ? "::1" : "127.0.0.1";
+    server_config.flexicast_interface = ipv6 ? ipv6_address : "127.0.0.1";
     client_a_config.flexicast_interface =
-        join_fallback ? "192.0.2.99" : "127.0.0.1";
-    if (ipv6)
-      client_a_config.flexicast_interface = "::1";
+        ipv6 ? ipv6_address : join_fallback ? "192.0.2.99" : "127.0.0.1";
+  }
+  if (mixed_retry) {
+    server_config.limits.max_udp_payload_size = 1452;
+    client_a_config.limits.max_udp_payload_size = 1200;
   }
   transport_config_t client_b_config = client_a_config;
+  if (mixed_retry)
+    client_b_config.enable_flexicast = false;
   client_b_config.user_data = &client_b_state;
   if (ack_fallback) {
     client_b_config.simulated_flexicast_feedback_loss_rate = 100;
@@ -581,6 +785,10 @@ int main(int argc, char **argv) {
     if (server)
       transport_destroy(server);
     return 1;
+  }
+  if (native6_fallback) {
+    ipv6_fallback_host = server->drive_host;
+    server->drive_host.send = fail_ipv6_multicast_send;
   }
   server_state.transport = server;
   client_a_state.transport = client_a;
@@ -625,9 +833,9 @@ int main(int argc, char **argv) {
   }
 
   moq_track_id_t track = {
-      .type = MOQ_TRACK_VIDEO,
+      .type = mixed_retry ? MOQ_TRACK_DATA : MOQ_TRACK_VIDEO,
       .flags = ((ack_fallback || pacing) ? 0 : MOQ_TRACK_FLAG_FEC_ENABLED)};
-  strcpy(track.name, "shared-video");
+  strcpy(track.name, mixed_retry ? "mixed-retry" : "shared-video");
   if (!transport_subscribe(client_a, track) ||
       !transport_subscribe(client_b, track)) {
     fprintf(stderr, "Flexicast subscriptions failed\n");
@@ -635,20 +843,27 @@ int main(int argc, char **argv) {
   }
 
   transport_stats_t source_stats = {0};
+  const size_t expected_members = join_fallback ? 0U : mixed_retry ? 1U : 2U;
   retries = 300;
   while (retries-- > 0) {
     drive(server, client_a, client_b);
     (void)transport_get_stats(server, &source_stats);
     if (server_state.subscriptions == 2 &&
         source_stats.flexicast_active_flows == 1 &&
-        source_stats.flexicast_active_members == (join_fallback ? 0U : 2U))
+        source_stats.flexicast_active_members == expected_members)
       break;
     usleep(5000);
   }
   if (source_stats.flexicast_active_flows != 1 ||
-      source_stats.flexicast_active_members != (join_fallback ? 0U : 2U)) {
+      source_stats.flexicast_active_members != expected_members) {
     fprintf(stderr, "subscribers did not join one shared flow\n");
     goto Fail;
+  }
+
+  if (mixed_retry) {
+    test_mixed_group_retry(server, &client_a_state, &client_b_state, &track);
+    puts("===FLEXICAST MIXED GROUP RETRY OK===");
+    goto Success;
   }
 
   static const uint8_t payload[] = "one ciphertext, two subscribers";
@@ -675,15 +890,23 @@ int main(int argc, char **argv) {
   transport_stats_t client_a_stats = {0}, client_b_stats = {0};
   (void)transport_get_stats(client_a, &client_a_stats);
   (void)transport_get_stats(client_b, &client_b_stats);
+  /* For native IPv6, both peers must receive a Flexicast packet and all
+   * shared submissions must have used the multicast destination. */
   if (!client_a_state.received || !client_b_state.received ||
       client_a_state.payload_size != sizeof(payload) ||
       client_b_state.payload_size != sizeof(payload) ||
       memcmp(client_a_state.payload, payload, sizeof(payload)) != 0 ||
       memcmp(client_b_state.payload, payload, sizeof(payload)) != 0 ||
       (!join_fallback && source_stats.flexicast_packets_sent == 0) ||
-      (native_multicast && !join_fallback &&
-       source_stats.flexicast_native_packets_sent == 0 &&
-       (!ipv6 || source_stats.flexicast_fallbacks == 0)) ||
+      (native_multicast && !join_fallback && !native6_fallback &&
+       source_stats.flexicast_native_packets_sent == 0) ||
+      (native6 && source_stats.flexicast_native_packets_sent !=
+                      source_stats.flexicast_packets_sent) ||
+      (ipv6 && (client_a_stats.flexicast_packets_received == 0 ||
+                client_b_stats.flexicast_packets_received == 0)) ||
+      (native6_fallback && (ipv6_multicast_send_failures == 0 ||
+                            source_stats.flexicast_fallbacks == 0 ||
+                            source_stats.flexicast_native_packets_sent != 0)) ||
       (!join_fallback && source_stats.flexicast_rekeys == 0) ||
       (join_fallback && (client_a_stats.flexicast_fallbacks == 0 ||
                          client_b_stats.flexicast_fallbacks == 0)) ||
@@ -692,9 +915,13 @@ int main(int argc, char **argv) {
       (ack_fallback && source_stats.flexicast_acks_received < 1)) {
     fprintf(stderr,
             "shared delivery failed (a=%d, b=%d, packets=%" PRIu64
+            ", native=%" PRIu64 ", a_rx=%" PRIu64 ", b_rx=%" PRIu64
             ", acks=%" PRIu64 ")\n",
             client_a_state.received, client_b_state.received,
             source_stats.flexicast_packets_sent,
+            source_stats.flexicast_native_packets_sent,
+            client_a_stats.flexicast_packets_received,
+            client_b_stats.flexicast_packets_received,
             source_stats.flexicast_acks_received);
     goto Fail;
   }
@@ -952,13 +1179,15 @@ int main(int argc, char **argv) {
     }
   }
 
-  printf(ipv6               ? "===FLEXICAST IPV6 MULTICAST OK===\n"
+  printf(native6            ? "===FLEXICAST IPV6 MULTICAST OK===\n"
+         : native6_fallback ? "===FLEXICAST IPV6 SEND FALLBACK OK===\n"
          : pacing           ? "===FLEXICAST PACING OK===\n"
          : control_flood    ? "===FLEXICAST CONTROL THROTTLE OK===\n"
          : ack_fallback     ? "===FLEXICAST ACK FALLBACK OK===\n"
          : join_fallback    ? "===FLEXICAST JOIN FALLBACK OK===\n"
          : native_multicast ? "===FLEXICAST MULTICAST OK===\n"
                             : "===FLEXICAST TRANSPORT OK===\n");
+Success:
   transport_destroy(client_b);
   transport_destroy(client_a);
   transport_destroy(server);

@@ -800,6 +800,17 @@ static void set_member_listening(transport_flexicast_flow_t *flow,
     recount_member_feedback(flow);
 }
 
+static void demote_source_member(transport_flexicast_flow_t *flow,
+                                 transport_flexicast_member_t *member,
+                                 int64_t now) {
+  (void)quicly_flexicast_detach(flow->crypto, member->conn->id, now);
+  member->join_epoch_floor =
+      flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
+  member->joined = false;
+  member->key_pending = false;
+  set_member_listening(flow, member, false);
+}
+
 static void record_member_submission(transport_flexicast_flow_t *flow,
                                      transport_flexicast_member_t *member,
                                      int64_t now) {
@@ -1107,13 +1118,7 @@ static void fallback_source_flow(transport_t *t,
       continue;
     (void)send_state(member->conn, flow->flow_id, flow->key_epoch,
                      QUICLY_FLEXICAST_STATE_LEAVE);
-    (void)quicly_flexicast_detach(flow->crypto, member->conn->id,
-                                  transport_now_ms(t));
-    member->join_epoch_floor =
-        flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
-    member->joined = false;
-    member->key_pending = false;
-    set_member_listening(flow, member, false);
+    demote_source_member(flow, member, transport_now_ms(t));
     t->stats.flexicast_fallbacks++;
   }
 }
@@ -1319,15 +1324,10 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
     if (member->reoffer_pending ||
         !admit_member_transition(t, flow, member, transport_now_ms(t)))
       return true;
-    (void)quicly_flexicast_detach(flow->crypto, conn->id, transport_now_ms(t));
-    member->join_epoch_floor =
-        flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
-    member->joined = false;
-    member->key_pending = false;
+    demote_source_member(flow, member, transport_now_ms(t));
     member->offer_pending = false;
     member->reoffer_pending = true;
     member->rejoining = member->join_sequence != 0;
-    set_member_listening(flow, member, false);
     schedule_source_rekey(t, flow, transport_now_ms(t));
     return true;
   }
@@ -1561,13 +1561,8 @@ static bool admit_member_transition(transport_t *t,
 
   t->stats.flexicast_control_frames_throttled++;
   if (member->joined || member->listening) {
-    (void)quicly_flexicast_detach(flow->crypto, member->conn->id, now);
-    member->join_epoch_floor =
-        flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
-    member->joined = false;
-    member->key_pending = false;
+    demote_source_member(flow, member, now);
     member->recovery_baseline_pending = false;
-    set_member_listening(flow, member, false);
     schedule_source_rekey(t, flow, now);
   }
   return false;
@@ -1662,13 +1657,8 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     if (needs_rekey &&
         !admit_member_transition(t, flow, member, transport_now_ms(t)))
       return true;
-    (void)quicly_flexicast_detach(flow->crypto, conn->id, transport_now_ms(t));
-    member->join_epoch_floor =
-        flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
-    member->joined = false;
-    member->key_pending = false;
+    demote_source_member(flow, member, transport_now_ms(t));
     member->recovery_baseline_pending = false;
-    set_member_listening(flow, member, false);
     if (needs_rekey)
       schedule_source_rekey(t, flow, transport_now_ms(t));
   } else {
@@ -1930,12 +1920,7 @@ void transport_flexicast_tick(transport_t *t) {
         continue;
       (void)send_state(member->conn, flow->flow_id, flow->key_epoch,
                        QUICLY_FLEXICAST_STATE_LEAVE);
-      (void)quicly_flexicast_detach(flow->crypto, member->conn->id, now);
-      member->join_epoch_floor =
-          flow->key_epoch == UINT32_MAX ? UINT32_MAX : flow->key_epoch + 1U;
-      member->joined = false;
-      member->key_pending = false;
-      set_member_listening(flow, member, false);
+      demote_source_member(flow, member, now);
       t->stats.flexicast_fallbacks++;
       t->stats.flexicast_feedback_fallbacks++;
       removed = true;
