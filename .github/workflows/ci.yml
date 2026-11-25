@@ -19,7 +19,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev
 
-      - name: Configure loopback aliases
+      - name: Configure test network interfaces
         run: |
           sudo ip addr add 127.0.1.1/32 dev lo
           sudo ip addr add 127.0.2.1/32 dev lo
@@ -29,8 +29,13 @@ jobs:
           sudo ip addr add 127.0.2.2/32 dev lo
           sudo ip addr add 127.0.3.2/32 dev lo
           sudo ip addr add 127.0.4.2/32 dev lo
+          sudo ip link add qlinq-mcast6 type dummy
+          sudo ip link set qlinq-mcast6 up multicast on
+          sudo ip -6 addr add fd42:716c:696e:7100::1/128 dev qlinq-mcast6 nodad
 
       - name: Run tests
+        env:
+          QLINQ_TEST_NATIVE6_ADDRESS: fd42:716c:696e:7100::1
         run: make check
 
       - name: Real TUN and multipath acceptance (isolated network namespaces)
