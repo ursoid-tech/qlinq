@@ -168,8 +168,10 @@ quicly_cid_encryptor_t *transport_tls_new_cid_encryptor(const transport_t *t,
   cached_cid_encryptor_t *cache = malloc(sizeof(*cache));
   if (!cache)
     return delegate;
-  cache->super = (quicly_cid_encryptor_t){
-      cached_encrypt_cid, cached_decrypt_cid, cached_generate_reset_token};
+  cache->super = (quicly_cid_encryptor_t){.encrypt_cid = cached_encrypt_cid,
+                                          .decrypt_cid = cached_decrypt_cid,
+                                          .generate_stateless_reset_token =
+                                              cached_generate_reset_token};
   cache->delegate = delegate;
   cache->cid_size = cipher->block_size;
   cache->count = cache->next = 0;
