@@ -312,6 +312,16 @@ int main(void) {
   config.initial_cwnd_packets = 0;
   config.congestion_control = QLINQ_CC_DEFAULT;
   config.pacing = QLINQ_PACING_DEFAULT;
+  config.group_delivery.enabled = true;
+  config.group_delivery.congestion_control = QLINQ_GROUP_CC_MCBBR;
+  qlinq_endpoint_t *group_endpoint = qlinq_connect(context, &config);
+  assert(group_endpoint && group_endpoint->transport->flexicast_cc_mode ==
+                               TRANSPORT_FLEXICAST_CC_MCBBR);
+  qlinq_endpoint_close(group_endpoint);
+  config.group_delivery.congestion_control = (qlinq_group_cc_t)-1;
+  assert(!qlinq_connect(context, &config));
+  assert(qlinq_context_last_status(context) == QLINQ_STATUS_INVALID);
+  config.group_delivery = (qlinq_group_delivery_config_t){0};
   for (int policy = 0; policy <= QLINQ_TLS_GROUP_REQUIRE_HYBRID; policy++) {
     config.security.tls_group_policy = policy;
     qlinq_endpoint_t *endpoint = qlinq_connect(context, &config);

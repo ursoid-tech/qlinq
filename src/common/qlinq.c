@@ -677,6 +677,9 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
       !qlinq_tls_group_policy_name(config->security.tls_group_policy) ||
       ((unsigned)config->congestion_control > QLINQ_CC_CUBIC &&
        config->congestion_control != QLINQ_CC_BBR) ||
+      (config->group_delivery.congestion_control !=
+           QLINQ_GROUP_CC_CONSERVATIVE &&
+       config->group_delivery.congestion_control != QLINQ_GROUP_CC_MCBBR) ||
       (unsigned)config->pacing > QLINQ_PACING_ENABLED ||
       (config->congestion_control == QLINQ_CC_BBR &&
        config->pacing == QLINQ_PACING_DISABLED) ||
@@ -771,6 +774,10 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.flexicast_group_port = config->group_delivery.port;
   transport_config.flexicast_interface =
       config->group_delivery.interface_address;
+  transport_config.flexicast_cc_mode =
+      config->group_delivery.congestion_control == QLINQ_GROUP_CC_MCBBR
+          ? TRANSPORT_FLEXICAST_CC_MCBBR
+          : TRANSPORT_FLEXICAST_CC_MULTICAST;
   transport_config.flexicast_cc_startup_rate =
       config->group_delivery.startup_rate_bytes_per_second;
   transport_config.flexicast_cc_minimum_rate =

@@ -194,6 +194,11 @@ typedef struct {
   qlinq_tls_group_policy_t tls_group_policy;
 } qlinq_security_config_t;
 
+typedef enum {
+  QLINQ_GROUP_CC_CONSERVATIVE = 0,
+  QLINQ_GROUP_CC_MCBBR = 1
+} qlinq_group_cc_t;
+
 typedef struct {
   bool enabled;
   /* source sets group_address, port, and interface_address; receiver may set
@@ -206,6 +211,8 @@ typedef struct {
   uint64_t maximum_rate_bytes_per_second;
   uint64_t aggregate_rate_bytes_per_second;
   uint32_t feedback_timeout_ms;
+  /* Source-side controller for Flexicast. Zero selects multicast. */
+  qlinq_group_cc_t congestion_control;
 } qlinq_group_delivery_config_t;
 
 typedef struct {

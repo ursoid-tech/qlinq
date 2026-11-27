@@ -43,6 +43,11 @@ typedef enum {
   TRANSPORT_REPAIR_MODE_RATELESS = 2
 } transport_repair_mode_t;
 
+typedef enum {
+  TRANSPORT_FLEXICAST_CC_MULTICAST = 0,
+  TRANSPORT_FLEXICAST_CC_MCBBR = 1
+} transport_flexicast_cc_mode_t;
+
 typedef struct {
   moq_track_type_t type;
   uint8_t flags;
@@ -290,6 +295,7 @@ typedef struct {
   const char *flexicast_group;
   uint16_t flexicast_group_port;
   const char *flexicast_interface;
+  transport_flexicast_cc_mode_t flexicast_cc_mode;
   /* multicast congestion controller rate bounds in bytes/s (0 = default) */
   uint64_t flexicast_cc_startup_rate;
   uint64_t flexicast_cc_minimum_rate;

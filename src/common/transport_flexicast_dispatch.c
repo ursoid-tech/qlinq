@@ -1,6 +1,7 @@
 #include "transport_flexicast.h"
 
 #include "portable_sockets.h"
+#include "transport_group_cc.h"
 #include "transport_internal.h"
 #include "transport_publish.h"
 
@@ -148,25 +149,68 @@ static uint64_t member_delivery_rate(const transport_flexicast_member_t *member,
   return rate;
 }
 
-static size_t active_sender_count(const transport_t *t,
-                                  const transport_flexicast_flow_t *flow,
-                                  int64_t now) {
-  size_t count = 0;
+static bool active_sender(const transport_flexicast_flow_t *flow, int64_t now,
+                          int64_t window) {
+  return flow->data_queue.count != 0 ||
+         (flow->last_payload_sent_ms != 0 &&
+          now - flow->last_payload_sent_ms <= window);
+}
+
+static int compare_rates(const void *lhs, const void *rhs) {
+  uint64_t a = *(const uint64_t *)lhs, b = *(const uint64_t *)rhs;
+  return (a > b) - (a < b);
+}
+
+/* rates and activity can change during a pacing tick; only reuse snapshot
+ * for active senders since an idle sender's hypothetical share is private */
+static size_t update_controller_hints(transport_t *t,
+                                      transport_flexicast_flow_t *flow,
+                                      int64_t now) {
+  bool mcbbr = transport_group_cc_mcbbr_is(flow->cc);
+  uint64_t aggregate = t->flexicast_cc_aggregate_rate_limit;
+  if (!mcbbr && aggregate == 0)
+    return 1;
+  transport_flexicast_registry_t *registry = &t->flexicast;
   int64_t active_window =
       2 * (int64_t)(t->flexicast_cc_feedback_timeout_ms != 0
                         ? t->flexicast_cc_feedback_timeout_ms
                         : 1000U);
-  for (size_t i = 0; i < t->flexicast.capacity; i++) {
-    const transport_flexicast_flow_t *candidate = &t->flexicast.flows[i];
-    if (!candidate->active || !candidate->source || !candidate->crypto ||
-        transport_flexicast_listening_members(candidate) == 0 ||
-        (candidate != flow && candidate->data_queue.count == 0 &&
-         (candidate->last_payload_sent_ms == 0 ||
-          now - candidate->last_payload_sent_ms > active_window)))
-      continue;
-    count++;
+  bool active = active_sender(flow, now, active_window);
+  size_t count = registry->cohort_count;
+  if (!active || count == 0 || registry->cohort_at_ms != now) {
+    uint64_t rates[TRANSPORT_FLEXICAST_MAX_FLOWS];
+    count = 0;
+    for (size_t i = 0; i < registry->capacity; i++) {
+      const transport_flexicast_flow_t *candidate = &registry->flows[i];
+      if (!candidate->active || !candidate->source || !candidate->cc ||
+          candidate->listening_count == 0 ||
+          (candidate != flow && !active_sender(candidate, now, active_window)))
+        continue;
+      if (mcbbr)
+        rates[count] = candidate->cc->output.rate_bytes_per_second;
+      ++count;
+    }
+    if (count == 0)
+      return 1;
+    if (mcbbr) {
+      qsort(rates, count, sizeof(*rates), compare_rates);
+      registry->cohort_median_rate = rates[count / 2];
+    }
+    registry->cohort_count = active ? count : 0;
+    registry->cohort_at_ms = now;
   }
-  return count != 0 ? count : 1;
+  if (!mcbbr)
+    return count;
+  transport_group_cc_hints_t hints = {
+      .active_senders = (uint32_t)count,
+      .aggregate_rate_limit_bytes_per_second =
+          aggregate / count + (aggregate % count != 0),
+      .median_sender_rate_bytes_per_second = registry->cohort_median_rate};
+  uint64_t previous = flow->cc->output.rate_bytes_per_second;
+  transport_group_cc_mcbbr_set_hints(flow->cc, &hints, now);
+  if (flow->cc->output.rate_bytes_per_second != previous)
+    registry->cohort_count = 0;
+  return count;
 }
 
 /* credit elapsed interval at previous rate using wide intermediate math */
@@ -192,8 +236,8 @@ static void refill_tokens(uint64_t *tokens, uint64_t *remainder,
 }
 
 static uint64_t pacing_burst(const transport_t *t, uint64_t rate,
-                             uint64_t suggested) {
-  uint64_t minimum = t->limits.max_udp_payload_size * 4U;
+                             uint64_t suggested, bool mcbbr) {
+  uint64_t minimum = t->limits.max_udp_payload_size * (mcbbr ? 2U : 4U);
   uint64_t burst = suggested < minimum ? minimum : suggested;
   uint64_t traditional_maximum = t->limits.max_udp_payload_size * 10U;
   if (burst > traditional_maximum)
@@ -216,7 +260,7 @@ static void refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
   refill_tokens(&registry->pacing_tokens, &registry->pacing_remainder,
                 &registry->pacing_last_refill_ms, registry->pacing_rate, 1,
                 registry->pacing_burst, now);
-  size_t active = active_sender_count(t, flow, now);
+  size_t active = update_controller_hints(t, flow, now);
   uint64_t aggregate = t->flexicast_cc_aggregate_rate_limit;
   quicly_flexicast_cc_output_t cc_output;
   quicly_flexicast_cc_get_flow_output(flow->crypto, &cc_output);
@@ -245,7 +289,10 @@ static void refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
     divisor = (uint32_t)active;
     rate = numerator / divisor + (numerator % divisor != 0);
   }
-  uint64_t burst = pacing_burst(t, rate, cc_output.burst_bytes);
+  uint64_t mcbbr_burst = transport_group_cc_mcbbr_burst_bytes(flow->cc);
+  uint64_t burst = pacing_burst(
+      t, rate, mcbbr_burst != 0 ? mcbbr_burst : cc_output.burst_bytes,
+      mcbbr_burst != 0);
   if (flow->pacing_last_refill_ms == 0) {
     flow->pacing_tokens = burst;
     flow->pacing_last_refill_ms = now;
@@ -259,7 +306,7 @@ static void refresh_pacer_at(transport_t *t, transport_flexicast_flow_t *flow,
   if (flow->pacing_tokens > burst)
     flow->pacing_tokens = burst;
   if (aggregate != 0) {
-    uint64_t aggregate_burst = pacing_burst(t, aggregate, 0);
+    uint64_t aggregate_burst = pacing_burst(t, aggregate, 0, false);
     if (registry->pacing_last_refill_ms == 0) {
       registry->pacing_tokens = aggregate_burst;
       registry->pacing_last_refill_ms = now;
@@ -280,6 +327,15 @@ static uint64_t pacing_available(const transport_t *t,
   return available;
 }
 
+/* fractional credit is expressed in units of 1 / (1000 * divisor) byte */
+static uint64_t token_wait_ms(uint64_t deficit, uint64_t remainder,
+                              uint32_t divisor, uint64_t rate) {
+  if (!deficit)
+    return 0;
+  uint64_t needed = deficit * 1000U * divisor - remainder;
+  return needed / rate + (needed % rate != 0);
+}
+
 static int64_t pacing_ready_at(const transport_t *t,
                                const transport_flexicast_flow_t *flow,
                                size_t cost, int64_t now) {
@@ -290,24 +346,22 @@ static int64_t pacing_ready_at(const transport_t *t,
   refill_tokens(&tokens, &remainder, &refill, flow->pacing_rate_numerator,
                 flow->pacing_rate_divisor, flow->pacing_burst_bytes, now);
   uint64_t shared = t->flexicast.pacing_tokens;
-  remainder = t->flexicast.pacing_remainder;
+  uint64_t shared_remainder = t->flexicast.pacing_remainder;
   refill = t->flexicast.pacing_last_refill_ms;
-  refill_tokens(&shared, &remainder, &refill, t->flexicast.pacing_rate, 1,
-                t->flexicast.pacing_burst, now);
+  refill_tokens(&shared, &shared_remainder, &refill, t->flexicast.pacing_rate,
+                1, t->flexicast.pacing_burst, now);
   uint64_t delay = 0;
   if (cost > tokens ||
       (t->flexicast_cc_aggregate_rate_limit != 0 && cost > shared)) {
     if (flow->pacing_rate_numerator == 0)
       return INT64_MAX;
     uint64_t deficit = cost > tokens ? cost - tokens : 0;
-    uint64_t needed = deficit * 1000U * flow->pacing_rate_divisor;
-    delay = needed / flow->pacing_rate_numerator +
-            (needed % flow->pacing_rate_numerator != 0);
+    delay = token_wait_ms(deficit, remainder, flow->pacing_rate_divisor,
+                          flow->pacing_rate_numerator);
     if (t->flexicast_cc_aggregate_rate_limit != 0 && cost > shared) {
-      needed = (cost - shared) * 1000U;
       uint64_t shared_delay =
-          needed / t->flexicast_cc_aggregate_rate_limit +
-          (needed % t->flexicast_cc_aggregate_rate_limit != 0);
+          token_wait_ms(cost - shared, shared_remainder, 1,
+                        t->flexicast_cc_aggregate_rate_limit);
       if (delay < shared_delay)
         delay = shared_delay;
     }
@@ -318,6 +372,14 @@ static int64_t pacing_ready_at(const transport_t *t,
       delay > (uint64_t)(INT64_MAX - now) ? INT64_MAX : now + (int64_t)delay;
   return ready < flow->dispatch_retry_at_ms ? flow->dispatch_retry_at_ms
                                             : ready;
+}
+
+/* empty queue is app-limited only after leaving send credit unused;
+ * remember when another full-size datagram could have been sent */
+static void record_mcbbr_idle(const transport_t *t,
+                              transport_flexicast_flow_t *flow, int64_t now) {
+  flow->cc_idle_ready_at_ms =
+      pacing_ready_at(t, flow, t->limits.max_udp_payload_size, now);
 }
 
 static size_t pacing_cost(const transport_flexicast_flow_t *flow,
@@ -390,31 +452,159 @@ account_protected_packet(transport_t *t, transport_flexicast_flow_t *flow,
                          transport_flexicast_member_t *recipient,
                          uint32_t physical_fanout, bool app_limited) {
   int64_t now = transport_now_ms(t);
+  bool mcbbr = transport_group_cc_mcbbr_is(flow->cc);
+  uint32_t flags = QUICLY_FLEXICAST_SAMPLE_VALID;
+  if (mcbbr) {
+    flags |= queued->cc_sample_flags;
+    if ((flags & QUICLY_FLEXICAST_SAMPLE_MIXED) != 0)
+      flags &= ~QUICLY_FLEXICAST_SAMPLE_VALID;
+  } else if (app_limited) {
+    flags |= QUICLY_FLEXICAST_SAMPLE_APP_LIMITED;
+  }
   quicly_flexicast_send_context_t ctx = {
       .pacing_rate_bytes_per_second = flow->pacing_rate_bytes_per_second,
       .physical_fanout = physical_fanout != 0 ? physical_fanout : 1U,
-      .flags = QUICLY_FLEXICAST_SAMPLE_VALID |
-               (app_limited ? QUICLY_FLEXICAST_SAMPLE_APP_LIMITED : 0U)};
+      .flags = flags};
   (void)quicly_flexicast_mark_submitted(flow->crypto,
                                         recipient ? recipient->conn->id : 0,
                                         queued->packet_number, now, &ctx);
   tf_record_delivery_submission(t, flow, recipient, !queued->counted);
-  if (!queued->counted) {
-    t->stats.flexicast_packets_sent++;
-    t->stats.flexicast_paced_packets++;
+  if (mcbbr || !queued->counted) {
     flow->pacing_tokens = queued->packet_size <= flow->pacing_tokens
                               ? flow->pacing_tokens - queued->packet_size
                               : 0;
-    if (t->flexicast_cc_aggregate_rate_limit != 0)
-      t->flexicast.pacing_tokens =
-          queued->packet_size <= t->flexicast.pacing_tokens
-              ? t->flexicast.pacing_tokens - queued->packet_size
+    if (t->flexicast_cc_aggregate_rate_limit != 0) {
+      transport_flexicast_registry_t *registry = &t->flexicast;
+      registry->pacing_tokens =
+          queued->packet_size <= registry->pacing_tokens
+              ? registry->pacing_tokens - queued->packet_size
               : 0;
+      size_t size = t->limits.max_udp_payload_size;
+      if (mcbbr && registry->pacing_tokens < size) {
+        /* other flows can use spare credit during an idle interval; only
+         * postpone readiness when less than a full datagram remains */
+        uint64_t wait = token_wait_ms(size - registry->pacing_tokens,
+                                      registry->pacing_remainder, 1,
+                                      t->flexicast_cc_aggregate_rate_limit);
+        int64_t base = registry->pacing_last_refill_ms;
+        registry->shared_credit_ready_at_ms =
+            wait > (uint64_t)(INT64_MAX - base) ? INT64_MAX
+                                                : base + (int64_t)wait;
+      }
+    }
+  }
+  if (!queued->counted) {
+    t->stats.flexicast_packets_sent++;
+    t->stats.flexicast_paced_packets++;
     queued->counted = true;
   }
   if (!recipient)
     t->stats.flexicast_native_packets_sent++;
   flow->last_payload_sent_ms = now;
+}
+
+/* queue head keeps the same slot across retries and key rotations;
+ * bits follow subscribers when entries are moved by member_remove */
+static void snapshot_recipients(transport_t *t,
+                                transport_flexicast_flow_t *flow,
+                                transport_flexicast_queued_payload_t *queued) {
+  size_t slot = (flow->data_queue.head + flow->data_queue.count) %
+                flow->data_queue.capacity;
+  uint64_t bit = UINT64_C(1) << (slot % 64);
+  queued->recipient_epoch = flow->cc_membership_epoch;
+  for (size_t i = 0; i < flow->member_count; ++i) {
+    transport_flexicast_member_t *member = &flow->members[i];
+    uint64_t *pending = &member->pending_payloads[slot / 64];
+    if (member->listening && transport_publish_recipient_eligible(
+                                 t, member->conn, &flow->track_id)) {
+      *pending |= bit;
+      queued->recipient_count++;
+    } else {
+      *pending &= ~bit;
+      if (member->joined)
+        queued->replicated = true;
+    }
+  }
+}
+
+static void exclude_recipient(transport_flexicast_flow_t *flow,
+                              transport_flexicast_queued_payload_t *queued,
+                              transport_flexicast_member_t *member) {
+  size_t slot = flow->data_queue.head;
+  member->pending_payloads[slot / 64] &= ~(UINT64_C(1) << (slot % 64));
+  queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_MIXED;
+  queued->replicated = true;
+  if (queued->packet_ready) {
+    int complete;
+    (void)quicly_flexicast_abandon_datagram(flow->crypto, member->conn->id,
+                                            queued->packet_number, &complete);
+  }
+}
+
+static flexicast_dispatch_result_t
+recheck_queued_recipients(transport_t *t, transport_flexicast_flow_t *flow,
+                          transport_flexicast_queued_payload_t *queued,
+                          size_t word, uint64_t bit) {
+  bool has_recipient = false;
+  queued->waiting_for_members = false;
+  for (size_t i = 0; i < flow->member_count; ++i) {
+    transport_flexicast_member_t *member = &flow->members[i];
+    if (!(member->pending_payloads[word] & bit)) {
+      /* joiner may already hold key before LISTEN arrives */
+      if (member->joined)
+        queued->replicated = true;
+      continue;
+    }
+    if (!transport_publish_recipient_eligible(t, member->conn,
+                                              &flow->track_id)) {
+      exclude_recipient(flow, queued, member);
+      continue;
+    }
+    /* quicly captures ACK obligations when it encrypts */
+    queued->waiting_for_members |= !member->listening;
+    has_recipient = true;
+  }
+  if (!has_recipient)
+    return FLEXICAST_DISPATCH_OK;
+  return queued->waiting_for_members ? FLEXICAST_DISPATCH_BLOCKED
+                                     : FLEXICAST_DISPATCH_FAILED;
+}
+
+static flexicast_dispatch_result_t
+prepare_protected_packet(transport_t *t, transport_flexicast_flow_t *flow,
+                         transport_flexicast_queued_payload_t *queued,
+                         size_t word, uint64_t bit, int64_t now) {
+  size_t size = pacing_cost(flow, queued->size);
+  if (size == 0 || size > t->limits.max_udp_payload_size ||
+      size > queued->packet_capacity)
+    return FLEXICAST_DISPATCH_FAILED;
+  if (size > pacing_available(t, flow))
+    return FLEXICAST_DISPATCH_BLOCKED;
+  int result = quicly_flexicast_send_datagram(
+      flow->crypto, ptls_iovec_init(queued->data, queued->size), queued->packet,
+      size, &queued->packet_size, &queued->packet_number, now);
+  if (result != QUICLY_FLEXICAST_OK) {
+    if (result == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED)
+      return tf_rotate_source_flow(t, flow) ? FLEXICAST_DISPATCH_BLOCKED
+                                            : FLEXICAST_DISPATCH_FAILED;
+    if (result == QUICLY_FLEXICAST_ERROR_SEND_WINDOW ||
+        result == QUICLY_FLEXICAST_ERROR_NO_MEMBERS) {
+      flow->dispatch_retry_at_ms = now + 10;
+      return FLEXICAST_DISPATCH_BLOCKED;
+    }
+    return FLEXICAST_DISPATCH_FAILED;
+  }
+  queued->packet_ready = true;
+  queued->packet_epoch = flow->key_epoch;
+  for (size_t i = 0; i < flow->member_count; i++) {
+    transport_flexicast_member_t *member = &flow->members[i];
+    if (!(member->pending_payloads[word] & bit)) {
+      int complete;
+      (void)quicly_flexicast_abandon_datagram(flow->crypto, member->conn->id,
+                                              queued->packet_number, &complete);
+    }
+  }
+  return FLEXICAST_DISPATCH_OK;
 }
 
 static flexicast_dispatch_result_t
@@ -423,62 +613,43 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
                  bool app_limited) {
   if (flow->listening_count == 0)
     return FLEXICAST_DISPATCH_BLOCKED;
+  bool mcbbr = transport_group_cc_mcbbr_is(flow->cc);
   int64_t now = transport_now_ms(t);
   if (now < flow->dispatch_retry_at_ms)
     return FLEXICAST_DISPATCH_BLOCKED;
+  if (queued->recipient_count == 0)
+    return FLEXICAST_DISPATCH_OK;
   if (queued->packet_ready && queued->packet_epoch != flow->key_epoch) {
     queued->packet_ready = false;
     queued->packet_size = 0;
     queued->next_member = 0;
     queued->counted = false;
-    /* keep interrupted replicated packet replicated across key rotation */
-    queued->replicated = true;
+    queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_MIXED;
+  }
+  size_t word = flow->data_queue.head / 64;
+  uint64_t bit = UINT64_C(1) << (flow->data_queue.head % 64);
+  bool membership_changed =
+      queued->recipient_epoch != flow->cc_membership_epoch;
+  if (membership_changed) {
+    queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_MIXED;
+    if (queued->packet_ready)
+      queued->replicated = true;
+    queued->recipient_epoch = flow->cc_membership_epoch;
+  }
+  /* direct sends just took a snapshot; on queued retry QUIC may have closed
+   * without LISTEN/LEAVE, so recheck recipients before first send */
+  bool resuming_replicas = queued->counted && !membership_changed;
+  if (flow->data_queue.count != 0 && !resuming_replicas) {
+    flexicast_dispatch_result_t check =
+        recheck_queued_recipients(t, flow, queued, word, bit);
+    if (check != FLEXICAST_DISPATCH_FAILED)
+      return check;
   }
   if (!queued->packet_ready) {
-    size_t size = pacing_cost(flow, queued->size);
-    if (size == 0 || size > t->limits.max_udp_payload_size ||
-        size > queued->packet_capacity)
-      return FLEXICAST_DISPATCH_FAILED;
-    if (size > pacing_available(t, flow))
-      return FLEXICAST_DISPATCH_BLOCKED;
-    int result = quicly_flexicast_send_datagram(
-        flow->crypto, ptls_iovec_init(queued->data, queued->size),
-        queued->packet, size, &queued->packet_size, &queued->packet_number,
-        now);
-    if (result != QUICLY_FLEXICAST_OK) {
-      if (result == QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED) {
-        if (!tf_rotate_source_flow(t, flow))
-          return FLEXICAST_DISPATCH_FAILED;
-        return FLEXICAST_DISPATCH_BLOCKED;
-      }
-      if (result == QUICLY_FLEXICAST_ERROR_SEND_WINDOW ||
-          result == QUICLY_FLEXICAST_ERROR_NO_MEMBERS) {
-        flow->dispatch_retry_at_ms = now + 10;
-        return FLEXICAST_DISPATCH_BLOCKED;
-      }
-      return FLEXICAST_DISPATCH_FAILED;
-    }
-    queued->packet_ready = true;
-    queued->packet_epoch = flow->key_epoch;
-    if (queued->delivery_id == 0) {
-      if (++flow->next_payload_delivery_id == 0) {
-        flow->next_payload_delivery_id = 1;
-        for (size_t i = 0; i < flow->member_count; i++)
-          flow->members[i].payload_delivery_id = 0;
-      }
-      queued->delivery_id = flow->next_payload_delivery_id;
-    }
-    for (size_t i = 0; i < flow->member_count; i++) {
-      transport_flexicast_member_t *member = &flow->members[i];
-      if (!member->listening ||
-          member->payload_delivery_id == queued->delivery_id ||
-          !transport_publish_recipient_eligible(t, member->conn,
-                                                &flow->track_id)) {
-        int complete;
-        (void)quicly_flexicast_abandon_datagram(
-            flow->crypto, member->conn->id, queued->packet_number, &complete);
-      }
-    }
+    flexicast_dispatch_result_t prep =
+        prepare_protected_packet(t, flow, queued, word, bit, now);
+    if (prep != FLEXICAST_DISPATCH_OK)
+      return prep;
   }
 
   /* snapshot local addresses for live socket lookup */
@@ -499,30 +670,28 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
       return FLEXICAST_DISPATCH_OK;
     }
     if (result == 0) {
+      if (mcbbr)
+        queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
       flow->dispatch_retry_at_ms = now + 10;
       return FLEXICAST_DISPATCH_BLOCKED;
     }
     t->stats.flexicast_fallbacks++;
   }
   queued->replicated = true;
-  uint32_t fanout = 0;
-  for (size_t i = 0; i < flow->member_count; i++) {
-    transport_flexicast_member_t *m = &flow->members[i];
-    if (m->listening &&
-        transport_publish_recipient_eligible(t, m->conn, &flow->track_id))
-      fanout++;
-  }
-  if (fanout == 0)
-    fanout = 1U;
   while (queued->next_member < flow->member_count) {
     transport_flexicast_member_t *member = &flow->members[queued->next_member];
-    if (!member->listening ||
-        member->payload_delivery_id == queued->delivery_id ||
-        !transport_publish_recipient_eligible(t, member->conn,
-                                              &flow->track_id)) {
+    if (!(member->pending_payloads[word] & bit)) {
       queued->next_member++;
       continue;
     }
+    if (resuming_replicas && !transport_publish_recipient_eligible(
+                                 t, member->conn, &flow->track_id)) {
+      exclude_recipient(flow, queued, member);
+      queued->next_member++;
+      continue;
+    }
+    if (mcbbr && queued->packet_size > pacing_available(t, flow))
+      return FLEXICAST_DISPATCH_BLOCKED;
     struct sockaddr_storage destination, peer_source;
     size_t fd_index = transport_path_select_peer_egress(
         member->conn->quic, local_addrs, t->socket_count, &destination,
@@ -532,29 +701,31 @@ dispatch_payload(transport_t *t, transport_flexicast_flow_t *flow,
         (const struct sockaddr *)&peer_source, false,
         flow_ecn_mark(t, member->conn), queued);
     if (result == 0) {
+      if (mcbbr)
+        queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_HOST_LIMITED;
       flow->dispatch_retry_at_ms = now + 10;
       return FLEXICAST_DISPATCH_BLOCKED;
     }
     if (result > 0) {
-      account_protected_packet(t, flow, queued, member, fanout, app_limited);
+      account_protected_packet(t, flow, queued, member, queued->recipient_count,
+                               app_limited);
     } else {
+      if (mcbbr)
+        queued->cc_sample_flags |= QUICLY_FLEXICAST_SAMPLE_MIXED;
       int complete;
       (void)quicly_flexicast_abandon_datagram(flow->crypto, member->conn->id,
                                               queued->packet_number, &complete);
       t->stats.flexicast_fallbacks++;
       t->stats.flexicast_pacing_dropped++;
     }
-    member->payload_delivery_id = queued->delivery_id;
+    member->pending_payloads[word] &= ~bit;
     queued->next_member++;
   }
   /* rescan once in case member removal swapped a survivor into an earlier slot
    */
   for (size_t i = 0; i < flow->member_count; i++) {
     transport_flexicast_member_t *member = &flow->members[i];
-    if (member->listening &&
-        member->payload_delivery_id != queued->delivery_id &&
-        transport_publish_recipient_eligible(t, member->conn,
-                                             &flow->track_id)) {
+    if (member->pending_payloads[word] & bit) {
       queued->next_member = i;
       return FLEXICAST_DISPATCH_BLOCKED;
     }
@@ -575,17 +746,6 @@ bool transport_flexicast_can_queue(const transport_t *t,
   return true;
 }
 
-static bool queue_payload(transport_t *t, transport_flexicast_flow_t *flow,
-                          ptls_iovec_t payload, size_t packet_capacity,
-                          const transport_flexicast_queued_payload_t *partial) {
-  if (payload.len > SIZE_MAX - packet_capacity ||
-      !transport_flexicast_can_queue(t, flow, 1, payload.len)) {
-    t->stats.flexicast_pacing_backpressure++;
-    return false;
-  }
-  return queue_push_slot(flow, payload, packet_capacity, partial);
-}
-
 bool tf_enqueue_payload(transport_t *t, transport_flexicast_flow_t *flow,
                         ptls_iovec_t payload) {
   if (!t || !flow || !flow->source || !flow->crypto || !payload.base ||
@@ -594,21 +754,36 @@ bool tf_enqueue_payload(transport_t *t, transport_flexicast_flow_t *flow,
   size_t cost = pacing_cost(flow, payload.len);
   if (cost == 0 || cost > t->limits.max_udp_payload_size)
     return false;
+  bool mcbbr = transport_group_cc_mcbbr_is(flow->cc);
+  int64_t now = transport_now_ms(t);
+  transport_flexicast_queued_payload_t direct = {0};
+  if (flow->data_queue.capacity == 0 || payload.len > SIZE_MAX - cost ||
+      !transport_flexicast_can_queue(t, flow, 1, payload.len)) {
+    t->stats.flexicast_pacing_backpressure++;
+    return false;
+  }
+  snapshot_recipients(t, flow, &direct);
+  if (mcbbr && flow->data_queue.count == 0) {
+    if (flow->cc_idle_ready_at_ms > 0 && flow->cc_idle_ready_at_ms < now &&
+        t->flexicast.shared_credit_ready_at_ms < now)
+      direct.cc_sample_flags = QUICLY_FLEXICAST_SAMPLE_APP_LIMITED;
+    flow->cc_idle_ready_at_ms = 0;
+  }
   if (flow->data_queue.count == 0 && cost <= sizeof(t->send_buffer) &&
-      payload.len <= SIZE_MAX - cost &&
-      transport_flexicast_can_queue(t, flow, 1, payload.len) &&
       tf_reserve_queue_slots(flow, 1, payload.len + cost)) {
-    refresh_pacer_at(t, flow, transport_now_ms(t));
+    refresh_pacer_at(t, flow, now);
     if (cost <= pacing_available(t, flow)) {
-      transport_flexicast_queued_payload_t direct = {
-          .data = (uint8_t *)payload.base,
-          .size = payload.len,
-          .packet = t->send_buffer,
-          .packet_capacity = sizeof(t->send_buffer)};
+      direct.data = payload.base;
+      direct.size = payload.len;
+      direct.packet = t->send_buffer;
+      direct.packet_capacity = sizeof(t->send_buffer);
       flexicast_dispatch_result_t result =
           dispatch_payload(t, flow, &direct, true);
-      if (result == FLEXICAST_DISPATCH_OK)
+      if (result == FLEXICAST_DISPATCH_OK) {
+        if (mcbbr)
+          record_mcbbr_idle(t, flow, transport_now_ms(t));
         return true;
+      }
       if (result == FLEXICAST_DISPATCH_FAILED) {
         t->stats.flexicast_pacing_dropped++;
         return false;
@@ -616,7 +791,9 @@ bool tf_enqueue_payload(transport_t *t, transport_flexicast_flow_t *flow,
       return queue_push_slot(flow, payload, cost, &direct);
     }
   }
-  return queue_payload(t, flow, payload, cost, NULL);
+  if (flow->data_queue.count == 0)
+    t->flexicast.cohort_count = 0;
+  return queue_push_slot(flow, payload, cost, &direct);
 }
 
 void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {
@@ -649,6 +826,8 @@ void tf_drain_paced_payloads(transport_t *t, transport_flexicast_flow_t *flow) {
     if (result != FLEXICAST_DISPATCH_OK)
       break;
   }
+  if (flow->data_queue.count == 0 && transport_group_cc_mcbbr_is(flow->cc))
+    record_mcbbr_idle(t, flow, transport_now_ms(t));
 }
 
 bool transport_flexicast_track_ready(transport_t *t,
@@ -714,18 +893,15 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
           member->ready_deadline_ms < first_timeout)
         first_timeout = member->ready_deadline_ms;
     }
-    if (flow->feedback_outstanding_count != 0) {
-      quicly_flexicast_cc_output_t output;
-      quicly_flexicast_cc_get_flow_output(flow->crypto, &output);
-      if (output.next_timeout < first_timeout)
-        first_timeout = output.next_timeout;
-    }
+    int64_t cc_deadline = tf_cc_deadline(flow);
+    if (cc_deadline < first_timeout)
+      first_timeout = cc_deadline;
     if (flow->data_queue.count == 0 ||
         transport_flexicast_listening_members(flow) == 0)
       continue;
     transport_flexicast_queued_payload_t *payload =
         queue_front(&flow->data_queue);
-    if (!payload)
+    if (!payload || payload->waiting_for_members)
       continue;
     int64_t timeout =
         pacing_ready_at(t, flow, pacing_cost(flow, payload->size), now);

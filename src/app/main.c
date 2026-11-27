@@ -71,6 +71,11 @@ typedef struct {
   size_t stripes;
   bool multihome;
   unsigned congestion_control;
+  bool enable_flexicast;
+  const char *flexicast_group;
+  uint16_t flexicast_port;
+  const char *flexicast_interface;
+  transport_flexicast_cc_mode_t flexicast_cc_mode;
   uint32_t initial_cwnd_packets;
   size_t max_udp_payload_size;
   uint32_t jumpstart_packets;
@@ -160,6 +165,10 @@ static void show_help(FILE *out, const char *program) {
       "  --multihome                 auto-bind all active non-loopback "
       "interfaces\n"
       "  --cc cubic|cuback|bbr   congestion controller (default: cubic)\n"
+      "  --flexicast                 enable Flexicast group delivery\n"
+      "  --flexicast-group GROUP --flexicast-port PORT\n"
+      "  --flexicast-interface ADDRESS\n"
+      "  --flexicast-cc multicast|mcbbr (default: multicast)\n"
       "  --initial-cwnd N            initial window packets (default: 4096)\n"
       "  --udp-payload N             maximum UDP payload, 1200..1500 bytes "
       "(default: 1280; must fit the path MTU)\n"
@@ -728,6 +737,10 @@ static bool parse_options(int argc, char **argv, options_t *options) {
       options->allow_insecure = true;
       continue;
     }
+    if (strcmp(arg, "--flexicast") == 0) {
+      options->enable_flexicast = true;
+      continue;
+    }
     if (strcmp(arg, "--transfer") == 0) {
       options->transfer = true;
       continue;
@@ -794,6 +807,25 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         options->congestion_control = TRANSPORT_CC_BBR;
       else
         goto invalid;
+    } else if (strcmp(arg, "--flexicast-group") == 0) {
+      options->flexicast_group = value;
+      options->enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-port") == 0) {
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || parsed == 0)
+        goto invalid;
+      options->flexicast_port = (uint16_t)parsed;
+      options->enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-interface") == 0) {
+      options->flexicast_interface = value;
+      options->enable_flexicast = true;
+    } else if (strcmp(arg, "--flexicast-cc") == 0) {
+      if (strcmp(value, "multicast") == 0)
+        options->flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_MULTICAST;
+      else if (strcmp(value, "mcbbr") == 0)
+        options->flexicast_cc_mode = TRANSPORT_FLEXICAST_CC_MCBBR;
+      else
+        goto invalid;
+      options->enable_flexicast = true;
     } else if (strcmp(arg, "--initial-cwnd") == 0) {
       if (!cli_parse_u64(value, 65535, &parsed) || parsed == 0)
         goto invalid;
@@ -1327,6 +1359,11 @@ static int run_app(const options_t *options) {
   config.reconnect_enabled = options->peer_arg != NULL;
   config.repair_mode = options->repair_mode;
   config.congestion_control = options->congestion_control;
+  config.enable_flexicast = options->enable_flexicast;
+  config.flexicast_group = options->flexicast_group;
+  config.flexicast_group_port = options->flexicast_port;
+  config.flexicast_interface = options->flexicast_interface;
+  config.flexicast_cc_mode = options->flexicast_cc_mode;
   config.limits.max_stream_egress_bytes = 128 * 1024 * 1024;
   config.limits.max_total_stream_egress_bytes = 256 * 1024 * 1024;
   config.limits.max_egress_packets_per_socket = 8192;

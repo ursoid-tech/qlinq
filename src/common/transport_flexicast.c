@@ -1,6 +1,7 @@
 #include "transport_flexicast.h"
 
 #include "portable_sockets.h"
+#include "transport_group_cc.h"
 #include "transport_internal.h"
 #include "transport_publish.h"
 #include "transport_stream.h"
@@ -201,13 +202,20 @@ static void retire_flow_id(transport_t *t, uint64_t flow_id, uint32_t epoch) {
 
 static quicly_flexicast_flow_id_t flexicast_wire_id(uint64_t flow_id);
 
+static void free_flow_cc(quicly_flexicast_cc_t *cc) {
+  if (transport_group_cc_mcbbr_is(cc))
+    transport_group_cc_mcbbr_free(cc);
+  else
+    quicly_flexicast_cc_free_multicast(cc);
+}
+
 static void dispose_flow(transport_flexicast_flow_t *flow) {
   if (!flow)
     return;
   (void)tf_clear_flow_queue(flow);
   tf_queue_dispose(&flow->data_queue);
   quicly_flexicast_flow_free(flow->crypto);
-  quicly_flexicast_cc_free_multicast(flow->cc);
+  free_flow_cc(flow->cc);
   free(flow->members);
   free(flow->member_map);
   ptls_clear_memory(flow->secret, sizeof(flow->secret));
@@ -223,7 +231,9 @@ static bool create_crypto_with_secret(transport_t *t,
   quicly_flexicast_flow_id_t wire_id = flexicast_wire_id(flow->flow_id);
   quicly_flexicast_cc_t *cc = NULL;
   if (flow->source) {
-    cc = quicly_flexicast_cc_new_multicast(&flow->cc_config, now);
+    cc = t->flexicast_cc_mode == TRANSPORT_FLEXICAST_CC_MCBBR
+             ? transport_group_cc_mcbbr_new(&flow->cc_config, now)
+             : quicly_flexicast_cc_new_multicast(&flow->cc_config, now);
     if (!cc)
       return false;
   } else if (flow->control_conn && flow->control_conn->quic &&
@@ -250,7 +260,7 @@ static bool create_crypto_with_secret(transport_t *t,
       .packet_reordering_threshold = 3,
       .now = now};
   if (quicly_flexicast_flow_create(crypto, &config) != QUICLY_FLEXICAST_OK) {
-    quicly_flexicast_cc_free_multicast(cc);
+    free_flow_cc(cc);
     return false;
   }
   if (flow->source)
@@ -496,8 +506,10 @@ static void release_membership(transport_t *t,
 
 static void release_flow(transport_t *t, transport_flexicast_flow_t *flow) {
   unindex_flow(t, flow);
-  if (t && flow && flow->active && t->flexicast.active_count > 0)
+  if (t && flow && flow->active && t->flexicast.active_count > 0) {
     t->flexicast.active_count--;
+    t->flexicast.cohort_count = 0;
+  }
   release_membership(t, flow);
   dispose_flow(flow);
 }
@@ -774,8 +786,18 @@ static void recount_member_feedback(transport_flexicast_flow_t *flow) {
 static void set_member_listening(transport_flexicast_flow_t *flow,
                                  transport_flexicast_member_t *member,
                                  bool listening) {
+  /* key rotation temporarily clears listening while member stays joined;
+   * LEAVE, demotion, and unsubscribe cancel queued copies */
+  if (!listening && !member->joined)
+    memset(member->pending_payloads, 0, sizeof(member->pending_payloads));
+  /* last owed LISTEN or departure can expose a pacing deadline even
+   * without enough credit to dispatch on this tick */
+  if ((member->listening != listening || !member->joined) &&
+      flow->data_queue.count != 0)
+    flow->data_queue.entries[flow->data_queue.head].waiting_for_members = false;
   if (member->listening == listening)
     return;
+  bool had_outstanding = flow->feedback_outstanding_count != 0;
   bool inconsistent = false;
   if (listening) {
     flow->listening_count++;
@@ -796,8 +818,13 @@ static void set_member_listening(transport_flexicast_flow_t *flow,
     member->first_unacknowledged_ms = 0;
   }
   member->listening = listening;
+  member->conn->transport->flexicast.cohort_count = 0;
+  flow->cc_membership_epoch++;
+  flow->cc_idle_ready_at_ms = 0;
   if (inconsistent)
     recount_member_feedback(flow);
+  if (had_outstanding && flow->feedback_outstanding_count == 0)
+    transport_group_cc_mcbbr_on_delivery_clear(flow->cc);
 }
 
 static void demote_source_member(transport_flexicast_flow_t *flow,
@@ -827,6 +854,7 @@ void tf_record_delivery_submission(transport_t *t,
                                    transport_flexicast_flow_t *flow,
                                    transport_flexicast_member_t *recipient,
                                    bool first_submission) {
+  bool had_outstanding = flow->feedback_outstanding_count != 0;
   if (first_submission) {
     uint64_t previous = flow->delivery_epoch;
     flow->delivery_epoch = previous == UINT64_MAX ? 1 : previous + 1U;
@@ -848,6 +876,8 @@ void tf_record_delivery_submission(transport_t *t,
     for (size_t i = 0; i < flow->member_count; ++i)
       record_member_submission(flow, &flow->members[i], now);
   }
+  if (!had_outstanding && flow->feedback_outstanding_count != 0)
+    transport_group_cc_mcbbr_on_submitted(flow->cc, now);
 }
 
 static uint64_t
@@ -884,6 +914,15 @@ tf_member_feedback_deadline(const transport_flexicast_flow_t *flow,
              : member->first_unacknowledged_ms + (int64_t)interval;
 }
 
+int64_t tf_cc_deadline(const transport_flexicast_flow_t *flow) {
+  /* MCBBr disarms its feedback timer when idle, but a drain can still expire.
+   */
+  if (!flow->cc || (flow->feedback_outstanding_count == 0 &&
+                    !transport_group_cc_mcbbr_is(flow->cc)))
+    return INT64_MAX;
+  return flow->cc->output.next_timeout;
+}
+
 static bool member_remove(transport_flexicast_flow_t *flow,
                           transport_flexicast_member_t *member) {
   if (!flow || !flow->members || !member || flow->member_count == 0)
@@ -892,19 +931,8 @@ static bool member_remove(transport_flexicast_flow_t *flow,
   if (slot >= flow->member_count)
     return false;
   size_t last = flow->member_count - 1U;
-  bool inconsistent = false;
-  if (member->listening) {
-    if (flow->listening_count == 0)
-      inconsistent = true;
-    else
-      flow->listening_count--;
-    if (member->acknowledged_delivery_epoch < flow->delivery_epoch) {
-      if (flow->feedback_outstanding_count == 0)
-        inconsistent = true;
-      else
-        flow->feedback_outstanding_count--;
-    }
-  }
+  member->joined = false;
+  set_member_listening(flow, member, false);
   member_map_remove(flow, member->conn);
   if (slot != last) {
     flow->members[slot] = flow->members[last];
@@ -912,8 +940,6 @@ static bool member_remove(transport_flexicast_flow_t *flow,
   }
   memset(&flow->members[last], 0, sizeof(flow->members[last]));
   flow->member_count--;
-  if (inconsistent)
-    recount_member_feedback(flow);
   return true;
 }
 
@@ -1078,9 +1104,10 @@ static bool rekey_source_flow(transport_t *t,
   t->tls_ctx.random_bytes(next_secret, sizeof(next_secret));
   uint64_t first_packet_number =
       quicly_flexicast_get_next_packet_number(flow->crypto);
+  int64_t now = transport_now_ms(t);
   if (quicly_flexicast_flow_rekey(
           flow->crypto, ptls_iovec_init(next_secret, sizeof(next_secret)),
-          first_packet_number, transport_now_ms(t)) != QUICLY_FLEXICAST_OK) {
+          first_packet_number, now) != QUICLY_FLEXICAST_OK) {
     ptls_clear_memory(next_secret, sizeof(next_secret));
     return false;
   }
@@ -1088,6 +1115,7 @@ static bool rekey_source_flow(transport_t *t,
   memcpy(flow->secret, next_secret, sizeof(flow->secret));
   ptls_clear_memory(next_secret, sizeof(next_secret));
   flow->key_epoch++;
+  int64_t ready_window = 3 * (int64_t)flow->cc_config.feedback_timeout_msec;
 
   for (size_t i = 0; i < flow->member_count; i++) {
     transport_flexicast_member_t *member = &flow->members[i];
@@ -1098,9 +1126,10 @@ static bool rekey_source_flow(transport_t *t,
     if (!member->conn || !member->joined)
       continue;
     set_member_listening(flow, member, false);
-    member->ready_deadline_ms =
-        transport_now_ms(t) +
-        3 * (int64_t)flow->cc_config.feedback_timeout_msec;
+    /* churn from other subscribers must not prolong a stalled rejoin */
+    if (member->ready_deadline_ms == 0)
+      member->ready_deadline_ms =
+          now > INT64_MAX - ready_window ? INT64_MAX : now + ready_window;
     member->key_pending = !send_current_key(flow, member);
   }
   t->stats.flexicast_rekeys++;
@@ -1287,12 +1316,15 @@ bool transport_flexicast_offer(transport_t *t, transport_conn_t *conn,
     flow->source = true;
     flow->key_epoch = 1;
     flow->track_id = *track;
+    bool mcbbr = t->flexicast_cc_mode == TRANSPORT_FLEXICAST_CC_MCBBR;
+    if (mcbbr)
+      flow->cc_config.maximum_members = flow->member_capacity;
     flow->cc_config.startup_rate_bytes_per_second =
         t->flexicast_cc_startup_rate != 0 ? t->flexicast_cc_startup_rate
-                                          : 64U * 1024U;
+                                          : (mcbbr ? 1250U : 64U * 1024U);
     flow->cc_config.minimum_rate_bytes_per_second =
         t->flexicast_cc_minimum_rate != 0 ? t->flexicast_cc_minimum_rate
-                                          : 2U * 1024U;
+                                          : (mcbbr ? 250U : 2U * 1024U);
     flow->cc_config.maximum_rate_bytes_per_second =
         t->flexicast_cc_maximum_rate != 0 ? t->flexicast_cc_maximum_rate
                                           : 1024U * 1024U * 1024U;
@@ -1478,15 +1510,19 @@ bool transport_flexicast_receive_path_ack(
   if (!member || !member->listening)
     return true;
   size_t num_acked = 0, num_completed = 0, num_lost = 0;
+  uint64_t previous_rate = flow->cc->output.rate_bytes_per_second;
   int ret = quicly_flexicast_ack_frame(flow->crypto, conn->id, ack, 0,
                                        &num_acked, &num_lost, &num_completed,
                                        transport_now_ms(t));
+  if (previous_rate != flow->cc->output.rate_bytes_per_second)
+    t->flexicast.cohort_count = 0;
   (void)num_lost;
   (void)num_completed;
   if (ret != QUICLY_FLEXICAST_OK)
     return false;
   t->stats.flexicast_acks_received += num_acked;
   if (num_acked > 0) {
+    bool had_outstanding = flow->feedback_outstanding_count != 0;
     bool recount = false;
     if (member_delivery_debt(flow, member) != 0) {
       if (flow->feedback_outstanding_count != 0)
@@ -1498,6 +1534,8 @@ bool transport_flexicast_receive_path_ack(
     member->first_unacknowledged_ms = 0;
     if (recount || flow->feedback_outstanding_count > flow->listening_count)
       recount_member_feedback(flow);
+    if (had_outstanding && flow->feedback_outstanding_count == 0)
+      transport_group_cc_mcbbr_on_delivery_clear(flow->cc);
   }
   return true;
 }
@@ -1623,6 +1661,7 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
     if (!admit_member_transition(t, flow, member, transport_now_ms(t)))
       return true;
     member->joined = true;
+    member->ready_deadline_ms = 0;
     member->key_pending = false;
     member->join_sequence = (uint32_t)state->sequence;
     member->recovery_baseline_pending = !member->rejoining;
@@ -1902,11 +1941,10 @@ void transport_flexicast_tick(transport_t *t) {
           send_current_key(flow, member))
         member->key_pending = false;
     }
-    if (flow->feedback_outstanding_count != 0) {
-      quicly_flexicast_cc_output_t output;
-      quicly_flexicast_cc_get_flow_output(flow->crypto, &output);
-      if (output.next_timeout != INT64_MAX && now >= output.next_timeout)
-        quicly_flexicast_cc_on_flow_timeout(flow->crypto, now);
+    int64_t cc_deadline = tf_cc_deadline(flow);
+    if (cc_deadline != INT64_MAX && now >= cc_deadline) {
+      quicly_flexicast_cc_on_flow_timeout(flow->crypto, now);
+      t->flexicast.cohort_count = 0;
     }
     bool removed = false;
     for (size_t i = 0; i < flow->member_count; i++) {
