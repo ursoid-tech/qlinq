@@ -1,11 +1,9 @@
 #include "emcon_rateless.h"
 
-#include "emcon_manifest.h"
 #include "fec.h"
 #include "picotls/openssl.h"
 #include "quicly/defaults.h"
 #include "transport_fec_state.h"
-#include "transport_wire.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -47,29 +45,32 @@ static quicly_flexicast_flow_id_t encode_flow_id(uint64_t flow_id) {
   return quicly_flexicast_flow_id_init(encoded, sizeof(encoded));
 }
 
-static int derive_epoch_secret(uint8_t *derived, ptls_hash_algorithm_t *hash,
-                               uint32_t key_epoch,
-                               const uint8_t *traffic_secret) {
-  uint8_t epoch_be[4];
-  quicly_encode32(epoch_be, key_epoch);
-  return ptls_hkdf_expand_label(
+static int derive_epoch_secret(
+    uint8_t *derived, ptls_hash_algorithm_t *hash, uint32_t key_epoch,
+    const uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE],
+    const uint8_t *traffic_secret) {
+  uint8_t context[4 + QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
+  quicly_encode32(context, key_epoch);
+  memcpy(context + 4, manifest_digest, QLINQ_EMCON_MANIFEST_DIGEST_SIZE);
+  int ret = ptls_hkdf_expand_label(
       hash, derived, hash->digest_size,
       ptls_iovec_init(traffic_secret, hash->digest_size), "qlinq emcon epoch",
-      ptls_iovec_init(epoch_be, sizeof(epoch_be)), NULL);
+      ptls_iovec_init(context, sizeof(context)), NULL);
+  ptls_clear_memory(context, sizeof(context));
+  return ret;
 }
 
-int qlinq_emcon_sender_create(qlinq_emcon_sender_t **sender, uint64_t flow_id,
-                              uint32_t key_epoch,
-                              uint64_t initial_packet_number,
-                              uint64_t next_packet_number,
-                              const uint8_t *traffic_secret,
-                              size_t traffic_secret_size) {
+int qlinq_emcon_sender_create(
+    qlinq_emcon_sender_t **sender, uint64_t flow_id, uint32_t key_epoch,
+    const uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE],
+    uint64_t initial_packet_number, uint64_t next_packet_number,
+    const uint8_t *traffic_secret, size_t traffic_secret_size) {
   ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
   uint8_t derived[PTLS_MAX_DIGEST_SIZE];
   if (!sender)
     return QLINQ_EMCON_INVALID;
   *sender = NULL;
-  if (flow_id == 0 || key_epoch == 0 || !traffic_secret ||
+  if (flow_id == 0 || key_epoch == 0 || !manifest_digest || !traffic_secret ||
       traffic_secret_size != suite->hash->digest_size ||
       initial_packet_number > QLINQ_EMCON_MAX_PACKET_NUMBER ||
       next_packet_number < initial_packet_number)
@@ -85,8 +86,8 @@ int qlinq_emcon_sender_create(qlinq_emcon_sender_t **sender, uint64_t flow_id,
   created->next_packet_number = next_packet_number;
   created->packet_number_limit = limit;
   created->egress.crypto_engine = &quicly_default_crypto_engine;
-  int ret =
-      derive_epoch_secret(derived, suite->hash, key_epoch, traffic_secret);
+  int ret = derive_epoch_secret(derived, suite->hash, key_epoch,
+                                manifest_digest, traffic_secret);
   if (ret == 0)
     ret = created->egress.crypto_engine->setup_cipher(
         created->egress.crypto_engine, NULL, QUICLY_EPOCH_1RTT, 1,
@@ -141,22 +142,22 @@ bool qlinq_emcon_sender_has_capacity(const qlinq_emcon_sender_t *sender,
          packets <= sender->packet_number_limit - sender->next_packet_number;
 }
 
-int qlinq_emcon_flexicast_create(quicly_flexicast_flow_t **flow,
-                                 uint64_t flow_id, uint32_t key_epoch,
-                                 uint64_t first_packet_number,
-                                 const uint8_t *traffic_secret,
-                                 size_t traffic_secret_size) {
+int qlinq_emcon_flexicast_create(
+    quicly_flexicast_flow_t **flow, uint64_t flow_id, uint32_t key_epoch,
+    const uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE],
+    uint64_t first_packet_number, const uint8_t *traffic_secret,
+    size_t traffic_secret_size) {
   ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
   uint8_t derived[PTLS_MAX_DIGEST_SIZE];
   if (!flow)
     return QLINQ_EMCON_INVALID;
   *flow = NULL;
-  if (flow_id == 0 || key_epoch == 0 || !traffic_secret ||
+  if (flow_id == 0 || key_epoch == 0 || !manifest_digest || !traffic_secret ||
       first_packet_number > QLINQ_EMCON_MAX_PACKET_NUMBER ||
       traffic_secret_size != suite->hash->digest_size)
     return QLINQ_EMCON_INVALID;
-  if (derive_epoch_secret(derived, suite->hash, key_epoch, traffic_secret) !=
-      0) {
+  if (derive_epoch_secret(derived, suite->hash, key_epoch, manifest_digest,
+                          traffic_secret) != 0) {
     ptls_clear_memory(derived, sizeof(derived));
     return QLINQ_EMCON_CRYPTO;
   }
@@ -200,7 +201,7 @@ int qlinq_emcon_flexicast_seal(qlinq_emcon_sender_t *sender,
   uint8_t *framed = stack_buf;
   if (!sender || !packet || !packet_size || !packet_number ||
       (payload.len != 0 && !payload.base) || type < QLINQ_EMCON_RECORD_DATA ||
-      type > QLINQ_EMCON_RECORD_ABORT ||
+      type > QLINQ_EMCON_RECORD_END ||
       payload.len > QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE - 1U)
     return QLINQ_EMCON_INVALID;
   size_t framed_len = 1U + payload.len;
@@ -245,7 +246,7 @@ int qlinq_emcon_flexicast_open(quicly_flexicast_flow_t *flow, uint8_t *packet,
       pn < epoch_start || pn >= epoch_limit)
     return QLINQ_EMCON_INVALID;
   if (datagram.len < 1U || datagram.base[0] < QLINQ_EMCON_RECORD_DATA ||
-      datagram.base[0] > QLINQ_EMCON_RECORD_ABORT)
+      datagram.base[0] > QLINQ_EMCON_RECORD_END)
     return QLINQ_EMCON_INVALID;
   message->type = (qlinq_emcon_record_type_t)datagram.base[0];
   message->packet_number = pn;
@@ -653,41 +654,16 @@ int qlinq_emcon_receiver_ingest_message(qlinq_emcon_receiver_t *receiver,
     if (decoded == QLINQ_EMCON_OK)
       event->type = QLINQ_EMCON_EVENT_RECORD;
     return decoded;
-  case QLINQ_EMCON_RECORD_SESSION:
-    decoded = qlinq_emcon_decode_session(
-        message->payload.base, message->payload.len, &event->value.session);
-    event->type = decoded == QLINQ_EMCON_METADATA_OK ? QLINQ_EMCON_EVENT_SESSION
-                                                     : QLINQ_EMCON_EVENT_NONE;
-    break;
-  case QLINQ_EMCON_RECORD_WINDOW:
-    decoded = qlinq_emcon_decode_window(
-        message->payload.base, message->payload.len, &event->value.window);
-    if (decoded == QLINQ_EMCON_METADATA_OK &&
-        event->value.window.alias != receiver->alias)
-      decoded = QLINQ_EMCON_METADATA_INVALID;
-    event->type = decoded == QLINQ_EMCON_METADATA_OK ? QLINQ_EMCON_EVENT_WINDOW
-                                                     : QLINQ_EMCON_EVENT_NONE;
-    break;
   case QLINQ_EMCON_RECORD_END:
-    decoded = qlinq_emcon_decode_end(message->payload.base,
-                                     message->payload.len, &event->value.end);
-    if (decoded == QLINQ_EMCON_METADATA_OK &&
+    if (qlinq_wire_decode_track_end(message->payload.base, message->payload.len,
+                                    &event->value.end) != QLINQ_WIRE_OK ||
         event->value.end.alias != receiver->alias)
-      decoded = QLINQ_EMCON_METADATA_INVALID;
-    event->type = decoded == QLINQ_EMCON_METADATA_OK ? QLINQ_EMCON_EVENT_END
-                                                     : QLINQ_EMCON_EVENT_NONE;
-    break;
-  case QLINQ_EMCON_RECORD_ABORT:
-    decoded = qlinq_emcon_decode_abort(
-        message->payload.base, message->payload.len, &event->value.abort);
-    event->type = decoded == QLINQ_EMCON_METADATA_OK ? QLINQ_EMCON_EVENT_ABORT
-                                                     : QLINQ_EMCON_EVENT_NONE;
-    break;
+      return QLINQ_EMCON_INVALID;
+    event->type = QLINQ_EMCON_EVENT_END;
+    return QLINQ_EMCON_OK;
   default:
     return QLINQ_EMCON_INVALID;
   }
-  return decoded == QLINQ_EMCON_METADATA_OK ? QLINQ_EMCON_OK
-                                            : QLINQ_EMCON_INVALID;
 }
 
 void qlinq_emcon_record_release(qlinq_emcon_record_t *record) {

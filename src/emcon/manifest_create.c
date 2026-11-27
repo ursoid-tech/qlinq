@@ -1,5 +1,6 @@
 #include "manifest_create.h"
 
+#include "cli_parse.h"
 #include "emcon_manifest.h"
 #include "emcon_socket.h"
 
@@ -39,16 +40,15 @@ enum config_field {
   FIELD_REPLAY_WINDOW = 1U << 11,
   FIELD_RATE = 1U << 12,
   FIELD_BURST = 1U << 13,
-  FIELD_METADATA_REPEAT = 1U << 14,
-  FIELD_TERMINAL_REPEAT = 1U << 15,
-  FIELD_SYMBOL_SIZE = 1U << 16,
-  FIELD_REPAIR_SYMBOLS = 1U << 17,
+  FIELD_TERMINAL_REPEAT = 1U << 14,
+  FIELD_SYMBOL_SIZE = 1U << 15,
+  FIELD_REPAIR_SYMBOLS = 1U << 16,
 };
 
 #define REQUIRED_FIELDS                                                        \
   (FIELD_KEY_EPOCH | FIELD_SOURCE | FIELD_DESTINATION | FIELD_RATE |           \
-   FIELD_BURST | FIELD_METADATA_REPEAT | FIELD_TERMINAL_REPEAT |               \
-   FIELD_SYMBOL_SIZE | FIELD_REPAIR_SYMBOLS)
+   FIELD_BURST | FIELD_TERMINAL_REPEAT | FIELD_SYMBOL_SIZE |                   \
+   FIELD_REPAIR_SYMBOLS)
 
 typedef struct {
   const char *config_file;
@@ -174,36 +174,16 @@ static int decode_hex_id(const char *text, uint8_t *output, size_t size) {
 static int parse_endpoint(const char *text,
                           qlinq_emcon_manifest_endpoint_t *endpoint) {
   char address[INET6_ADDRSTRLEN];
-  const char *port_text;
-  size_t address_size;
-  if (text[0] == '[') {
-    const char *close = strchr(text + 1, ']');
-    if (!close || close[1] != ':' || close == text + 1)
-      return -1;
-    address_size = (size_t)(close - text - 1);
-    port_text = close + 2;
-    endpoint->family = 6;
-    if (address_size >= sizeof(address))
-      return -1;
-    memcpy(address, text + 1, address_size);
-  } else {
-    const char *colon = strrchr(text, ':');
-    if (!colon || colon == text || strchr(text, ':') != colon)
-      return -1;
-    address_size = (size_t)(colon - text);
-    port_text = colon + 1;
-    endpoint->family = 4;
-    if (address_size >= sizeof(address))
-      return -1;
-    memcpy(address, text, address_size);
-  }
-  address[address_size] = '\0';
-  uint64_t port;
+  bool has_port = false;
+  if (!cli_parse_endpoint(text, address, sizeof(address), &endpoint->port,
+                          &has_port) ||
+      !has_port)
+    return -1;
+  endpoint->family = text[0] == '[' ? 6 : 4;
   memset(endpoint->address, 0, sizeof(endpoint->address));
-  int family = endpoint->family == 4 ? AF_INET : AF_INET6;
-  return parse_u64(port_text, UINT16_MAX, &port) && port != 0 &&
-                 inet_pton(family, address, endpoint->address) == 1
-             ? (endpoint->port = (uint16_t)port, 0)
+  return inet_pton(endpoint->family == 4 ? AF_INET : AF_INET6, address,
+                   endpoint->address) == 1
+             ? 0
              : -1;
 }
 
@@ -343,11 +323,6 @@ static int parse_config_value(char *key, char *value,
     if (assign_number(value, UINT32_MAX, FIELD_BURST, seen, &number) != 0)
       return -1;
     manifest->burst_bytes = (uint32_t)number;
-  } else if (strcmp(key, "metadata_repeat_interval_ms") == 0) {
-    if (assign_number(value, UINT32_MAX, FIELD_METADATA_REPEAT, seen,
-                      &number) != 0)
-      return -1;
-    manifest->metadata_repeat_interval_ms = (uint32_t)number;
   } else if (strcmp(key, "terminal_repeat_count") == 0) {
     if (assign_number(value, UINT16_MAX, FIELD_TERMINAL_REPEAT, seen,
                       &number) != 0)

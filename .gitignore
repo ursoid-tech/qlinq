@@ -21,7 +21,6 @@ t/assets/
 /t/00util/test_egress_errors
 /t/00util/test_emcon_activation
 /t/00util/test_emcon_manifest
-/t/00util/test_emcon_metadata
 /t/00util/test_emcon_rateless
 /t/00util/test_emcon_receive_socket
 /t/00util/test_emcon_session

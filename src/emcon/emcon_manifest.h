@@ -16,6 +16,7 @@
 #define QLINQ_EMCON_MANIFEST_SIGNATURE_SIZE 64U
 #define QLINQ_EMCON_MANIFEST_ID_SIZE 16U
 #define QLINQ_EMCON_MANIFEST_KEY_ID_SIZE 32U
+#define QLINQ_EMCON_MANIFEST_DIGEST_SIZE 32U
 #define QLINQ_EMCON_MANIFEST_STREAM_NAME_SIZE 64U
 
 #define QLINQ_EMCON_CIPHER_AES_128_GCM_SHA256 1U
@@ -67,13 +68,14 @@ typedef struct {
   uint32_t replay_window_packets;
   uint64_t rate_bytes_per_second;
   uint32_t burst_bytes;
-  uint32_t metadata_repeat_interval_ms;
   uint16_t terminal_repeat_count;
   uint16_t symbol_size;
   uint16_t repair_symbols;
   uint16_t stream_count;
   qlinq_emcon_manifest_stream_t streams[QLINQ_EMCON_MANIFEST_MAX_STREAMS];
 } qlinq_emcon_manifest_t;
+
+const char *qlinq_emcon_manifest_strerror(int error);
 
 int qlinq_emcon_manifest_validate(const qlinq_emcon_manifest_t *manifest,
                                   uint64_t now_ms);

@@ -1,5 +1,5 @@
-#include "emcon_rateless.h"
-#include "emcon_manifest.h"
+#include "../../src/emcon/emcon_rateless.h"
+#include "../../src/emcon/emcon_manifest.h"
 #include "transport_wire.h"
 
 #include "picotls/openssl.h"
@@ -181,21 +181,35 @@ static bool capture_packet(void *user_data, uint16_t symbol_index,
 
 static int test_receive_packet_hardening(void) {
   const uint8_t secret[32] = {0x49};
+  const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x91};
+  const uint8_t other_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x92};
   const uint64_t start = 500;
-  quicly_flexicast_flow_t *receiver = NULL;
-  CHECK(qlinq_emcon_flexicast_create(&receiver, 77, 1, start, secret,
-                                     sizeof(secret)) == QLINQ_EMCON_OK,
-        "create hardened receive flow");
+  quicly_flexicast_flow_t *receiver = NULL, *other_receiver = NULL,
+                          *limited_receiver = NULL;
+  CHECK(qlinq_emcon_flexicast_create(&receiver, 77, 1, digest, start, secret,
+                                     sizeof(secret)) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_create(&other_receiver, 77, 1, other_digest,
+                                         start, secret,
+                                         sizeof(secret)) == QLINQ_EMCON_OK,
+        "create hardened receive flows");
 
-  /* derive the same epoch secret to craft raw flexicast packets */
+  /* derive the same manifest-bound epoch secret to craft raw packets */
   ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
-  uint8_t derived[PTLS_MAX_DIGEST_SIZE], epoch_be[4];
-  quicly_encode32(epoch_be, 1);
+  uint8_t derived[PTLS_MAX_DIGEST_SIZE], other_derived[PTLS_MAX_DIGEST_SIZE];
+  uint8_t context[4 + QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
+  quicly_encode32(context, 1);
+  memcpy(context + 4, digest, sizeof(digest));
   CHECK(ptls_hkdf_expand_label(
             suite->hash, derived, suite->hash->digest_size,
             ptls_iovec_init(secret, sizeof(secret)), "qlinq emcon epoch",
-            ptls_iovec_init(epoch_be, sizeof(epoch_be)), NULL) == 0,
+            ptls_iovec_init(context, sizeof(context)), NULL) == 0,
         "derive test epoch secret");
+  memcpy(context + 4, other_digest, sizeof(other_digest));
+  CHECK(ptls_hkdf_expand_label(
+            suite->hash, other_derived, suite->hash->digest_size,
+            ptls_iovec_init(secret, sizeof(secret)), "qlinq emcon epoch",
+            ptls_iovec_init(context, sizeof(context)), NULL) == 0,
+        "derive alternate epoch secret");
   quicly_flexicast_egress_t egress = {.crypto_engine =
                                           &quicly_default_crypto_engine};
   CHECK(egress.crypto_engine->setup_cipher(
@@ -209,14 +223,52 @@ static int test_receive_packet_hardening(void) {
   quicly_encode64(flow_bytes, 77);
   quicly_flexicast_flow_id_t flow_id =
       quicly_flexicast_flow_id_init(flow_bytes, sizeof(flow_bytes));
-  uint8_t framed[2] = {QLINQ_EMCON_RECORD_SESSION, 0};
+  quicly_flexicast_config_t limited_cfg = {
+      .flow_id = flow_id,
+      .first_packet_number = start,
+      .cipher_suite = suite,
+      .crypto_engine = &quicly_default_crypto_engine,
+      .traffic_secret =
+          ptls_iovec_init(other_derived, suite->hash->digest_size),
+      .max_authentication_failures = 1,
+      .max_packet_size = QLINQ_EMCON_MAX_PACKET_SIZE,
+  };
+  CHECK(quicly_flexicast_flow_create(&limited_receiver, &limited_cfg) ==
+            QUICLY_FLEXICAST_OK,
+        "create failure-limited receive flow");
+  ptls_clear_memory(other_derived, sizeof(other_derived));
+  uint8_t framed[1 + QLINQ_WIRE_TRACK_END_SIZE] = {QLINQ_EMCON_RECORD_END};
+  qlinq_wire_track_end_t end = {
+      .alias = 7, .group_id = 3, .final_object_id = 42};
+  CHECK(qlinq_wire_encode_track_end(framed + 1, QLINQ_WIRE_TRACK_END_SIZE,
+                                    &end) == QLINQ_WIRE_OK,
+        "encode terminal metadata");
   uint8_t packet[128];
   size_t packet_size = 0;
   qlinq_emcon_message_t message;
 
+  /* valid 4-byte PN packet opens and decodes as END event */
+  qlinq_emcon_receiver_t *assembler = qlinq_emcon_receiver_create(7, 64);
+  qlinq_emcon_event_t event;
+  CHECK(assembler &&
+            quicly_flexicast_encode_datagram_packet(
+                &egress, &flow_id, start, 4,
+                ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+                &packet_size) == QUICLY_FLEXICAST_OK &&
+            qlinq_emcon_flexicast_open(receiver, packet, packet_size,
+                                       &message) == QLINQ_EMCON_OK &&
+            qlinq_emcon_receiver_ingest_message(assembler, &message, &event) ==
+                QLINQ_EMCON_OK &&
+            event.type == QLINQ_EMCON_EVENT_END && event.value.end.alias == 7 &&
+            event.value.end.group_id == 3 &&
+            event.value.end.final_object_id == 42,
+        "authenticate and decode manifest-bound END packet");
+  qlinq_emcon_event_release(&event);
+  qlinq_emcon_receiver_free(assembler);
+
   /* 2-byte truncated wire packet number must be rejected */
   CHECK(quicly_flexicast_encode_datagram_packet(
-            &egress, &flow_id, start, QUICLY_SEND_PN_SIZE,
+            &egress, &flow_id, start + 1, QUICLY_SEND_PN_SIZE,
             ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
             &packet_size) == QUICLY_FLEXICAST_OK &&
             qlinq_emcon_flexicast_open(receiver, packet, packet_size,
@@ -233,14 +285,32 @@ static int test_receive_packet_hardening(void) {
                                        &message) == QLINQ_EMCON_INVALID,
         "reject packet number at epoch upper bound");
 
+  /* manifest digest mismatch must fail AEAD and trip failure limit */
+  CHECK(quicly_flexicast_encode_datagram_packet(
+            &egress, &flow_id, start, 4,
+            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+            &packet_size) == QUICLY_FLEXICAST_OK &&
+            qlinq_emcon_flexicast_open(other_receiver, packet, packet_size,
+                                       &message) == QLINQ_EMCON_DISCARDED &&
+            quicly_flexicast_encode_datagram_packet(
+                &egress, &flow_id, start, 4,
+                ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+                &packet_size) == QUICLY_FLEXICAST_OK &&
+            qlinq_emcon_flexicast_open(limited_receiver, packet, packet_size,
+                                       &message) == QLINQ_EMCON_CRYPTO,
+        "reject packet bound to a different manifest digest");
+
   ptls_cipher_free(egress.header_protection);
   ptls_aead_free(egress.aead);
+  quicly_flexicast_flow_free(limited_receiver);
+  quicly_flexicast_flow_free(other_receiver);
   quicly_flexicast_flow_free(receiver);
   return 0;
 }
 
 static int test_late_join(void) {
   const uint8_t secret[32] = {0x37};
+  const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x55};
   const uint8_t payload[] = "late multicast delivery";
   const uint64_t first = UINT32_MAX - 3;
   const uint64_t last = first + QUICLY_FLEXICAST_SENT_WINDOW + 1;
@@ -248,7 +318,7 @@ static int test_late_join(void) {
   size_t packet_size;
   uint64_t number;
   qlinq_emcon_sender_t *sender = NULL;
-  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, first, first, secret,
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, digest, first, first, secret,
                                   sizeof(secret)) == QLINQ_EMCON_OK,
         "create EMCON sender before listeners exist");
   for (uint64_t expected = first; expected <= last; ++expected) {
@@ -263,7 +333,7 @@ static int test_late_join(void) {
 
   for (size_t i = 0; i < 2; ++i) {
     quicly_flexicast_flow_t *receiver = NULL;
-    CHECK(qlinq_emcon_flexicast_create(&receiver, 44, 3, first, secret,
+    CHECK(qlinq_emcon_flexicast_create(&receiver, 44, 3, digest, first, secret,
                                        sizeof(secret)) == QLINQ_EMCON_OK,
           "initialize a late listener from the initial epoch");
     uint8_t copy[sizeof(packet)];
@@ -289,13 +359,15 @@ static int test_late_join(void) {
 
 static int test_packet_number_ceiling(void) {
   const uint8_t secret[32] = {0x38};
+  const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x56};
   const uint64_t ceiling = (UINT64_C(1) << 62) - 1;
   uint8_t payload[] = "last packet";
   qlinq_emcon_sender_t *sender = NULL;
   quicly_flexicast_flow_t *receiver = NULL;
-  CHECK(qlinq_emcon_sender_create(&sender, 44, 4, ceiling, ceiling, secret,
-                                  sizeof(secret)) == QLINQ_EMCON_OK &&
-            qlinq_emcon_flexicast_create(&receiver, 44, 4, ceiling, secret,
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 4, digest, ceiling, ceiling,
+                                  secret, sizeof(secret)) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_create(&receiver, 44, 4, digest, ceiling,
+                                         secret,
                                          sizeof(secret)) == QLINQ_EMCON_OK,
         "initialize sender and receiver at the last QUIC packet number");
   uint8_t packet[128], replay[sizeof(packet)];
@@ -355,13 +427,15 @@ int main(int argc, char **argv) {
     third[i] = (uint8_t)(i * 29U + 5U);
   }
   memset(secret, 0xa6, ptls_openssl_aes128gcmsha256.hash->digest_size);
+  const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x57};
   qlinq_emcon_sender_t *sender = NULL;
   quicly_flexicast_flow_t *receiver_protection = NULL;
   size_t secret_size = ptls_openssl_aes128gcmsha256.hash->digest_size;
-  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, 1000, 1000, secret,
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, digest, 1000, 1000, secret,
                                   secret_size) == QLINQ_EMCON_OK &&
-            qlinq_emcon_flexicast_create(&receiver_protection, 44, 3, 1000,
-                                         secret, secret_size) == QLINQ_EMCON_OK,
+            qlinq_emcon_flexicast_create(&receiver_protection, 44, 3, digest,
+                                         1000, secret,
+                                         secret_size) == QLINQ_EMCON_OK,
         "protection setup");
 
   qlinq_emcon_rateless_config_t config = {
@@ -457,7 +531,7 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i <= QLINQ_EMCON_REPLAY_WINDOW_PACKETS; i++) {
     size_t slot = i < 2 ? i : 2;
     CHECK(qlinq_emcon_flexicast_seal(
-              sender, QLINQ_EMCON_RECORD_SESSION, ptls_iovec_init(&payload, 1),
+              sender, QLINQ_EMCON_RECORD_END, ptls_iovec_init(&payload, 1),
               replay_packets[slot], sizeof(replay_packets[slot]),
               &replay_sizes[slot], &number) == QLINQ_EMCON_OK,
           "seal replay-window test packet");
@@ -481,9 +555,8 @@ int main(int argc, char **argv) {
                                 sizeof(input), capture_packet,
                                 &rejected) == QLINQ_EMCON_EMIT_FAILED &&
             qlinq_emcon_flexicast_seal(
-                sender, QLINQ_EMCON_RECORD_SESSION,
-                ptls_iovec_init(&payload, 1), replay_packets[0],
-                sizeof(replay_packets[0]), &replay_sizes[0],
+                sender, QLINQ_EMCON_RECORD_END, ptls_iovec_init(&payload, 1),
+                replay_packets[0], sizeof(replay_packets[0]), &replay_sizes[0],
                 &number) == QLINQ_EMCON_OK &&
             number == before_failed_emit + 1,
         "a failed FEC emission still consumes its protected packet number");

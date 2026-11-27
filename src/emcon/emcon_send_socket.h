@@ -21,6 +21,8 @@ typedef struct {
 int qlinq_emcon_send_socket_create(qlinq_emcon_send_socket_t **sender,
                                    const struct sockaddr *local_address,
                                    socklen_t local_address_len,
+                                   const struct sockaddr *destination,
+                                   socklen_t destination_len,
                                    uint64_t rate_bytes_per_second,
                                    size_t burst_bytes, uint64_t expires_at_ms);
 void qlinq_emcon_send_socket_free(qlinq_emcon_send_socket_t *sender);
@@ -28,9 +30,6 @@ void qlinq_emcon_send_socket_free(qlinq_emcon_send_socket_t *sender);
 void qlinq_emcon_send_socket_set_cancel(qlinq_emcon_send_socket_t *sender,
                                         qlinq_emcon_cancel_fn should_cancel,
                                         void *cancel_data);
-int qlinq_emcon_send_socket_set_destination(qlinq_emcon_send_socket_t *sender,
-                                            const struct sockaddr *destination,
-                                            socklen_t destination_len);
 
 int qlinq_emcon_send_socket_send(qlinq_emcon_send_socket_t *sender,
                                  const uint8_t *packet, size_t packet_size);

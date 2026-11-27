@@ -1,4 +1,4 @@
-#include "emcon_activation.h"
+#include "../../src/emcon/emcon_activation.h"
 
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -57,7 +57,6 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
       .replay_window_packets = QLINQ_EMCON_REPLAY_WINDOW_PACKETS,
       .rate_bytes_per_second = 1000000,
       .burst_bytes = 2048,
-      .metadata_repeat_interval_ms = 1000,
       .terminal_repeat_count = 2,
       .symbol_size = 256,
       .repair_symbols = 4,
@@ -78,15 +77,16 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
   return manifest;
 }
 
-static bool find_single_state_file(const char *directory_path, char *out,
-                                   size_t out_capacity) {
+static bool find_prefixed_file(const char *directory_path, const char *prefix,
+                               char *out, size_t out_capacity) {
   DIR *directory = opendir(directory_path);
   if (!directory)
     return false;
   bool found = false;
+  size_t prefix_len = strlen(prefix);
   struct dirent *entry;
   while ((entry = readdir(directory)) != NULL) {
-    if (strncmp(entry->d_name, "sender-", 7) != 0)
+    if (strncmp(entry->d_name, prefix, prefix_len) != 0)
       continue;
     int written =
         snprintf(out, out_capacity, "%s/%s", directory_path, entry->d_name);
@@ -231,13 +231,19 @@ int main(void) {
       qlinq_emcon_activation_open_managed(&managed, directory, &same_domain) ==
           QLINQ_EMCON_ACTIVATION_IDENTITY_MISMATCH,
       "alternate manifest cannot bypass nonce-domain state");
+  struct stat claim_info;
+  char claim_path[512];
   CHECK(qlinq_emcon_receiver_activation_claim(directory, &manifest) ==
                 QLINQ_EMCON_ACTIVATION_OK &&
+            find_prefixed_file(directory, "receiver-", claim_path,
+                               sizeof(claim_path)) &&
+            stat(claim_path, &claim_info) == 0 && claim_info.st_size == 0 &&
+            (claim_info.st_mode & 0777) == 0600 &&
             qlinq_emcon_receiver_activation_claim(directory, &manifest) ==
                 QLINQ_EMCON_ACTIVATION_REUSED &&
             qlinq_emcon_receiver_activation_claim(directory, &same_domain) ==
                 QLINQ_EMCON_ACTIVATION_REUSED,
-        "receiver key epoch is claimed exactly once");
+        "receiver key epoch is claimed once via an empty protected marker");
 
   qlinq_emcon_manifest_t next_epoch = manifest;
   next_epoch.key_epoch++;
@@ -268,7 +274,8 @@ int main(void) {
             QLINQ_EMCON_ACTIVATION_OK,
         "write corruption fixture");
   qlinq_emcon_activation_close(corrupt);
-  CHECK(find_single_state_file(corrupt_dir, state_path, sizeof(state_path)),
+  CHECK(find_prefixed_file(corrupt_dir, "sender-", state_path,
+                           sizeof(state_path)),
         "locate canonical sender state file");
 
   CHECK(chmod(state_path, 0644) == 0 &&

@@ -1,11 +1,11 @@
 /* qlinq-emcon: minimal cold-start file/stdin sender and receiver. */
 
+#include "cli_parse.h"
 #include "emcon_manifest.h"
 #include "emcon_session.h"
 #include "manifest_create.h"
 
 #include <openssl/crypto.h>
-#include <openssl/rand.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -95,18 +95,6 @@ static void show_help(FILE *output, const char *program) {
           program, program, program);
 }
 
-static bool parse_u64(const char *text, uint64_t *value) {
-  if (!text || !text[0] || text[0] == '-')
-    return false;
-  errno = 0;
-  char *end = NULL;
-  unsigned long long parsed = strtoull(text, &end, 10);
-  if (errno != 0 || !end || *end != '\0')
-    return false;
-  *value = (uint64_t)parsed;
-  return true;
-}
-
 static bool option_value(int argc, char **argv, int *index,
                          const char **value) {
   if (*index + 1 >= argc)
@@ -147,25 +135,24 @@ static bool parse_options(int argc, char **argv, emcon_options_t *options) {
     else if (strcmp(argv[i], "--alias") == 0 &&
              option_value(argc, argv, &i, &value)) {
       uint64_t alias;
-      if (!parse_u64(value, &alias) || alias > UINT8_MAX)
+      if (!cli_parse_u64(value, UINT8_MAX, &alias))
         return false;
       options->alias = (uint8_t)alias;
       options->alias_set = true;
     } else if (strcmp(argv[i], "--group") == 0 &&
                option_value(argc, argv, &i, &value)) {
-      if (!parse_u64(value, &options->group_id))
+      if (!cli_parse_u64(value, UINT64_MAX, &options->group_id))
         return false;
     } else if (strcmp(argv[i], "--block-size") == 0 &&
                option_value(argc, argv, &i, &value)) {
       uint64_t block_size;
-      if (!parse_u64(value, &block_size) || block_size == 0 ||
-          block_size > SIZE_MAX)
+      if (!cli_parse_u64(value, SIZE_MAX, &block_size) || block_size == 0)
         return false;
       options->block_size = (size_t)block_size;
       options->block_size_set = true;
     } else if (strcmp(argv[i], "--reservation-packets") == 0 &&
                option_value(argc, argv, &i, &value)) {
-      if (!parse_u64(value, &options->reservation_packets) ||
+      if (!cli_parse_u64(value, UINT64_MAX, &options->reservation_packets) ||
           options->reservation_packets == 0)
         return false;
     } else if (strcmp(argv[i], "--interface") == 0 &&
@@ -260,7 +247,8 @@ static int run_sender(const emcon_options_t *options,
                          options->reservation_packets)
                    : QLINQ_EMCON_SESSION_IO;
       if (ret != QLINQ_EMCON_SESSION_OK) {
-        fprintf(stderr, "qlinq-emcon: sender activation failed: %d\n", ret);
+        fprintf(stderr, "qlinq-emcon: sender activation failed: %s\n",
+                qlinq_emcon_session_strerror(ret));
         failed = true;
         break;
       }
@@ -271,7 +259,8 @@ static int run_sender(const emcon_options_t *options,
                                           0, block, size);
     if (ret != QLINQ_EMCON_SESSION_OK) {
       if (ret != QLINQ_EMCON_SESSION_INTERRUPTED)
-        fprintf(stderr, "qlinq-emcon: send object failed: %d\n", ret);
+        fprintf(stderr, "qlinq-emcon: send object failed: %s\n",
+                qlinq_emcon_session_strerror(ret));
       failed = true;
       break;
     }
@@ -294,22 +283,13 @@ static int run_sender(const emcon_options_t *options,
     failed = true;
   }
   if (!failed) {
-    qlinq_emcon_end_metadata_t end = {
-        .alias = options->alias,
-        .group_id = options->group_id,
-        .final_object_id = object_id - 1,
-    };
-    if (RAND_bytes(end.transmission_nonce, sizeof(end.transmission_nonce)) !=
-        1) {
-      fprintf(stderr, "qlinq-emcon: terminal metadata failed\n");
+    int end_ret = qlinq_emcon_session_send_end(
+        session, options->alias, options->group_id, object_id - 1);
+    if (end_ret != QLINQ_EMCON_SESSION_OK) {
+      if (end_ret != QLINQ_EMCON_SESSION_INTERRUPTED)
+        fprintf(stderr, "qlinq-emcon: terminal metadata failed: %s\n",
+                qlinq_emcon_session_strerror(end_ret));
       failed = true;
-    } else {
-      int end_ret = qlinq_emcon_session_send_end(session, &end);
-      if (end_ret != QLINQ_EMCON_SESSION_OK) {
-        if (end_ret != QLINQ_EMCON_SESSION_INTERRUPTED)
-          fprintf(stderr, "qlinq-emcon: terminal metadata failed\n");
-        failed = true;
-      }
     }
   }
   qlinq_emcon_session_stats_t stats = qlinq_emcon_session_stats(session);
@@ -414,7 +394,8 @@ static int run_receiver(const emcon_options_t *options,
       options->state_directory, options->receiver_interface,
       !options->preprovisioned);
   if (ret != QLINQ_EMCON_SESSION_OK) {
-    fprintf(stderr, "qlinq-emcon: receiver activation failed: %d\n", ret);
+    fprintf(stderr, "qlinq-emcon: receiver activation failed: %s\n",
+            qlinq_emcon_session_strerror(ret));
     return 1;
   }
   bool truncate_output;
@@ -429,7 +410,8 @@ static int run_receiver(const emcon_options_t *options,
   } else {
     ret = qlinq_emcon_session_claim_receiver(session);
     if (ret != QLINQ_EMCON_SESSION_OK)
-      fprintf(stderr, "qlinq-emcon: receiver activation failed: %d\n", ret);
+      fprintf(stderr, "qlinq-emcon: receiver activation failed: %s\n",
+              qlinq_emcon_session_strerror(ret));
     else if (truncate_output && ftruncate(fileno(output), 0) != 0) {
       fprintf(stderr, "qlinq-emcon: cannot truncate output: %s\n",
               strerror(errno));
@@ -458,7 +440,8 @@ static int run_receiver(const emcon_options_t *options,
         ret == QLINQ_EMCON_SESSION_DISCARDED)
       continue;
     if (ret != QLINQ_EMCON_SESSION_OK) {
-      fprintf(stderr, "qlinq-emcon: receive failed: %d\n", ret);
+      fprintf(stderr, "qlinq-emcon: receive failed: %s\n",
+              qlinq_emcon_session_strerror(ret));
       failed = true;
       break;
     }
@@ -498,10 +481,6 @@ static int run_receiver(const emcon_options_t *options,
         final_object = event.value.end.final_object_id;
         end_seen = true;
       }
-    } else if (event.type == QLINQ_EMCON_EVENT_ABORT) {
-      fprintf(stderr, "qlinq-emcon: sender aborted the session: reason=%u\n",
-              event.value.abort.reason);
-      failed = true;
     }
     qlinq_emcon_event_release(&event);
     if (failed)
@@ -553,11 +532,15 @@ int main(int argc, char **argv) {
 
   uint64_t now_ms = qlinq_emcon_realtime_ms();
   qlinq_emcon_manifest_t manifest;
-  int loaded = qlinq_emcon_manifest_load_signed(
-      &manifest, options.manifest_file, options.signature_file,
-      options.public_key_file, now_ms);
-  if (now_ms == 0 || loaded != QLINQ_EMCON_MANIFEST_OK) {
-    fprintf(stderr, "qlinq-emcon: signed manifest load failed: %d\n", loaded);
+  int loaded =
+      now_ms
+          ? qlinq_emcon_manifest_load_signed(&manifest, options.manifest_file,
+                                             options.signature_file,
+                                             options.public_key_file, now_ms)
+          : QLINQ_EMCON_MANIFEST_IO;
+  if (loaded != QLINQ_EMCON_MANIFEST_OK) {
+    fprintf(stderr, "qlinq-emcon: signed manifest load failed: %s\n",
+            qlinq_emcon_manifest_strerror(loaded));
     return 1;
   }
   if (options.command == EMCON_RECEIVE) {

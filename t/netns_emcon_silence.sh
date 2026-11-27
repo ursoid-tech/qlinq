@@ -196,7 +196,6 @@ interface_index=$source_index
 replay_window_packets=64
 rate_bytes_per_second=1000000
 burst_bytes=4096
-metadata_repeat_interval_ms=10000
 terminal_repeat_count=3
 symbol_size=512
 repair_symbols=4

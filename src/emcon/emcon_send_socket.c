@@ -10,10 +10,8 @@
 
 struct qlinq_emcon_send_socket_t {
   int fd;
-  int family;
   struct sockaddr_storage destination;
   socklen_t destination_len;
-  bool destination_set;
   uint64_t rate_bytes_per_second;
   size_t burst_bytes;
   uint64_t burst_ns;
@@ -37,17 +35,61 @@ static uint64_t duration_ns(size_t bytes, uint64_t rate) {
   return scaled > UINT64_MAX ? UINT64_MAX : (uint64_t)scaled;
 }
 
+static int configure_multicast_destination(int fd,
+                                           const struct sockaddr *destination) {
+  if (destination->sa_family == AF_INET) {
+    const struct sockaddr_in *v4 = (const struct sockaddr_in *)destination;
+    if (IN_MULTICAST(ntohl(v4->sin_addr.s_addr))) {
+      struct sockaddr_in local = {0};
+      socklen_t local_len = sizeof(local);
+      unsigned char loop = 1, ttl = 1;
+      if (getsockname(fd, (struct sockaddr *)&local, &local_len) != 0 ||
+          setsockopt(fd, IPPROTO_IP, IP_MULTICAST_IF, &local.sin_addr,
+                     sizeof(local.sin_addr)) != 0 ||
+          setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop)) !=
+              0 ||
+          setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) != 0)
+        return -1;
+    }
+  } else if (destination->sa_family == AF_INET6) {
+    const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)destination;
+    if (IN6_IS_ADDR_MULTICAST(&v6->sin6_addr)) {
+      unsigned int loop = 1;
+      int hops = 1;
+      if (v6->sin6_scope_id != 0) {
+        unsigned int ifindex = v6->sin6_scope_id;
+        if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifindex,
+                       sizeof(ifindex)) != 0)
+          return -1;
+      }
+      if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &loop,
+                     sizeof(loop)) != 0 ||
+          setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops,
+                     sizeof(hops)) != 0)
+        return -1;
+    }
+  }
+  return 0;
+}
+
 int qlinq_emcon_send_socket_create(qlinq_emcon_send_socket_t **sender,
                                    const struct sockaddr *local_address,
                                    socklen_t local_address_len,
+                                   const struct sockaddr *destination,
+                                   socklen_t destination_len,
                                    uint64_t rate_bytes_per_second,
                                    size_t burst_bytes, uint64_t expires_at_ms) {
   qlinq_emcon_send_socket_t *created;
   int fd;
   if (!sender ||
       !qlinq_emcon_sockaddr_valid(local_address, local_address_len) ||
-      rate_bytes_per_second == 0 || burst_bytes == 0)
+      !qlinq_emcon_sockaddr_valid(destination, destination_len) ||
+      destination->sa_family != local_address->sa_family ||
+      destination_len > sizeof(created->destination) ||
+      rate_bytes_per_second == 0 || burst_bytes == 0) {
+    errno = EINVAL;
     return -1;
+  }
   *sender = NULL;
 #ifdef SOCK_CLOEXEC
   fd = socket(local_address->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -60,13 +102,15 @@ int qlinq_emcon_send_socket_create(qlinq_emcon_send_socket_t **sender,
   if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0)
     goto Error;
 #endif
-  if (bind(fd, local_address, local_address_len) != 0)
+  if (bind(fd, local_address, local_address_len) != 0 ||
+      configure_multicast_destination(fd, destination) != 0)
     goto Error;
   created = calloc(1, sizeof(*created));
   if (!created)
     goto Error;
   created->fd = fd;
-  created->family = local_address->sa_family;
+  memcpy(&created->destination, destination, destination_len);
+  created->destination_len = destination_len;
   created->rate_bytes_per_second = rate_bytes_per_second;
   created->burst_bytes = burst_bytes;
   created->burst_ns = duration_ns(burst_bytes, rate_bytes_per_second);
@@ -98,56 +142,6 @@ void qlinq_emcon_send_socket_set_cancel(qlinq_emcon_send_socket_t *sender,
     return;
   sender->should_cancel = should_cancel;
   sender->cancel_data = cancel_data;
-}
-
-int qlinq_emcon_send_socket_set_destination(qlinq_emcon_send_socket_t *sender,
-                                            const struct sockaddr *destination,
-                                            socklen_t destination_len) {
-  if (!sender || sender->fd < 0 ||
-      !qlinq_emcon_sockaddr_valid(destination, destination_len) ||
-      destination->sa_family != sender->family ||
-      destination_len > sizeof(sender->destination)) {
-    errno = EINVAL;
-    return -1;
-  }
-  if (destination->sa_family == AF_INET) {
-    const struct sockaddr_in *v4 = (const struct sockaddr_in *)destination;
-    if (IN_MULTICAST(ntohl(v4->sin_addr.s_addr))) {
-      struct sockaddr_in local = {0};
-      socklen_t local_len = sizeof(local);
-      unsigned char loop = 1, ttl = 1;
-      if (getsockname(sender->fd, (struct sockaddr *)&local, &local_len) != 0 ||
-          setsockopt(sender->fd, IPPROTO_IP, IP_MULTICAST_IF, &local.sin_addr,
-                     sizeof(local.sin_addr)) != 0 ||
-          setsockopt(sender->fd, IPPROTO_IP, IP_MULTICAST_LOOP, &loop,
-                     sizeof(loop)) != 0 ||
-          setsockopt(sender->fd, IPPROTO_IP, IP_MULTICAST_TTL, &ttl,
-                     sizeof(ttl)) != 0)
-        return -1;
-    }
-  } else if (destination->sa_family == AF_INET6) {
-    const struct sockaddr_in6 *v6 = (const struct sockaddr_in6 *)destination;
-    if (IN6_IS_ADDR_MULTICAST(&v6->sin6_addr)) {
-      unsigned int loop = 1;
-      int hops = 1;
-      if (v6->sin6_scope_id != 0) {
-        unsigned int ifindex = v6->sin6_scope_id;
-        if (setsockopt(sender->fd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifindex,
-                       sizeof(ifindex)) != 0)
-          return -1;
-      }
-      if (setsockopt(sender->fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &loop,
-                     sizeof(loop)) != 0 ||
-          setsockopt(sender->fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops,
-                     sizeof(hops)) != 0)
-        return -1;
-    }
-  }
-  memset(&sender->destination, 0, sizeof(sender->destination));
-  memcpy(&sender->destination, destination, destination_len);
-  sender->destination_len = destination_len;
-  sender->destination_set = true;
-  return 0;
 }
 
 static int wait_for_pacer(qlinq_emcon_send_socket_t *sender,
@@ -221,8 +215,7 @@ static int wait_for_pacer(qlinq_emcon_send_socket_t *sender,
 
 int qlinq_emcon_send_socket_send(qlinq_emcon_send_socket_t *sender,
                                  const uint8_t *packet, size_t packet_size) {
-  if (!sender || sender->fd < 0 || !sender->destination_set || !packet ||
-      packet_size == 0) {
+  if (!sender || sender->fd < 0 || !packet || packet_size == 0) {
     errno = EINVAL;
     return QLINQ_EMCON_SOCKET_INVALID;
   }

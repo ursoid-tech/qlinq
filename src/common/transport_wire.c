@@ -1,42 +1,17 @@
 #include "transport_wire.h"
+#include "wire_endian.h"
 
 #include <limits.h>
 #include <string.h>
 
 #define QLINQ_WIRE_MAGIC_0 0x51U
 #define QLINQ_WIRE_MAGIC_1 0x4cU
-static void write_u16(uint8_t *dst, uint16_t value) {
-  dst[0] = (uint8_t)(value >> 8);
-  dst[1] = (uint8_t)value;
-}
-
-static void write_u32(uint8_t *dst, uint32_t value) {
-  dst[0] = (uint8_t)(value >> 24);
-  dst[1] = (uint8_t)(value >> 16);
-  dst[2] = (uint8_t)(value >> 8);
-  dst[3] = (uint8_t)value;
-}
-
-static void write_u64(uint8_t *dst, uint64_t value) {
-  for (size_t i = 0; i < 8; i++)
-    dst[i] = (uint8_t)(value >> (56U - i * 8U));
-}
-
-static uint16_t read_u16(const uint8_t *src) {
-  return (uint16_t)(((uint16_t)src[0] << 8) | src[1]);
-}
-
-static uint32_t read_u32(const uint8_t *src) {
-  return ((uint32_t)src[0] << 24) | ((uint32_t)src[1] << 16) |
-         ((uint32_t)src[2] << 8) | src[3];
-}
-
-static uint64_t read_u64(const uint8_t *src) {
-  uint64_t value = 0;
-  for (size_t i = 0; i < 8; i++)
-    value = (value << 8) | src[i];
-  return value;
-}
+#define write_u16 qlinq_write_u16
+#define write_u32 qlinq_write_u32
+#define write_u64 qlinq_write_u64
+#define read_u16 qlinq_read_u16
+#define read_u32 qlinq_read_u32
+#define read_u64 qlinq_read_u64
 
 static qlinq_wire_result_t check_envelope(const uint8_t *src, size_t len,
                                           uint8_t kind) {

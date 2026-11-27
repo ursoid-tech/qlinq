@@ -1,7 +1,8 @@
 #ifndef QLINQ_EMCON_RATELESS_H
 #define QLINQ_EMCON_RATELESS_H
 
-#include "emcon_metadata.h"
+#include "emcon_manifest.h"
+#include "transport_wire.h"
 
 #include "quicly/flexicast.h"
 
@@ -18,10 +19,7 @@ typedef struct qlinq_emcon_sender_t qlinq_emcon_sender_t;
 
 typedef enum {
   QLINQ_EMCON_RECORD_DATA = 1,
-  QLINQ_EMCON_RECORD_SESSION = 2,
-  QLINQ_EMCON_RECORD_WINDOW = 3,
-  QLINQ_EMCON_RECORD_END = 4,
-  QLINQ_EMCON_RECORD_ABORT = 5
+  QLINQ_EMCON_RECORD_END = 2
 } qlinq_emcon_record_type_t;
 
 typedef struct {
@@ -30,24 +28,23 @@ typedef struct {
   ptls_iovec_t payload; /* borrows mutable packet passed to open */
 } qlinq_emcon_message_t;
 
-/* sender owns egress keys and epoch packet-number range */
-int qlinq_emcon_sender_create(qlinq_emcon_sender_t **sender, uint64_t flow_id,
-                              uint32_t key_epoch,
-                              uint64_t initial_packet_number,
-                              uint64_t next_packet_number,
-                              const uint8_t *traffic_secret,
-                              size_t traffic_secret_size);
+/* sender owns egress keys bound to the manifest digest and epoch PN range */
+int qlinq_emcon_sender_create(
+    qlinq_emcon_sender_t **sender, uint64_t flow_id, uint32_t key_epoch,
+    const uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE],
+    uint64_t initial_packet_number, uint64_t next_packet_number,
+    const uint8_t *traffic_secret, size_t traffic_secret_size);
 void qlinq_emcon_sender_free(qlinq_emcon_sender_t *sender);
 uint64_t
 qlinq_emcon_sender_next_packet_number(const qlinq_emcon_sender_t *sender);
 bool qlinq_emcon_sender_has_capacity(const qlinq_emcon_sender_t *sender,
                                      uint64_t packets);
-/* creates an epoch-scoped flexicast flow for silent reception */
-int qlinq_emcon_flexicast_create(quicly_flexicast_flow_t **flow,
-                                 uint64_t flow_id, uint32_t key_epoch,
-                                 uint64_t first_packet_number,
-                                 const uint8_t *traffic_secret,
-                                 size_t traffic_secret_size);
+/* creates a manifest-bound epoch flexicast flow for silent reception */
+int qlinq_emcon_flexicast_create(
+    quicly_flexicast_flow_t **flow, uint64_t flow_id, uint32_t key_epoch,
+    const uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE],
+    uint64_t first_packet_number, const uint8_t *traffic_secret,
+    size_t traffic_secret_size);
 int qlinq_emcon_flexicast_seal(qlinq_emcon_sender_t *sender,
                                qlinq_emcon_record_type_t type,
                                ptls_iovec_t payload, uint8_t *packet,
@@ -102,20 +99,14 @@ typedef struct {
 typedef enum {
   QLINQ_EMCON_EVENT_NONE = 0,
   QLINQ_EMCON_EVENT_RECORD,
-  QLINQ_EMCON_EVENT_SESSION,
-  QLINQ_EMCON_EVENT_WINDOW,
-  QLINQ_EMCON_EVENT_END,
-  QLINQ_EMCON_EVENT_ABORT
+  QLINQ_EMCON_EVENT_END
 } qlinq_emcon_event_type_t;
 
 typedef struct {
   qlinq_emcon_event_type_t type;
   union {
     qlinq_emcon_record_t record;
-    qlinq_emcon_session_metadata_t session;
-    qlinq_emcon_window_metadata_t window;
-    qlinq_emcon_end_metadata_t end;
-    qlinq_emcon_abort_metadata_t abort;
+    qlinq_wire_track_end_t end;
   } value;
 } qlinq_emcon_event_t;
 

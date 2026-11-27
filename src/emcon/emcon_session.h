@@ -45,6 +45,8 @@ typedef struct {
   qlinq_emcon_send_stats_t send;
 } qlinq_emcon_session_stats_t;
 
+const char *qlinq_emcon_session_strerror(int error);
+
 /* production sender with durable nonce reservations and exclusive lock */
 int qlinq_emcon_session_create_sender_persistent(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
@@ -66,14 +68,8 @@ int qlinq_emcon_session_send_object(qlinq_emcon_session_t *session,
                                     uint64_t object_id, bool keyframe,
                                     uint8_t priority, const void *data,
                                     size_t size);
-int qlinq_emcon_session_send_window(
-    qlinq_emcon_session_t *session,
-    const qlinq_emcon_window_metadata_t *window);
-int qlinq_emcon_session_send_end(qlinq_emcon_session_t *session,
-                                 const qlinq_emcon_end_metadata_t *end);
-int qlinq_emcon_session_send_abort(
-    qlinq_emcon_session_t *session,
-    const qlinq_emcon_abort_metadata_t *abort_metadata);
+int qlinq_emcon_session_send_end(qlinq_emcon_session_t *session, uint8_t alias,
+                                 uint64_t group_id, uint64_t final_object_id);
 
 int qlinq_emcon_session_receive(qlinq_emcon_session_t *session,
                                 qlinq_emcon_event_t *event, bool nonblocking);

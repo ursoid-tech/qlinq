@@ -1,4 +1,4 @@
-#include "emcon_manifest.h"
+#include "../../src/emcon/emcon_manifest.h"
 
 #include <arpa/inet.h>
 #include <openssl/pem.h>
@@ -28,7 +28,6 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
       .replay_window_packets = QLINQ_EMCON_REPLAY_WINDOW_PACKETS,
       .rate_bytes_per_second = 1000000,
       .burst_bytes = 2048,
-      .metadata_repeat_interval_ms = 1000,
       .terminal_repeat_count = 3,
       .symbol_size = 256,
       .repair_symbols = 8,
@@ -83,7 +82,9 @@ int main(void) {
             QLINQ_EMCON_MANIFEST_NOT_YET_VALID,
         "not-yet-valid rejection");
   CHECK(qlinq_emcon_manifest_validate(&manifest, 5000) ==
-            QLINQ_EMCON_MANIFEST_EXPIRED,
+                QLINQ_EMCON_MANIFEST_EXPIRED &&
+            strcmp(qlinq_emcon_manifest_strerror(QLINQ_EMCON_MANIFEST_EXPIRED),
+                   "manifest expired") == 0,
         "expiry rejection");
   CHECK(qlinq_emcon_manifest_check_traffic_key(
             &manifest, secret, sizeof(secret)) == QLINQ_EMCON_MANIFEST_OK,

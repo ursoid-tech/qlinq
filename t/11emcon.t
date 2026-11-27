@@ -10,8 +10,6 @@ my @tests = (
      qr/===EMCON ACTIVATION OK===/],
     ['signed manifest', './t/00util/test_emcon_manifest',
      qr/===EMCON MANIFEST OK===/],
-    ['metadata', './t/00util/test_emcon_metadata',
-     qr/===EMCON METADATA OK===/],
     ['rateless reconstruction', './t/00util/test_emcon_rateless',
      qr/===EMCON RATELESS OK===/],
     ['late multicast listeners', './t/00util/test_emcon_rateless --late-join',

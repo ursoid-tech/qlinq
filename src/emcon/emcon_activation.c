@@ -1,6 +1,6 @@
 #include "emcon_activation.h"
 
-#include "emcon_endian.h"
+#include "wire_endian.h"
 
 #include <openssl/crypto.h>
 #include <openssl/sha.h>
@@ -25,7 +25,6 @@
 #define ACTIVATION_FILE_SIZE (ACTIVATION_SLOT_SIZE * ACTIVATION_SLOT_COUNT)
 #define ACTIVATION_CHECKSUM_OFFSET 128U
 #define ACTIVATION_FILENAME_SIZE 82U
-#define RECEIVER_CLAIM_SIZE 160U
 
 struct qlinq_emcon_activation_t {
   int fd;
@@ -74,8 +73,8 @@ static int decode_slot(const uint8_t slot[ACTIVATION_SLOT_SIZE],
   uint8_t checksum[32];
   if (slot[0] != ACTIVATION_MAGIC_0 || slot[1] != ACTIVATION_MAGIC_1 ||
       slot[2] != ACTIVATION_MAGIC_2 || slot[3] != ACTIVATION_MAGIC_3 ||
-      qlinq_emcon_read_u16(slot + 4) != ACTIVATION_VERSION ||
-      qlinq_emcon_read_u16(slot + 6) != ACTIVATION_SLOT_SIZE ||
+      qlinq_read_u16(slot + 4) != ACTIVATION_VERSION ||
+      qlinq_read_u16(slot + 6) != ACTIVATION_SLOT_SIZE ||
       !all_zero(slot + 120, 8) ||
       !SHA256(slot, ACTIVATION_CHECKSUM_OFFSET, checksum) ||
       CRYPTO_memcmp(checksum, slot + ACTIVATION_CHECKSUM_OFFSET,
@@ -89,8 +88,8 @@ static int decode_slot(const uint8_t slot[ACTIVATION_SLOT_SIZE],
                     sizeof(manifest->traffic_key_id)) != 0 ||
       CRYPTO_memcmp(slot + 72, manifest_digest, 32) != 0)
     return QLINQ_EMCON_ACTIVATION_IDENTITY_MISMATCH;
-  *next_packet_number = qlinq_emcon_read_u64(slot + 104);
-  *generation = qlinq_emcon_read_u64(slot + 112);
+  *next_packet_number = qlinq_read_u64(slot + 104);
+  *generation = qlinq_read_u64(slot + 112);
   if (*next_packet_number <= manifest->initial_packet_number ||
       *next_packet_number >
           qlinq_emcon_packet_number_limit(manifest->initial_packet_number) ||
@@ -107,8 +106,8 @@ static bool encode_slot(uint8_t slot[ACTIVATION_SLOT_SIZE],
   slot[1] = ACTIVATION_MAGIC_1;
   slot[2] = ACTIVATION_MAGIC_2;
   slot[3] = ACTIVATION_MAGIC_3;
-  qlinq_emcon_write_u16(slot + 4, ACTIVATION_VERSION);
-  qlinq_emcon_write_u16(slot + 6, ACTIVATION_SLOT_SIZE);
+  qlinq_write_u16(slot + 4, ACTIVATION_VERSION);
+  qlinq_write_u16(slot + 6, ACTIVATION_SLOT_SIZE);
   memcpy(slot + 8, activation->manifest.session_id,
          sizeof(activation->manifest.session_id));
   memcpy(slot + 24, activation->manifest.sender_id,
@@ -117,8 +116,8 @@ static bool encode_slot(uint8_t slot[ACTIVATION_SLOT_SIZE],
          sizeof(activation->manifest.traffic_key_id));
   memcpy(slot + 72, activation->manifest_digest,
          sizeof(activation->manifest_digest));
-  qlinq_emcon_write_u64(slot + 104, next_packet_number);
-  qlinq_emcon_write_u64(slot + 112, generation);
+  qlinq_write_u64(slot + 104, next_packet_number);
+  qlinq_write_u64(slot + 112, generation);
   return SHA256(slot, ACTIVATION_CHECKSUM_OFFSET,
                 slot + ACTIVATION_CHECKSUM_OFFSET) != NULL;
 }
@@ -163,9 +162,9 @@ static int activation_filename(char filename[ACTIVATION_FILENAME_SIZE],
   memcpy(input + offset, manifest->traffic_key_id,
          sizeof(manifest->traffic_key_id));
   offset += sizeof(manifest->traffic_key_id);
-  qlinq_emcon_write_u32(input + offset, manifest->key_epoch);
+  qlinq_write_u32(input + offset, manifest->key_epoch);
   offset += 4;
-  qlinq_emcon_write_u16(input + offset, manifest->cipher_suite);
+  qlinq_write_u16(input + offset, manifest->cipher_suite);
   uint8_t digest[32];
   if (!SHA256(input, sizeof(input), digest))
     return -1;
@@ -313,10 +312,6 @@ int qlinq_emcon_receiver_activation_claim(
   if (!manifest ||
       qlinq_emcon_manifest_validate(manifest, 0) != QLINQ_EMCON_MANIFEST_OK)
     return QLINQ_EMCON_ACTIVATION_INVALID;
-  uint8_t manifest_digest[32];
-  if (qlinq_emcon_manifest_digest(manifest, manifest_digest) !=
-      QLINQ_EMCON_MANIFEST_OK)
-    return QLINQ_EMCON_ACTIVATION_INVALID;
   int directory_fd = open_state_directory(state_directory);
   if (directory_fd < 0)
     return QLINQ_EMCON_ACTIVATION_IO;
@@ -334,38 +329,14 @@ int qlinq_emcon_receiver_activation_claim(
     return ret;
   }
   struct stat info;
-  if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
-      info.st_uid != geteuid() || info.st_nlink != 1 ||
-      (info.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
-    close(fd);
-    close(directory_fd);
-    return QLINQ_EMCON_ACTIVATION_IO;
-  }
-
-  uint8_t claim[RECEIVER_CLAIM_SIZE];
-  memset(claim, 0, sizeof(claim));
-  claim[0] = 'Q';
-  claim[1] = 'E';
-  claim[2] = 'M';
-  claim[3] = 'R';
-  qlinq_emcon_write_u16(claim + 4, ACTIVATION_VERSION);
-  qlinq_emcon_write_u16(claim + 6, RECEIVER_CLAIM_SIZE);
-  memcpy(claim + 8, manifest->session_id, sizeof(manifest->session_id));
-  memcpy(claim + 24, manifest->sender_id, sizeof(manifest->sender_id));
-  memcpy(claim + 40, manifest->traffic_key_id,
-         sizeof(manifest->traffic_key_id));
-  memcpy(claim + 72, manifest_digest, sizeof(manifest_digest));
-  qlinq_emcon_write_u64(claim + 104, manifest->flow_id);
-  qlinq_emcon_write_u32(claim + 112, manifest->key_epoch);
-  qlinq_emcon_write_u16(claim + 116, manifest->cipher_suite);
-  int ret = SHA256(claim, ACTIVATION_CHECKSUM_OFFSET,
-                   claim + ACTIVATION_CHECKSUM_OFFSET) &&
-                    write_exact_at(fd, claim, sizeof(claim), 0) == 0 &&
+  int ret = fstat(fd, &info) == 0 && S_ISREG(info.st_mode) &&
+                    info.st_uid == geteuid() && info.st_nlink == 1 &&
+                    (info.st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
                     fdatasync(fd) == 0 && fsync(directory_fd) == 0
                 ? QLINQ_EMCON_ACTIVATION_OK
                 : QLINQ_EMCON_ACTIVATION_IO;
-  OPENSSL_cleanse(claim, sizeof(claim));
-  OPENSSL_cleanse(manifest_digest, sizeof(manifest_digest));
+  if (ret != QLINQ_EMCON_ACTIVATION_OK)
+    (void)unlinkat(directory_fd, filename, 0);
   close(fd);
   close(directory_fd);
   return ret;

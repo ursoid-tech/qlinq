@@ -56,7 +56,7 @@ open my $config_file, '>', $config or die "open config: $!";
 print {$config_file} <<"CONFIG";
 session_id=random
 sender_id=random
-flow_id=91
+flow_id=0x5b
 key_epoch=1
 initial_packet_number=4611686018427383808
 valid_for_seconds=120
@@ -66,7 +66,6 @@ interface_index=0
 replay_window_packets=64
 rate_bytes_per_second=100000000
 burst_bytes=4096
-metadata_repeat_interval_ms=10000
 terminal_repeat_count=3
 symbol_size=512
 repair_symbols=8
@@ -239,7 +238,6 @@ interface_index=0
 replay_window_packets=64
 rate_bytes_per_second=100000000
 burst_bytes=4096
-metadata_repeat_interval_ms=10000
 terminal_repeat_count=2
 symbol_size=512
 repair_symbols=1
@@ -276,7 +274,7 @@ while (1) {
     push @captured, $datagram;
 }
 close $capture_sock;
-is(scalar(@captured), 37, 'captured SESSION + 17*2 object packets + 2 END packets');
+is(scalar(@captured), 36, 'captured 17*2 object packets + 2 END packets');
 
 my $reorder_output = "$directory/reorder-out.bin";
 open my $seed_fh, '>', $reorder_output or die "seed reorder output: $!";
@@ -304,8 +302,8 @@ my $replay_sock = IO::Socket::INET->new(
     PeerAddr  => '127.0.0.1', PeerPort  => $destination_port,
     Proto     => 'udp',
 ) or die "replay socket: $!";
-# Send SESSION (0), objects 1..16 (3..34), then delayed object 0 (1..2), then END (35..36).
-for my $idx (0, 3 .. 34, 1, 2, 35, 36) {
+# Send objects 1..16 (2..33), then delayed object 0 (0..1), then END (34..35).
+for my $idx (2 .. 33, 0, 1, 34, 35) {
     $replay_sock->send($captured[$idx]) or die "replay send: $!";
 }
 close $replay_sock;
@@ -334,7 +332,6 @@ interface_index=0
 replay_window_packets=64
 rate_bytes_per_second=500
 burst_bytes=1200
-metadata_repeat_interval_ms=10000
 terminal_repeat_count=4
 symbol_size=512
 repair_symbols=4
