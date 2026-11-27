@@ -395,8 +395,11 @@ void test_fifty_writer_fifo(void) {
   }
 
   if (!seed_text) {
-    /* bottleneck runs that previously stranded a writer for 112 and 37 s */
+    /* delayed feedback previously stranded individual writers on these runs */
     check_fifo(false, false, 19);
+    check_fifo(false, false, 40);
+    check_fifo(false, false, 59);
+    check_fifo(false, false, 210);
     check_fifo(true, false, 25);
 
     /* with FIFO drops only, shared publishers must still drain a slow link */

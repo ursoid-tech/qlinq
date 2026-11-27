@@ -3,18 +3,13 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <string.h>
 void test_fifty_writer_fifo(void);
 
 typedef struct {
   quicly_flexicast_cc_t *cc;
   int64_t now;
   uint64_t epochs[64], rtt_epochs[64];
-  struct {
-    quicly_flexicast_feedback_t feedback;
-    transport_group_cc_trace_state_t state_after;
-    uint32_t reason;
-  } event;
+  transport_group_cc_trace_state_t state;
 } fixture_t;
 static uint64_t rate(quicly_flexicast_cc_t *cc) {
   return cc->output.rate_bytes_per_second;
@@ -54,24 +49,28 @@ static quicly_flexicast_feedback_t input(fixture_t *w, unsigned id,
   f.delivery_rate_sample_epoch = w->epochs[id];
   return f;
 }
-static void sample(quicly_flexicast_feedback_t *f, uint64_t ref,
-                   uint64_t delivered) {
+static void completed_sample(quicly_flexicast_feedback_t *f, uint64_t ref,
+                             uint64_t delivered, int64_t acked_at_end,
+                             uint32_t duration_ms) {
   f->delivery_sample_flags = QUICLY_FLEXICAST_SAMPLE_VALID;
   f->delivery_sample_fanout = 1;
   f->delivery_sample_pacing_rate_bytes_per_second = ref;
   f->delivery_rate_bytes_per_second = delivered;
-  f->delivery_sample_bytes = delivered;
-  f->delivery_sample_sent_at_start = f->now - f->raw_rtt_msec - 1001;
-  f->delivery_sample_sent_at_end = f->now - f->raw_rtt_msec - 1;
-  f->delivery_sample_acked_at_start = f->now - 1001;
-  f->delivery_sample_acked_at_end = f->now - 1;
+  f->delivery_sample_bytes = (__uint128_t)delivered * duration_ms / 1000;
+  f->delivery_sample_sent_at_end = acked_at_end - f->raw_rtt_msec;
+  f->delivery_sample_sent_at_start =
+      f->delivery_sample_sent_at_end - duration_ms;
+  f->delivery_sample_acked_at_start = acked_at_end - duration_ms;
+  f->delivery_sample_acked_at_end = acked_at_end;
+}
+static void sample(quicly_flexicast_feedback_t *f, uint64_t ref,
+                   uint64_t delivered) {
+  completed_sample(f, ref, delivered, f->now - 1, 1000);
 }
 static void submit(fixture_t *w, const quicly_flexicast_feedback_t *f) {
   quicly_flexicast_cc_on_feedback(w->cc, f);
-  w->event.feedback = *f;
-  w->event.reason = w->cc->output.reason;
-  assert(transport_group_cc_mcbbr_get_trace_state(w->cc, f->member_id,
-                                                  &w->event.state_after));
+  assert(
+      transport_group_cc_mcbbr_get_trace_state(w->cc, f->member_id, &w->state));
 }
 static void warm(fixture_t *w, bool capacity) {
   for (unsigned e = 0; e < 10; e++) {
@@ -99,8 +98,6 @@ static void bounded_recovery(void) {
     assert(rate(w.cc) <= 32000);
   }
   assert(rate(w.cc) > reduced && rate(w.cc) == 32000);
-  assert(w.event.feedback.latest_rtt_msec == 100 &&
-         w.event.feedback.minimum_rtt_msec == 10);
   transport_group_cc_mcbbr_free(w.cc);
 }
 static void no_unsupported_growth(unsigned mode) {
@@ -201,7 +198,7 @@ static void proof_and_invalid_capacity(unsigned mode) {
 static void capacity_and_radio_loss(bool growing) {
   fixture_t w = create();
   warm(&w, true);
-  assert(w.event.state_after.baseline_delivery_ratio_ppm == 1000000);
+  assert(w.state.baseline_delivery_ratio_ppm == 1000000);
   uint64_t before = rate(w.cc);
   for (unsigned e = 0; e < (growing ? 2U : 6U); e++) {
     quicly_flexicast_feedback_t f =
@@ -212,10 +209,9 @@ static void capacity_and_radio_loss(bool growing) {
       assert(rate(w.cc) >= before);
   }
   if (growing)
-    assert(rate(w.cc) <= before / 2 + 1 &&
-           w.event.state_after.delivery_sample_post_cut);
+    assert(rate(w.cc) <= before / 2 + 1);
   else
-    assert(w.event.state_after.baseline_delivery_ratio_ppm <= 250000);
+    assert(w.state.baseline_delivery_ratio_ppm <= 250000);
   transport_group_cc_mcbbr_free(w.cc);
 }
 static void loss_burst_vetoes_growth(void) {
@@ -264,15 +260,6 @@ static void stable_delay_loss_response(bool policed) {
   transport_group_cc_mcbbr_free(w.cc);
 }
 
-static void completed_sample(quicly_flexicast_feedback_t *f, uint64_t paced,
-                             uint64_t delivered, int64_t acked_at_end) {
-  sample(f, paced, delivered);
-  f->delivery_sample_acked_at_start = acked_at_end - 1000;
-  f->delivery_sample_acked_at_end = acked_at_end;
-  f->delivery_sample_sent_at_start = acked_at_end - 1000 - f->raw_rtt_msec;
-  f->delivery_sample_sent_at_end = acked_at_end - f->raw_rtt_msec;
-}
-
 static void group_service_provenance(void) {
   enum {
     MATCHED_SERVICE,
@@ -297,7 +284,8 @@ static void group_service_provenance(void) {
     uint64_t paced = rate(w.cc);
     quicly_flexicast_feedback_t f =
         input(&w, 1, 100, mode == STALE ? 10000 : 1000);
-    completed_sample(&f, paced, paced / 4, prior.now - (mode == UNMATCHED));
+    completed_sample(&f, paced, paced / 4, prior.now - (mode == UNMATCHED),
+                     1000);
     f.delivery_sample_fanout = 2;
     if (mode == NATIVE_SHARED_LOSS) {
       f.delivery_sample_fanout = 1;
@@ -334,13 +322,13 @@ static void group_service_drains_after_queue_evidence(void) {
 
   uint64_t paced = rate(w.cc);
   f = input(&w, 1, 100, 1000);
-  completed_sample(&f, paced, paced / 2, previous_at);
+  completed_sample(&f, paced, paced / 2, previous_at, 1000);
   f.acked_packets = 8;
   f.lost_packets = 4;
   submit(&w, &f);
   uint64_t discovery_rate = paced * 7 / 8;
   assert(rate(w.cc) == discovery_rate);
-  assert(w.event.state_after.growth_blocked_until == f.now + 2000);
+  assert(w.state.growth_blocked_until == f.now + 2000);
 
   f = input(&w, 1, 140, 100);
   f.lost_packets = 4;
@@ -351,7 +339,7 @@ static void group_service_drains_after_queue_evidence(void) {
   f.lost_packets = 4;
   submit(&w, &f);
   assert(rate(w.cc) == discovery_rate / 2);
-  assert(w.event.state_after.growth_blocked_until == f.now + 5000);
+  assert(w.state.growth_blocked_until == f.now + 5000);
   transport_group_cc_mcbbr_free(w.cc);
 }
 
@@ -372,12 +360,12 @@ static void group_service_limited_queue_with_baseline_loss(void) {
     uint64_t before = rate(w.cc);
     int64_t previous_at = f.now;
     f = input(&w, 1, 140, 1000);
-    completed_sample(&f, before, before / 2, previous_at);
+    completed_sample(&f, before, before / 2, previous_at, 1000);
     f.acked_packets = 8;
     f.lost_packets = 4;
     submit(&w, &f);
     assert(rate(w.cc) == (baseline_loss ? before * 7 / 8 : before / 2));
-    assert(w.event.state_after.growth_blocked_until ==
+    assert(w.state.growth_blocked_until ==
            f.now + (baseline_loss ? 2000 : 5000));
     transport_group_cc_mcbbr_free(w.cc);
   }
@@ -396,14 +384,14 @@ static void group_service_respects_a_fully_served_offer(void) {
 
   uint64_t paced = rate(w.cc);
   f = input(&w, 1, 100, 1000);
-  completed_sample(&f, paced, paced / 2, previous_at);
+  completed_sample(&f, paced, paced / 2, previous_at, 1000);
   f.acked_packets = 8;
   submit(&w, &f);
   assert(rate(w.cc) == paced);
 
   /* receiver was fully served at a lower stamped pacing rate */
   f = input(&w, 2, 100, 0);
-  completed_sample(&f, paced / 4, paced / 4, previous_at);
+  completed_sample(&f, paced / 4, paced / 4, previous_at, 1000);
   f.acked_packets = 8;
   f.lost_packets = 4;
   submit(&w, &f);
@@ -421,7 +409,7 @@ static void group_service_holds_then_allows_growth(bool expire) {
   submit(&w, &f);
   int64_t previous_at = f.now;
   f = input(&w, 1, 100, 1000);
-  completed_sample(&f, paced, paced / 2, previous_at);
+  completed_sample(&f, paced, paced / 2, previous_at, 1000);
   f.acked_packets = 8;
   submit(&w, &f);
   assert(rate(w.cc) == paced);
@@ -439,7 +427,7 @@ static void group_service_holds_then_allows_growth(bool expire) {
     if (expire)
       sample(&f, paced, paced);
     else
-      completed_sample(&f, paced, paced, previous_at);
+      completed_sample(&f, paced, paced, previous_at, 1000);
     f.acked_packets = 8;
     submit(&w, &f);
   }
@@ -493,14 +481,16 @@ static void effective_rate_and_idle_timeout(void) {
 static void cumulative_growth(void) {
   fixture_t w = create();
   warm(&w, false);
-  uint64_t before = rate(w.cc);
+  uint64_t before = rate(w.cc), prev = before;
+  unsigned cuts = 0;
   for (unsigned e = 1; e <= 60; e++) {
     quicly_flexicast_feedback_t f = input(&w, 1, 100 + e, 1000);
     submit(&w, &f);
+    if (rate(w.cc) < prev)
+      ++cuts;
+    prev = rate(w.cc);
   }
-  transport_group_cc_stats_t out;
-  assert(transport_group_cc_mcbbr_get_stats(w.cc, &out));
-  assert(out.rtt_reduction_events >= 2 && rate(w.cc) < before);
+  assert(cuts >= 2 && rate(w.cc) < before);
   transport_group_cc_mcbbr_free(w.cc);
 }
 static void correlated_receivers(void) {
@@ -512,20 +502,16 @@ static void correlated_receivers(void) {
       quicly_flexicast_feedback_t f = input(&w, id, 100 + 20 * phase, 30);
       submit(&w, &f);
     }
-  transport_group_cc_stats_t o;
-  assert(transport_group_cc_mcbbr_get_stats(w.cc, &o));
-  assert(o.rtt_reduction_events == 1 && rate(w.cc) == 28800);
+  assert(rate(w.cc) == 28800);
   /* large old flights cannot furnish post-cut trend evidence */
   for (unsigned id = 1; id <= 50; id++) {
     quicly_flexicast_feedback_t f = input(&w, id, 5000, 1);
     submit(&w, &f);
   }
-  assert(transport_group_cc_mcbbr_get_stats(w.cc, &o));
-  assert(o.rtt_reduction_events == 1);
+  assert(rate(w.cc) == 28800);
   quicly_flexicast_feedback_t first_post_cut = input(&w, 2, 5500, 15000);
   submit(&w, &first_post_cut);
-  assert(transport_group_cc_mcbbr_get_stats(w.cc, &o));
-  assert(o.rtt_reduction_events == 1);
+  assert(rate(w.cc) == 28800);
   transport_group_cc_mcbbr_free(w.cc);
 }
 static void lower_path_then_renewed_growth(void) {
@@ -588,7 +574,7 @@ static void timeout_and_members(void) {
   quicly_flexicast_cc_on_member_removed(w.cc, 1, w.now);
   quicly_flexicast_feedback_t f = input(&w, 1, 100, 1000);
   submit(&w, &f);
-  assert(!w.event.state_after.member_present);
+  assert(!w.state.member_present);
   transport_group_cc_mcbbr_free(w.cc);
 }
 
@@ -603,12 +589,11 @@ static void suspended_member_compaction(void) {
   quicly_flexicast_cc_on_member_removed(w.cc, 3, w.now);
   quicly_flexicast_feedback_t ignored = input(&w, 2, 999, 1000);
   submit(&w, &ignored);
-  assert(w.event.state_after.member_present &&
-         w.event.state_after.previous_rtt == 200);
+  assert(w.state.member_present && w.state.previous_rtt == 200);
   assert(quicly_flexicast_cc_on_member_added(w.cc, 2, w.now) == 0);
   quicly_flexicast_feedback_t resumed = input(&w, 2, 100, 1000);
   submit(&w, &resumed);
-  assert(w.event.state_after.previous_rtt == 100);
+  assert(w.state.previous_rtt == 100);
   assert(quicly_flexicast_cc_on_member_added(w.cc, 3, w.now) == 0);
   transport_group_cc_trace_state_t state;
   assert(transport_group_cc_mcbbr_get_trace_state(w.cc, 3, &state));
@@ -626,38 +611,13 @@ static void epoch_clears_samples(void) {
   w.epochs[1] = w.rtt_epochs[1] = 0;
   quicly_flexicast_feedback_t f = input(&w, 1, 100, 1000);
   submit(&w, &f);
-  assert(rate(w.cc) == before &&
-         w.event.state_after.last_rtt_sample_epoch == 1);
-  assert(w.event.state_after.rising_delay_epochs == 0);
+  assert(rate(w.cc) == before && w.state.last_rtt_sample_epoch == 1);
   transport_group_cc_mcbbr_free(w.cc);
 }
-static void external_and_hard_bound(void) {
+static void hard_rate_bound(void) {
   fixture_t w = create();
   warm(&w, false);
-  ce(&w);
-  uint64_t before = rate(w.cc);
-  transport_group_cc_hints_t h = {.external_load_epoch = 1,
-                                  .external_load_queued_bytes = 1000};
-  transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
-  warm(&w, false);
-  assert(rate(w.cc) == before);
-  h.external_load_queued_bytes = 0;
-  for (unsigned e = 0; e < 4; e++) {
-    transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
-    warm(&w, false);
-    assert(rate(w.cc) == before);
-  }
-  for (unsigned e = 0; e < 2; e++) {
-    ++h.external_load_epoch;
-    transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
-    warm(&w, false);
-    assert(rate(w.cc) == before);
-  }
-  ++h.external_load_epoch;
-  transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
-  warm(&w, false);
-  assert(rate(w.cc) > before);
-  h.aggregate_rate_limit_bytes_per_second = 200;
+  transport_group_cc_hints_t h = {.aggregate_rate_limit_bytes_per_second = 200};
   transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
   assert(rate(w.cc) == 200);
   warm(&w, true);
@@ -679,8 +639,6 @@ static void precut_capacity_is_not_current_proof(void) {
   f.delivery_sample_sent_at_end = cut_at - 1;
   submit(&w, &f);
   assert(rate(w.cc) == before);
-  assert(w.event.state_after.delivery_ceiling_eligible &&
-         !w.event.state_after.delivery_sample_post_cut);
   transport_group_cc_mcbbr_free(w.cc);
 }
 static void minimum_and_burst_bounds(void) {
@@ -730,8 +688,7 @@ static void zero_clock_and_overflow(void) {
   sample(&f, UINT64_MAX, UINT64_MAX);
   f.delivery_sample_fanout = UINT32_MAX;
   submit(&w, &f);
-  assert(rate(w.cc) > before &&
-         w.event.state_after.recent_delivery_ratio_ppm == 1000000);
+  assert(rate(w.cc) > before && w.state.recent_delivery_ratio_ppm == 1000000);
   transport_group_cc_mcbbr_free(w.cc);
 }
 static void bbrv3_drain_and_cohort(void) {
@@ -744,20 +701,20 @@ static void bbrv3_drain_and_cohort(void) {
   quicly_flexicast_feedback_t f1 = input(&w, 1, 100, 100);
   f1.minimum_rtt_msec = 0;
   submit(&w, &f1);
-  assert(w.event.state_after.minimum_rtt == 100);
+  assert(w.state.minimum_rtt == 100);
   /* single uncorroborated rise on member 1 blocks only for member 1's flight */
   f1 = input(&w, 1, 120, 100);
   f1.minimum_rtt_msec = 0;
   submit(&w, &f1);
-  assert(w.event.state_after.growth_blocked_until == f1.now + 250);
+  assert(w.state.growth_blocked_until == f1.now + 250);
   /* corroborated rise on member 1 when member 2 also rises blocks for group */
   f2 = input(&w, 2, 2200, 100);
   f2.minimum_rtt_msec = 0;
   submit(&w, &f2);
-  assert(w.event.state_after.growth_blocked_until == f2.now + 2210);
+  assert(w.state.growth_blocked_until == f2.now + 2210);
   transport_group_cc_mcbbr_free(w.cc);
 
-  /* cohort median catch-up and drain lifecycle */
+  /* cohort median catch-up */
   w = create();
   warm(&w, true);
   uint64_t base = rate(w.cc);
@@ -768,116 +725,208 @@ static void bbrv3_drain_and_cohort(void) {
   sample(&f, base, base);
   submit(&w, &f);
   assert(rate(w.cc) == base + 1500);
-  f = input(&w, 1, 130, 1000);
-  sample(&f, rate(w.cc), rate(w.cc) / 2);
+  transport_group_cc_mcbbr_free(w.cc);
+}
+
+static void pending_drain_clears_on_recovery(void) {
+  fixture_t w = create();
+  warm(&w, true);
+  uint64_t peak = rate(w.cc);
+  quicly_flexicast_feedback_t f = input(&w, 1, 130, 1000);
+  completed_sample(&f, peak, peak / 2, f.now - 1, 25);
   submit(&w, &f);
-  assert(w.event.state_after.drain_phase == 1);
-  f = input(&w, 1, 100, 1000);
-  sample(&f, rate(w.cc), rate(w.cc));
+  /* Full delivery at baseline RTT interrupts the queued reports. */
+  f = input(&w, 1, 100, 200);
+  completed_sample(&f, peak, peak, f.now - 1, 25);
   submit(&w, &f);
-  assert(w.event.state_after.drain_phase == 0 &&
-         (w.event.reason & TRANSPORT_GROUP_CC_REASON_DRAIN_CLEAR));
+  f = input(&w, 1, 165, 100);
+  completed_sample(&f, peak, peak / 2, f.now - 1, 25);
+  submit(&w, &f);
+  assert(rate(w.cc) == peak);
+  transport_group_cc_mcbbr_free(w.cc);
+}
+
+static void precut_service_cannot_confirm_drain(void) {
+  fixture_t w = create();
+  warm(&w, true);
+  assert(quicly_flexicast_cc_on_member_added(w.cc, 2, w.now) == 0);
+  uint64_t peak = rate(w.cc);
+  quicly_flexicast_feedback_t f = input(&w, 1, 130, 1000);
+  sample(&f, peak, peak / 4);
+  submit(&w, &f);
+  assert(rate(w.cc) == peak);
+  f = input(&w, 2, 100, 260);
+  f.ecn_ce_count = 1;
+  submit(&w, &f);
+  uint64_t after_ecn = rate(w.cc);
+  assert(after_ecn < peak);
+  int64_t cut_at = w.now;
+  f = input(&w, 1, 165, 250);
+  /* The RTT describes a new packet. The delivery bucket predates the cut. */
+  completed_sample(&f, peak, peak / 4, cut_at + 80, 200);
+  assert(f.rtt_sample_at - f.raw_rtt_msec > cut_at &&
+         f.delivery_sample_sent_at_end < cut_at);
+  submit(&w, &f);
+  assert(rate(w.cc) == after_ecn);
+  f = input(&w, 1, 200, 1000);
+  completed_sample(&f, after_ecn, after_ecn / 4, f.now - 1, 200);
+  assert(f.delivery_sample_sent_at_start > cut_at);
+  submit(&w, &f);
+  assert(rate(w.cc) < after_ecn);
+  transport_group_cc_mcbbr_free(w.cc);
+}
+
+static void active_drain_waits_for_group_flight(void) {
+  fixture_t w = create();
+  warm(&w, true);
+  assert(quicly_flexicast_cc_on_member_added(w.cc, 2, w.now) == 0);
+  uint64_t peak = rate(w.cc);
+  uint64_t confirmed_service = peak / 2;
+  int64_t cut_at = 0;
+  for (unsigned i = 0; i < 5; ++i) {
+    quicly_flexicast_feedback_t f = input(&w, 1, 130 + 35 * i, i ? 250 : 3000);
+    f.rtt_ack_delay_msec = f.applied_ack_delay_msec = 1000;
+    f.raw_rtt_msec = f.latest_rtt_msec + f.applied_ack_delay_msec;
+    completed_sample(&f, peak, i < 2 ? confirmed_service : peak / 12, f.now - 1,
+                     200);
+    f.acked_bytes = f.delivery_sample_bytes;
+    if (i >= 2)
+      assert(f.delivery_sample_sent_at_end < cut_at);
+    submit(&w, &f);
+    if (i == 1)
+      cut_at = f.now;
+    assert(rate(w.cc) == (i == 0 ? peak : peak / 2));
+  }
+  /* A different member's ACK advances the drain to its original target. */
+  quicly_flexicast_feedback_t f = input(&w, 2, 100, 550);
+  submit(&w, &f);
+  uint64_t expected = confirmed_service * 4 / 5;
+  assert(rate(w.cc) + 2 >= expected && rate(w.cc) <= expected + 2);
+  transport_group_cc_mcbbr_free(w.cc);
+}
+
+static void measured_drain_in_small_cohort(void) {
+  fixture_t w = create();
+  warm(&w, true);
+  uint64_t peak = rate(w.cc);
+  transport_group_cc_hints_t h = {
+      .active_senders = 4, .median_sender_rate_bytes_per_second = peak * 2};
+  transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
+  for (unsigned i = 0; i < 3; ++i) {
+    quicly_flexicast_feedback_t f = input(&w, 1, 200 + 110 * i, 1000);
+    sample(&f, rate(w.cc), peak / 3);
+    submit(&w, &f);
+  }
+  assert(rate(w.cc) <= peak / 3);
   transport_group_cc_mcbbr_free(w.cc);
 }
 
 static void drain_active_and_hint_isolation(void) {
-  /* active drain cuts toward 0.8 * ceiling with DRAIN_CUT */
+  /* sustained capacity drop with growing RTT cuts toward measured ceiling */
   fixture_t w = create();
   warm(&w, true);
+  assert(quicly_flexicast_cc_on_member_added(w.cc, 2, w.now) == 0);
   uint64_t peak = rate(w.cc);
   uint64_t cap = (peak * 3) / 4;
   quicly_flexicast_feedback_t f = input(&w, 1, 130, 1000);
   sample(&f, peak, cap);
   submit(&w, &f);
-  assert(w.event.state_after.drain_phase == 1);
   f = input(&w, 1, 165, 1000);
   sample(&f, peak, cap);
   submit(&w, &f);
-  uint64_t expected_target = (cap * 80) / 100;
-  assert(w.event.state_after.drain_phase == 2);
-  assert((w.event.reason & TRANSPORT_GROUP_CC_REASON_DRAIN_ENTER) &&
-         (w.event.reason & TRANSPORT_GROUP_CC_REASON_DRAIN_CUT));
-  assert(rate(w.cc) == w.event.state_after.drain_target_bytes_per_second);
-  assert(rate(w.cc) + 2 >= expected_target &&
-         rate(w.cc) <= expected_target + 2);
+  uint64_t expected = (cap * 80) / 100;
+  assert(rate(w.cc) + 2 >= expected && rate(w.cc) <= expected + 2);
+  /* An ECN cut from a different member preserves the active drain's hold. */
+  transport_group_cc_hints_t h = {.active_senders = 4,
+                                  .median_sender_rate_bytes_per_second =
+                                      rate(w.cc) * 2};
+  transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
+  f = input(&w, 2, 100, 260);
+  f.ecn_ce_count = 1;
   uint64_t draining = rate(w.cc);
-  transport_group_cc_hints_t cohort = {
-      .active_senders = 4, .median_sender_rate_bytes_per_second = draining * 2};
-  transport_group_cc_mcbbr_set_hints(w.cc, &cohort, w.now);
-  f = input(&w, 1, 100, 1250);
   submit(&w, &f);
-  assert(w.event.state_after.drain_phase == 2 && rate(w.cc) == draining);
-  assert(w.event.reason & TRANSPORT_GROUP_CC_REASON_GROWTH_FROZEN);
-  transport_group_cc_mcbbr_on_delivery_clear(w.cc);
+  uint64_t after_ecn = rate(w.cc);
+  assert(after_ecn < draining);
+  f = input(&w, 2, 100, 1050);
+  submit(&w, &f);
+  assert(rate(w.cc) == after_ecn);
   int64_t drain_deadline = w.cc->output.next_timeout;
-  assert(drain_deadline > w.now && drain_deadline != INT64_MAX);
+  assert(w.now < drain_deadline && drain_deadline < INT64_MAX);
   quicly_flexicast_cc_on_timeout(w.cc, drain_deadline);
-  assert(w.cc->output.next_timeout == INT64_MAX &&
-         (w.cc->output.reason & TRANSPORT_GROUP_CC_REASON_DRAIN_EXPIRE) &&
-         !(w.cc->output.reason & QUICLY_FLEXICAST_CC_REASON_TIMEOUT));
+  assert(w.cc->output.next_timeout == INT64_MAX && rate(w.cc) == after_ecn);
   transport_group_cc_mcbbr_free(w.cc);
 
-  /* stale external-load epochs are ignored and rate limits avoid cut_seen */
+  /* rate limit clamps output without recording a congestion cut */
   w = create();
-  transport_group_cc_hints_t h = {.aggregate_rate_limit_bytes_per_second =
-                                      10000,
-                                  .external_load_epoch = 10,
-                                  .external_load_queued_bytes = 4096};
+  h = (transport_group_cc_hints_t){.aggregate_rate_limit_bytes_per_second =
+                                       10000};
   transport_group_cc_mcbbr_set_hints(w.cc, &h, w.now);
-  assert(
-      transport_group_cc_mcbbr_get_trace_state(w.cc, 1, &w.event.state_after));
-  assert(rate(w.cc) == 10000 && w.event.state_after.last_reduction_epoch == 0 &&
-         w.event.state_after.external_load);
-  for (uint64_t ep = 1; ep <= 4; ep++) {
-    transport_group_cc_hints_t stale = {.active_senders = 8,
-                                        .external_load_epoch = ep};
-    transport_group_cc_mcbbr_set_hints(w.cc, &stale, w.now + (int64_t)ep);
-    assert(transport_group_cc_mcbbr_get_trace_state(w.cc, 1,
-                                                    &w.event.state_after));
-  }
-  assert(w.event.state_after.external_load);
+  assert(rate(w.cc) == 10000);
   transport_group_cc_mcbbr_free(w.cc);
 }
 
 static void loopback_low_startup_ramp(void) {
   /* 1250 B/s startup on 0..3 ms loopback RTT ramps without false queue cuts */
-  quicly_flexicast_cc_t *cc = NULL;
   quicly_flexicast_cc_config_t cfg = {.maximum_members = 8,
                                       .startup_rate_bytes_per_second = 1250,
                                       .minimum_rate_bytes_per_second = 250,
                                       .maximum_datagram_size = 1200,
                                       .feedback_timeout_msec = 1000};
   int64_t now = 100000;
-  cc = transport_group_cc_mcbbr_new(&cfg, now);
+  quicly_flexicast_cc_t *cc = transport_group_cc_mcbbr_new(&cfg, now);
   assert(cc != NULL);
   quicly_flexicast_cc_on_member_added(cc, 1, now);
   for (unsigned step = 1; step <= 10; step++) {
     now += 260;
     uint32_t rtt = step % 3; /* 0, 1, 2 ms sub-ms and poll quantized RTT */
-    quicly_flexicast_feedback_t f = {0};
-    f.member_id = 1;
-    f.epoch = step;
-    f.now = now;
-    f.acked_packets = 2;
-    f.acked_bytes = 2400;
-    f.largest_acknowledged = step * 2;
-    f.latest_rtt_msec = rtt;
-    f.raw_rtt_msec = rtt;
-    f.rtt_sample_flags = QUICLY_FLEXICAST_RTT_VALID;
-    f.rtt_sample_epoch = step;
-    f.rtt_sample_at = now;
-    f.delivery_sample_flags = 0;
+    quicly_flexicast_feedback_t f = {.member_id = 1,
+                                     .epoch = step,
+                                     .now = now,
+                                     .acked_packets = 2,
+                                     .acked_bytes = 2400,
+                                     .largest_acknowledged = step * 2,
+                                     .latest_rtt_msec = rtt,
+                                     .raw_rtt_msec = rtt,
+                                     .rtt_sample_flags =
+                                         QUICLY_FLEXICAST_RTT_VALID,
+                                     .rtt_sample_epoch = step,
+                                     .rtt_sample_at = now};
     if (step >= 3) {
       f.delivery_rate_sample_epoch = step - 2;
       sample(&f, rate(cc), rate(cc));
     }
+    uint64_t prev = rate(cc);
     quicly_flexicast_cc_on_feedback(cc, &f);
+    assert(rate(cc) >= prev);
   }
-  transport_group_cc_stats_t st;
-  assert(transport_group_cc_mcbbr_get_stats(cc, &st));
-  assert(st.rtt_reduction_events == 0);
   assert(cc->output.rate_bytes_per_second >= 10000);
   transport_group_cc_mcbbr_free(cc);
+}
+
+static quicly_flexicast_feedback_t
+inconsistent_feedback(fixture_t *w, uint32_t wire_rtt, uint32_t ack_delay,
+                      uint32_t min_rtt, uint64_t acked_packets,
+                      uint64_t lost_packets, int64_t step) {
+  w->now += step;
+  uint32_t raw_rtt = wire_rtt + ack_delay;
+  uint64_t ep = ++w->epochs[1];
+  return (quicly_flexicast_feedback_t){
+      .member_id = 1,
+      .epoch = ep,
+      .now = w->now,
+      .acked_packets = acked_packets,
+      .lost_packets = lost_packets,
+      .acked_bytes = acked_packets * 1200,
+      .largest_acknowledged = ep * acked_packets,
+      .minimum_rtt_msec = min_rtt,
+      .raw_rtt_msec = raw_rtt,
+      .latest_rtt_msec = raw_rtt,
+      .smoothed_rtt_msec = raw_rtt,
+      .rtt_ack_delay_msec = ack_delay,
+      .rtt_sample_flags = QUICLY_FLEXICAST_RTT_VALID |
+                          QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT,
+      .rtt_sample_epoch = ++w->rtt_epochs[1],
+      .rtt_sample_at = w->now};
 }
 
 static void quicly_unsubtracted_min_rtt_recovery(void) {
@@ -889,28 +938,9 @@ static void quicly_unsubtracted_min_rtt_recovery(void) {
   w.now += 9000 + 2500;
   assert(rate(w.cc) <= 4000);
   for (unsigned step = 1; step <= 16; step++) {
-    w.now += 600;
-    uint32_t wire_rtt = 2040;
-    uint32_t ack_delay = 300 + (step % 4) * 300;
-    uint32_t raw_rtt = wire_rtt + ack_delay;
-    quicly_flexicast_feedback_t f = {0};
-    f.member_id = 1;
-    f.epoch = ++w.epochs[1];
-    f.now = w.now;
-    f.acked_packets = 8;
-    f.lost_packets = step % 2 ? 2 : 1;
-    f.acked_bytes = 9600;
-    f.largest_acknowledged = f.epoch * 8;
-    f.minimum_rtt_msec = 2340;
-    f.raw_rtt_msec = raw_rtt;
-    f.latest_rtt_msec = raw_rtt;
-    f.smoothed_rtt_msec = raw_rtt;
-    f.rtt_ack_delay_msec = ack_delay;
-    f.applied_ack_delay_msec = 0;
-    f.rtt_sample_flags = QUICLY_FLEXICAST_RTT_VALID |
-                         QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT;
-    f.rtt_sample_epoch = ++w.rtt_epochs[1];
-    f.rtt_sample_at = w.now;
+    uint32_t wire_rtt = 2040, ack_delay = 300 + (step % 4) * 300;
+    quicly_flexicast_feedback_t f = inconsistent_feedback(
+        &w, wire_rtt, ack_delay, 2340, 8, step % 2 ? 2 : 1, 600);
     sample(&f, rate(w.cc), (rate(w.cc) * 8) / 10);
     f.delivery_sample_sent_at_start = w.now - (int64_t)wire_rtt - 600;
     f.delivery_sample_sent_at_end = w.now - (int64_t)wire_rtt;
@@ -958,27 +988,11 @@ static void queue_drain_and_post_congestion_timeout_recovery(void) {
   assert(rate(w.cc) >= 9000 && rate(w.cc) <= 10000);
 
   /* initial queued sample at 16000 ms wire RTT + ECN sets congestion_seen */
-  w.now += 1000;
-  quicly_flexicast_feedback_t f0 = {0};
-  f0.member_id = 1;
-  f0.epoch = ++w.epochs[1];
-  f0.now = w.now;
-  f0.acked_packets = 4;
-  f0.acked_bytes = 4800;
-  f0.largest_acknowledged = 4;
+  quicly_flexicast_feedback_t f0 =
+      inconsistent_feedback(&w, 16000, 5000, 21000, 4, 0, 1000);
   f0.ecn_ce_count = 1;
-  f0.minimum_rtt_msec = 21000;
-  f0.raw_rtt_msec = 21000;
-  f0.latest_rtt_msec = 21000;
-  f0.smoothed_rtt_msec = 21000;
-  f0.rtt_ack_delay_msec = 5000;
-  f0.applied_ack_delay_msec = 0;
-  f0.rtt_sample_flags =
-      QUICLY_FLEXICAST_RTT_VALID | QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT;
-  f0.rtt_sample_epoch = ++w.rtt_epochs[1];
-  f0.rtt_sample_at = w.now;
   submit(&w, &f0);
-  assert(w.event.state_after.previous_rtt == 16000);
+  assert(w.state.previous_rtt == 16000);
 
   /* silence timeouts cut rate while 16000 ms win_min is still in window */
   transport_group_cc_mcbbr_on_submitted(w.cc, w.now);
@@ -990,32 +1004,13 @@ static void queue_drain_and_post_congestion_timeout_recovery(void) {
 
   /* queue drains to 2050 ms (< 16000 / 2) with INCONSISTENT ack_delay */
   for (unsigned step = 0; step < 12; step++) {
-    w.now += 600;
-    uint32_t wire = 2050;
-    uint32_t ack_delay = 1500 + (step % 3) * 400;
-    uint32_t raw = wire + ack_delay;
-    quicly_flexicast_feedback_t f = {0};
-    f.member_id = 1;
-    f.epoch = ++w.epochs[1];
-    f.now = w.now;
-    f.acked_packets = 2;
-    f.acked_bytes = 2400;
-    f.largest_acknowledged = 4 + (step + 1) * 2;
-    f.minimum_rtt_msec = 21000;
-    f.raw_rtt_msec = raw;
-    f.latest_rtt_msec = raw;
-    f.smoothed_rtt_msec = raw;
-    f.rtt_ack_delay_msec = ack_delay;
-    f.applied_ack_delay_msec = 0;
-    f.rtt_sample_flags = QUICLY_FLEXICAST_RTT_VALID |
-                         QUICLY_FLEXICAST_RTT_ACK_DELAY_INCONSISTENT;
-    f.rtt_sample_epoch = ++w.rtt_epochs[1];
-    f.rtt_sample_at = w.now;
+    quicly_flexicast_feedback_t f = inconsistent_feedback(
+        &w, 2050, 1500 + (step % 3) * 400, 21000, 2, 0, 600);
     f.delivery_sample_flags =
         QUICLY_FLEXICAST_SAMPLE_VALID | QUICLY_FLEXICAST_SAMPLE_MIXED;
     submit(&w, &f);
   }
-  assert(w.event.state_after.previous_rtt == 2050);
+  assert(w.state.previous_rtt == 2050);
   assert(rate(w.cc) >= 4500);
   transport_group_cc_mcbbr_free(w.cc);
 }
@@ -1200,15 +1195,15 @@ static void precut_delay_does_not_extend_growth_hold(void) {
   fixture_t w = create();
   warm(&w, false);
   ce(&w);
-  int64_t hold = w.event.state_after.growth_blocked_until;
+  int64_t hold = w.state.growth_blocked_until;
   quicly_flexicast_feedback_t f = input(&w, 1, 4000, 3000);
   submit(&w, &f);
-  assert(w.event.state_after.previous_rtt == 4000);
-  assert(w.event.state_after.growth_blocked_until == hold);
+  assert(w.state.previous_rtt == 4000);
+  assert(w.state.growth_blocked_until == hold);
 
   f = input(&w, 1, 4100, 2000);
   submit(&w, &f);
-  assert(w.event.state_after.growth_blocked_until > hold);
+  assert(w.state.growth_blocked_until > hold);
   transport_group_cc_mcbbr_free(w.cc);
 }
 
@@ -1256,19 +1251,15 @@ static void speculative_growth_requires_probe_feedback(bool shared) {
 }
 
 static void lagging_sender_recovers_on_current_feedback(void) {
-  enum { CLEAN, OLD_RTT, LOSS, EXTERNAL_LOAD, ECN };
+  enum { CLEAN, OLD_RTT, LOSS, ECN };
   for (unsigned mode = CLEAN; mode <= ECN; ++mode) {
     fixture_t w = create();
     warm(&w, false);
     ce(&w);
-    int64_t hold = w.event.state_after.growth_blocked_until;
+    int64_t hold = w.state.growth_blocked_until;
     uint64_t reduced = rate(w.cc);
     transport_group_cc_hints_t hints = {
         .active_senders = 4, .median_sender_rate_bytes_per_second = 36000};
-    if (mode == EXTERNAL_LOAD) {
-      hints.external_load_epoch = 1;
-      hints.external_load_queued_bytes = 1000;
-    }
     transport_group_cc_mcbbr_set_hints(w.cc, &hints, w.now);
 
     quicly_flexicast_feedback_t f = input(&w, 1, 100, 1250);
@@ -1284,8 +1275,7 @@ static void lagging_sender_recovers_on_current_feedback(void) {
     submit(&w, &f);
     if (mode == CLEAN) {
       uint64_t trial = rate(w.cc);
-      assert(trial > reduced &&
-             w.event.state_after.growth_blocked_until == hold);
+      assert(trial > reduced && w.state.growth_blocked_until == hold);
       f = input(&w, 1, 100, 500);
       f.raw_rtt_msec = 700;
       f.rtt_ack_delay_msec = f.applied_ack_delay_msec = 600;
@@ -1309,11 +1299,11 @@ static void lagging_sender_respects_hold_before_first_cut(void) {
   uint64_t before = rate(w.cc);
   quicly_flexicast_feedback_t f = input(&w, 1, 220, 1000);
   submit(&w, &f);
-  int64_t hold = w.event.state_after.growth_blocked_until;
+  int64_t hold = w.state.growth_blocked_until;
   f = input(&w, 1, 100, 200);
   assert(f.now < hold);
   submit(&w, &f);
-  assert(rate(w.cc) == before && w.event.state_after.last_reduction_epoch == 0);
+  assert(rate(w.cc) == before);
   transport_group_cc_mcbbr_free(w.cc);
 }
 
@@ -1336,26 +1326,26 @@ static void tdma_long_cycle_slot_quantization(void) {
     for (unsigned m = 1; m <= 99; m++) {
       now += 120;
       uint32_t min_rtt = 1200 + (m % 5) * 600;
-      uint32_t slot_jitter = ((round + m) % 4 == 0) ? 7200 : 2800;
-      uint32_t cur_rtt = min_rtt + slot_jitter;
-      quicly_flexicast_feedback_t f = {0};
-      f.member_id = m;
-      f.epoch = ++ep[m];
-      f.now = now;
-      f.acked_packets = 3;
-      f.lost_packets = (m + round) % 4 == 0 ? 1 : 0;
-      f.acked_bytes = 3300;
-      f.largest_acknowledged = ep[m] * 3;
-      f.latest_rtt_msec = cur_rtt;
-      f.minimum_rtt_msec = min_rtt;
-      f.smoothed_rtt_msec = cur_rtt;
-      f.raw_rtt_msec = cur_rtt + 400;
-      f.rtt_ack_delay_msec = f.applied_ack_delay_msec = 400;
-      f.rtt_sample_flags = QUICLY_FLEXICAST_RTT_VALID;
-      f.rtt_sample_epoch = ++rtt_ep[m];
-      f.rtt_sample_at = now;
-      f.delivery_sample_flags =
-          QUICLY_FLEXICAST_SAMPLE_VALID | QUICLY_FLEXICAST_SAMPLE_APP_LIMITED;
+      uint32_t cur_rtt = min_rtt + (((round + m) % 4 == 0) ? 7200 : 2800);
+      quicly_flexicast_feedback_t f = {
+          .member_id = m,
+          .epoch = ++ep[m],
+          .now = now,
+          .acked_packets = 3,
+          .lost_packets = (m + round) % 4 == 0 ? 1 : 0,
+          .acked_bytes = 3300,
+          .largest_acknowledged = ep[m] * 3,
+          .latest_rtt_msec = cur_rtt,
+          .minimum_rtt_msec = min_rtt,
+          .smoothed_rtt_msec = cur_rtt,
+          .raw_rtt_msec = cur_rtt + 400,
+          .rtt_ack_delay_msec = 400,
+          .applied_ack_delay_msec = 400,
+          .rtt_sample_flags = QUICLY_FLEXICAST_RTT_VALID,
+          .rtt_sample_epoch = ++rtt_ep[m],
+          .rtt_sample_at = now,
+          .delivery_sample_flags = QUICLY_FLEXICAST_SAMPLE_VALID |
+                                   QUICLY_FLEXICAST_SAMPLE_APP_LIMITED};
       quicly_flexicast_cc_on_feedback(cc, &f);
     }
   }
@@ -1388,11 +1378,15 @@ int main(void) {
   timeout_and_members();
   suspended_member_compaction();
   epoch_clears_samples();
-  external_and_hard_bound();
+  hard_rate_bound();
   precut_capacity_is_not_current_proof();
   minimum_and_burst_bounds();
   zero_clock_and_overflow();
   bbrv3_drain_and_cohort();
+  pending_drain_clears_on_recovery();
+  precut_service_cannot_confirm_drain();
+  active_drain_waits_for_group_flight();
+  measured_drain_in_small_cohort();
   drain_active_and_hint_isolation();
   loopback_low_startup_ramp();
   quicly_unsubtracted_min_rtt_recovery();
