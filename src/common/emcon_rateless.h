@@ -30,8 +30,7 @@ typedef struct {
   ptls_iovec_t payload; /* borrows mutable packet passed to open */
 } qlinq_emcon_message_t;
 
-/* A sender owns only egress keys and the packet-number range for its epoch.
- * Persistent callers must durably reserve every number before sealing it. */
+/* sender owns egress keys and epoch packet-number range */
 int qlinq_emcon_sender_create(qlinq_emcon_sender_t **sender, uint64_t flow_id,
                               uint32_t key_epoch,
                               uint64_t initial_packet_number,
@@ -43,7 +42,7 @@ uint64_t
 qlinq_emcon_sender_next_packet_number(const qlinq_emcon_sender_t *sender);
 bool qlinq_emcon_sender_has_capacity(const qlinq_emcon_sender_t *sender,
                                      uint64_t packets);
-/* Create an epoch-scoped flexicast flow for silent reception. */
+/* creates an epoch-scoped flexicast flow for silent reception */
 int qlinq_emcon_flexicast_create(quicly_flexicast_flow_t **flow,
                                  uint64_t flow_id, uint32_t key_epoch,
                                  uint64_t first_packet_number,
@@ -62,11 +61,11 @@ typedef enum {
   QLINQ_EMCON_OK = 0,
   QLINQ_EMCON_INCOMPLETE = 1,
   QLINQ_EMCON_DUPLICATE = 2,
+  QLINQ_EMCON_DISCARDED = 3,
   QLINQ_EMCON_INVALID = -1,
   QLINQ_EMCON_NO_MEMORY = -2,
   QLINQ_EMCON_CRYPTO = -3,
   QLINQ_EMCON_CODEC = -4,
-  QLINQ_EMCON_BUSY = -5,
   QLINQ_EMCON_EMIT_FAILED = -6,
   QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED = -7
 } qlinq_emcon_result_t;

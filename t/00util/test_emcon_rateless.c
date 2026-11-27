@@ -1,5 +1,6 @@
 #include "emcon_rateless.h"
 #include "emcon_manifest.h"
+#include "transport_wire.h"
 
 #include "picotls/openssl.h"
 
@@ -23,6 +24,71 @@ typedef struct {
   size_t capacity;
 } capture_t;
 
+static int ingest_symbol(qlinq_emcon_receiver_t *receiver, uint64_t pn,
+                         uint64_t group, uint64_t object, uint16_t index,
+                         qlinq_emcon_event_t *event) {
+  uint8_t wire[QLINQ_WIRE_FEC_HEADER_SIZE + 1];
+  qlinq_wire_fec_header_t header = {.alias = 7,
+                                    .group_id = group,
+                                    .object_id = object,
+                                    .symbol_index = index,
+                                    .data_symbols = 3,
+                                    .total_symbols = 4,
+                                    .symbol_size = 1,
+                                    .original_size = 3};
+  if (qlinq_wire_encode_fec_header(wire, sizeof(wire), &header) !=
+      QLINQ_WIRE_OK)
+    return QLINQ_EMCON_INVALID;
+  wire[QLINQ_WIRE_FEC_HEADER_SIZE] = (uint8_t)('A' + index);
+  qlinq_emcon_message_t message = {.type = QLINQ_EMCON_RECORD_DATA,
+                                   .packet_number = pn,
+                                   .payload =
+                                       ptls_iovec_init(wire, sizeof(wire))};
+  return qlinq_emcon_receiver_ingest_message(receiver, &message, event);
+}
+
+static int test_partial_objects(void) {
+  qlinq_emcon_receiver_t *receiver =
+      qlinq_emcon_receiver_create_for_messages(7);
+  CHECK(receiver != NULL, "create bounded object assembler");
+  qlinq_emcon_event_t event;
+  uint64_t pn = 100;
+  for (uint64_t i = 0; i < QLINQ_EMCON_MAX_ACTIVE_OBJECTS; ++i)
+    CHECK(ingest_symbol(receiver, pn++, 1, i, 0, &event) ==
+              QLINQ_EMCON_INCOMPLETE,
+          "leave one partial object in each slot");
+  CHECK(ingest_symbol(receiver, pn++, 1, 0, 1, &event) ==
+            QLINQ_EMCON_INCOMPLETE,
+        "refresh an object with a useful new symbol");
+  CHECK(ingest_symbol(receiver, pn++, 2, 0, 0, &event) ==
+            QLINQ_EMCON_INCOMPLETE,
+        "start a new group after permanent loss fills the slots");
+  CHECK(ingest_symbol(receiver, 99, 1, 1, 1, &event) == QLINQ_EMCON_INCOMPLETE,
+        "a delayed symbol cannot evict newer partial objects");
+  CHECK(ingest_symbol(receiver, pn++, 1, 2, 1, &event) ==
+                QLINQ_EMCON_INCOMPLETE &&
+            ingest_symbol(receiver, pn++, 1, 2, 2, &event) == QLINQ_EMCON_OK &&
+            event.value.record.object_id == 2,
+        "the oldest retained object survives the delayed symbol");
+  qlinq_emcon_event_release(&event);
+  CHECK(ingest_symbol(receiver, pn++, 1, 0, 2, &event) == QLINQ_EMCON_OK &&
+            event.type == QLINQ_EMCON_EVENT_RECORD &&
+            event.value.record.group_id == 1 && event.value.record.size == 3 &&
+            memcmp(event.value.record.data, "ABC", 3) == 0,
+        "keep the recently active object and its data");
+  qlinq_emcon_event_release(&event);
+  CHECK(ingest_symbol(receiver, pn++, 2, 0, 1, &event) ==
+                QLINQ_EMCON_INCOMPLETE &&
+            ingest_symbol(receiver, pn, 2, 0, 2, &event) == QLINQ_EMCON_OK &&
+            event.type == QLINQ_EMCON_EVENT_RECORD &&
+            event.value.record.group_id == 2 && event.value.record.size == 3 &&
+            memcmp(event.value.record.data, "ABC", 3) == 0,
+        "deliver a complete record from the newer group");
+  qlinq_emcon_event_release(&event);
+  qlinq_emcon_receiver_free(receiver);
+  return 0;
+}
+
 static bool capture_packet(void *user_data, uint16_t symbol_index,
                            const uint8_t *packet, size_t packet_size) {
   capture_t *capture = user_data;
@@ -41,7 +107,8 @@ static bool capture_packet(void *user_data, uint16_t symbol_index,
 static int test_late_join(void) {
   const uint8_t secret[32] = {0x37};
   const uint8_t payload[] = "late multicast delivery";
-  const uint64_t first = 100, last = first + QUICLY_FLEXICAST_SENT_WINDOW + 1;
+  const uint64_t first = UINT32_MAX - 3;
+  const uint64_t last = first + QUICLY_FLEXICAST_SENT_WINDOW + 1;
   uint8_t packet[128];
   size_t packet_size;
   uint64_t number;
@@ -70,10 +137,11 @@ static int test_late_join(void) {
     CHECK(quicly_flexicast_receive_datagram(receiver, copy, packet_size,
                                             &decoded, &number, 0,
                                             0) == QUICLY_FLEXICAST_OK &&
-              number == last && decoded.len == 1 + sizeof(payload) &&
+              (copy[0] & 3U) == 3U && number == last &&
+              decoded.len == 1 + sizeof(payload) &&
               decoded.base[0] == QLINQ_EMCON_RECORD_DATA &&
               memcmp(decoded.base + 1, payload, sizeof(payload)) == 0,
-          "ordinary Flexicast decoder reads the EMCON DATAGRAM");
+          "late Flexicast listener authenticates after 32-bit rollover");
     memcpy(copy, packet, packet_size);
     CHECK(quicly_flexicast_receive_datagram(receiver, copy, packet_size,
                                             &decoded, &number, 0,
@@ -81,15 +149,59 @@ static int test_late_join(void) {
           "ordinary Flexicast decoder rejects a replay");
     quicly_flexicast_flow_free(receiver);
   }
-  puts("===EMCON LATE JOIN OK===");
+  return 0;
+}
+
+static int test_packet_number_ceiling(void) {
+  const uint8_t secret[32] = {0x38};
+  const uint64_t ceiling = (UINT64_C(1) << 62) - 1;
+  uint8_t payload[] = "last packet";
+  qlinq_emcon_sender_t *sender = NULL;
+  quicly_flexicast_flow_t *receiver = NULL;
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 4, ceiling, ceiling, secret,
+                                  sizeof(secret)) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_create(&receiver, 44, 4, ceiling, secret,
+                                         sizeof(secret)) == QLINQ_EMCON_OK,
+        "initialize sender and receiver at the last QUIC packet number");
+  uint8_t packet[128], replay[sizeof(packet)];
+  size_t packet_size;
+  uint64_t number;
+  ptls_iovec_t data = ptls_iovec_init(payload, sizeof(payload));
+  CHECK(qlinq_emcon_flexicast_seal(sender, QLINQ_EMCON_RECORD_DATA, data,
+                                   packet, sizeof(packet), &packet_size,
+                                   &number) == QLINQ_EMCON_OK &&
+            number == ceiling &&
+            qlinq_emcon_sender_next_packet_number(sender) == ceiling + 1,
+        "seal the final QUIC packet number");
+  memcpy(replay, packet, packet_size);
+  qlinq_emcon_message_t message;
+  CHECK(qlinq_emcon_flexicast_open(receiver, packet, packet_size, &message) ==
+                QLINQ_EMCON_OK &&
+            message.packet_number == ceiling &&
+            message.payload.len == sizeof(payload) &&
+            memcmp(message.payload.base, payload, sizeof(payload)) == 0 &&
+            qlinq_emcon_flexicast_open(receiver, replay, packet_size,
+                                       &message) == QLINQ_EMCON_DUPLICATE,
+        "authenticate the final packet and reject its replay");
+  CHECK(qlinq_emcon_flexicast_seal(
+            sender, QLINQ_EMCON_RECORD_DATA, data, packet, sizeof(packet),
+            &packet_size, &number) == QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED,
+        "refuse to seal past the QUIC packet-number ceiling");
+  quicly_flexicast_flow_free(receiver);
+  qlinq_emcon_sender_free(sender);
   return 0;
 }
 
 int main(int argc, char **argv) {
-  if (argc == 2 && strcmp(argv[1], "--late-join") == 0)
-    return test_late_join();
+  if (argc == 2 && strcmp(argv[1], "--late-join") == 0) {
+    if (test_late_join() != 0 || test_packet_number_ceiling() != 0)
+      return 1;
+    puts("===EMCON LATE JOIN OK===");
+    return 0;
+  }
   if (argc != 1)
     return 1;
+  CHECK(test_partial_objects() == 0, "bounded assembly after loss");
   enum { PACKET_CAPACITY = 128 };
   uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0};
   uint8_t input[5000], second[5000], third[5000];
@@ -124,9 +236,7 @@ int main(int argc, char **argv) {
         "encode object");
   CHECK(capture.count == 30, "expected original plus repair count");
 
-  /* Drop five original symbols, then deliver everything else in reverse order.
-   * This exercises proactive RaptorQ repair and packet reordering without any
-   * feedback path. */
+  /* drop five original symbols and deliver the rest in reverse order */
   qlinq_emcon_receiver_t *receiver =
       qlinq_emcon_receiver_create(receiver_protection, 7);
   CHECK(receiver, "receiver setup");
@@ -151,9 +261,7 @@ int main(int argc, char **argv) {
 
   qlinq_emcon_record_release(&record);
 
-  /* Keep two objects active at once and deliver both in a crossed order. FEC
-   * reordering is useful only if the receive window does not discard symbols
-   * from the adjacent object. */
+  /* interleave two active objects to verify FEC receive window retention */
   CHECK(qlinq_emcon_send_object(sender, &config, 12, 35, false, 1, second,
                                 sizeof(second), capture_packet,
                                 &capture) == QLINQ_EMCON_OK &&

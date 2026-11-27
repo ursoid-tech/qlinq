@@ -13,17 +13,6 @@ struct qlinq_emcon_receive_socket_t {
   int fd;
 };
 
-static bool address_length_valid(const struct sockaddr *address,
-                                 socklen_t length) {
-  if (!address)
-    return false;
-  if (address->sa_family == AF_INET)
-    return length >= sizeof(struct sockaddr_in);
-  if (address->sa_family == AF_INET6)
-    return length >= sizeof(struct sockaddr_in6);
-  return false;
-}
-
 static bool address_is_multicast(const struct sockaddr *address) {
   if (address->sa_family == AF_INET) {
     const struct sockaddr_in *v4 = (const struct sockaddr_in *)address;
@@ -45,8 +34,9 @@ int qlinq_emcon_receive_socket_create_multicast(
   int fd;
   bool multicast;
 
-  if (!receiver || !address_length_valid(local_address, local_address_len) ||
-      !address_length_valid(source_address, source_address_len) ||
+  if (!receiver ||
+      !qlinq_emcon_sockaddr_valid(local_address, local_address_len) ||
+      !qlinq_emcon_sockaddr_valid(source_address, source_address_len) ||
       local_address->sa_family != source_address->sa_family)
     return QLINQ_EMCON_SOCKET_INVALID;
   *receiver = NULL;
@@ -157,20 +147,33 @@ int qlinq_emcon_receive_socket_local_address(
 
 int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,
                                        uint8_t *packet, size_t capacity,
-                                       size_t *packet_size, bool nonblocking) {
-  ssize_t received;
-  int flags = MSG_TRUNC | (nonblocking ? MSG_DONTWAIT : 0);
+                                       size_t *packet_size, bool nonblocking,
+                                       uint64_t expires_at_ms) {
   if (!receiver || receiver->fd < 0 || !packet || capacity == 0 || !packet_size)
     return QLINQ_EMCON_SOCKET_INVALID;
-  do {
-    received = recv(receiver->fd, packet, capacity, flags);
-  } while (received < 0 && errno == EINTR);
-  if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-    return QLINQ_EMCON_SOCKET_WOULD_BLOCK;
-  if (received < 0)
-    return QLINQ_EMCON_SOCKET_SYSTEM;
-  if ((size_t)received > capacity)
-    return QLINQ_EMCON_SOCKET_TOO_LARGE;
-  *packet_size = (size_t)received;
-  return QLINQ_EMCON_SOCKET_OK;
+  for (;;) {
+    ssize_t received =
+        recv(receiver->fd, packet, capacity, MSG_TRUNC | MSG_DONTWAIT);
+    int error = errno;
+    uint64_t now = qlinq_emcon_realtime_ms();
+    if (!now)
+      return QLINQ_EMCON_SOCKET_SYSTEM;
+    if (now >= expires_at_ms)
+      return QLINQ_EMCON_SOCKET_EXPIRED;
+    if (received >= 0) {
+      if ((size_t)received > capacity)
+        return QLINQ_EMCON_SOCKET_TOO_LARGE;
+      *packet_size = (size_t)received;
+      return QLINQ_EMCON_SOCKET_OK;
+    }
+    if (error == EINTR)
+      continue;
+    if (error != EAGAIN && error != EWOULDBLOCK)
+      return QLINQ_EMCON_SOCKET_SYSTEM;
+    if (nonblocking)
+      return QLINQ_EMCON_SOCKET_WOULD_BLOCK;
+    int ret = qlinq_emcon_socket_wait(receiver->fd, POLLIN, expires_at_ms);
+    if (ret != QLINQ_EMCON_SOCKET_OK)
+      return ret;
+  }
 }

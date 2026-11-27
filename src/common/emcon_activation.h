@@ -18,33 +18,25 @@ typedef enum {
   QLINQ_EMCON_ACTIVATION_REUSED = -7
 } qlinq_emcon_activation_result_t;
 
-/* Opens and exclusively locks one sender activation file. The lock remains
- * held until close, preventing concurrent use of the same nonce domain. */
+/* opens and exclusively locks one sender activation file until close */
 int qlinq_emcon_activation_open(qlinq_emcon_activation_t **activation,
                                 const char *state_file,
                                 const qlinq_emcon_manifest_t *manifest);
 
-/* Derives one canonical sender state filename from the traffic-key epoch
- * inside an owner-only state directory. Manifests sharing that nonce domain
- * cannot bypass the existing state by choosing another filename. */
+/* derives one canonical sender state filename from the traffic-key epoch */
 int qlinq_emcon_activation_open_managed(qlinq_emcon_activation_t **activation,
                                         const char *state_directory,
                                         const qlinq_emcon_manifest_t *manifest);
 
-/* Checks for an existing receiver claim without creating state. Concurrent
- * use is resolved by the exclusive creation in the claim operation. */
+/* checks for an existing receiver claim without creating state */
 int qlinq_emcon_receiver_activation_check_available(
     const char *state_directory, const qlinq_emcon_manifest_t *manifest);
 
-/* Permanently claims one receiver key epoch before packet consumption.
- * Reopening the same nonce domain returns QLINQ_EMCON_ACTIVATION_REUSED. */
+/* permanently claims one receiver key epoch before packet consumption */
 int qlinq_emcon_receiver_activation_claim(
     const char *state_directory, const qlinq_emcon_manifest_t *manifest);
 
-/* Durably reserves [first_packet_number, reserved_until). The range contains
- * preferred_packets unless the key epoch has fewer remaining, and fails if
- * minimum_packets cannot be met. All reserved numbers consume the key budget.
- */
+/* durably reserves [first_packet_number, reserved_until) within the epoch */
 int qlinq_emcon_activation_reserve(qlinq_emcon_activation_t *activation,
                                    uint64_t minimum_packets,
                                    uint64_t preferred_packets,

@@ -623,8 +623,11 @@ t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
+ifeq ($(UNAME_S),Linux)
+t/00util/test_emcon_activation: private EMCON_ACTIVATION_TEST_LDFLAGS = -Wl,--wrap=fsync
+endif
 t/00util/test_emcon_activation: t/00util/test_emcon_activation.o src/common/emcon_activation.o src/common/emcon_manifest.o
-	$(CC) -o $@ $^ $(LDFLAGS)
+	$(CC) -o $@ $^ $(LDFLAGS) $(EMCON_ACTIVATION_TEST_LDFLAGS)
 
 t/00util/test_emcon_manifest: t/00util/test_emcon_manifest.o src/common/emcon_manifest.o
 	$(CC) -o $@ $^ $(LDFLAGS)

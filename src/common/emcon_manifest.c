@@ -1,13 +1,14 @@
 #include "emcon_manifest.h"
 
+#include "emcon_endian.h"
 #include "transport_fec_state.h"
 #include "transport_wire.h"
 
 #include <openssl/pem.h>
 #include <openssl/sha.h>
 
-#include <stdbool.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,40 +19,6 @@
 #define MANIFEST_MAGIC_1 'E'
 #define MANIFEST_MAGIC_2 'M'
 #define MANIFEST_MAGIC_3 'F'
-#define MANIFEST_AEAD_TAG_SIZE 16U
-
-static void write_u16(uint8_t *dst, uint16_t value) {
-  dst[0] = (uint8_t)(value >> 8);
-  dst[1] = (uint8_t)value;
-}
-
-static void write_u32(uint8_t *dst, uint32_t value) {
-  dst[0] = (uint8_t)(value >> 24);
-  dst[1] = (uint8_t)(value >> 16);
-  dst[2] = (uint8_t)(value >> 8);
-  dst[3] = (uint8_t)value;
-}
-
-static void write_u64(uint8_t *dst, uint64_t value) {
-  for (size_t i = 0; i < 8; i++)
-    dst[i] = (uint8_t)(value >> (56U - 8U * i));
-}
-
-static uint16_t read_u16(const uint8_t *src) {
-  return (uint16_t)(((uint16_t)src[0] << 8) | src[1]);
-}
-
-static uint32_t read_u32(const uint8_t *src) {
-  return ((uint32_t)src[0] << 24) | ((uint32_t)src[1] << 16) |
-         ((uint32_t)src[2] << 8) | src[3];
-}
-
-static uint64_t read_u64(const uint8_t *src) {
-  uint64_t value = 0;
-  for (size_t i = 0; i < 8; i++)
-    value = (value << 8) | src[i];
-  return value;
-}
 
 static bool nonzero(const uint8_t *value, size_t size) {
   uint8_t combined = 0;
@@ -67,9 +34,10 @@ static bool endpoint_valid(const qlinq_emcon_manifest_endpoint_t *endpoint) {
 }
 
 uint64_t qlinq_emcon_packet_number_limit(uint64_t initial_packet_number) {
-  uint64_t limit = initial_packet_number + QLINQ_EMCON_MAX_PACKETS_PER_KEY;
-  uint64_t wire_limit = UINT64_C(1) + QLINQ_EMCON_MAX_PACKET_NUMBER;
-  return limit < wire_limit ? limit : wire_limit;
+  const uint64_t quic_limit = QLINQ_EMCON_MAX_PACKET_NUMBER + 1;
+  if (initial_packet_number >= quic_limit - QLINQ_EMCON_MAX_PACKETS_PER_KEY)
+    return quic_limit;
+  return initial_packet_number + QLINQ_EMCON_MAX_PACKETS_PER_KEY;
 }
 
 int qlinq_emcon_manifest_validate(const qlinq_emcon_manifest_t *manifest,
@@ -140,36 +108,36 @@ int qlinq_emcon_manifest_encode(const qlinq_emcon_manifest_t *manifest,
   output[1] = MANIFEST_MAGIC_1;
   output[2] = MANIFEST_MAGIC_2;
   output[3] = MANIFEST_MAGIC_3;
-  write_u16(output + 4, QLINQ_EMCON_MANIFEST_VERSION);
-  write_u16(output + 6, QLINQ_EMCON_MANIFEST_HEADER_SIZE);
-  write_u32(output + 8, (uint32_t)required);
+  qlinq_emcon_write_u16(output + 4, QLINQ_EMCON_MANIFEST_VERSION);
+  qlinq_emcon_write_u16(output + 6, QLINQ_EMCON_MANIFEST_HEADER_SIZE);
+  qlinq_emcon_write_u32(output + 8, (uint32_t)required);
   memcpy(output + 16, manifest->session_id, sizeof(manifest->session_id));
   memcpy(output + 32, manifest->sender_id, sizeof(manifest->sender_id));
   memcpy(output + 48, manifest->traffic_key_id,
          sizeof(manifest->traffic_key_id));
-  write_u64(output + 80, manifest->flow_id);
-  write_u32(output + 88, manifest->key_epoch);
-  write_u16(output + 92, manifest->cipher_suite);
-  write_u16(output + 94, manifest->stream_count);
-  write_u64(output + 96, manifest->initial_packet_number);
-  write_u64(output + 104, manifest->valid_from_ms);
-  write_u64(output + 112, manifest->expires_at_ms);
+  qlinq_emcon_write_u64(output + 80, manifest->flow_id);
+  qlinq_emcon_write_u32(output + 88, manifest->key_epoch);
+  qlinq_emcon_write_u16(output + 92, manifest->cipher_suite);
+  qlinq_emcon_write_u16(output + 94, manifest->stream_count);
+  qlinq_emcon_write_u64(output + 96, manifest->initial_packet_number);
+  qlinq_emcon_write_u64(output + 104, manifest->valid_from_ms);
+  qlinq_emcon_write_u64(output + 112, manifest->expires_at_ms);
   output[120] = manifest->source.family;
-  write_u16(output + 122, manifest->source.port);
+  qlinq_emcon_write_u16(output + 122, manifest->source.port);
   memcpy(output + 124, manifest->source.address,
          sizeof(manifest->source.address));
   output[140] = manifest->destination.family;
-  write_u16(output + 142, manifest->destination.port);
+  qlinq_emcon_write_u16(output + 142, manifest->destination.port);
   memcpy(output + 144, manifest->destination.address,
          sizeof(manifest->destination.address));
-  write_u32(output + 160, manifest->interface_index);
-  write_u32(output + 164, manifest->replay_window_packets);
-  write_u64(output + 168, manifest->rate_bytes_per_second);
-  write_u32(output + 176, manifest->burst_bytes);
-  write_u32(output + 180, manifest->metadata_repeat_interval_ms);
-  write_u16(output + 184, manifest->terminal_repeat_count);
-  write_u16(output + 186, manifest->symbol_size);
-  write_u16(output + 188, manifest->repair_symbols);
+  qlinq_emcon_write_u32(output + 160, manifest->interface_index);
+  qlinq_emcon_write_u32(output + 164, manifest->replay_window_packets);
+  qlinq_emcon_write_u64(output + 168, manifest->rate_bytes_per_second);
+  qlinq_emcon_write_u32(output + 176, manifest->burst_bytes);
+  qlinq_emcon_write_u32(output + 180, manifest->metadata_repeat_interval_ms);
+  qlinq_emcon_write_u16(output + 184, manifest->terminal_repeat_count);
+  qlinq_emcon_write_u16(output + 186, manifest->symbol_size);
+  qlinq_emcon_write_u16(output + 188, manifest->repair_symbols);
   for (size_t i = 0; i < manifest->stream_count; i++) {
     const qlinq_emcon_manifest_stream_t *stream = &manifest->streams[i];
     uint8_t *encoded = output + QLINQ_EMCON_MANIFEST_HEADER_SIZE +
@@ -177,7 +145,7 @@ int qlinq_emcon_manifest_encode(const qlinq_emcon_manifest_t *manifest,
     encoded[0] = stream->alias;
     encoded[1] = stream->delivery;
     encoded[2] = stream->content_type;
-    write_u32(encoded + 4, stream->maximum_record_size);
+    qlinq_emcon_write_u32(encoded + 4, stream->maximum_record_size);
     size_t name_size = strnlen(stream->name, sizeof(stream->name));
     memcpy(encoded + 8, stream->name, name_size);
   }
@@ -193,11 +161,11 @@ int qlinq_emcon_manifest_decode(qlinq_emcon_manifest_t *manifest,
   if (input[0] != MANIFEST_MAGIC_0 || input[1] != MANIFEST_MAGIC_1 ||
       input[2] != MANIFEST_MAGIC_2 || input[3] != MANIFEST_MAGIC_3)
     return QLINQ_EMCON_MANIFEST_INVALID;
-  if (read_u16(input + 4) != QLINQ_EMCON_MANIFEST_VERSION)
+  if (qlinq_emcon_read_u16(input + 4) != QLINQ_EMCON_MANIFEST_VERSION)
     return QLINQ_EMCON_MANIFEST_UNSUPPORTED;
-  uint16_t header_size = read_u16(input + 6);
-  uint32_t total_size = read_u32(input + 8);
-  uint16_t stream_count = read_u16(input + 94);
+  uint16_t header_size = qlinq_emcon_read_u16(input + 6);
+  uint32_t total_size = qlinq_emcon_read_u32(input + 8);
+  uint16_t stream_count = qlinq_emcon_read_u16(input + 94);
   if (header_size != QLINQ_EMCON_MANIFEST_HEADER_SIZE || stream_count == 0 ||
       stream_count > QLINQ_EMCON_MANIFEST_MAX_STREAMS ||
       total_size != input_size ||
@@ -218,19 +186,19 @@ int qlinq_emcon_manifest_decode(qlinq_emcon_manifest_t *manifest,
   memcpy(manifest->sender_id, input + 32, sizeof(manifest->sender_id));
   memcpy(manifest->traffic_key_id, input + 48,
          sizeof(manifest->traffic_key_id));
-  manifest->flow_id = read_u64(input + 80);
-  manifest->key_epoch = read_u32(input + 88);
-  manifest->cipher_suite = read_u16(input + 92);
+  manifest->flow_id = qlinq_emcon_read_u64(input + 80);
+  manifest->key_epoch = qlinq_emcon_read_u32(input + 88);
+  manifest->cipher_suite = qlinq_emcon_read_u16(input + 92);
   manifest->stream_count = stream_count;
-  manifest->initial_packet_number = read_u64(input + 96);
-  manifest->valid_from_ms = read_u64(input + 104);
-  manifest->expires_at_ms = read_u64(input + 112);
+  manifest->initial_packet_number = qlinq_emcon_read_u64(input + 96);
+  manifest->valid_from_ms = qlinq_emcon_read_u64(input + 104);
+  manifest->expires_at_ms = qlinq_emcon_read_u64(input + 112);
   manifest->source.family = input[120];
-  manifest->source.port = read_u16(input + 122);
+  manifest->source.port = qlinq_emcon_read_u16(input + 122);
   memcpy(manifest->source.address, input + 124,
          sizeof(manifest->source.address));
   manifest->destination.family = input[140];
-  manifest->destination.port = read_u16(input + 142);
+  manifest->destination.port = qlinq_emcon_read_u16(input + 142);
   memcpy(manifest->destination.address, input + 144,
          sizeof(manifest->destination.address));
   if ((manifest->source.family == 4 &&
@@ -238,14 +206,14 @@ int qlinq_emcon_manifest_decode(qlinq_emcon_manifest_t *manifest,
       (manifest->destination.family == 4 &&
        nonzero(manifest->destination.address + 4, 12)))
     return QLINQ_EMCON_MANIFEST_INVALID;
-  manifest->interface_index = read_u32(input + 160);
-  manifest->replay_window_packets = read_u32(input + 164);
-  manifest->rate_bytes_per_second = read_u64(input + 168);
-  manifest->burst_bytes = read_u32(input + 176);
-  manifest->metadata_repeat_interval_ms = read_u32(input + 180);
-  manifest->terminal_repeat_count = read_u16(input + 184);
-  manifest->symbol_size = read_u16(input + 186);
-  manifest->repair_symbols = read_u16(input + 188);
+  manifest->interface_index = qlinq_emcon_read_u32(input + 160);
+  manifest->replay_window_packets = qlinq_emcon_read_u32(input + 164);
+  manifest->rate_bytes_per_second = qlinq_emcon_read_u64(input + 168);
+  manifest->burst_bytes = qlinq_emcon_read_u32(input + 176);
+  manifest->metadata_repeat_interval_ms = qlinq_emcon_read_u32(input + 180);
+  manifest->terminal_repeat_count = qlinq_emcon_read_u16(input + 184);
+  manifest->symbol_size = qlinq_emcon_read_u16(input + 186);
+  manifest->repair_symbols = qlinq_emcon_read_u16(input + 188);
   for (size_t i = 0; i < stream_count; i++) {
     const uint8_t *encoded = input + QLINQ_EMCON_MANIFEST_HEADER_SIZE +
                              i * QLINQ_EMCON_MANIFEST_STREAM_SIZE;
@@ -258,7 +226,8 @@ int qlinq_emcon_manifest_decode(qlinq_emcon_manifest_t *manifest,
     manifest->streams[i].alias = encoded[0];
     manifest->streams[i].delivery = encoded[1];
     manifest->streams[i].content_type = encoded[2];
-    manifest->streams[i].maximum_record_size = read_u32(encoded + 4);
+    manifest->streams[i].maximum_record_size =
+        qlinq_emcon_read_u32(encoded + 4);
     memcpy(manifest->streams[i].name, encoded + 8,
            sizeof(manifest->streams[i].name));
   }

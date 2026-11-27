@@ -20,7 +20,7 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
       .flow_id = 500,
       .key_epoch = 7,
       .cipher_suite = QLINQ_EMCON_CIPHER_AES_128_GCM_SHA256,
-      .initial_packet_number = 300,
+      .initial_packet_number = (UINT64_C(1) << 32) + 300,
       .valid_from_ms = 1000,
       .expires_at_ms = 5000,
       .source = {.family = 4, .port = 12070},
@@ -66,17 +66,19 @@ int main(void) {
             QLINQ_EMCON_MANIFEST_INVALID,
         "reject a replay window different from flexicast's window");
   invalid = manifest;
-  invalid.initial_packet_number = UINT64_C(1) << 32;
+  const uint64_t quic_limit = UINT64_C(1) << 62;
+  invalid.initial_packet_number = quic_limit;
   CHECK(qlinq_emcon_manifest_validate(&invalid, 2000) ==
             QLINQ_EMCON_MANIFEST_INVALID,
-        "reject a packet number outside the 32-bit EMCON range");
+        "reject a packet number outside the QUIC range");
   qlinq_emcon_manifest_t final_number = manifest;
-  final_number.initial_packet_number = UINT32_MAX;
+  final_number.initial_packet_number = quic_limit - 1;
   CHECK(qlinq_emcon_manifest_validate(&final_number, 2000) ==
                 QLINQ_EMCON_MANIFEST_OK &&
             qlinq_emcon_packet_number_limit(
-                final_number.initial_packet_number) == (UINT64_C(1) << 32),
-        "allow the last 32-bit packet number as the epoch start");
+                final_number.initial_packet_number) == quic_limit &&
+            qlinq_emcon_packet_number_limit(UINT64_MAX) == quic_limit,
+        "allow the final QUIC number and clamp without integer overflow");
   CHECK(qlinq_emcon_manifest_validate(&manifest, 999) ==
             QLINQ_EMCON_MANIFEST_NOT_YET_VALID,
         "not-yet-valid rejection");
@@ -97,6 +99,7 @@ int main(void) {
                                     &encoded_size) == QLINQ_EMCON_MANIFEST_OK &&
             qlinq_emcon_manifest_decode(&decoded, encoded, encoded_size,
                                         2000) == QLINQ_EMCON_MANIFEST_OK &&
+            decoded.initial_packet_number == manifest.initial_packet_number &&
             qlinq_emcon_manifest_encode(&decoded, reencoded, sizeof(reencoded),
                                         &reencoded_size) ==
                 QLINQ_EMCON_MANIFEST_OK &&

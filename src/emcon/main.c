@@ -60,13 +60,6 @@ static void handle_signal(int signal_number) {
   emcon_running = 0;
 }
 
-static uint64_t realtime_ms(void) {
-  struct timespec now;
-  if (clock_gettime(CLOCK_REALTIME, &now) != 0)
-    return 0;
-  return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
-}
-
 static void show_help(FILE *output, const char *program) {
   fprintf(output,
           "usage: %s send [options] INPUT|-\n"
@@ -221,20 +214,12 @@ static FILE *open_data_file(const char *path, const char *mode,
 static int run_sender(const emcon_options_t *options,
                       const qlinq_emcon_manifest_t *manifest,
                       const qlinq_emcon_manifest_stream_t *stream,
-                      const uint8_t *traffic_secret, size_t traffic_secret_size,
-                      uint64_t now_ms) {
+                      const uint8_t *traffic_secret,
+                      size_t traffic_secret_size) {
   qlinq_emcon_session_t *session = NULL;
-  int ret = qlinq_emcon_session_create_sender_persistent(
-      &session, manifest, traffic_secret, traffic_secret_size, now_ms,
-      options->state_directory, options->reservation_packets);
-  if (ret != QLINQ_EMCON_SESSION_OK) {
-    fprintf(stderr, "qlinq-emcon: sender activation failed: %d\n", ret);
-    return 1;
-  }
   FILE *input = open_data_file(options->data_file, "rb", stdin);
   if (!input) {
     fprintf(stderr, "qlinq-emcon: cannot open input: %s\n", strerror(errno));
-    qlinq_emcon_session_free(session);
     return 1;
   }
   size_t block_size =
@@ -246,7 +231,6 @@ static int run_sender(const emcon_options_t *options,
     fprintf(stderr, "qlinq-emcon: cannot allocate input block\n");
     if (input != stdin)
       fclose(input);
-    qlinq_emcon_session_free(session);
     return 1;
   }
 
@@ -255,30 +239,44 @@ static int run_sender(const emcon_options_t *options,
   bool failed = false;
   while (emcon_running) {
     size_t size = fread(block, 1, block_size, input);
-    if (size != 0) {
-      ret = qlinq_emcon_session_send_object(session, options->alias,
-                                            options->group_id, object_id, false,
-                                            0, block, size);
-      if (ret != QLINQ_EMCON_SESSION_OK) {
-        fprintf(stderr, "qlinq-emcon: send object failed: %d\n", ret);
-        failed = true;
-        break;
-      }
-      bytes += size;
-      if (object_id == UINT64_MAX) {
-        fprintf(stderr, "qlinq-emcon: object identifier exhausted\n");
-        failed = true;
-        break;
-      }
-      object_id++;
-    }
-    if (size != block_size) {
-      if (ferror(input)) {
-        fprintf(stderr, "qlinq-emcon: input read failed\n");
-        failed = true;
-      }
+    if (ferror(input)) {
+      fprintf(stderr, "qlinq-emcon: input read failed\n");
+      failed = true;
       break;
     }
+    if (size == 0 || !emcon_running)
+      break;
+    int ret;
+    if (!session) {
+      uint64_t now_ms = qlinq_emcon_realtime_ms();
+      ret = now_ms ? qlinq_emcon_session_create_sender_persistent(
+                         &session, manifest, traffic_secret,
+                         traffic_secret_size, now_ms, options->state_directory,
+                         options->reservation_packets)
+                   : QLINQ_EMCON_SESSION_IO;
+      if (ret != QLINQ_EMCON_SESSION_OK) {
+        fprintf(stderr, "qlinq-emcon: sender activation failed: %d\n", ret);
+        failed = true;
+        break;
+      }
+    }
+    ret = qlinq_emcon_session_send_object(session, options->alias,
+                                          options->group_id, object_id, false,
+                                          0, block, size);
+    if (ret != QLINQ_EMCON_SESSION_OK) {
+      fprintf(stderr, "qlinq-emcon: send object failed: %d\n", ret);
+      failed = true;
+      break;
+    }
+    bytes += size;
+    if (object_id == UINT64_MAX) {
+      fprintf(stderr, "qlinq-emcon: object identifier exhausted\n");
+      failed = true;
+      break;
+    }
+    object_id++;
+    if (size != block_size)
+      break;
   }
   if (!emcon_running) {
     fprintf(stderr, "qlinq-emcon: interrupted\n");
@@ -377,7 +375,7 @@ static FILE *open_receiver_output(const char *path, bool *truncate_output) {
     return stdout;
   }
 
-  /* Keep existing output intact until the durable claim succeeds. */
+  /* keep existing output intact until durable claim succeeds */
   int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0666);
   if (fd < 0)
     return NULL;
@@ -443,7 +441,8 @@ static int run_receiver(const emcon_options_t *options,
       continue;
     }
     if (ret == QLINQ_EMCON_SESSION_INCOMPLETE ||
-        ret == QLINQ_EMCON_SESSION_DUPLICATE)
+        ret == QLINQ_EMCON_SESSION_DUPLICATE ||
+        ret == QLINQ_EMCON_SESSION_DISCARDED)
       continue;
     if (ret != QLINQ_EMCON_SESSION_OK) {
       fprintf(stderr, "qlinq-emcon: receive failed: %d\n", ret);
@@ -523,7 +522,7 @@ int main(int argc, char **argv) {
   signal(SIGINT, handle_signal);
   signal(SIGTERM, handle_signal);
 
-  uint64_t now_ms = realtime_ms();
+  uint64_t now_ms = qlinq_emcon_realtime_ms();
   qlinq_emcon_manifest_t manifest;
   int loaded = qlinq_emcon_manifest_load_signed(
       &manifest, options.manifest_file, options.signature_file,
@@ -583,7 +582,7 @@ int main(int argc, char **argv) {
   }
   int ret = options.command == EMCON_SEND
                 ? run_sender(&options, &manifest, stream, traffic_secret,
-                             traffic_secret_size, now_ms)
+                             traffic_secret_size)
                 : run_receiver(&options, &manifest, traffic_secret,
                                traffic_secret_size, now_ms);
   OPENSSL_cleanse(traffic_secret, sizeof(traffic_secret));

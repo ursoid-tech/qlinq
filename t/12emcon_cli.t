@@ -56,9 +56,9 @@ open my $config_file, '>', $config or die "open config: $!";
 print {$config_file} <<"CONFIG";
 session_id=random
 sender_id=random
-flow_id=random
+flow_id=91
 key_epoch=1
-initial_packet_number=100
+initial_packet_number=4611686018427383808
 valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
@@ -89,6 +89,7 @@ my $explicit_text = do { local $/; <$source_config> };
 close $source_config;
 my $now_ms = time() * 1000;
 $explicit_text =~ s/valid_for_seconds=120/valid_from_ms=@{[$now_ms - 1000]}\nexpires_at_ms=@{[$now_ms + 120000]}/;
+$explicit_text =~ s/key_epoch=1/key_epoch=2/;
 my $explicit_config = "$directory/explicit.conf";
 open my $explicit_file, '>', $explicit_config or die "explicit config: $!";
 print {$explicit_file} $explicit_text;
@@ -129,6 +130,16 @@ mkdir "$directory/receiver-state", 0700 or die "receiver state: $!";
 my @common = ('--manifest', $manifest, '--signature', $signature,
               '--public-key', $public_key, '--traffic-key', $traffic_key,
               '--alias', '7', '--group', '42');
+ok(!run_command($qlinq_emcon, 'send', @common, '--state-dir',
+                "$directory/sender-state", "$directory/missing/input.bin"),
+   'sender reports missing input');
+open my $empty, '>', "$directory/empty.bin" or die "empty input: $!";
+close $empty;
+ok(!run_command($qlinq_emcon, 'send', @common, '--state-dir',
+                "$directory/sender-state", "$directory/empty.bin"),
+   'sender reports empty input');
+is_deeply([glob "$directory/sender-state/*"], [],
+          'unusable input consumes no sender packet-number range');
 ok(!run_command($qlinq_emcon, 'receive', @common, '--state-dir',
                 "$directory/receiver-state", "$directory/missing/output.bin"),
    'receiver startup fails when the output cannot be opened');
@@ -147,7 +158,19 @@ if ($receiver == 0) {
       "$directory/receiver-state", $output;
     exit 127;
 }
-select undef, undef, undef, 0.2;
+for (1 .. 200) {
+    last if -z $output;
+    select undef, undef, undef, 0.01;
+}
+ok(-z $output, 'receiver claimed its epoch and opened the output');
+open my $other_input, '>', "$directory/other.bin" or die "other input: $!";
+print {$other_input} "from another key epoch";
+close $other_input;
+ok(run_command($qlinq_emcon, 'send', '--manifest', "$directory/explicit.bin",
+               '--signature', "$directory/explicit.sig", '--public-key', $public_key,
+               '--traffic-key', $traffic_key, '--alias', '7', '--group', '42',
+               '--state-dir', "$directory/sender-state", "$directory/other.bin"),
+   'deliver a transfer from another epoch on the same flow and UDP tuple');
 ok(run_command($qlinq_emcon, 'send', @common, '--state-dir',
                "$directory/sender-state", '--block-size', '4096', $input),
    'send file through generated manifest');

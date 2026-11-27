@@ -16,20 +16,11 @@ struct qlinq_emcon_send_socket_t {
   bool destination_set;
   uint64_t rate_bytes_per_second;
   size_t burst_bytes;
+  uint64_t burst_ns;
+  uint64_t expires_at_ms;
   uint64_t virtual_finish_ns;
   qlinq_emcon_send_stats_t stats;
 };
-
-static bool address_length_valid(const struct sockaddr *address,
-                                 socklen_t length) {
-  if (!address)
-    return false;
-  if (address->sa_family == AF_INET)
-    return length >= sizeof(struct sockaddr_in);
-  if (address->sa_family == AF_INET6)
-    return length >= sizeof(struct sockaddr_in6);
-  return false;
-}
 
 static uint64_t monotonic_ns(void) {
   struct timespec now;
@@ -48,10 +39,11 @@ int qlinq_emcon_send_socket_create(qlinq_emcon_send_socket_t **sender,
                                    const struct sockaddr *local_address,
                                    socklen_t local_address_len,
                                    uint64_t rate_bytes_per_second,
-                                   size_t burst_bytes) {
+                                   size_t burst_bytes, uint64_t expires_at_ms) {
   qlinq_emcon_send_socket_t *created;
   int fd;
-  if (!sender || !address_length_valid(local_address, local_address_len) ||
+  if (!sender ||
+      !qlinq_emcon_sockaddr_valid(local_address, local_address_len) ||
       rate_bytes_per_second == 0 || burst_bytes == 0)
     return -1;
   *sender = NULL;
@@ -75,11 +67,8 @@ int qlinq_emcon_send_socket_create(qlinq_emcon_send_socket_t **sender,
   created->family = local_address->sa_family;
   created->rate_bytes_per_second = rate_bytes_per_second;
   created->burst_bytes = burst_bytes;
-  created->virtual_finish_ns = monotonic_ns();
-  if (created->virtual_finish_ns == 0) {
-    free(created);
-    goto Error;
-  }
+  created->burst_ns = duration_ns(burst_bytes, rate_bytes_per_second);
+  created->expires_at_ms = expires_at_ms;
   *sender = created;
   return 0;
 
@@ -114,7 +103,7 @@ int qlinq_emcon_send_socket_set_destination(qlinq_emcon_send_socket_t *sender,
                                             const struct sockaddr *destination,
                                             socklen_t destination_len) {
   if (!sender || sender->fd < 0 ||
-      !address_length_valid(destination, destination_len) ||
+      !qlinq_emcon_sockaddr_valid(destination, destination_len) ||
       destination->sa_family != sender->family ||
       destination_len > sizeof(sender->destination)) {
     errno = EINVAL;
@@ -161,39 +150,46 @@ int qlinq_emcon_send_socket_set_destination(qlinq_emcon_send_socket_t *sender,
 }
 
 static int wait_for_pacer(qlinq_emcon_send_socket_t *sender,
-                          size_t packet_size) {
+                          uint64_t packet_ns) {
   uint64_t now = monotonic_ns();
-  if (now == 0 || packet_size > sender->burst_bytes) {
-    errno = packet_size > sender->burst_bytes ? EMSGSIZE : EIO;
-    return -1;
-  }
-  uint64_t burst_ns =
-      duration_ns(sender->burst_bytes, sender->rate_bytes_per_second);
-  uint64_t earliest = sender->virtual_finish_ns > burst_ns
-                          ? sender->virtual_finish_ns - burst_ns
+  if (!now)
+    return QLINQ_EMCON_SOCKET_SYSTEM;
+  uint64_t credit_ns = sender->burst_ns - packet_ns;
+  uint64_t earliest = sender->virtual_finish_ns > credit_ns
+                          ? sender->virtual_finish_ns - credit_ns
                           : 0;
-  uint64_t send_at = now > earliest ? now : earliest;
-  if (send_at > now) {
-    struct timespec deadline = {
-        .tv_sec = (time_t)(send_at / UINT64_C(1000000000)),
-        .tv_nsec = (long)(send_at % UINT64_C(1000000000))};
-    int ret;
-    do {
-      ret = clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
-    } while (ret == EINTR);
-    if (ret != 0) {
-      errno = ret;
-      return -1;
-    }
-    sender->stats.pacing_delays++;
-    sender->stats.pacing_delay_ns += send_at - now;
+  if (earliest <= now)
+    return QLINQ_EMCON_SOCKET_OK;
+
+  uint64_t wall_ms = qlinq_emcon_realtime_ms();
+  if (!wall_ms)
+    return QLINQ_EMCON_SOCKET_SYSTEM;
+  if (wall_ms >= sender->expires_at_ms)
+    return QLINQ_EMCON_SOCKET_EXPIRED;
+  uint64_t delay = earliest - now;
+  uint64_t remaining_ms = sender->expires_at_ms - wall_ms;
+  clockid_t clock = CLOCK_MONOTONIC;
+  struct timespec deadline = {
+      .tv_sec = (time_t)(earliest / UINT64_C(1000000000)),
+      .tv_nsec = (long)(earliest % UINT64_C(1000000000))};
+  if (delay / 1000000 >= remaining_ms) {
+    clock = CLOCK_REALTIME;
+    deadline.tv_sec = (time_t)(sender->expires_at_ms / 1000);
+    deadline.tv_nsec = (long)(sender->expires_at_ms % 1000) * 1000000;
+    delay = remaining_ms * 1000000;
   }
-  uint64_t base =
-      sender->virtual_finish_ns > send_at ? sender->virtual_finish_ns : send_at;
-  uint64_t packet_ns = duration_ns(packet_size, sender->rate_bytes_per_second);
-  sender->virtual_finish_ns =
-      packet_ns > UINT64_MAX - base ? UINT64_MAX : base + packet_ns;
-  return 0;
+  int ret;
+  do {
+    ret = clock_nanosleep(clock, TIMER_ABSTIME, &deadline, NULL);
+  } while (ret == EINTR);
+  if (ret != 0) {
+    errno = ret;
+    return QLINQ_EMCON_SOCKET_SYSTEM;
+  }
+  sender->stats.pacing_delays++;
+  sender->stats.pacing_delay_ns += delay;
+  return clock == CLOCK_REALTIME ? QLINQ_EMCON_SOCKET_EXPIRED
+                                 : QLINQ_EMCON_SOCKET_OK;
 }
 
 int qlinq_emcon_send_socket_send(qlinq_emcon_send_socket_t *sender,
@@ -201,31 +197,48 @@ int qlinq_emcon_send_socket_send(qlinq_emcon_send_socket_t *sender,
   if (!sender || sender->fd < 0 || !sender->destination_set || !packet ||
       packet_size == 0) {
     errno = EINVAL;
-    return -1;
+    return QLINQ_EMCON_SOCKET_INVALID;
   }
-  if (wait_for_pacer(sender, packet_size) != 0)
-    return -1;
-  ssize_t sent;
-  do {
-    sent = sendto(sender->fd, packet, packet_size, 0,
-                  (struct sockaddr *)&sender->destination,
-                  sender->destination_len);
-  } while (sent < 0 && errno == EINTR);
-  if (sent != (ssize_t)packet_size) {
+  if (packet_size > sender->burst_bytes) {
+    errno = EMSGSIZE;
+    return QLINQ_EMCON_SOCKET_INVALID;
+  }
+  uint64_t packet_ns = duration_ns(packet_size, sender->rate_bytes_per_second);
+  int ret = wait_for_pacer(sender, packet_ns);
+  if (ret != QLINQ_EMCON_SOCKET_OK)
+    return ret;
+  for (;;) {
+    uint64_t now = qlinq_emcon_realtime_ms();
+    if (!now)
+      return QLINQ_EMCON_SOCKET_SYSTEM;
+    if (now >= sender->expires_at_ms)
+      return QLINQ_EMCON_SOCKET_EXPIRED;
+    ssize_t sent = sendto(sender->fd, packet, packet_size, MSG_DONTWAIT,
+                          (struct sockaddr *)&sender->destination,
+                          sender->destination_len);
+    if (sent == (ssize_t)packet_size)
+      break;
+    if (sent < 0 && errno == EINTR)
+      continue;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      ret = qlinq_emcon_socket_wait(sender->fd, POLLOUT, sender->expires_at_ms);
+      if (ret != QLINQ_EMCON_SOCKET_OK)
+        return ret;
+      continue;
+    }
     sender->stats.hard_send_errors++;
     if (sent >= 0)
       errno = EIO;
-    return -1;
+    return QLINQ_EMCON_SOCKET_SYSTEM;
   }
+  uint64_t base = monotonic_ns();
+  if (base < sender->virtual_finish_ns)
+    base = sender->virtual_finish_ns;
+  sender->virtual_finish_ns =
+      packet_ns > UINT64_MAX - base ? UINT64_MAX : base + packet_ns;
   sender->stats.packets_sent++;
   sender->stats.bytes_sent += packet_size;
-  return 0;
-}
-
-bool qlinq_emcon_send_socket_emit(void *user_data, uint16_t symbol_index,
-                                  const uint8_t *packet, size_t packet_size) {
-  (void)symbol_index;
-  return qlinq_emcon_send_socket_send(user_data, packet, packet_size) == 0;
+  return QLINQ_EMCON_SOCKET_OK;
 }
 
 qlinq_emcon_send_stats_t

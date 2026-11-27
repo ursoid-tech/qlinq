@@ -126,7 +126,8 @@ static int inject_unknown_alias(const qlinq_emcon_manifest_t *manifest,
   uint64_t packet_number;
   int ok =
       qlinq_emcon_sender_create(&sender, manifest->flow_id, manifest->key_epoch,
-                                manifest->initial_packet_number, 750, secret,
+                                manifest->initial_packet_number,
+                                manifest->initial_packet_number + 50, secret,
                                 32) == QLINQ_EMCON_OK &&
       qlinq_wire_encode_fec_header(payload, sizeof(payload), &header) ==
           QLINQ_WIRE_OK &&
@@ -172,9 +173,86 @@ static int check_session_object(qlinq_emcon_session_t *receiver,
   return 0;
 }
 
+static int check_io_limits(const uint8_t secret[32]) {
+  uint64_t now = now_ms();
+  qlinq_emcon_manifest_t manifest = fixture(secret, now);
+  manifest.key_epoch += 100;
+  manifest.expires_at_ms = now + 200;
+  qlinq_emcon_session_t *receiver = NULL, *sender = NULL;
+  qlinq_emcon_event_t event;
+  CHECK(qlinq_emcon_session_create_receiver(&receiver, &manifest, secret, 32,
+                                            now) == QLINQ_EMCON_SESSION_OK,
+        "open receiver with finite wait");
+  alarm(5);
+  CHECK(qlinq_emcon_session_receive(receiver, &event, false) ==
+                QLINQ_EMCON_SESSION_EXPIRED &&
+            now_ms() >= manifest.expires_at_ms,
+        "idle blocking receive returns at manifest expiry");
+  alarm(0);
+  qlinq_emcon_session_free(receiver);
+
+  now = now_ms();
+  manifest.key_epoch++;
+  manifest.expires_at_ms = now + 400;
+  manifest.burst_bytes = 600;
+  manifest.rate_bytes_per_second = 100;
+  CHECK(qlinq_emcon_session_create_sender(&sender, &manifest, secret, 32,
+                                          now) == QLINQ_EMCON_SESSION_OK,
+        "open paced sender");
+  uint8_t record[1024] = {0};
+  CHECK(qlinq_emcon_session_send_object(sender, 20, 0, 0, false, 0, record,
+                                        sizeof(record)) ==
+                QLINQ_EMCON_SESSION_EXPIRED &&
+            qlinq_emcon_session_stats(sender).send.packets_sent == 2,
+        "only metadata and the first symbol fit before expiry");
+  qlinq_emcon_session_free(sender);
+
+  now = now_ms();
+  manifest.key_epoch++;
+  manifest.expires_at_ms = now + 400;
+  manifest.terminal_repeat_count = 32;
+  CHECK(qlinq_emcon_session_create_sender(&sender, &manifest, secret, 32,
+                                          now) == QLINQ_EMCON_SESSION_OK,
+        "open terminal metadata sender");
+  qlinq_emcon_end_metadata_t end = {.alias = 20};
+  memset(end.transmission_nonce, 1, sizeof(end.transmission_nonce));
+  CHECK(qlinq_emcon_session_send_end(sender, &end) ==
+            QLINQ_EMCON_SESSION_EXPIRED,
+        "terminal repetition stops at expiry");
+  qlinq_emcon_session_stats_t stats = qlinq_emcon_session_stats(sender);
+  CHECK(stats.metadata_sent > 1 &&
+            stats.metadata_sent < manifest.terminal_repeat_count,
+        "transmit only the terminal repeats that fit");
+  qlinq_emcon_session_free(sender);
+
+  uint8_t packet[128] = {0};
+  struct sockaddr_in local = {.sin_family = AF_INET,
+                              .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  struct sockaddr_in destination = local;
+  destination.sin_port = htons(manifest.destination.port);
+  qlinq_emcon_send_socket_t *socket_sender;
+  CHECK(qlinq_emcon_send_socket_create(
+            &socket_sender, (struct sockaddr *)&local, sizeof(local),
+            sizeof(packet) * 10, sizeof(packet), UINT64_MAX) == 0 &&
+            qlinq_emcon_send_socket_set_destination(
+                socket_sender, (struct sockaddr *)&destination,
+                sizeof(destination)) == 0,
+        "create one-packet burst sender");
+  now = now_ms();
+  CHECK(qlinq_emcon_send_socket_send(socket_sender, packet, sizeof(packet)) ==
+                0 &&
+            qlinq_emcon_send_socket_send(socket_sender, packet,
+                                         sizeof(packet)) == 0 &&
+            now_ms() >= now + 99,
+        "two full packets require at least one packet interval");
+  qlinq_emcon_send_socket_free(socket_sender);
+  return 0;
+}
+
 int main(void) {
   uint8_t secret[32];
   memset(secret, 0xb7, sizeof(secret));
+  CHECK(check_io_limits(secret) == 0, "enforce signed I/O limits");
   uint64_t now = now_ms();
   qlinq_emcon_manifest_t manifest = fixture(secret, now);
   CHECK(manifest.source.port && manifest.destination.port,
@@ -184,9 +262,25 @@ int main(void) {
                                             sizeof(secret),
                                             now) == QLINQ_EMCON_SESSION_OK,
         "create multi-alias receiver");
+  qlinq_emcon_event_t unknown_event;
+  qlinq_emcon_manifest_t other = manifest;
+  other.flow_id++;
+  other.key_epoch++;
+  CHECK(inject_unknown_alias(&other, secret) == 0 &&
+            qlinq_emcon_session_receive(receiver, &unknown_event, true) ==
+                QLINQ_EMCON_SESSION_DISCARDED &&
+            qlinq_emcon_session_stats(receiver).authentication_failures == 0,
+        "discard an unrelated flow before authenticating");
+  other = manifest;
+  other.key_epoch--;
+  CHECK(inject_unknown_alias(&other, secret) == 0 &&
+            qlinq_emcon_session_receive(receiver, &unknown_event, true) ==
+                QLINQ_EMCON_SESSION_DISCARDED &&
+            qlinq_emcon_session_stats(receiver).authentication_failures == 1,
+        "discard a packet from the previous epoch and count its failed "
+        "authentication");
   CHECK(inject_unknown_alias(&manifest, secret) == 0,
         "inject authenticated unknown alias");
-  qlinq_emcon_event_t unknown_event;
   CHECK(qlinq_emcon_session_receive(receiver, &unknown_event, false) ==
                 QLINQ_EMCON_SESSION_UNKNOWN_ALIAS &&
             qlinq_emcon_session_stats(receiver).unknown_aliases == 1,
@@ -259,10 +353,10 @@ int main(void) {
       qlinq_emcon_session_stats(receiver);
   CHECK(sender_stats.send.packets_sent == 49 &&
             sender_stats.metadata_sent == 13 &&
-            receiver_stats.packets_received == 50 &&
+            receiver_stats.packets_received == 52 &&
             receiver_stats.records_completed == 6 &&
             receiver_stats.metadata_received == 13 &&
-            receiver_stats.authentication_failures == 0 &&
+            receiver_stats.authentication_failures == 1 &&
             receiver_stats.unknown_aliases == 1,
         "session counters");
 
@@ -270,6 +364,8 @@ int main(void) {
   qlinq_emcon_session_free(receiver);
 
   manifest.key_epoch++;
+  const uint64_t before_wrap = UINT32_MAX - 100;
+  manifest.initial_packet_number = before_wrap;
   char activation_directory[] = "/tmp/qlinq-emcon-session-XXXXXX";
   CHECK(mkdtemp(activation_directory), "create session state directory");
   qlinq_emcon_session_t *persistent = NULL, *competing = NULL;
@@ -324,8 +420,8 @@ int main(void) {
   qlinq_emcon_session_stats_t persistent_stats =
       qlinq_emcon_session_stats(persistent);
   CHECK(persistent_stats.persistent_activation &&
-            persistent_stats.next_packet_number == 700 &&
-            persistent_stats.reserved_until == 704,
+            persistent_stats.next_packet_number == before_wrap &&
+            persistent_stats.reserved_until == before_wrap + 4,
         "initial packet-number reservation");
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &competing, &manifest, secret, sizeof(secret), now,
@@ -335,25 +431,12 @@ int main(void) {
                                         sizeof(data[0])) ==
             QLINQ_EMCON_SESSION_OK,
         "extend reservation before multi-packet send");
-  bool persistent_record = false;
-  for (size_t packet = 0; packet < 7; packet++) {
-    qlinq_emcon_event_t event;
-    int ret = qlinq_emcon_session_receive(persistent_receiver, &event, false);
-    CHECK(ret == QLINQ_EMCON_SESSION_OK ||
-              ret == QLINQ_EMCON_SESSION_INCOMPLETE ||
-              ret == QLINQ_EMCON_SESSION_DUPLICATE,
-          "receive persistent sender packet");
-    if (ret == QLINQ_EMCON_SESSION_OK) {
-      if (event.type == QLINQ_EMCON_EVENT_RECORD)
-        persistent_record =
-            event.value.record.size == sizeof(data[0]) &&
-            memcmp(event.value.record.data, data[0], sizeof(data[0])) == 0;
-      qlinq_emcon_event_release(&event);
-    }
-  }
+  CHECK(check_session_object(persistent_receiver, 1, data[0],
+                             sizeof(data[0])) == 0,
+        "running receiver recovers the object before wire rollover");
   persistent_stats = qlinq_emcon_session_stats(persistent);
-  CHECK(persistent_record && persistent_stats.next_packet_number == 707 &&
-            persistent_stats.reserved_until == 708,
+  CHECK(persistent_stats.next_packet_number == before_wrap + 7 &&
+            persistent_stats.reserved_until == before_wrap + 8,
         "use only durably reserved packet numbers");
   qlinq_emcon_session_free(persistent);
   persistent = NULL;
@@ -362,30 +445,52 @@ int main(void) {
             activation_directory, 65536) == QLINQ_EMCON_SESSION_OK,
         "restart persistent sender");
   persistent_stats = qlinq_emcon_session_stats(persistent);
-  CHECK(persistent_stats.next_packet_number == 708 &&
-            persistent_stats.reserved_until == 708 + 65536,
+  const uint64_t after_wrap = before_wrap + 8 + 65536;
+  CHECK(persistent_stats.next_packet_number == before_wrap + 8 &&
+            persistent_stats.reserved_until == after_wrap,
         "restart skips unused packet numbers");
   qlinq_emcon_session_free(persistent);
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &persistent, &manifest, secret, sizeof(secret), now,
             activation_directory, 65536) == QLINQ_EMCON_SESSION_OK &&
             qlinq_emcon_session_stats(persistent).next_packet_number ==
-                708 + 65536 &&
+                after_wrap &&
             qlinq_emcon_session_send_object(persistent, 20, 8, 2, false, 0,
                                             data[0], sizeof(data[0])) ==
                 QLINQ_EMCON_SESSION_OK,
         "send across a skipped default reservation");
   CHECK(check_session_object(persistent_receiver, 2, data[0],
                              sizeof(data[0])) == 0,
-        "running receiver recovers the restarted sender's object");
+        "running receiver recovers the restarted sender's object after wire "
+        "rollover");
   qlinq_emcon_session_free(persistent_receiver);
   qlinq_emcon_session_free(persistent);
 
+  qlinq_emcon_session_t *late_receiver = NULL;
+  CHECK(qlinq_emcon_session_create_receiver(&late_receiver, &manifest, secret,
+                                            sizeof(secret),
+                                            now) == QLINQ_EMCON_SESSION_OK,
+        "open a fresh listener provisioned with the original packet number");
+  CHECK(qlinq_emcon_session_create_sender_persistent(
+            &persistent, &manifest, secret, sizeof(secret), now,
+            activation_directory, 4) == QLINQ_EMCON_SESSION_OK &&
+            qlinq_emcon_session_stats(persistent).next_packet_number ==
+                after_wrap + 65536 &&
+            qlinq_emcon_session_send_object(persistent, 20, 8, 3, false, 0,
+                                            data[0], sizeof(data[0])) ==
+                QLINQ_EMCON_SESSION_OK,
+        "send to a late listener after restart");
+  CHECK(
+      check_session_object(late_receiver, 3, data[0], sizeof(data[0])) == 0,
+      "late listener reconstructs the full packet numbers after wire rollover");
+  qlinq_emcon_session_free(late_receiver);
+  qlinq_emcon_session_free(persistent);
+
   manifest.key_epoch++;
-  manifest.initial_packet_number = UINT32_MAX - 10;
+  manifest.initial_packet_number = QLINQ_EMCON_MAX_PACKET_NUMBER - 10;
   qlinq_emcon_activation_t *budget = NULL;
   uint64_t budget_first, budget_reserved;
-  const uint64_t key_limit = UINT64_C(1) << 32;
+  const uint64_t key_limit = QLINQ_EMCON_MAX_PACKET_NUMBER + UINT64_C(1);
   CHECK(qlinq_emcon_activation_open_managed(&budget, activation_directory,
                                             &manifest) ==
                 QLINQ_EMCON_ACTIVATION_OK &&
@@ -398,13 +503,13 @@ int main(void) {
   CHECK(qlinq_emcon_session_create_receiver(&persistent_receiver, &manifest,
                                             secret, sizeof(secret),
                                             now) == QLINQ_EMCON_SESSION_OK,
-        "open a receiver near the 32-bit ceiling");
+        "open a receiver near the 62-bit ceiling");
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &persistent, &manifest, secret, sizeof(secret), now,
             activation_directory, 4) == QLINQ_EMCON_SESSION_OK &&
             qlinq_emcon_session_stats(persistent).reserved_until ==
                 key_limit - 3,
-        "start sender near the 32-bit ceiling");
+        "start sender near the 62-bit ceiling");
   CHECK(qlinq_emcon_session_send_object(persistent, 20, 8, 3, false, 0, data[0],
                                         sizeof(data[0])) ==
                 QLINQ_EMCON_SESSION_OK &&
@@ -414,12 +519,12 @@ int main(void) {
         "extend with the final partial block and use the last packet number");
   CHECK(check_session_object(persistent_receiver, 3, data[0],
                              sizeof(data[0])) == 0,
-        "receiver recovers metadata and FEC at the 32-bit ceiling");
+        "receiver recovers metadata and FEC at the 62-bit ceiling");
   qlinq_emcon_session_free(persistent_receiver);
   CHECK(qlinq_emcon_session_send_object(persistent, 20, 8, 4, false, 0, data[0],
                                         sizeof(data[0])) ==
             QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED,
-        "refuse encryption beyond the 32-bit ceiling");
+        "refuse encryption beyond the 62-bit ceiling");
   qlinq_emcon_session_free(persistent);
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &persistent, &manifest, secret, sizeof(secret), now,

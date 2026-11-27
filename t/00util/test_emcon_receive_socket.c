@@ -48,18 +48,29 @@ int main(void) {
   uint8_t packet[64];
   size_t packet_size = 0;
   CHECK(qlinq_emcon_receive_socket_receive(receiver, packet, sizeof(packet),
-                                           &packet_size,
-                                           false) == QLINQ_EMCON_SOCKET_OK &&
+                                           &packet_size, false, UINT64_MAX) ==
+                QLINQ_EMCON_SOCKET_OK &&
             packet_size == sizeof(payload) &&
             memcmp(packet, payload, sizeof(payload)) == 0,
         "receive datagram");
   CHECK(qlinq_emcon_receive_socket_receive(receiver, packet, sizeof(packet),
-                                           &packet_size, true) ==
+                                           &packet_size, true, UINT64_MAX) ==
             QLINQ_EMCON_SOCKET_WOULD_BLOCK,
         "no receiver feedback datagram");
   CHECK(recv(sender, packet, sizeof(packet), MSG_DONTWAIT) < 0 &&
             (errno == EAGAIN || errno == EWOULDBLOCK),
         "sender observes no feedback");
+
+  CHECK(sendto(sender, payload, sizeof(payload), 0,
+               (struct sockaddr *)&receiver_address,
+               sizeof(receiver_address)) == (ssize_t)sizeof(payload),
+        "queue a datagram at expiry");
+  packet_size = 0;
+  CHECK(qlinq_emcon_receive_socket_receive(
+            receiver, packet, sizeof(packet), &packet_size, false,
+            qlinq_emcon_realtime_ms()) == QLINQ_EMCON_SOCKET_EXPIRED &&
+            packet_size == 0,
+        "never accept queued data after expiry");
 
   qlinq_emcon_receive_socket_free(receiver);
   close(sender);

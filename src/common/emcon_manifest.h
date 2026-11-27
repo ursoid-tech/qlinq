@@ -22,7 +22,7 @@
 #define QLINQ_EMCON_DELIVERY_RATELESS 3U
 #define QLINQ_EMCON_REPLAY_WINDOW_PACKETS 64U
 #define QLINQ_EMCON_MAX_PACKETS_PER_KEY (UINT64_C(1) << 23)
-#define QLINQ_EMCON_MAX_PACKET_NUMBER UINT32_MAX
+#define QLINQ_EMCON_MAX_PACKET_NUMBER ((UINT64_C(1) << 62) - 1)
 #define QLINQ_EMCON_FLEXICAST_OVERHEAD 64U
 
 typedef enum {
@@ -77,7 +77,7 @@ typedef struct {
 
 int qlinq_emcon_manifest_validate(const qlinq_emcon_manifest_t *manifest,
                                   uint64_t now_ms);
-/* Exclusive end of the sender packet-number range for a valid epoch start. */
+/* exclusive end of sender packet-number range for a valid epoch start */
 uint64_t qlinq_emcon_packet_number_limit(uint64_t initial_packet_number);
 int qlinq_emcon_manifest_encode(const qlinq_emcon_manifest_t *manifest,
                                 uint8_t *output, size_t capacity,

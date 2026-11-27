@@ -16,6 +16,7 @@ typedef enum {
   QLINQ_EMCON_SESSION_INCOMPLETE = 1,
   QLINQ_EMCON_SESSION_DUPLICATE = 2,
   QLINQ_EMCON_SESSION_WOULD_BLOCK = 3,
+  QLINQ_EMCON_SESSION_DISCARDED = 4,
   QLINQ_EMCON_SESSION_INVALID = -1,
   QLINQ_EMCON_SESSION_NO_MEMORY = -2,
   QLINQ_EMCON_SESSION_CRYPTO = -3,
@@ -48,9 +49,7 @@ int qlinq_emcon_session_create_sender(qlinq_emcon_session_t **session,
                                       const uint8_t *traffic_secret,
                                       size_t traffic_secret_size,
                                       uint64_t now_ms);
-/* Production sender constructor. It durably reserves packet-number ranges and
- * holds an exclusive activation lock for the session lifetime. The state
- * filename is derived inside state_directory from the traffic-key epoch. */
+/* production sender with durable nonce reservations and exclusive lock */
 int qlinq_emcon_session_create_sender_persistent(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
@@ -60,16 +59,12 @@ int qlinq_emcon_session_create_receiver(qlinq_emcon_session_t **session,
                                         const uint8_t *traffic_secret,
                                         size_t traffic_secret_size,
                                         uint64_t now_ms);
-/* Sets up the receiver socket and claims the key epoch before packet
- * consumption. Restart requires a newly provisioned key epoch. */
+/* creates receiver socket and permanently claims key epoch before receive */
 int qlinq_emcon_session_create_receiver_claimed(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory);
-/* Prepares a receiver socket while blocking packet consumption, so callers
- * can set up output before committing the one-shot claim. Passive multicast
- * (join_group=false) requires a receiver-local interface index, existing host
- * membership, and a provisioned receive-only link. */
+/* prepares receiver socket before committing the one-shot epoch claim */
 int qlinq_emcon_session_prepare_receiver(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,

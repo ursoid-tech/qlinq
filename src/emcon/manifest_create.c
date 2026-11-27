@@ -1,6 +1,7 @@
 #include "manifest_create.h"
 
 #include "emcon_manifest.h"
+#include "emcon_socket.h"
 
 #include <arpa/inet.h>
 #include <openssl/crypto.h>
@@ -369,13 +370,6 @@ static int parse_config_value(char *key, char *value,
   return 0;
 }
 
-static uint64_t realtime_ms(void) {
-  struct timespec now;
-  if (clock_gettime(CLOCK_REALTIME, &now) != 0)
-    return 0;
-  return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
-}
-
 static int read_config(const char *path, qlinq_emcon_manifest_t *manifest) {
   FILE *file = fopen(path, "r");
   if (!file)
@@ -448,7 +442,7 @@ static int read_config(const char *path, qlinq_emcon_manifest_t *manifest) {
     return -1;
   }
   if (duration) {
-    uint64_t now = realtime_ms();
+    uint64_t now = qlinq_emcon_realtime_ms();
     if (now == 0 || valid_for_seconds > (UINT64_MAX - now) / 1000U)
       return -1;
     manifest->valid_from_ms = now;

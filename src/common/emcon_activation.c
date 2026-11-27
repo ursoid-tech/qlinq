@@ -1,5 +1,7 @@
 #include "emcon_activation.h"
 
+#include "emcon_endian.h"
+
 #include <openssl/crypto.h>
 #include <openssl/sha.h>
 
@@ -28,41 +30,12 @@
 struct qlinq_emcon_activation_t {
   int fd;
   int directory_fd;
-  char *state_file;
   qlinq_emcon_manifest_t manifest;
   uint8_t manifest_digest[32];
   uint64_t next_packet_number;
   uint64_t generation;
   bool needs_directory_sync;
 };
-
-static void write_u16(uint8_t *dst, uint16_t value) {
-  dst[0] = (uint8_t)(value >> 8);
-  dst[1] = (uint8_t)value;
-}
-
-static void write_u32(uint8_t *dst, uint32_t value) {
-  dst[0] = (uint8_t)(value >> 24);
-  dst[1] = (uint8_t)(value >> 16);
-  dst[2] = (uint8_t)(value >> 8);
-  dst[3] = (uint8_t)value;
-}
-
-static void write_u64(uint8_t *dst, uint64_t value) {
-  for (size_t i = 0; i < 8; i++)
-    dst[i] = (uint8_t)(value >> (56U - 8U * i));
-}
-
-static uint16_t read_u16(const uint8_t *src) {
-  return (uint16_t)(((uint16_t)src[0] << 8) | src[1]);
-}
-
-static uint64_t read_u64(const uint8_t *src) {
-  uint64_t value = 0;
-  for (size_t i = 0; i < 8; i++)
-    value = (value << 8) | src[i];
-  return value;
-}
 
 static bool all_zero(const uint8_t *value, size_t size) {
   uint8_t combined = 0;
@@ -76,9 +49,10 @@ static int read_state(int fd, uint8_t state[ACTIVATION_FILE_SIZE],
   struct stat info;
   if (fstat(fd, &info) != 0)
     return QLINQ_EMCON_ACTIVATION_IO;
-  if (info.st_size < 0 || (uint64_t)info.st_size > ACTIVATION_FILE_SIZE)
+  /* opener may close before first reservation; covered slots must be valid */
+  if (info.st_size != 0 && info.st_size != ACTIVATION_SLOT_SIZE &&
+      info.st_size != ACTIVATION_FILE_SIZE)
     return QLINQ_EMCON_ACTIVATION_CORRUPT;
-  memset(state, 0, ACTIVATION_FILE_SIZE);
   size_t required = (size_t)info.st_size;
   size_t offset = 0;
   while (offset < required) {
@@ -97,13 +71,12 @@ static int decode_slot(const uint8_t slot[ACTIVATION_SLOT_SIZE],
                        uint64_t *next_packet_number, uint64_t *generation,
                        const qlinq_emcon_manifest_t *manifest,
                        const uint8_t manifest_digest[32]) {
-  if (all_zero(slot, ACTIVATION_SLOT_SIZE))
-    return 0;
   uint8_t checksum[32];
   if (slot[0] != ACTIVATION_MAGIC_0 || slot[1] != ACTIVATION_MAGIC_1 ||
       slot[2] != ACTIVATION_MAGIC_2 || slot[3] != ACTIVATION_MAGIC_3 ||
-      read_u16(slot + 4) != ACTIVATION_VERSION ||
-      read_u16(slot + 6) != ACTIVATION_SLOT_SIZE || !all_zero(slot + 120, 8) ||
+      qlinq_emcon_read_u16(slot + 4) != ACTIVATION_VERSION ||
+      qlinq_emcon_read_u16(slot + 6) != ACTIVATION_SLOT_SIZE ||
+      !all_zero(slot + 120, 8) ||
       !SHA256(slot, ACTIVATION_CHECKSUM_OFFSET, checksum) ||
       CRYPTO_memcmp(checksum, slot + ACTIVATION_CHECKSUM_OFFSET,
                     sizeof(checksum)) != 0)
@@ -116,14 +89,17 @@ static int decode_slot(const uint8_t slot[ACTIVATION_SLOT_SIZE],
                     sizeof(manifest->traffic_key_id)) != 0 ||
       CRYPTO_memcmp(slot + 72, manifest_digest, 32) != 0)
     return QLINQ_EMCON_ACTIVATION_IDENTITY_MISMATCH;
-  *next_packet_number = read_u64(slot + 104);
-  *generation = read_u64(slot + 112);
-  if (*next_packet_number < manifest->initial_packet_number || *generation == 0)
+  *next_packet_number = qlinq_emcon_read_u64(slot + 104);
+  *generation = qlinq_emcon_read_u64(slot + 112);
+  if (*next_packet_number <= manifest->initial_packet_number ||
+      *next_packet_number >
+          qlinq_emcon_packet_number_limit(manifest->initial_packet_number) ||
+      *generation == 0)
     return QLINQ_EMCON_ACTIVATION_CORRUPT;
-  return 1;
+  return QLINQ_EMCON_ACTIVATION_OK;
 }
 
-static void encode_slot(uint8_t slot[ACTIVATION_SLOT_SIZE],
+static bool encode_slot(uint8_t slot[ACTIVATION_SLOT_SIZE],
                         const qlinq_emcon_activation_t *activation,
                         uint64_t next_packet_number, uint64_t generation) {
   memset(slot, 0, ACTIVATION_SLOT_SIZE);
@@ -131,8 +107,8 @@ static void encode_slot(uint8_t slot[ACTIVATION_SLOT_SIZE],
   slot[1] = ACTIVATION_MAGIC_1;
   slot[2] = ACTIVATION_MAGIC_2;
   slot[3] = ACTIVATION_MAGIC_3;
-  write_u16(slot + 4, ACTIVATION_VERSION);
-  write_u16(slot + 6, ACTIVATION_SLOT_SIZE);
+  qlinq_emcon_write_u16(slot + 4, ACTIVATION_VERSION);
+  qlinq_emcon_write_u16(slot + 6, ACTIVATION_SLOT_SIZE);
   memcpy(slot + 8, activation->manifest.session_id,
          sizeof(activation->manifest.session_id));
   memcpy(slot + 24, activation->manifest.sender_id,
@@ -141,9 +117,10 @@ static void encode_slot(uint8_t slot[ACTIVATION_SLOT_SIZE],
          sizeof(activation->manifest.traffic_key_id));
   memcpy(slot + 72, activation->manifest_digest,
          sizeof(activation->manifest_digest));
-  write_u64(slot + 104, next_packet_number);
-  write_u64(slot + 112, generation);
-  SHA256(slot, ACTIVATION_CHECKSUM_OFFSET, slot + ACTIVATION_CHECKSUM_OFFSET);
+  qlinq_emcon_write_u64(slot + 104, next_packet_number);
+  qlinq_emcon_write_u64(slot + 112, generation);
+  return SHA256(slot, ACTIVATION_CHECKSUM_OFFSET,
+                slot + ACTIVATION_CHECKSUM_OFFSET) != NULL;
 }
 
 static int write_exact_at(int fd, const uint8_t *data, size_t size,
@@ -159,27 +136,6 @@ static int write_exact_at(int fd, const uint8_t *data, size_t size,
     written += (size_t)result;
   }
   return 0;
-}
-
-static int sync_parent_directory(const char *path) {
-  char *copy = strdup(path);
-  if (!copy)
-    return -1;
-  char *slash = strrchr(copy, '/');
-  const char *directory = ".";
-  if (slash) {
-    if (slash == copy)
-      slash[1] = '\0';
-    else
-      *slash = '\0';
-    directory = copy;
-  }
-  int directory_fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  int ret = directory_fd >= 0 && fsync(directory_fd) == 0 ? 0 : -1;
-  if (directory_fd >= 0)
-    close(directory_fd);
-  free(copy);
-  return ret;
 }
 
 static int open_state_directory(const char *path) {
@@ -207,9 +163,9 @@ static int activation_filename(char filename[ACTIVATION_FILENAME_SIZE],
   memcpy(input + offset, manifest->traffic_key_id,
          sizeof(manifest->traffic_key_id));
   offset += sizeof(manifest->traffic_key_id);
-  write_u32(input + offset, manifest->key_epoch);
+  qlinq_emcon_write_u32(input + offset, manifest->key_epoch);
   offset += 4;
-  write_u16(input + offset, manifest->cipher_suite);
+  qlinq_emcon_write_u16(input + offset, manifest->cipher_suite);
   uint8_t digest[32];
   if (!SHA256(input, sizeof(input), digest))
     return -1;
@@ -228,16 +184,14 @@ static int activation_filename(char filename[ACTIVATION_FILENAME_SIZE],
 }
 
 static int finish_activation_open(qlinq_emcon_activation_t **activation, int fd,
-                                  int directory_fd, const char *state_file,
-                                  bool created_file,
+                                  int directory_fd,
                                   const qlinq_emcon_manifest_t *manifest) {
   struct stat info;
   if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
       info.st_uid != geteuid() || info.st_nlink != 1 ||
       (info.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
     close(fd);
-    if (directory_fd >= 0)
-      close(directory_fd);
+    close(directory_fd);
     return QLINQ_EMCON_ACTIVATION_IO;
   }
   if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
@@ -245,27 +199,24 @@ static int finish_activation_open(qlinq_emcon_activation_t **activation, int fd,
                   ? QLINQ_EMCON_ACTIVATION_LOCKED
                   : QLINQ_EMCON_ACTIVATION_IO;
     close(fd);
-    if (directory_fd >= 0)
-      close(directory_fd);
+    close(directory_fd);
     return ret;
   }
 
   qlinq_emcon_activation_t *opened = calloc(1, sizeof(*opened));
   if (!opened) {
     close(fd);
-    if (directory_fd >= 0)
-      close(directory_fd);
+    close(directory_fd);
     return QLINQ_EMCON_ACTIVATION_IO;
   }
   opened->fd = fd;
   opened->directory_fd = directory_fd;
-  opened->state_file = state_file ? strdup(state_file) : NULL;
   opened->manifest = *manifest;
   opened->next_packet_number = manifest->initial_packet_number;
-  opened->needs_directory_sync = created_file;
-  if ((state_file && !opened->state_file) ||
-      qlinq_emcon_manifest_digest(manifest, opened->manifest_digest) !=
-          QLINQ_EMCON_MANIFEST_OK) {
+  /* earlier opener may have written first slot without syncing directory */
+  opened->needs_directory_sync = true;
+  if (qlinq_emcon_manifest_digest(manifest, opened->manifest_digest) !=
+      QLINQ_EMCON_MANIFEST_OK) {
     qlinq_emcon_activation_close(opened);
     return QLINQ_EMCON_ACTIVATION_IO;
   }
@@ -277,31 +228,23 @@ static int finish_activation_open(qlinq_emcon_activation_t **activation, int fd,
     qlinq_emcon_activation_close(opened);
     return ret;
   }
-  if (state_size != 0 && state_size < ACTIVATION_SLOT_SIZE) {
-    qlinq_emcon_activation_close(opened);
-    return QLINQ_EMCON_ACTIVATION_CORRUPT;
-  }
-  if (state_size == 0)
-    opened->needs_directory_sync = true;
-  bool slot_valid[ACTIVATION_SLOT_COUNT] = {false};
+  size_t slot_count = state_size / ACTIVATION_SLOT_SIZE;
   uint64_t slot_next[ACTIVATION_SLOT_COUNT] = {0};
   uint64_t slot_generation[ACTIVATION_SLOT_COUNT] = {0};
-  for (size_t i = 0; i < ACTIVATION_SLOT_COUNT; i++) {
+  for (size_t i = 0; i < slot_count; i++) {
     int decoded =
         decode_slot(state + i * ACTIVATION_SLOT_SIZE, &slot_next[i],
                     &slot_generation[i], manifest, opened->manifest_digest);
-    if (decoded < 0) {
+    if (decoded != QLINQ_EMCON_ACTIVATION_OK) {
       qlinq_emcon_activation_close(opened);
       return decoded;
     }
-    slot_valid[i] = decoded > 0;
-    if (slot_valid[i] &&
-        (slot_generation[i] - 1) % ACTIVATION_SLOT_COUNT != i) {
+    if ((slot_generation[i] - 1) % ACTIVATION_SLOT_COUNT != i) {
       qlinq_emcon_activation_close(opened);
       return QLINQ_EMCON_ACTIVATION_CORRUPT;
     }
   }
-  if (slot_valid[0] && slot_valid[1]) {
+  if (slot_count == ACTIVATION_SLOT_COUNT) {
     size_t newer = slot_generation[1] > slot_generation[0] ? 1 : 0;
     size_t older = 1 - newer;
     if (slot_generation[newer] - slot_generation[older] != 1 ||
@@ -311,14 +254,13 @@ static int finish_activation_open(qlinq_emcon_activation_t **activation, int fd,
     }
     opened->next_packet_number = slot_next[newer];
     opened->generation = slot_generation[newer];
-  } else if (slot_valid[0] || slot_valid[1]) {
-    size_t valid = slot_valid[1] ? 1 : 0;
-    if (valid != 0 || slot_generation[valid] != 1) {
+  } else if (slot_count == 1) {
+    if (slot_generation[0] != 1) {
       qlinq_emcon_activation_close(opened);
       return QLINQ_EMCON_ACTIVATION_CORRUPT;
     }
-    opened->next_packet_number = slot_next[valid];
-    opened->generation = slot_generation[valid];
+    opened->next_packet_number = slot_next[0];
+    opened->generation = slot_generation[0];
   }
   *activation = opened;
   return QLINQ_EMCON_ACTIVATION_OK;
@@ -331,18 +273,24 @@ int qlinq_emcon_activation_open(qlinq_emcon_activation_t **activation,
       qlinq_emcon_manifest_validate(manifest, 0) != QLINQ_EMCON_MANIFEST_OK)
     return QLINQ_EMCON_ACTIVATION_INVALID;
   *activation = NULL;
-  bool created_file = false;
-  int fd = open(state_file, O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_CREAT | O_EXCL,
-                0600);
-  if (fd >= 0) {
-    created_file = true;
-  } else if (errno == EEXIST) {
-    fd = open(state_file, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-  }
-  if (fd < 0)
+  const char *slash = strrchr(state_file, '/');
+  const char *filename = slash ? slash + 1 : state_file;
+  char *parent = slash && slash != state_file
+                     ? strndup(state_file, (size_t)(slash - state_file))
+                     : strdup(slash ? "/" : ".");
+  if (!parent)
     return QLINQ_EMCON_ACTIVATION_IO;
-  return finish_activation_open(activation, fd, -1, state_file, created_file,
-                                manifest);
+  int directory_fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  free(parent);
+  if (directory_fd < 0)
+    return QLINQ_EMCON_ACTIVATION_IO;
+  int fd = openat(directory_fd, filename,
+                  O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_CREAT, 0600);
+  if (fd < 0) {
+    close(directory_fd);
+    return QLINQ_EMCON_ACTIVATION_IO;
+  }
+  return finish_activation_open(activation, fd, directory_fd, manifest);
 }
 
 int qlinq_emcon_activation_open_managed(
@@ -360,20 +308,13 @@ int qlinq_emcon_activation_open_managed(
     close(directory_fd);
     return QLINQ_EMCON_ACTIVATION_IO;
   }
-  bool created_file = false;
   int fd = openat(directory_fd, filename,
-                  O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_CREAT | O_EXCL, 0600);
-  if (fd >= 0) {
-    created_file = true;
-  } else if (errno == EEXIST) {
-    fd = openat(directory_fd, filename, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
-  }
+                  O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_CREAT, 0600);
   if (fd < 0) {
     close(directory_fd);
     return QLINQ_EMCON_ACTIVATION_IO;
   }
-  return finish_activation_open(activation, fd, directory_fd, NULL,
-                                created_file, manifest);
+  return finish_activation_open(activation, fd, directory_fd, manifest);
 }
 
 int qlinq_emcon_receiver_activation_check_available(
@@ -434,18 +375,19 @@ int qlinq_emcon_receiver_activation_claim(
   claim[1] = 'E';
   claim[2] = 'M';
   claim[3] = 'R';
-  write_u16(claim + 4, ACTIVATION_VERSION);
-  write_u16(claim + 6, RECEIVER_CLAIM_SIZE);
+  qlinq_emcon_write_u16(claim + 4, ACTIVATION_VERSION);
+  qlinq_emcon_write_u16(claim + 6, RECEIVER_CLAIM_SIZE);
   memcpy(claim + 8, manifest->session_id, sizeof(manifest->session_id));
   memcpy(claim + 24, manifest->sender_id, sizeof(manifest->sender_id));
   memcpy(claim + 40, manifest->traffic_key_id,
          sizeof(manifest->traffic_key_id));
   memcpy(claim + 72, manifest_digest, sizeof(manifest_digest));
-  write_u64(claim + 104, manifest->flow_id);
-  write_u32(claim + 112, manifest->key_epoch);
-  write_u16(claim + 116, manifest->cipher_suite);
-  SHA256(claim, ACTIVATION_CHECKSUM_OFFSET, claim + ACTIVATION_CHECKSUM_OFFSET);
-  int ret = write_exact_at(fd, claim, sizeof(claim), 0) == 0 &&
+  qlinq_emcon_write_u64(claim + 104, manifest->flow_id);
+  qlinq_emcon_write_u32(claim + 112, manifest->key_epoch);
+  qlinq_emcon_write_u16(claim + 116, manifest->cipher_suite);
+  int ret = SHA256(claim, ACTIVATION_CHECKSUM_OFFSET,
+                   claim + ACTIVATION_CHECKSUM_OFFSET) &&
+                    write_exact_at(fd, claim, sizeof(claim), 0) == 0 &&
                     fdatasync(fd) == 0 && fsync(directory_fd) == 0
                 ? QLINQ_EMCON_ACTIVATION_OK
                 : QLINQ_EMCON_ACTIVATION_IO;
@@ -478,14 +420,12 @@ int qlinq_emcon_activation_reserve(qlinq_emcon_activation_t *activation,
   uint64_t generation = activation->generation + 1;
   size_t slot_index = (size_t)((generation - 1) % ACTIVATION_SLOT_COUNT);
   uint8_t slot[ACTIVATION_SLOT_SIZE];
-  encode_slot(slot, activation, next, generation);
-  if (write_exact_at(activation->fd, slot, sizeof(slot),
+  if (!encode_slot(slot, activation, next, generation) ||
+      write_exact_at(activation->fd, slot, sizeof(slot),
                      (off_t)(slot_index * ACTIVATION_SLOT_SIZE)) != 0 ||
       fdatasync(activation->fd) != 0 ||
       (activation->needs_directory_sync &&
-       (activation->directory_fd >= 0
-            ? fsync(activation->directory_fd)
-            : sync_parent_directory(activation->state_file)) != 0))
+       fsync(activation->directory_fd) != 0))
     return QLINQ_EMCON_ACTIVATION_IO;
   activation->needs_directory_sync = false;
   *first_packet_number = activation->next_packet_number;
@@ -502,7 +442,6 @@ void qlinq_emcon_activation_close(qlinq_emcon_activation_t *activation) {
     close(activation->fd);
   if (activation->directory_fd >= 0)
     close(activation->directory_fd);
-  free(activation->state_file);
   OPENSSL_cleanse(activation, sizeof(*activation));
   free(activation);
 }

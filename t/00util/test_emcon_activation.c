@@ -2,8 +2,9 @@
 
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
-#include <openssl/sha.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,30 @@
       return 1;                                                                \
     }                                                                          \
   } while (0)
+
+enum { SLOT_SIZE = 160 };
+
+#ifdef __linux__
+enum { EXIT_BEFORE_DIRECTORY_SYNC = 77 };
+static unsigned int directory_sync_calls;
+static bool exit_before_directory_sync;
+static bool fail_directory_sync;
+
+int __real_fsync(int fd);
+int __wrap_fsync(int fd) {
+  struct stat info;
+  if (fstat(fd, &info) == 0 && S_ISDIR(info.st_mode)) {
+    directory_sync_calls++;
+    if (exit_before_directory_sync)
+      _exit(EXIT_BEFORE_DIRECTORY_SYNC);
+    if (fail_directory_sync) {
+      errno = EIO;
+      return -1;
+    }
+  }
+  return __real_fsync(fd);
+}
+#endif
 
 static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
   qlinq_emcon_manifest_t manifest = {
@@ -68,6 +93,51 @@ static int remove_state_directory(const char *path) {
   closedir(directory);
   return ret == 0 ? rmdir(path) : -1;
 }
+
+#ifdef __linux__
+static int test_interrupted_creation(const char *directory,
+                                     qlinq_emcon_manifest_t manifest) {
+  manifest.key_epoch += 2;
+  pid_t child = fork();
+  CHECK(child >= 0, "fork before syncing the state directory");
+  if (child == 0) {
+    qlinq_emcon_activation_t *activation = NULL;
+    uint64_t start, limit;
+    exit_before_directory_sync = true;
+    if (qlinq_emcon_activation_open_managed(
+            &activation, directory, &manifest) == QLINQ_EMCON_ACTIVATION_OK)
+      qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit);
+    _exit(1);
+  }
+  int status;
+  CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == EXIT_BEFORE_DIRECTORY_SYNC,
+        "exit after writing the first slot but before syncing its directory");
+
+  qlinq_emcon_activation_t *activation = NULL;
+  CHECK(qlinq_emcon_activation_open_managed(
+            &activation, directory, &manifest) == QLINQ_EMCON_ACTIVATION_OK,
+        "recover a valid first slot after the interruption");
+  uint64_t start = 0, limit = 0;
+  directory_sync_calls = 0;
+  fail_directory_sync = true;
+  CHECK(qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit) ==
+                QLINQ_EMCON_ACTIVATION_IO &&
+            start == 0 && limit == 0 && directory_sync_calls == 1,
+        "require parent sync before returning a usable range after reopen");
+  fail_directory_sync = false;
+  CHECK(qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            start == 108 && limit == 116 && directory_sync_calls == 2,
+        "retry parent sync and skip the interrupted sender's range");
+  CHECK(qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            start == 116 && limit == 124 && directory_sync_calls == 2,
+        "sync the directory once per activation");
+  qlinq_emcon_activation_close(activation);
+  return 0;
+}
+#endif
 
 int main(void) {
   uint8_t secret[32];
@@ -214,6 +284,39 @@ int main(void) {
             QLINQ_EMCON_ACTIVATION_CORRUPT,
         "corrupt state fails closed");
 
+  CHECK(unlink(corrupt_path) == 0 &&
+            qlinq_emcon_activation_open(&corrupt, corrupt_path, &manifest) ==
+                QLINQ_EMCON_ACTIVATION_OK,
+        "create empty activation for retry");
+  qlinq_emcon_activation_close(corrupt);
+  CHECK(qlinq_emcon_activation_open(&corrupt, corrupt_path, &manifest) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_reserve(corrupt, 4, 4, &start, &limit) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            start == 100,
+        "reopen an empty activation after aborting before reservation");
+  qlinq_emcon_activation_close(corrupt);
+  CHECK(truncate(corrupt_path, SLOT_SIZE + 1) == 0 &&
+            qlinq_emcon_activation_open(&corrupt, corrupt_path, &manifest) ==
+                QLINQ_EMCON_ACTIVATION_CORRUPT,
+        "reject a partial second slot even when it is zero");
+  CHECK(truncate(corrupt_path, 2 * SLOT_SIZE) == 0 &&
+            qlinq_emcon_activation_open(&corrupt, corrupt_path, &manifest) ==
+                QLINQ_EMCON_ACTIVATION_CORRUPT,
+        "reject a zeroed second slot even with a valid first slot");
+  CHECK(truncate(corrupt_path, 0) == 0 &&
+            truncate(corrupt_path, SLOT_SIZE) == 0 &&
+            qlinq_emcon_activation_open(&corrupt, corrupt_path, &manifest) ==
+                QLINQ_EMCON_ACTIVATION_CORRUPT &&
+            truncate(corrupt_path, 2 * SLOT_SIZE) == 0 &&
+            qlinq_emcon_activation_open(&corrupt, corrupt_path, &manifest) ==
+                QLINQ_EMCON_ACTIVATION_CORRUPT,
+        "reject zeroed journals of either persisted size");
+#ifdef __linux__
+  CHECK(test_interrupted_creation(directory, manifest) == 0,
+        "recover interrupted directory sync");
+#endif
+
   qlinq_emcon_activation_t *budget = NULL;
   CHECK(qlinq_emcon_activation_open(&budget, mismatch_path, &manifest) ==
             QLINQ_EMCON_ACTIVATION_OK,
@@ -243,37 +346,45 @@ int main(void) {
         "restarting an exhausted key fails closed");
   qlinq_emcon_activation_close(budget);
 
-  const uint64_t wire_limit = UINT64_C(1) << 32;
-  char legacy_path[256];
-  snprintf(legacy_path, sizeof(legacy_path), "%s/legacy.state", directory);
+  const uint64_t rollover = UINT64_C(1) << 32;
+  char rollover_path[256], ceiling_path[256];
+  snprintf(rollover_path, sizeof(rollover_path), "%s/rollover.state",
+           directory);
+  snprintf(ceiling_path, sizeof(ceiling_path), "%s/ceiling.state", directory);
+  qlinq_emcon_manifest_t rollover_manifest = manifest;
+  rollover_manifest.initial_packet_number = rollover - 3;
+  CHECK(
+      qlinq_emcon_activation_open(&budget, rollover_path, &rollover_manifest) ==
+              QLINQ_EMCON_ACTIVATION_OK &&
+          qlinq_emcon_activation_reserve(budget, 4, 4, &start, &limit) ==
+              QLINQ_EMCON_ACTIVATION_OK &&
+          start == rollover - 3 && limit == rollover + 1,
+      "reserve a durable range spanning 32-bit rollover");
+  qlinq_emcon_activation_close(budget);
+  CHECK(
+      qlinq_emcon_activation_open(&budget, rollover_path, &rollover_manifest) ==
+              QLINQ_EMCON_ACTIVATION_OK &&
+          qlinq_emcon_activation_reserve(budget, 1, 1, &start, &limit) ==
+              QLINQ_EMCON_ACTIVATION_OK &&
+          start == rollover + 1 && limit == rollover + 2,
+      "restart from a persisted range above 32 bits");
+  qlinq_emcon_activation_close(budget);
+
+  const uint64_t quic_limit = UINT64_C(1) << 62;
   qlinq_emcon_manifest_t near_ceiling = manifest;
-  near_ceiling.initial_packet_number = UINT32_MAX - 2;
-  CHECK(qlinq_emcon_activation_open(&budget, legacy_path, &near_ceiling) ==
+  near_ceiling.initial_packet_number = quic_limit - 3;
+  CHECK(qlinq_emcon_activation_open(&budget, ceiling_path, &near_ceiling) ==
                 QLINQ_EMCON_ACTIVATION_OK &&
             qlinq_emcon_activation_reserve(budget, 1, 65536, &start, &limit) ==
                 QLINQ_EMCON_ACTIVATION_OK &&
-            start == near_ceiling.initial_packet_number && limit == wire_limit,
-        "clip durable reservations to the 32-bit ceiling");
+            start == near_ceiling.initial_packet_number && limit == quic_limit,
+        "clip durable reservations to the QUIC packet-number ceiling");
   qlinq_emcon_activation_close(budget);
-
-  /* Simulate a valid slot written before the 32-bit ceiling was enforced. */
-  enum { SLOT_SIZE = 160, NEXT_PACKET_OFFSET = 104, CHECKSUM_OFFSET = 128 };
-  uint8_t slot[SLOT_SIZE];
-  int legacy_fd = open(legacy_path, O_RDWR | O_CLOEXEC);
-  CHECK(legacy_fd >= 0 && pread(legacy_fd, slot, sizeof(slot), 0) == SLOT_SIZE,
-        "read sender activation slot");
-  for (size_t i = 0; i < sizeof(uint64_t); i++)
-    slot[NEXT_PACKET_OFFSET + i] =
-        (uint8_t)((wire_limit + 1) >> (56U - 8U * i));
-  SHA256(slot, CHECKSUM_OFFSET, slot + CHECKSUM_OFFSET);
-  CHECK(pwrite(legacy_fd, slot, SLOT_SIZE, 0) == SLOT_SIZE &&
-            fsync(legacy_fd) == 0 && close(legacy_fd) == 0,
-        "persist a legacy reservation above the 32-bit ceiling");
-  CHECK(qlinq_emcon_activation_open(&budget, legacy_path, &near_ceiling) ==
+  CHECK(qlinq_emcon_activation_open(&budget, ceiling_path, &near_ceiling) ==
                 QLINQ_EMCON_ACTIVATION_OK &&
             qlinq_emcon_activation_reserve(budget, 1, 1, &start, &limit) ==
                 QLINQ_EMCON_ACTIVATION_EXHAUSTED,
-        "treat a legacy reservation above the ceiling as exhausted");
+        "reopen a journal exhausted at the QUIC packet-number ceiling");
   qlinq_emcon_activation_close(budget);
 
   unlink(directory_link);

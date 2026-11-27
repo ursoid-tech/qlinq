@@ -150,7 +150,7 @@ static int seal_framed(qlinq_emcon_sender_t *sender, ptls_iovec_t framed,
           &sender->egress, &sender->flow_id, pn, EMCON_PACKET_NUMBER_LENGTH,
           framed, packet, capacity, packet_size) != QUICLY_FLEXICAST_OK)
     return QLINQ_EMCON_CRYPTO;
-  /* Consume the number on protection, before any attempt to emit the packet. */
+  /* consume packet number on protection, before emission */
   sender->next_packet_number = pn + 1;
   if (packet_number)
     *packet_number = pn;
@@ -197,6 +197,12 @@ int qlinq_emcon_flexicast_open(quicly_flexicast_flow_t *flow, uint8_t *packet,
                                               &datagram, &pn, 0, 0);
   if (ret == QUICLY_FLEXICAST_ERROR_REPLAY)
     return QLINQ_EMCON_DUPLICATE;
+  if (ret == QUICLY_FLEXICAST_ERROR_WRONG_FLOW ||
+      ret == QUICLY_FLEXICAST_ERROR_INVALID ||
+      ret == QUICLY_FLEXICAST_ERROR_CRYPTO)
+    return QLINQ_EMCON_DISCARDED;
+  if (ret == QUICLY_FLEXICAST_ERROR_NO_MEMORY)
+    return QLINQ_EMCON_NO_MEMORY;
   if (ret != QUICLY_FLEXICAST_OK)
     return QLINQ_EMCON_CRYPTO;
   if (datagram.len < 1U || datagram.base[0] < QLINQ_EMCON_RECORD_DATA ||
@@ -218,6 +224,7 @@ typedef struct {
   uint16_t data_symbols;
   uint16_t symbol_size;
   uint32_t original_size;
+  uint64_t latest_symbol_pn;
   size_t received_count;
   uint8_t *storage;
   uint8_t **blocks;
@@ -312,7 +319,7 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
     } else if (repair_index == config->repair_symbols) {
       use_data = true;
     } else {
-      /* Pick the class with less normalized progress. */
+      /* pick class with less normalized progress */
       use_data = (data_index + 1) * (size_t)config->repair_symbols <=
                  (repair_index + 1) * data_symbols;
     }
@@ -410,6 +417,8 @@ static int receiver_start_object(qlinq_emcon_receive_object_t *object,
           (uint32_t)header->data_symbols * header->symbol_size)
     return QLINQ_EMCON_INVALID;
   bytes = (size_t)header->total_symbols * header->symbol_size;
+  if (object->active)
+    receiver_clear_object(object);
   object->storage = calloc(1, bytes);
   object->blocks =
       malloc((size_t)header->total_symbols * sizeof(*object->blocks));
@@ -488,7 +497,7 @@ static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
                                 const qlinq_emcon_message_t *message,
                                 qlinq_emcon_record_t *record) {
   qlinq_wire_fec_header_t header;
-  qlinq_emcon_receive_object_t *object = NULL, *empty = NULL;
+  qlinq_emcon_receive_object_t *object = NULL, *slot = NULL;
   if (message->payload.len < QLINQ_WIRE_FEC_HEADER_SIZE ||
       qlinq_wire_decode_fec_header(message->payload.base, message->payload.len,
                                    &header) != QLINQ_WIRE_OK ||
@@ -502,19 +511,21 @@ static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
         receiver->completed[i].object_id == header.object_id)
       return QLINQ_EMCON_DUPLICATE;
   for (size_t i = 0; i < QLINQ_EMCON_MAX_ACTIVE_OBJECTS; i++) {
-    if (receiver->objects[i].active &&
-        receiver->objects[i].group_id == header.group_id &&
-        receiver->objects[i].object_id == header.object_id) {
-      object = &receiver->objects[i];
+    qlinq_emcon_receive_object_t *candidate = &receiver->objects[i];
+    if (candidate->active && candidate->group_id == header.group_id &&
+        candidate->object_id == header.object_id) {
+      object = candidate;
       break;
     }
-    if (!receiver->objects[i].active && !empty)
-      empty = &receiver->objects[i];
+    if (!slot || !candidate->active ||
+        (slot->active && candidate->latest_symbol_pn < slot->latest_symbol_pn))
+      slot = candidate;
   }
   if (!object) {
-    if (!empty)
-      return QLINQ_EMCON_BUSY;
-    object = empty;
+    /* under pressure, keep objects with the most recent useful symbols */
+    if (slot->active && message->packet_number <= slot->latest_symbol_pn)
+      return QLINQ_EMCON_INCOMPLETE;
+    object = slot;
     int started = receiver_start_object(object, receiver->alias, &header);
     if (started != QLINQ_EMCON_OK)
       return started;
@@ -534,6 +545,8 @@ static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
            object->symbol_size);
     object->received[header.symbol_index] = true;
     object->received_count++;
+    if (message->packet_number > object->latest_symbol_pn)
+      object->latest_symbol_pn = message->packet_number;
   }
   if (object->received_count < object->data_symbols)
     return QLINQ_EMCON_INCOMPLETE;

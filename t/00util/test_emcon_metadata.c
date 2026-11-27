@@ -2,6 +2,7 @@
 #include "emcon_rateless.h"
 
 #include "picotls/openssl.h"
+#include "quicly/defaults.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -99,11 +100,13 @@ static int test_protected_dispatch(void) {
   qlinq_emcon_sender_t *sender = NULL;
   quicly_flexicast_flow_t *receiver_flow = NULL;
   size_t secret_size = ptls_openssl_aes128gcmsha256.hash->digest_size;
-  CHECK(qlinq_emcon_sender_create(&sender, 91, 5, UINT32_MAX, UINT32_MAX,
-                                  secret, secret_size) == QLINQ_EMCON_OK &&
-            qlinq_emcon_flexicast_create(&receiver_flow, 91, 5, UINT32_MAX,
-                                         secret, secret_size) == QLINQ_EMCON_OK,
-        "set up an epoch at the last 32-bit packet number");
+  CHECK(qlinq_emcon_sender_create(&sender, 91, 5, PTLS_QUICINT_MAX,
+                                  PTLS_QUICINT_MAX, secret,
+                                  secret_size) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_create(&receiver_flow, 91, 5,
+                                         PTLS_QUICINT_MAX, secret,
+                                         secret_size) == QLINQ_EMCON_OK,
+        "set up an epoch at the last QUIC packet number");
   qlinq_emcon_receiver_t *receiver =
       qlinq_emcon_receiver_create(receiver_flow, 7);
   CHECK(sender && receiver_flow && receiver, "protected fixture");
@@ -114,8 +117,25 @@ static int test_protected_dispatch(void) {
                                      ptls_iovec_init(payload, sizeof(payload)),
                                      packet, sizeof(packet), &packet_size,
                                      &packet_number) == QLINQ_EMCON_OK &&
-          packet_number == UINT32_MAX,
+          packet_number == PTLS_QUICINT_MAX,
       "protect window at the last packet number");
+  /* receiver with a different key and 1 auth failure left reports exhaustion */
+  uint8_t flow_id[8] = {0, 0, 0, 0, 0, 0, 0, 91};
+  quicly_flexicast_config_t limited_config = {
+      .flow_id = quicly_flexicast_flow_id_init(flow_id, sizeof(flow_id)),
+      .cipher_suite = &ptls_openssl_aes128gcmsha256,
+      .crypto_engine = &quicly_default_crypto_engine,
+      .traffic_secret = ptls_iovec_init(secret, secret_size),
+      .max_authentication_failures = 1};
+  quicly_flexicast_flow_t *limited = NULL;
+  uint8_t copy[sizeof(packet)];
+  memcpy(copy, packet, packet_size);
+  qlinq_emcon_message_t message;
+  CHECK(quicly_flexicast_flow_create(&limited, &limited_config) == 0 &&
+            qlinq_emcon_flexicast_open(limited, copy, packet_size, &message) ==
+                QLINQ_EMCON_CRYPTO,
+        "key exhaustion remains fatal");
+  quicly_flexicast_flow_free(limited);
   qlinq_emcon_event_t event;
   CHECK(qlinq_emcon_receiver_ingest_packet(receiver, packet, packet_size,
                                            &event) == QLINQ_EMCON_OK &&
