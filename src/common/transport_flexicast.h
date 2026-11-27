@@ -15,6 +15,8 @@
 #define TRANSPORT_FLEXICAST_MEMBER_TRANSITIONS_PER_SECOND 16U
 #define TRANSPORT_FLEXICAST_REKEY_HOLDOFF_MS 250
 
+struct transport_flexicast_flow_t;
+
 typedef struct transport_flexicast_io {
   uint32_t (*interface_index)(int family, const void *address);
   int (*open)(uint8_t version, uint16_t port);
@@ -23,6 +25,12 @@ typedef struct transport_flexicast_io {
   void (*close)(int);
   ssize_t (*receive)(transport_t *, size_t, uint8_t *, size_t,
                      transport_conn_t **, ptls_iovec_t *);
+  bool (*tunnel_join)(transport_t *, struct transport_flexicast_flow_t *);
+  void (*tunnel_leave)(transport_t *, struct transport_flexicast_flow_t *);
+  bool (*tunnel_ready)(transport_t *,
+                       const struct transport_flexicast_flow_t *);
+  int64_t (*tunnel_timeout)(transport_t *);
+  size_t (*tunnel_memberships)(transport_t *);
 } transport_flexicast_io_t;
 
 typedef struct transport_flexicast_member_t {
@@ -90,6 +98,8 @@ typedef struct transport_flexicast_flow_t {
   bool ready_pending;
   bool multicast_unavailable;
   bool membership_acquired;
+  bool amt_tunnel;
+  bool tunnel_leave_pending;
   uint8_t ip_version;
   uint8_t alias;
   uint32_t key_epoch;
@@ -214,6 +224,8 @@ bool transport_flexicast_member_is_listening(
 bool transport_flexicast_can_queue(const transport_t *t,
                                    const transport_flexicast_flow_t *flow,
                                    size_t packets, size_t bytes);
+void transport_flexicast_tunnel_failed(transport_t *,
+                                       transport_flexicast_flow_t *);
 void transport_flexicast_tick(transport_t *t);
 int64_t transport_flexicast_get_first_timeout(transport_t *t);
 bool transport_flexicast_track_ready(transport_t *t,

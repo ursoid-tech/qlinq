@@ -1158,6 +1158,17 @@ transport_t *transport_drive_create(const transport_config_t *config) {
     goto Fail;
 
   t->flexicast_enabled = config->enable_flexicast;
+  t->flexicast_receiver_backend = config->flexicast_receiver_backend;
+  if (config->flexicast_receiver_backend != TRANSPORT_GROUP_NATIVE &&
+      config->flexicast_receiver_backend != TRANSPORT_GROUP_AMT)
+    goto Fail;
+  if (config->flexicast_receiver_backend == TRANSPORT_GROUP_AMT &&
+      (!config->enable_flexicast || t->is_server ||
+       !t->drive_host.flexicast_io ||
+       !t->drive_host.flexicast_io->tunnel_join ||
+       !t->drive_host.flexicast_io->tunnel_leave ||
+       !t->drive_host.flexicast_io->tunnel_ready))
+    goto Fail;
   if (config->repair_mode != TRANSPORT_REPAIR_MODE_AUTO &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_INDEXED &&
       config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS)
@@ -2576,6 +2587,14 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
   }
   for (size_t m = 0; m < t->flexicast.capacity; m++)
     stats->flexicast_active_memberships += t->flexicast.memberships[m].active;
+  if (t->drive_host.flexicast_io &&
+      t->drive_host.flexicast_io->tunnel_memberships) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    stats->flexicast_active_memberships +=
+        t->drive_host.flexicast_io->tunnel_memberships(t);
+    t->host_callback_active = active;
+  }
   for (size_t i = 0; i < t->socket_count; i++) {
     const transport_egress_t *egress = &t->sockets[i].egress;
     accumulate_egress_stats(stats, egress, false);

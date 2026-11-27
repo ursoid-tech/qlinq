@@ -150,7 +150,14 @@ typedef bool (*transport_interface_callback_t)(
     void *user_data, const transport_interface_info_t *iface);
 
 #define TRANSPORT_MAX_PATHS 4
-#define TRANSPORT_MAX_POLL_FDS (TRANSPORT_MAX_PATHS + 3U)
+#define TRANSPORT_MAX_AMT_MEMBERSHIPS 64U
+#define TRANSPORT_MAX_POLL_FDS                                                 \
+  (TRANSPORT_MAX_PATHS + 3U + TRANSPORT_MAX_AMT_MEMBERSHIPS)
+typedef enum {
+  TRANSPORT_GROUP_NATIVE = 0,
+  TRANSPORT_GROUP_AMT = 1
+} transport_group_backend_t;
+
 enum {
   TRANSPORT_CC_DEFAULT,
   TRANSPORT_CC_RENO,
@@ -286,6 +293,10 @@ typedef struct {
   uint8_t simulated_flexicast_feedback_loss_rate;
   /* enable experimental flexicast datagram path */
   bool enable_flexicast;
+  /* receiver delivery backend; AMT keeps the source QUIC control connection */
+  transport_group_backend_t flexicast_receiver_backend;
+  const char *flexicast_relay_address; /* numeric IPv4 or IPv6 address */
+  uint16_t flexicast_relay_port;       /* 0: classic AMT UDP 2268 */
   /* optional IPv4/IPv6 SSM group, UDP port, and local interface address */
   const char *flexicast_group;
   uint16_t flexicast_group_port;
@@ -487,6 +498,8 @@ typedef struct {
   uint64_t flexicast_packets_sent;
   uint64_t flexicast_native_packets_sent;
   uint64_t flexicast_packets_received;
+  uint64_t flexicast_amt_packets_received;
+  uint64_t flexicast_amt_packets_rejected;
   uint64_t flexicast_acks_received;
   uint64_t flexicast_fallbacks;
   uint64_t flexicast_rekeys;

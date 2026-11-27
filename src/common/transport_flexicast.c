@@ -461,6 +461,16 @@ static void release_membership(transport_t *t,
                                transport_flexicast_flow_t *flow) {
   if (!t || !flow || !flow->membership_acquired)
     return;
+  if (flow->amt_tunnel) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    t->drive_host.flexicast_io->tunnel_leave(t, flow);
+    t->host_callback_active = active;
+    flow->membership_acquired = false;
+    flow->amt_tunnel = false;
+    t->stats.flexicast_membership_leaves++;
+    return;
+  }
   transport_flexicast_membership_t *membership =
       find_membership(t, flow->ip_version, flow->source_ip, flow->group_ip,
                       flow->udp_port, flow->interface_index);
@@ -557,6 +567,19 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
       (announce->ip_version == 6 && !ipv6_is_ssm(announce->group_ip))) {
     fprintf(stderr, "transport: announced group is outside the SSM range\n");
     return false;
+  }
+
+  if (t->flexicast_receiver_backend == TRANSPORT_GROUP_AMT) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    bool joined = t->drive_host.flexicast_io->tunnel_join(t, flow);
+    t->host_callback_active = active;
+    if (!joined)
+      return false;
+    flow->amt_tunnel = true;
+    flow->membership_acquired = true;
+    t->stats.flexicast_membership_joins++;
+    return true;
   }
 
   /* reject when configured interface is missing or family-mismatched */
@@ -1157,6 +1180,15 @@ static bool maybe_send_join(transport_flexicast_flow_t *flow) {
   if (flow->source || flow->join_sent || !flow->binding_received ||
       !flow->announcement_received || !flow->control_conn)
     return flow->join_sent;
+  transport_t *t = flow->control_conn->transport;
+  if (flow->amt_tunnel) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    bool ready = t->drive_host.flexicast_io->tunnel_ready(t, flow);
+    t->host_callback_active = active;
+    if (!ready)
+      return true; /* keep unicast delivery until AMT membership is installed */
+  }
   quicly_error_t ret =
       send_state_result(flow->control_conn, flow->flow_id, flow->key_epoch,
                         QUICLY_FLEXICAST_STATE_JOIN);
@@ -1417,6 +1449,7 @@ static void restart_receiver_offer(transport_t *t,
   }
   ptls_clear_memory(flow->secret, sizeof(flow->secret));
   flow->join_sent = false;
+  flow->tunnel_leave_pending = false;
   flow->ready_pending = false;
   flow->announcement_received = false;
 }
@@ -1856,6 +1889,20 @@ bool transport_flexicast_member_is_listening(
   return member_map_find(flow, conn, &slot) && flow->members[slot].listening;
 }
 
+void transport_flexicast_tunnel_failed(transport_t *t,
+                                       transport_flexicast_flow_t *flow) {
+  if (!t || !flow || !flow->amt_tunnel)
+    return;
+  if (flow->join_sent && flow->control_conn)
+    flow->tunnel_leave_pending =
+        !send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
+                    QUICLY_FLEXICAST_STATE_LEAVE);
+  flow->multicast_unavailable = true;
+  flow->ready_pending = false;
+  t->stats.flexicast_fallbacks++;
+  release_membership(t, flow);
+}
+
 void transport_flexicast_tick(transport_t *t) {
   if (!t || !t->flexicast_enabled)
     return;
@@ -1865,6 +1912,10 @@ void transport_flexicast_tick(transport_t *t) {
     if (!flow->active || flow->source || !flow->control_conn ||
         !flow->control_conn->quic)
       continue;
+    if (flow->tunnel_leave_pending &&
+        send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
+                   QUICLY_FLEXICAST_STATE_LEAVE))
+      flow->tunnel_leave_pending = false;
     if (flow->binding_received && flow->announcement_received &&
         !flow->join_sent && !flow->multicast_unavailable)
       (void)maybe_send_join(flow);
