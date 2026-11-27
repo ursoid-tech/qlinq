@@ -465,8 +465,8 @@ int qlinq_emcon_activation_reserve(qlinq_emcon_activation_t *activation,
       preferred_packets < minimum_packets || !first_packet_number ||
       !reserved_until)
     return QLINQ_EMCON_ACTIVATION_INVALID;
-  uint64_t limit =
-      qlinq_emcon_manifest_packet_number_limit(&activation->manifest);
+  uint64_t limit = qlinq_emcon_packet_number_limit(
+      activation->manifest.initial_packet_number);
   if (activation->generation == UINT64_MAX ||
       activation->next_packet_number >= limit ||
       minimum_packets > limit - activation->next_packet_number)

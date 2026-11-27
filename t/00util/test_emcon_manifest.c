@@ -66,10 +66,17 @@ int main(void) {
             QLINQ_EMCON_MANIFEST_INVALID,
         "reject a replay window different from flexicast's window");
   invalid = manifest;
-  invalid.initial_packet_number = UINT64_C(1) << 62;
+  invalid.initial_packet_number = UINT64_C(1) << 32;
   CHECK(qlinq_emcon_manifest_validate(&invalid, 2000) ==
             QLINQ_EMCON_MANIFEST_INVALID,
-        "reject a packet number outside the QUIC range");
+        "reject a packet number outside the 32-bit EMCON range");
+  qlinq_emcon_manifest_t final_number = manifest;
+  final_number.initial_packet_number = UINT32_MAX;
+  CHECK(qlinq_emcon_manifest_validate(&final_number, 2000) ==
+                QLINQ_EMCON_MANIFEST_OK &&
+            qlinq_emcon_packet_number_limit(
+                final_number.initial_packet_number) == (UINT64_C(1) << 32),
+        "allow the last 32-bit packet number as the epoch start");
   CHECK(qlinq_emcon_manifest_validate(&manifest, 999) ==
             QLINQ_EMCON_MANIFEST_NOT_YET_VALID,
         "not-yet-valid rejection");
@@ -110,6 +117,9 @@ int main(void) {
   EVP_PKEY *key = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
   EVP_PKEY *wrong_key = EVP_PKEY_Q_keygen(NULL, NULL, "ED25519");
   uint8_t signature[QLINQ_EMCON_MANIFEST_SIGNATURE_SIZE];
+  CHECK(key && qlinq_emcon_manifest_sign(&invalid, key, signature) ==
+                   QLINQ_EMCON_MANIFEST_INVALID,
+        "refuse to sign an out-of-range start");
   CHECK(key && wrong_key &&
             qlinq_emcon_manifest_sign(&manifest, key, signature) ==
                 QLINQ_EMCON_MANIFEST_OK &&

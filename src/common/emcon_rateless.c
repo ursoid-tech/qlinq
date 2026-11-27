@@ -17,56 +17,154 @@ _Static_assert(
     QLINQ_EMCON_MAX_PACKETS_PER_KEY < (UINT64_C(1) << 31),
     "the entire epoch must fit the packet number reconstruction window");
 
+#define EMCON_PACKET_NUMBER_LENGTH 4U
+
+struct qlinq_emcon_sender_t {
+  quicly_flexicast_egress_t egress;
+  quicly_flexicast_flow_id_t flow_id;
+  uint64_t next_packet_number;
+  uint64_t packet_number_limit;
+};
+
+static quicly_flexicast_flow_id_t encode_flow_id(uint64_t flow_id) {
+  uint8_t encoded[8];
+  quicly_encode64(encoded, flow_id);
+  return quicly_flexicast_flow_id_init(encoded, sizeof(encoded));
+}
+
+static int derive_epoch_secret(uint8_t *derived, ptls_hash_algorithm_t *hash,
+                               uint32_t key_epoch,
+                               const uint8_t *traffic_secret) {
+  uint8_t epoch_be[4];
+  quicly_encode32(epoch_be, key_epoch);
+  return ptls_hkdf_expand_label(
+      hash, derived, hash->digest_size,
+      ptls_iovec_init(traffic_secret, hash->digest_size), "qlinq emcon epoch",
+      ptls_iovec_init(epoch_be, sizeof(epoch_be)), NULL);
+}
+
+int qlinq_emcon_sender_create(qlinq_emcon_sender_t **sender, uint64_t flow_id,
+                              uint32_t key_epoch,
+                              uint64_t initial_packet_number,
+                              uint64_t next_packet_number,
+                              const uint8_t *traffic_secret,
+                              size_t traffic_secret_size) {
+  ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
+  uint8_t derived[PTLS_MAX_DIGEST_SIZE];
+  if (!sender)
+    return QLINQ_EMCON_INVALID;
+  *sender = NULL;
+  if (flow_id == 0 || key_epoch == 0 || !traffic_secret ||
+      traffic_secret_size != suite->hash->digest_size ||
+      initial_packet_number > QLINQ_EMCON_MAX_PACKET_NUMBER ||
+      next_packet_number < initial_packet_number)
+    return QLINQ_EMCON_INVALID;
+  uint64_t limit = qlinq_emcon_packet_number_limit(initial_packet_number);
+  if (next_packet_number >= limit)
+    return QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED;
+
+  qlinq_emcon_sender_t *created = calloc(1, sizeof(*created));
+  if (!created)
+    return QLINQ_EMCON_NO_MEMORY;
+  created->flow_id = encode_flow_id(flow_id);
+  created->next_packet_number = next_packet_number;
+  created->packet_number_limit = limit;
+  created->egress.crypto_engine = &quicly_default_crypto_engine;
+  int ret =
+      derive_epoch_secret(derived, suite->hash, key_epoch, traffic_secret);
+  if (ret == 0)
+    ret = created->egress.crypto_engine->setup_cipher(
+        created->egress.crypto_engine, NULL, QUICLY_EPOCH_1RTT, 1,
+        &created->egress.header_protection, &created->egress.aead, suite->aead,
+        suite->hash, derived);
+  ptls_clear_memory(derived, sizeof(derived));
+  if (ret != 0) {
+    qlinq_emcon_sender_free(created);
+    return QLINQ_EMCON_CRYPTO;
+  }
+  *sender = created;
+  return QLINQ_EMCON_OK;
+}
+
+void qlinq_emcon_sender_free(qlinq_emcon_sender_t *sender) {
+  if (!sender)
+    return;
+  if (sender->egress.header_protection)
+    ptls_cipher_free(sender->egress.header_protection);
+  if (sender->egress.aead)
+    ptls_aead_free(sender->egress.aead);
+  free(sender);
+}
+
+uint64_t
+qlinq_emcon_sender_next_packet_number(const qlinq_emcon_sender_t *sender) {
+  return sender ? sender->next_packet_number : 0;
+}
+
+bool qlinq_emcon_sender_has_capacity(const qlinq_emcon_sender_t *sender,
+                                     uint64_t packets) {
+  return sender &&
+         packets <= sender->packet_number_limit - sender->next_packet_number;
+}
+
 int qlinq_emcon_flexicast_create(quicly_flexicast_flow_t **flow,
                                  uint64_t flow_id, uint32_t key_epoch,
                                  uint64_t first_packet_number,
                                  const uint8_t *traffic_secret,
-                                 size_t traffic_secret_size,
-                                 bool allow_untracked_send) {
+                                 size_t traffic_secret_size) {
   ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
-  uint8_t epoch_be[4];
   uint8_t derived[PTLS_MAX_DIGEST_SIZE];
-  uint8_t flow_id_bytes[8];
-  if (!flow || flow_id == 0 || key_epoch == 0 || !traffic_secret ||
-      traffic_secret_size != suite->hash->digest_size)
+  if (!flow)
     return QLINQ_EMCON_INVALID;
   *flow = NULL;
-  epoch_be[0] = (uint8_t)(key_epoch >> 24);
-  epoch_be[1] = (uint8_t)(key_epoch >> 16);
-  epoch_be[2] = (uint8_t)(key_epoch >> 8);
-  epoch_be[3] = (uint8_t)key_epoch;
-  if (ptls_hkdf_expand_label(
-          suite->hash, derived, traffic_secret_size,
-          ptls_iovec_init(traffic_secret, traffic_secret_size),
-          "qlinq emcon epoch", ptls_iovec_init(epoch_be, sizeof(epoch_be)),
-          NULL) != 0)
+  if (flow_id == 0 || key_epoch == 0 || !traffic_secret ||
+      first_packet_number > QLINQ_EMCON_MAX_PACKET_NUMBER ||
+      traffic_secret_size != suite->hash->digest_size)
+    return QLINQ_EMCON_INVALID;
+  if (derive_epoch_secret(derived, suite->hash, key_epoch, traffic_secret) !=
+      0) {
+    ptls_clear_memory(derived, sizeof(derived));
     return QLINQ_EMCON_CRYPTO;
-  quicly_encode64(flow_id_bytes, flow_id);
+  }
   quicly_flexicast_config_t cfg = {
-      .flow_id =
-          quicly_flexicast_flow_id_init(flow_id_bytes, sizeof(flow_id_bytes)),
+      .flow_id = encode_flow_id(flow_id),
       .first_packet_number = first_packet_number,
       .cipher_suite = suite,
       .crypto_engine = &quicly_default_crypto_engine,
       .traffic_secret = ptls_iovec_init(derived, traffic_secret_size),
       .max_packets_per_key = QLINQ_EMCON_MAX_PACKETS_PER_KEY,
       .max_packet_size = QUICLY_FLEXICAST_MAX_PACKET_SIZE,
-      .allow_untracked_send = allow_untracked_send ? 1 : 0,
-      .send_packet_number_length = 4,
   };
   int ret = quicly_flexicast_flow_create(flow, &cfg);
   ptls_clear_memory(derived, sizeof(derived));
   return ret == QUICLY_FLEXICAST_OK ? QLINQ_EMCON_OK : QLINQ_EMCON_CRYPTO;
 }
 
-int qlinq_emcon_flexicast_seal(quicly_flexicast_flow_t *flow,
+static int seal_framed(qlinq_emcon_sender_t *sender, ptls_iovec_t framed,
+                       uint8_t *packet, size_t capacity, size_t *packet_size,
+                       uint64_t *packet_number) {
+  if (!qlinq_emcon_sender_has_capacity(sender, 1))
+    return QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED;
+  uint64_t pn = sender->next_packet_number;
+  if (quicly_flexicast_encode_datagram_packet(
+          &sender->egress, &sender->flow_id, pn, EMCON_PACKET_NUMBER_LENGTH,
+          framed, packet, capacity, packet_size) != QUICLY_FLEXICAST_OK)
+    return QLINQ_EMCON_CRYPTO;
+  /* Consume the number on protection, before any attempt to emit the packet. */
+  sender->next_packet_number = pn + 1;
+  if (packet_number)
+    *packet_number = pn;
+  return QLINQ_EMCON_OK;
+}
+
+int qlinq_emcon_flexicast_seal(qlinq_emcon_sender_t *sender,
                                qlinq_emcon_record_type_t type,
                                ptls_iovec_t payload, uint8_t *packet,
                                size_t capacity, size_t *packet_size,
                                uint64_t *packet_number) {
   uint8_t stack_buf[256];
   uint8_t *framed = stack_buf;
-  if (!flow || !packet || !packet_size || !packet_number ||
+  if (!sender || !packet || !packet_size || !packet_number ||
       (payload.len != 0 && !payload.base) || type < QLINQ_EMCON_RECORD_DATA ||
       type > QLINQ_EMCON_RECORD_ABORT ||
       payload.len > QUICLY_FLEXICAST_MAX_DATAGRAM_SIZE - 1U)
@@ -80,12 +178,11 @@ int qlinq_emcon_flexicast_seal(quicly_flexicast_flow_t *flow,
   framed[0] = (uint8_t)type;
   if (payload.len != 0)
     memcpy(framed + 1, payload.base, payload.len);
-  int ret = quicly_flexicast_send_datagram(
-      flow, ptls_iovec_init(framed, framed_len), packet, capacity, packet_size,
-      packet_number, 0);
+  int ret = seal_framed(sender, ptls_iovec_init(framed, framed_len), packet,
+                        capacity, packet_size, packet_number);
   if (framed != stack_buf)
     free(framed);
-  return ret == QUICLY_FLEXICAST_OK ? QLINQ_EMCON_OK : QLINQ_EMCON_CRYPTO;
+  return ret;
 }
 
 int qlinq_emcon_flexicast_open(quicly_flexicast_flow_t *flow, uint8_t *packet,
@@ -159,7 +256,7 @@ static bool sender_config_valid(const qlinq_emcon_rateless_config_t *config,
          *data_symbols + config->repair_symbols <= QLINQ_FEC_MAX_TOTAL_SYMBOLS;
 }
 
-int qlinq_emcon_send_object(quicly_flexicast_flow_t *flow,
+int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
                             const qlinq_emcon_rateless_config_t *config,
                             uint64_t group_id, uint64_t object_id,
                             bool keyframe, uint8_t priority, const void *data,
@@ -172,10 +269,12 @@ int qlinq_emcon_send_object(quicly_flexicast_flow_t *flow,
   fec_t *fec = NULL;
   int result = QLINQ_EMCON_NO_MEMORY;
 
-  if (!flow || !data || !emit ||
+  if (!sender || !data || !emit ||
       !sender_config_valid(config, size, &data_symbols))
     return QLINQ_EMCON_INVALID;
   total_symbols = data_symbols + config->repair_symbols;
+  if (!qlinq_emcon_sender_has_capacity(sender, total_symbols))
+    return QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED;
 
   data_storage = calloc(data_symbols, config->symbol_size);
   repair_storage = malloc((size_t)config->repair_symbols * config->symbol_size);
@@ -184,7 +283,9 @@ int qlinq_emcon_send_object(quicly_flexicast_flow_t *flow,
       malloc((size_t)config->repair_symbols * sizeof(*repair_blocks));
   size_t framed_size = 1U + QLINQ_WIRE_FEC_HEADER_SIZE + config->symbol_size;
   wire = malloc(framed_size);
-  size_t protected_capacity = quicly_flexicast_datagram_size(flow, framed_size);
+  size_t protected_capacity = quicly_flexicast_datagram_packet_size(
+      &sender->egress, &sender->flow_id, EMCON_PACKET_NUMBER_LENGTH,
+      framed_size);
   packet = protected_capacity != 0 ? malloc(protected_capacity) : NULL;
   if (!data_storage || !repair_storage || !data_blocks || !repair_blocks ||
       !wire || !packet)
@@ -244,15 +345,10 @@ int qlinq_emcon_send_object(quicly_flexicast_flow_t *flow,
                                 : repair_blocks[symbol_index - data_symbols];
     memcpy(wire + 1 + QLINQ_WIRE_FEC_HEADER_SIZE, symbol, config->symbol_size);
     size_t packet_size;
-    uint64_t packet_number;
-    if (quicly_flexicast_send_datagram(flow, ptls_iovec_init(wire, framed_size),
-                                       packet, protected_capacity, &packet_size,
-                                       &packet_number,
-                                       0) != QUICLY_FLEXICAST_OK) {
-      result = QLINQ_EMCON_CRYPTO;
+    result = seal_framed(sender, ptls_iovec_init(wire, framed_size), packet,
+                         protected_capacity, &packet_size, NULL);
+    if (result != QLINQ_EMCON_OK)
       goto Exit;
-    }
-    (void)packet_number;
     if (!emit(user_data, symbol_index, packet, packet_size)) {
       result = QLINQ_EMCON_EMIT_FAILED;
       goto Exit;

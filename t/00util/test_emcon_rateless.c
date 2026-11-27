@@ -38,17 +38,58 @@ static bool capture_packet(void *user_data, uint16_t symbol_index,
   return true;
 }
 
-static quicly_flexicast_flow_t *make_flow(const uint8_t *secret, bool sender) {
-  quicly_flexicast_flow_t *flow = NULL;
-  return qlinq_emcon_flexicast_create(
-             &flow, 44, 3, 1000, secret,
-             ptls_openssl_aes128gcmsha256.hash->digest_size,
-             sender) == QLINQ_EMCON_OK
-             ? flow
-             : NULL;
+static int test_late_join(void) {
+  const uint8_t secret[32] = {0x37};
+  const uint8_t payload[] = "late multicast delivery";
+  const uint64_t first = 100, last = first + QUICLY_FLEXICAST_SENT_WINDOW + 1;
+  uint8_t packet[128];
+  size_t packet_size;
+  uint64_t number;
+  qlinq_emcon_sender_t *sender = NULL;
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, first, first, secret,
+                                  sizeof(secret)) == QLINQ_EMCON_OK,
+        "create EMCON sender before listeners exist");
+  for (uint64_t expected = first; expected <= last; ++expected) {
+    CHECK(qlinq_emcon_flexicast_seal(sender, QLINQ_EMCON_RECORD_DATA,
+                                     ptls_iovec_init(payload, sizeof(payload)),
+                                     packet, sizeof(packet), &packet_size,
+                                     &number) == QLINQ_EMCON_OK &&
+              number == expected,
+          "continue sending past the connected flow's history window");
+  }
+  qlinq_emcon_sender_free(sender);
+
+  for (size_t i = 0; i < 2; ++i) {
+    quicly_flexicast_flow_t *receiver = NULL;
+    CHECK(qlinq_emcon_flexicast_create(&receiver, 44, 3, first, secret,
+                                       sizeof(secret)) == QLINQ_EMCON_OK,
+          "initialize a late listener from the initial epoch");
+    uint8_t copy[sizeof(packet)];
+    memcpy(copy, packet, packet_size);
+    ptls_iovec_t decoded;
+    CHECK(quicly_flexicast_receive_datagram(receiver, copy, packet_size,
+                                            &decoded, &number, 0,
+                                            0) == QUICLY_FLEXICAST_OK &&
+              number == last && decoded.len == 1 + sizeof(payload) &&
+              decoded.base[0] == QLINQ_EMCON_RECORD_DATA &&
+              memcmp(decoded.base + 1, payload, sizeof(payload)) == 0,
+          "ordinary Flexicast decoder reads the EMCON DATAGRAM");
+    memcpy(copy, packet, packet_size);
+    CHECK(quicly_flexicast_receive_datagram(receiver, copy, packet_size,
+                                            &decoded, &number, 0,
+                                            0) == QUICLY_FLEXICAST_ERROR_REPLAY,
+          "ordinary Flexicast decoder rejects a replay");
+    quicly_flexicast_flow_free(receiver);
+  }
+  puts("===EMCON LATE JOIN OK===");
+  return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--late-join") == 0)
+    return test_late_join();
+  if (argc != 1)
+    return 1;
   enum { PACKET_CAPACITY = 128 };
   uint8_t secret[PTLS_MAX_DIGEST_SIZE] = {0};
   uint8_t input[5000], second[5000], third[5000];
@@ -66,9 +107,14 @@ int main(void) {
     third[i] = (uint8_t)(i * 29U + 5U);
   }
   memset(secret, 0xa6, ptls_openssl_aes128gcmsha256.hash->digest_size);
-  quicly_flexicast_flow_t *sender = make_flow(secret, true);
-  quicly_flexicast_flow_t *receiver_protection = make_flow(secret, false);
-  CHECK(sender && receiver_protection, "protection setup");
+  qlinq_emcon_sender_t *sender = NULL;
+  quicly_flexicast_flow_t *receiver_protection = NULL;
+  size_t secret_size = ptls_openssl_aes128gcmsha256.hash->digest_size;
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, 1000, 1000, secret,
+                                  secret_size) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_create(&receiver_protection, 44, 3, 1000,
+                                         secret, secret_size) == QLINQ_EMCON_OK,
+        "protection setup");
 
   qlinq_emcon_rateless_config_t config = {
       .alias = 7, .symbol_size = 256, .repair_symbols = 10};
@@ -174,9 +220,22 @@ int main(void) {
         "accept reordering within the advertised window and reject older "
         "packets");
 
+  uint64_t before_failed_emit = qlinq_emcon_sender_next_packet_number(sender);
+  capture_t rejected = {0};
+  CHECK(qlinq_emcon_send_object(sender, &config, 12, 37, false, 1, input,
+                                sizeof(input), capture_packet,
+                                &rejected) == QLINQ_EMCON_EMIT_FAILED &&
+            qlinq_emcon_flexicast_seal(
+                sender, QLINQ_EMCON_RECORD_SESSION,
+                ptls_iovec_init(&payload, 1), replay_packets[0],
+                sizeof(replay_packets[0]), &replay_sizes[0],
+                &number) == QLINQ_EMCON_OK &&
+            number == before_failed_emit + 1,
+        "a failed FEC emission still consumes its protected packet number");
+
   qlinq_emcon_receiver_free(receiver);
   quicly_flexicast_flow_free(receiver_protection);
-  quicly_flexicast_flow_free(sender);
+  qlinq_emcon_sender_free(sender);
   for (size_t i = 0; i < capture.count; i++)
     free(packets[i]);
   puts("===EMCON RATELESS OK===");

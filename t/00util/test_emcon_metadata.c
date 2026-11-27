@@ -14,16 +14,6 @@
     }                                                                          \
   } while (0)
 
-static quicly_flexicast_flow_t *make_flow(const uint8_t *secret, bool sender) {
-  quicly_flexicast_flow_t *flow = NULL;
-  return qlinq_emcon_flexicast_create(
-             &flow, 91, 5, 100, secret,
-             ptls_openssl_aes128gcmsha256.hash->digest_size,
-             sender) == QLINQ_EMCON_OK
-             ? flow
-             : NULL;
-}
-
 static int test_plain_metadata(void) {
   uint8_t wire[QLINQ_EMCON_SESSION_WIRE_SIZE];
   qlinq_emcon_session_metadata_t session = {.source_time_ms =
@@ -106,18 +96,26 @@ static int test_protected_dispatch(void) {
                                           .final_object_id = 109,
                                           .final_window = false};
   memset(secret, 0x19, ptls_openssl_aes128gcmsha256.hash->digest_size);
-  quicly_flexicast_flow_t *sender = make_flow(secret, true);
-  quicly_flexicast_flow_t *receiver_flow = make_flow(secret, false);
+  qlinq_emcon_sender_t *sender = NULL;
+  quicly_flexicast_flow_t *receiver_flow = NULL;
+  size_t secret_size = ptls_openssl_aes128gcmsha256.hash->digest_size;
+  CHECK(qlinq_emcon_sender_create(&sender, 91, 5, UINT32_MAX, UINT32_MAX,
+                                  secret, secret_size) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_create(&receiver_flow, 91, 5, UINT32_MAX,
+                                         secret, secret_size) == QLINQ_EMCON_OK,
+        "set up an epoch at the last 32-bit packet number");
   qlinq_emcon_receiver_t *receiver =
       qlinq_emcon_receiver_create(receiver_flow, 7);
   CHECK(sender && receiver_flow && receiver, "protected fixture");
-  CHECK(qlinq_emcon_encode_window(payload, sizeof(payload), &window) ==
-                QLINQ_EMCON_METADATA_OK &&
-            qlinq_emcon_flexicast_seal(
-                sender, QLINQ_EMCON_RECORD_WINDOW,
-                ptls_iovec_init(payload, sizeof(payload)), packet,
-                sizeof(packet), &packet_size, &packet_number) == QLINQ_EMCON_OK,
-        "protect window");
+  CHECK(
+      qlinq_emcon_encode_window(payload, sizeof(payload), &window) ==
+              QLINQ_EMCON_METADATA_OK &&
+          qlinq_emcon_flexicast_seal(sender, QLINQ_EMCON_RECORD_WINDOW,
+                                     ptls_iovec_init(payload, sizeof(payload)),
+                                     packet, sizeof(packet), &packet_size,
+                                     &packet_number) == QLINQ_EMCON_OK &&
+          packet_number == UINT32_MAX,
+      "protect window at the last packet number");
   qlinq_emcon_event_t event;
   CHECK(qlinq_emcon_receiver_ingest_packet(receiver, packet, packet_size,
                                            &event) == QLINQ_EMCON_OK &&
@@ -127,9 +125,15 @@ static int test_protected_dispatch(void) {
             event.value.window.final_object_id == 109,
         "authenticated window dispatch");
   qlinq_emcon_event_release(&event);
+  CHECK(qlinq_emcon_flexicast_seal(sender, QLINQ_EMCON_RECORD_WINDOW,
+                                   ptls_iovec_init(payload, sizeof(payload)),
+                                   packet, sizeof(packet), &packet_size,
+                                   &packet_number) ==
+            QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED,
+        "refuse protection after the last packet number");
   qlinq_emcon_receiver_free(receiver);
   quicly_flexicast_flow_free(receiver_flow);
-  quicly_flexicast_flow_free(sender);
+  qlinq_emcon_sender_free(sender);
   return 0;
 }
 

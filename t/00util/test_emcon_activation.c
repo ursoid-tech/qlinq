@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <openssl/sha.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -240,6 +241,39 @@ int main(void) {
             qlinq_emcon_activation_reserve(budget, 1, 1, &start, &limit) ==
                 QLINQ_EMCON_ACTIVATION_EXHAUSTED,
         "restarting an exhausted key fails closed");
+  qlinq_emcon_activation_close(budget);
+
+  const uint64_t wire_limit = UINT64_C(1) << 32;
+  char legacy_path[256];
+  snprintf(legacy_path, sizeof(legacy_path), "%s/legacy.state", directory);
+  qlinq_emcon_manifest_t near_ceiling = manifest;
+  near_ceiling.initial_packet_number = UINT32_MAX - 2;
+  CHECK(qlinq_emcon_activation_open(&budget, legacy_path, &near_ceiling) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_reserve(budget, 1, 65536, &start, &limit) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            start == near_ceiling.initial_packet_number && limit == wire_limit,
+        "clip durable reservations to the 32-bit ceiling");
+  qlinq_emcon_activation_close(budget);
+
+  /* Simulate a valid slot written before the 32-bit ceiling was enforced. */
+  enum { SLOT_SIZE = 160, NEXT_PACKET_OFFSET = 104, CHECKSUM_OFFSET = 128 };
+  uint8_t slot[SLOT_SIZE];
+  int legacy_fd = open(legacy_path, O_RDWR | O_CLOEXEC);
+  CHECK(legacy_fd >= 0 && pread(legacy_fd, slot, sizeof(slot), 0) == SLOT_SIZE,
+        "read sender activation slot");
+  for (size_t i = 0; i < sizeof(uint64_t); i++)
+    slot[NEXT_PACKET_OFFSET + i] =
+        (uint8_t)((wire_limit + 1) >> (56U - 8U * i));
+  SHA256(slot, CHECKSUM_OFFSET, slot + CHECKSUM_OFFSET);
+  CHECK(pwrite(legacy_fd, slot, SLOT_SIZE, 0) == SLOT_SIZE &&
+            fsync(legacy_fd) == 0 && close(legacy_fd) == 0,
+        "persist a legacy reservation above the 32-bit ceiling");
+  CHECK(qlinq_emcon_activation_open(&budget, legacy_path, &near_ceiling) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_reserve(budget, 1, 1, &start, &limit) ==
+                QLINQ_EMCON_ACTIVATION_EXHAUSTED,
+        "treat a legacy reservation above the ceiling as exhausted");
   qlinq_emcon_activation_close(budget);
 
   unlink(directory_link);

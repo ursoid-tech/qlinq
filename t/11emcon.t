@@ -14,6 +14,8 @@ my @tests = (
      qr/===EMCON METADATA OK===/],
     ['rateless reconstruction', './t/00util/test_emcon_rateless',
      qr/===EMCON RATELESS OK===/],
+    ['late multicast listeners', './t/00util/test_emcon_rateless --late-join',
+     qr/===EMCON LATE JOIN OK===/],
     ['receive-only socket', './t/00util/test_emcon_receive_socket',
      qr/===EMCON RECEIVE SOCKET OK===/],
     ['multi-alias session', './t/00util/test_emcon_session',

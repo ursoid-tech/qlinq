@@ -134,13 +134,20 @@ QLINQ_AUTH_TOKEN='replace-with-a-secret' \
 
 ## EMCON packet numbers and key epochs
 
+qlinq owns EMCON sender state and uses quicly to protect each multicast
+DATAGRAM. Connected Flexicast tracks acknowledgments for its attached members.
+
 Set `replay_window_packets=64` in the manifest configuration, or omit the
 setting to use that default. A receiver accepts an unseen authenticated
 packet up to 63 packet numbers behind the largest authenticated packet.
-The sender can reserve up to 8,388,608 packet numbers per AES-128-GCM key
-epoch. Each durable reservation counts toward that limit, including unused
-numbers skipped after a restart. The default reservation is 65,536 packet
-numbers. A sender restart can use the same epoch while numbers remain.
+EMCON senders use four-byte packet numbers so a receiver can authenticate
+packets after a reservation is skipped, without an ACK exchange. Set
+`initial_packet_number` between 0 and 4,294,967,295. The sender can reserve up
+to 8,388,608 packet numbers per AES-128-GCM key epoch, bounded by the remaining
+32-bit packet numbers. Each durable reservation counts toward that limit,
+including unused numbers skipped after a restart. The default reservation is
+65,536 packet numbers. A sender restart can use the same epoch while numbers
+remain. Provision a fresh key epoch after exhaustion.
 
 Manifests with a different replay window must be regenerated and signed.
 If the manifest has already been activated, provision a fresh key epoch for

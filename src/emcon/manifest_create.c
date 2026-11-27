@@ -297,7 +297,8 @@ static int parse_config_value(char *key, char *value,
       return -1;
     manifest->key_epoch = (uint32_t)number;
   } else if (strcmp(key, "initial_packet_number") == 0) {
-    if (assign_number(value, UINT64_MAX, FIELD_INITIAL_PACKET_NUMBER, seen,
+    if (assign_number(value, QLINQ_EMCON_MAX_PACKET_NUMBER,
+                      FIELD_INITIAL_PACKET_NUMBER, seen,
                       &manifest->initial_packet_number) != 0)
       return -1;
   } else if (strcmp(key, "valid_from_ms") == 0) {

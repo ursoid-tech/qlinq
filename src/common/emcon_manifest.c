@@ -5,7 +5,6 @@
 
 #include <openssl/pem.h>
 #include <openssl/sha.h>
-#include <picotls.h>
 
 #include <stdbool.h>
 #include <fcntl.h>
@@ -67,12 +66,10 @@ static bool endpoint_valid(const qlinq_emcon_manifest_endpoint_t *endpoint) {
          endpoint->port != 0 && nonzero(endpoint->address, address_size);
 }
 
-uint64_t qlinq_emcon_manifest_packet_number_limit(
-    const qlinq_emcon_manifest_t *manifest) {
-  uint64_t limit =
-      manifest->initial_packet_number + QLINQ_EMCON_MAX_PACKETS_PER_KEY;
-  uint64_t quic_limit = PTLS_QUICINT_MAX + UINT64_C(1);
-  return limit < quic_limit ? limit : quic_limit;
+uint64_t qlinq_emcon_packet_number_limit(uint64_t initial_packet_number) {
+  uint64_t limit = initial_packet_number + QLINQ_EMCON_MAX_PACKETS_PER_KEY;
+  uint64_t wire_limit = UINT64_C(1) + QLINQ_EMCON_MAX_PACKET_NUMBER;
+  return limit < wire_limit ? limit : wire_limit;
 }
 
 int qlinq_emcon_manifest_validate(const qlinq_emcon_manifest_t *manifest,
@@ -83,7 +80,7 @@ int qlinq_emcon_manifest_validate(const qlinq_emcon_manifest_t *manifest,
       !nonzero(manifest->traffic_key_id, sizeof(manifest->traffic_key_id)) ||
       manifest->flow_id == 0 || manifest->key_epoch == 0 ||
       manifest->cipher_suite != QLINQ_EMCON_CIPHER_AES_128_GCM_SHA256 ||
-      manifest->initial_packet_number > PTLS_QUICINT_MAX ||
+      manifest->initial_packet_number > QLINQ_EMCON_MAX_PACKET_NUMBER ||
       manifest->valid_from_ms >= manifest->expires_at_ms ||
       !endpoint_valid(&manifest->source) ||
       !endpoint_valid(&manifest->destination) ||
