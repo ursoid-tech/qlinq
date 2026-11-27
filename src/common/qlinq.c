@@ -767,6 +767,19 @@ static qlinq_endpoint_t *open_endpoint(qlinq_context_t *context,
   transport_config.verify_peer =
       config->security.verify_peer || !config->security.allow_insecure_peer;
   transport_config.enable_flexicast = config->group_delivery.enabled;
+  transport_config.flexicast_receiver_backend =
+      (transport_group_backend_t)config->group_delivery.receiver_backend;
+  transport_config.flexicast_relay_address =
+      config->group_delivery.relay_address;
+  transport_config.flexicast_relay_port = config->group_delivery.relay_port;
+  transport_config.flexicast_relay_amtq_port =
+      config->group_delivery.relay_amtq_port;
+  transport_config.flexicast_relay_server_name =
+      config->group_delivery.relay_server_name;
+  transport_config.flexicast_relay_ca_file =
+      config->group_delivery.relay_ca_file;
+  transport_config.flexicast_amtq_reliable =
+      config->group_delivery.amtq_reliable;
   transport_config.flexicast_group = config->group_delivery.group_address;
   transport_config.flexicast_group_port = config->group_delivery.port;
   transport_config.flexicast_interface =

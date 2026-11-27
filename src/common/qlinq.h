@@ -194,6 +194,13 @@ typedef struct {
   qlinq_tls_group_policy_t tls_group_policy;
 } qlinq_security_config_t;
 
+typedef enum {
+  QLINQ_GROUP_NATIVE = 0,
+  QLINQ_GROUP_AMT = 1,
+  QLINQ_GROUP_AMTQ = 2,
+  QLINQ_GROUP_AUTO = 3
+} qlinq_group_backend_t;
+
 typedef struct {
   bool enabled;
   /* source sets group_address, port, and interface_address; receiver may set
@@ -206,6 +213,13 @@ typedef struct {
   uint64_t maximum_rate_bytes_per_second;
   uint64_t aggregate_rate_bytes_per_second;
   uint32_t feedback_timeout_ms;
+  qlinq_group_backend_t receiver_backend;
+  const char *relay_address;
+  uint16_t relay_port;      /* 0: UDP 2268 (or 2269 for QLINQ_GROUP_AMTQ) */
+  uint16_t relay_amtq_port; /* AUTO AMTQ port; 0: UDP 2269 */
+  const char *relay_server_name;
+  const char *relay_ca_file;
+  bool amtq_reliable;
 } qlinq_group_delivery_config_t;
 
 typedef struct {

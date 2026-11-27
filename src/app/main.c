@@ -5,6 +5,7 @@
 #endif
 
 #include "cli_parse.h"
+#include "amt_relay.h"
 #include "portable_sockets.h"
 #include "transport.h"
 #include "transport_wire.h"
@@ -42,7 +43,21 @@ typedef struct {
   bool initialized;
 } pv_path_t;
 
+typedef enum {
+  NETWORK_P2P,
+  NETWORK_MULTICAST,
+  NETWORK_AMT_RELAY
+} network_mode_t;
+
 typedef struct {
+  network_mode_t network_mode;
+  transport_group_backend_t group_backend;
+  bool group_backend_set;
+  const char *group, *group_interface, *amt_relay;
+  const char *amtq_server_name, *amtq_ca_file;
+  uint16_t group_port, amt_port, amtq_port;
+  bool amtq_reliable;
+  qlinq_relay_config_t relay;
   moq_track_id_t track;
   const uint8_t *auth_token;
   size_t auth_token_len;
@@ -154,6 +169,31 @@ static void show_help(FILE *out, const char *program) {
   fprintf(
       out,
       "usage: %s (--listen PORT | --peer HOST[:PORT]) [options]\n\n"
+      "Network modes:\n"
+      "  --network-mode p2p|multicast-fanout|amt-relay|amtq-relay (default: "
+      "p2p)\n"
+      "  --group IP --group-port PORT  multicast source SSM destination\n"
+      "  --group-interface IP        local multicast interface address\n"
+      "  --group-backend native|amt|amtq|auto  receiver group backend\n"
+      "  --amt-relay IP [--amt-port PORT]  receiver AMT/AMTQ relay (default: "
+      "2268)\n"
+      "  --amtq-port PORT            AMTQ UDP port (default: 2269)\n"
+      "  --amtq-server-name NAME     AMTQ TLS server name (default: relay IP)\n"
+      "  --amtq-ca FILE              AMTQ relay CA bundle (default: --ca)\n"
+      "  --amtq-reliable             prefer AMTQ Reliable Block Mode\n"
+      "  --relay-interface NAME      relay upstream interface (Linux, "
+      "CAP_NET_RAW)\n"
+      "  --relay-mtu BYTES           relay outer MTU (default: 1500)\n"
+      "  --relay-clients N           relay client limit (default: 64)\n"
+      "  --relay-groups N            upstream group limit (default: 1024)\n"
+      "  --relay-sources N           upstream source limit (default: 4096)\n"
+      "  --linux-gateway-family 4|6  optional Linux AMT gateway compatibility\n"
+      "  --no-classic-amt            disable UDP 2268 listener in amt-relay\n"
+      "  --amtq-datagram-only        disable Reliable Block Mode on AMTQ "
+      "relay\n"
+      "  AMT relay uses --bind/--listen (default: 0.0.0.0:2268); AMTQ uses\n"
+      "  --cert/--key (and optional --ca for client mTLS). --stats-ms emits "
+      "JSON.\n\n"
       "Network:\n"
       "  --bind ADDRESS              numeric local address (repeatable)\n"
       "  --stripes N                 multi-socket striping paths (1..4)\n"
@@ -715,13 +755,38 @@ static bool parse_options(int argc, char **argv, options_t *options) {
                          .verify_peer = true};
   uint64_t parsed;
   bool mode_set = false, raw_options = false, transfer_timeout_set = false;
-  bool track_set = false;
+  bool track_set = false, endpoint_options = false, relay_options = false;
 
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
+    if (strcmp(arg, "--network-mode") && strcmp(arg, "--bind") &&
+        strcmp(arg, "--listen") && strcmp(arg, "--stats-ms") &&
+        strcmp(arg, "--help") && strncmp(arg, "--relay-", 8) &&
+        strcmp(arg, "--linux-gateway-family") &&
+        strcmp(arg, "--no-classic-amt") &&
+        strcmp(arg, "--amtq-datagram-only") && strcmp(arg, "--amtq-port") &&
+        strcmp(arg, "--cert") && strcmp(arg, "--key") && strcmp(arg, "--ca"))
+      endpoint_options = true;
+    if (!strncmp(arg, "--relay-", 8) ||
+        !strcmp(arg, "--linux-gateway-family") ||
+        !strcmp(arg, "--no-classic-amt") ||
+        !strcmp(arg, "--amtq-datagram-only"))
+      relay_options = true;
     if (strcmp(arg, "--help") == 0) {
       options->help = true;
       return true;
+    }
+    if (strcmp(arg, "--no-classic-amt") == 0) {
+      options->relay.disable_classic_amt = true;
+      continue;
+    }
+    if (strcmp(arg, "--amtq-datagram-only") == 0) {
+      options->relay.amtq_disable_reliable = true;
+      continue;
+    }
+    if (strcmp(arg, "--amtq-reliable") == 0) {
+      options->amtq_reliable = true;
+      continue;
     }
     if (strcmp(arg, "--insecure-no-verify") == 0) {
       options->verify_peer = false;
@@ -760,7 +825,85 @@ static bool parse_options(int argc, char **argv, options_t *options) {
         strcmp(arg, "--send-batch") == 0 || strcmp(arg, "--batch") == 0 ||
         strcmp(arg, "--mbps") == 0)
       raw_options = true;
-    if (strcmp(arg, "--transfer-timeout-ms") == 0) {
+    if (strcmp(arg, "--network-mode") == 0) {
+      if (!strcmp(value, "p2p"))
+        options->network_mode = NETWORK_P2P;
+      else if (!strcmp(value, "multicast-fanout") ||
+               !strcmp(value, "multicast"))
+        options->network_mode = NETWORK_MULTICAST;
+      else if (!strcmp(value, "amt-relay"))
+        options->network_mode = NETWORK_AMT_RELAY;
+      else if (!strcmp(value, "amtq-relay")) {
+        options->network_mode = NETWORK_AMT_RELAY;
+        options->relay.disable_classic_amt = true;
+      } else
+        goto invalid;
+    } else if (!strcmp(arg, "--group-backend")) {
+      if (!strcmp(value, "native"))
+        options->group_backend = TRANSPORT_GROUP_NATIVE;
+      else if (!strcmp(value, "amt"))
+        options->group_backend = TRANSPORT_GROUP_AMT;
+      else if (!strcmp(value, "amtq"))
+        options->group_backend = TRANSPORT_GROUP_AMTQ;
+      else if (!strcmp(value, "auto"))
+        options->group_backend = TRANSPORT_GROUP_AUTO;
+      else
+        goto invalid;
+      options->group_backend_set = true;
+    } else if (!strcmp(arg, "--group")) {
+      options->group = value;
+    } else if (!strcmp(arg, "--group-interface")) {
+      options->group_interface = value;
+    } else if (!strcmp(arg, "--group-port") || !strcmp(arg, "--amt-port") ||
+               !strcmp(arg, "--amtq-port")) {
+      if (!cli_parse_u64(value, UINT16_MAX, &parsed) || !parsed)
+        goto invalid;
+      if (!strcmp(arg, "--group-port"))
+        options->group_port = (uint16_t)parsed;
+      else if (!strcmp(arg, "--amt-port"))
+        options->amt_port = (uint16_t)parsed;
+      else
+        options->amtq_port = (uint16_t)parsed;
+    } else if (!strcmp(arg, "--amtq-server-name")) {
+      if (!value[0])
+        goto invalid;
+      options->amtq_server_name = value;
+    } else if (!strcmp(arg, "--amtq-ca")) {
+      options->amtq_ca_file = value;
+    } else if (!strcmp(arg, "--amt-relay")) {
+      uint8_t address[16];
+      if (inet_pton(AF_INET, value, address) != 1 &&
+          inet_pton(AF_INET6, value, address) != 1)
+        goto invalid;
+      options->amt_relay = value;
+    } else if (!strcmp(arg, "--relay-interface")) {
+      options->relay.upstream_interface = value;
+    } else if (!strcmp(arg, "--relay-mtu") || !strcmp(arg, "--relay-clients") ||
+               !strcmp(arg, "--relay-groups") ||
+               !strcmp(arg, "--relay-sources") ||
+               !strcmp(arg, "--linux-gateway-family")) {
+      if (!cli_parse_u64(value, 65535, &parsed) || !parsed)
+        goto invalid;
+      if (!strcmp(arg, "--relay-mtu")) {
+        if (parsed < 576 || parsed > 65535)
+          goto invalid;
+        options->relay.path_mtu = (uint32_t)parsed;
+      } else if (!strcmp(arg, "--relay-clients")) {
+        if (parsed > 1024)
+          goto invalid;
+        options->relay.max_clients = (unsigned)parsed;
+      } else if (!strcmp(arg, "--relay-groups")) {
+        if (parsed > 4096)
+          goto invalid;
+        options->relay.max_groups = (unsigned)parsed;
+      } else if (!strcmp(arg, "--relay-sources")) {
+        options->relay.max_sources = (unsigned)parsed;
+      } else {
+        if (parsed != 4 && parsed != 6)
+          goto invalid;
+        options->relay.linux_gateway_family = (unsigned)parsed;
+      }
+    } else if (strcmp(arg, "--transfer-timeout-ms") == 0) {
       if (!cli_parse_u64(value, UINT32_MAX, &parsed) || parsed == 0)
         goto invalid;
       options->transfer_timeout_ms = (uint32_t)parsed;
@@ -919,6 +1062,86 @@ static bool parse_options(int argc, char **argv, options_t *options) {
     }
   }
 
+  if (options->network_mode == NETWORK_AMT_RELAY) {
+    uint8_t address[16];
+    bool want_amtq =
+        options->relay.disable_classic_amt || options->amtq_port != 0;
+    if (endpoint_options || !options->relay.upstream_interface ||
+        options->num_bind_hosts > 1 ||
+        (options->bind_host &&
+         inet_pton(AF_INET, options->bind_host, address) != 1 &&
+         inet_pton(AF_INET6, options->bind_host, address) != 1))
+      goto invalid;
+    if (!want_amtq) {
+      if (options->cert_file || options->key_file || options->ca_file ||
+          options->relay.amtq_disable_reliable)
+        goto invalid;
+      options->relay.port = options->listen_port;
+    } else {
+      if (!options->cert_file || !options->key_file)
+        goto invalid;
+      options->relay.amtq_cert_file = options->cert_file;
+      options->relay.amtq_key_file = options->key_file;
+      options->relay.amtq_ca_file = options->ca_file;
+      if (options->relay.disable_classic_amt) {
+        if (options->relay.linux_gateway_family ||
+            (options->listen_port && options->amtq_port &&
+             options->listen_port != options->amtq_port))
+          goto invalid;
+        options->relay.amtq_port =
+            options->amtq_port ? options->amtq_port : options->listen_port;
+      } else {
+        uint16_t classic_port =
+            options->listen_port ? options->listen_port : 2268;
+        if (classic_port == options->amtq_port)
+          goto invalid;
+        options->relay.port = options->listen_port;
+        options->relay.amtq_port = options->amtq_port;
+      }
+    }
+    options->relay.bind_address = options->bind_host;
+    return true;
+  }
+  if (relay_options)
+    goto invalid;
+  if (options->network_mode == NETWORK_P2P) {
+    if (options->group || options->group_port || options->group_interface ||
+        options->group_backend_set || options->amt_relay || options->amt_port ||
+        options->amtq_port || options->amtq_server_name ||
+        options->amtq_ca_file || options->amtq_reliable)
+      goto invalid;
+  } else {
+    transport_group_backend_t backend =
+        options->group_backend_set
+            ? options->group_backend
+            : (options->amt_relay ? TRANSPORT_GROUP_AMT
+                                  : TRANSPORT_GROUP_NATIVE);
+    options->group_backend = backend;
+    if (options->transfer || options->track.flags == MOQ_TRACK_FLAG_RELIABLE)
+      goto invalid;
+    if (options->listen_port) {
+      if (!options->input_path || !options->group || !options->group_port ||
+          !options->group_interface || options->group_backend_set ||
+          options->amt_relay || options->amt_port || options->amtq_port ||
+          options->amtq_server_name || options->amtq_ca_file ||
+          options->amtq_reliable)
+        goto invalid;
+    } else if (options->input_path || options->group || options->group_port) {
+      goto invalid;
+    } else if (backend == TRANSPORT_GROUP_NATIVE) {
+      if (options->amt_relay || options->amt_port || options->amtq_port ||
+          options->amtq_server_name || options->amtq_ca_file ||
+          options->amtq_reliable)
+        goto invalid;
+    } else {
+      if (!options->amt_relay ||
+          (backend != TRANSPORT_GROUP_AUTO && options->group_interface) ||
+          (backend == TRANSPORT_GROUP_AMT &&
+           (options->amtq_port || options->amtq_server_name ||
+            options->amtq_ca_file || options->amtq_reliable)))
+        goto invalid;
+    }
+  }
   if ((options->cert_file == NULL) != (options->key_file == NULL) ||
       ((options->listen_port != 0 || options->verify_peer) &&
        options->cert_file == NULL)) {
@@ -1287,6 +1510,21 @@ static int run_app(const options_t *options) {
   }
 
   transport_config_t config = {0};
+  config.enable_flexicast = options->network_mode == NETWORK_MULTICAST;
+  config.flexicast_group = options->group;
+  config.flexicast_group_port = options->group_port;
+  config.flexicast_interface = options->group_interface;
+  config.flexicast_receiver_backend = options->group_backend;
+  config.flexicast_relay_address = options->amt_relay;
+  config.flexicast_relay_port =
+      options->group_backend == TRANSPORT_GROUP_AMTQ && options->amtq_port &&
+              !options->amt_port
+          ? options->amtq_port
+          : options->amt_port;
+  config.flexicast_relay_amtq_port = options->amtq_port;
+  config.flexicast_relay_server_name = options->amtq_server_name;
+  config.flexicast_relay_ca_file = options->amtq_ca_file;
+  config.flexicast_amtq_reliable = options->amtq_reliable;
   config.multihome = options->multihome;
   const char *default_bind =
       (num_remotes > 0 && strchr(peer_hosts[0], ':')) ? "::" : "0.0.0.0";
@@ -1390,5 +1628,7 @@ int main(int argc, char **argv) {
     show_help(stdout, argv[0]);
     return 0;
   }
+  if (options.network_mode == NETWORK_AMT_RELAY)
+    return app_amt_relay_run(&options.relay, options.stats_ms);
   return run_app(&options);
 }

@@ -461,6 +461,16 @@ static void release_membership(transport_t *t,
                                transport_flexicast_flow_t *flow) {
   if (!t || !flow || !flow->membership_acquired)
     return;
+  if (flow->amt_tunnel) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    t->drive_host.flexicast_io->tunnel_leave(t, flow);
+    t->host_callback_active = active;
+    flow->membership_acquired = false;
+    flow->amt_tunnel = false;
+    t->stats.flexicast_membership_leaves++;
+    return;
+  }
   transport_flexicast_membership_t *membership =
       find_membership(t, flow->ip_version, flow->source_ip, flow->group_ip,
                       flow->udp_port, flow->interface_index);
@@ -514,8 +524,8 @@ void transport_flexicast_dispose(transport_t *t) {
 }
 
 static bool
-join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
-                     const quicly_flexicast_announce_frame_t *announce) {
+join_announced_backend(transport_t *t, transport_flexicast_flow_t *flow,
+                       const quicly_flexicast_announce_frame_t *announce) {
   size_t address_len = ip_address_size(announce->ip_version);
   if (address_len == 0 || announce->udp_port == 0)
     return false;
@@ -527,16 +537,22 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
                 t->flexicast_interface_family == AF_INET6))
           ? t->flexicast_interface_index
           : 0;
-  if (flow->membership_acquired && flow->ip_version == announce->ip_version &&
+  bool use_tunnel = t->flexicast_receiver_backend == TRANSPORT_GROUP_AMT ||
+                    t->flexicast_receiver_backend == TRANSPORT_GROUP_AMTQ ||
+                    (t->flexicast_receiver_backend == TRANSPORT_GROUP_AUTO &&
+                     flow->relay_auto_stage > 0);
+  uint32_t effective_ifindex = use_tunnel ? 0 : interface_index;
+  if (flow->membership_acquired && flow->amt_tunnel == use_tunnel &&
+      flow->ip_version == announce->ip_version &&
       flow->udp_port == announce->udp_port &&
-      flow->interface_index == interface_index &&
+      flow->interface_index == effective_ifindex &&
       memcmp(flow->source_ip, announce->source_ip, address_len) == 0 &&
       memcmp(flow->group_ip, announce->group_ip, address_len) == 0)
     return true;
   release_membership(t, flow);
   flow->native_multicast = false;
   flow->ip_version = announce->ip_version;
-  flow->interface_index = interface_index;
+  flow->interface_index = effective_ifindex;
   memcpy(flow->source_ip, announce->source_ip, address_len);
   memcpy(flow->group_ip, announce->group_ip, address_len);
   flow->udp_port = announce->udp_port;
@@ -557,6 +573,19 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
       (announce->ip_version == 6 && !ipv6_is_ssm(announce->group_ip))) {
     fprintf(stderr, "transport: announced group is outside the SSM range\n");
     return false;
+  }
+
+  if (use_tunnel) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    bool joined = t->drive_host.flexicast_io->tunnel_join(t, flow);
+    t->host_callback_active = active;
+    if (!joined)
+      return false;
+    flow->amt_tunnel = true;
+    flow->membership_acquired = true;
+    t->stats.flexicast_membership_joins++;
+    return true;
   }
 
   /* reject when configured interface is missing or family-mismatched */
@@ -619,6 +648,19 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
   flow->membership_acquired = true;
   flow->native_multicast = true;
   return true;
+}
+
+static bool
+join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
+                     const quicly_flexicast_announce_frame_t *announce) {
+  do {
+    if (join_announced_backend(t, flow, announce))
+      return true;
+    if (t->flexicast_receiver_backend != TRANSPORT_GROUP_AUTO ||
+        flow->relay_auto_stage >= 2)
+      return false;
+    flow->relay_auto_stage++;
+  } while (true);
 }
 
 #define FLEXICAST_MEMBER_MAP_EMPTY 0U
@@ -1157,6 +1199,15 @@ static bool maybe_send_join(transport_flexicast_flow_t *flow) {
   if (flow->source || flow->join_sent || !flow->binding_received ||
       !flow->announcement_received || !flow->control_conn)
     return flow->join_sent;
+  transport_t *t = flow->control_conn->transport;
+  if (flow->amt_tunnel) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    bool ready = t->drive_host.flexicast_io->tunnel_ready(t, flow);
+    t->host_callback_active = active;
+    if (!ready)
+      return true; /* keep unicast delivery until AMT membership is installed */
+  }
   quicly_error_t ret =
       send_state_result(flow->control_conn, flow->flow_id, flow->key_epoch,
                         QUICLY_FLEXICAST_STATE_JOIN);
@@ -1185,6 +1236,11 @@ static bool configured_interface_matches(const transport_t *t,
          interface_index == t->flexicast_interface_index;
 }
 
+static void fail_receiver_multicast(transport_t *t,
+                                    transport_flexicast_flow_t *flow,
+                                    bool send_leave, bool drop_crypto,
+                                    bool advance_auto);
+
 void transport_flexicast_interface_removed(transport_t *t, uint8_t ip_version,
                                            const uint8_t *address,
                                            uint32_t interface_index) {
@@ -1207,17 +1263,10 @@ void transport_flexicast_interface_removed(transport_t *t, uint8_t ip_version,
       }
       continue;
     }
-    if (flow->interface_index != interface_index && interface_index != 0)
+    if (!flow->native_multicast ||
+        (flow->interface_index != interface_index && interface_index != 0))
       continue;
-    if (flow->membership_acquired)
-      release_membership(t, flow);
-    flow->native_multicast = false;
-    flow->multicast_unavailable = true;
-    if (flow->join_sent && flow->control_conn) {
-      (void)send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
-                       QUICLY_FLEXICAST_STATE_LEAVE);
-      flow->join_sent = false;
-    }
+    fail_receiver_multicast(t, flow, true, false, true);
     t->stats.flexicast_interface_fallbacks++;
   }
 }
@@ -1242,6 +1291,8 @@ void transport_flexicast_interface_added(transport_t *t, uint8_t ip_version,
     }
     if (!flow->announcement_received || flow->membership_acquired)
       continue;
+    if (t->flexicast_receiver_backend == TRANSPORT_GROUP_AUTO)
+      flow->relay_auto_stage = 0;
     quicly_flexicast_announce_frame_t announce = {
         .flow_id = flexicast_wire_id(flow->flow_id),
         .sequence = flow->key_epoch,
@@ -1253,6 +1304,8 @@ void transport_flexicast_interface_added(transport_t *t, uint8_t ip_version,
     memcpy(announce.group_ip, flow->group_ip, address_size);
     flow->multicast_unavailable = false;
     if (join_announced_group(t, flow, &announce) && maybe_send_join(flow)) {
+      flow->relay_retry_at_ms = 0;
+      flow->relay_retry_delay_ms = 0;
       t->stats.flexicast_interface_rejoins++;
     } else {
       flow->multicast_unavailable = true;
@@ -1417,6 +1470,7 @@ static void restart_receiver_offer(transport_t *t,
   }
   ptls_clear_memory(flow->secret, sizeof(flow->secret));
   flow->join_sent = false;
+  flow->tunnel_leave_pending = false;
   flow->ready_pending = false;
   flow->announcement_received = false;
 }
@@ -1502,6 +1556,81 @@ bool transport_flexicast_receive_path_ack(
   return true;
 }
 
+static void schedule_tunnel_retry(transport_t *t,
+                                  transport_flexicast_flow_t *flow,
+                                  bool advance_auto) {
+  if (!t || !flow || flow->source ||
+      t->flexicast_receiver_backend == TRANSPORT_GROUP_NATIVE)
+    return;
+  int64_t now = transport_now_ms(t);
+  if (advance_auto && t->flexicast_receiver_backend == TRANSPORT_GROUP_AUTO &&
+      flow->relay_auto_stage < 2) {
+    flow->relay_auto_stage++;
+    flow->relay_retry_delay_ms = 0;
+    flow->relay_retry_at_ms = now > INT64_MAX - 200 ? INT64_MAX : now + 200;
+    return;
+  }
+  if (flow->relay_retry_delay_ms < 5000)
+    flow->relay_retry_delay_ms = 5000;
+  else if (flow->relay_retry_delay_ms < 30000)
+    flow->relay_retry_delay_ms = flow->relay_retry_delay_ms > 15000
+                                     ? 30000
+                                     : flow->relay_retry_delay_ms * 2;
+  flow->relay_retry_at_ms =
+      now > INT64_MAX - (int64_t)flow->relay_retry_delay_ms
+          ? INT64_MAX
+          : now + (int64_t)flow->relay_retry_delay_ms;
+}
+
+static void fail_receiver_multicast(transport_t *t,
+                                    transport_flexicast_flow_t *flow,
+                                    bool send_leave, bool drop_crypto,
+                                    bool advance_auto) {
+  if (!t || !flow || flow->source)
+    return;
+  if (send_leave && flow->join_sent && flow->control_conn) {
+    if (send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
+                   QUICLY_FLEXICAST_STATE_LEAVE))
+      flow->join_sent = false;
+    else
+      flow->tunnel_leave_pending = true;
+  } else {
+    flow->join_sent = false;
+  }
+  release_membership(t, flow);
+  if (drop_crypto && flow->crypto) {
+    quicly_flexicast_flow_free(flow->crypto);
+    flow->crypto = NULL;
+  }
+  flow->native_multicast = false;
+  flow->multicast_unavailable = true;
+  flow->ready_pending = false;
+  schedule_tunnel_retry(t, flow, advance_auto);
+}
+
+bool transport_flexicast_retry(transport_t *t,
+                               transport_flexicast_flow_t *flow) {
+  if (!t || !flow || !flow->active || flow->source || !flow->binding_received ||
+      !flow->control_conn ||
+      !transport_subscribe_conn(t, flow->control_conn, flow->track_id))
+    return false;
+  retire_flow_id(t, flow->flow_id, flow->key_epoch);
+  release_membership(t, flow);
+  if (flow->crypto) {
+    quicly_flexicast_flow_free(flow->crypto);
+    flow->crypto = NULL;
+  }
+  ptls_clear_memory(flow->secret, sizeof(flow->secret));
+  flow->binding_received = false;
+  flow->announcement_received = false;
+  flow->join_sent = false;
+  flow->ready_pending = false;
+  flow->tunnel_leave_pending = false;
+  flow->multicast_unavailable = false;
+  flow->native_multicast = false;
+  return true;
+}
+
 static bool
 receive_quic_announce(transport_t *t, transport_conn_t *conn,
                       const quicly_flexicast_announce_frame_t *announce) {
@@ -1532,8 +1661,11 @@ receive_quic_announce(transport_t *t, transport_conn_t *conn,
   if (flow->binding_received && announce->sequence > flow->key_epoch)
     restart_receiver_offer(t, flow);
   if (!join_announced_group(t, flow, announce)) {
-    flow->multicast_unavailable = true;
+    fail_receiver_multicast(t, flow, false, false, true);
     t->stats.flexicast_fallbacks++;
+  } else {
+    flow->multicast_unavailable = false;
+    flow->relay_retry_at_ms = 0;
   }
   flow->key_epoch = (uint32_t)announce->sequence;
   flow->ack_delay_msec = announce->ack_delay_msec > UINT32_MAX
@@ -1597,7 +1729,12 @@ static bool receive_quic_state(transport_t *t, transport_conn_t *conn,
         flow->control_conn != conn)
       return false;
     retire_flow_id(t, flow_id, flow->key_epoch);
-    release_flow(t, flow);
+    if (t->flexicast_receiver_backend != TRANSPORT_GROUP_NATIVE) {
+      bool was_available = !flow->multicast_unavailable;
+      fail_receiver_multicast(t, flow, false, true, was_available);
+    } else {
+      release_flow(t, flow);
+    }
     return true;
   }
   if (!flow->source)
@@ -1683,7 +1820,11 @@ static bool receive_quic_key(transport_t *t, transport_conn_t *conn,
   if (retired_flow_epoch(t, flow_id, &retired_epoch) &&
       key->sequence <= retired_epoch)
     return true;
-  if (flow->source || flow->control_conn != conn || !flow->join_sent)
+  if (flow->source || flow->control_conn != conn)
+    return false;
+  if (flow->multicast_unavailable)
+    return true;
+  if (!flow->join_sent)
     return false;
   if (key->sequence < flow->key_epoch)
     return true;
@@ -1707,6 +1848,8 @@ static bool receive_quic_key(transport_t *t, transport_conn_t *conn,
     flow->key_epoch = (uint32_t)key->sequence;
     flow->ready_pending = false;
   }
+  flow->relay_retry_at_ms = 0;
+  flow->relay_retry_delay_ms = 0;
   quicly_error_t state_ret = send_state_result(
       conn, flow->flow_id, flow->key_epoch, QUICLY_FLEXICAST_STATE_LISTEN);
   if (state_ret == 0) {
@@ -1856,6 +1999,15 @@ bool transport_flexicast_member_is_listening(
   return member_map_find(flow, conn, &slot) && flow->members[slot].listening;
 }
 
+void transport_flexicast_tunnel_failed(transport_t *t,
+                                       transport_flexicast_flow_t *flow) {
+  if (!t || !flow || !flow->amt_tunnel)
+    return;
+  bool was_available = !flow->multicast_unavailable;
+  fail_receiver_multicast(t, flow, true, false, was_available);
+  t->stats.flexicast_fallbacks++;
+}
+
 void transport_flexicast_tick(transport_t *t) {
   if (!t || !t->flexicast_enabled)
     return;
@@ -1865,6 +2017,30 @@ void transport_flexicast_tick(transport_t *t) {
     if (!flow->active || flow->source || !flow->control_conn ||
         !flow->control_conn->quic)
       continue;
+    if (flow->relay_retry_at_ms > 0 && now >= flow->relay_retry_at_ms) {
+      uint32_t delay =
+          flow->relay_retry_delay_ms < 5000 ? 5000 : flow->relay_retry_delay_ms;
+      flow->relay_retry_at_ms =
+          now > INT64_MAX - (int64_t)delay ? INT64_MAX : now + (int64_t)delay;
+      if (flow->relay_retry_delay_ms == 0)
+        flow->relay_retry_delay_ms = 5000;
+      else if (flow->relay_retry_delay_ms < 30000)
+        flow->relay_retry_delay_ms = flow->relay_retry_delay_ms > 15000
+                                         ? 30000
+                                         : flow->relay_retry_delay_ms * 2;
+      if (flow->binding_received)
+        (void)transport_flexicast_retry(t, flow);
+      else
+        (void)transport_subscribe_conn(t, flow->control_conn, flow->track_id);
+      if (!flow->active)
+        continue;
+    }
+    if (flow->tunnel_leave_pending &&
+        send_state(flow->control_conn, flow->flow_id, flow->key_epoch,
+                   QUICLY_FLEXICAST_STATE_LEAVE)) {
+      flow->tunnel_leave_pending = false;
+      flow->join_sent = false;
+    }
     if (flow->binding_received && flow->announcement_received &&
         !flow->join_sent && !flow->multicast_unavailable)
       (void)maybe_send_join(flow);

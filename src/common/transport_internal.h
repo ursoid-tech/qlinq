@@ -207,6 +207,7 @@ struct transport_t {
   size_t flexicast_retired_flow_count;
   size_t flexicast_retired_flow_next;
   bool flexicast_enabled;
+  transport_group_backend_t flexicast_receiver_backend;
   uint64_t flexicast_cc_startup_rate;
   uint64_t flexicast_cc_minimum_rate;
   uint64_t flexicast_cc_maximum_rate;

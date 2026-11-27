@@ -104,3 +104,6 @@ crash-*
 /.work/
 __pycache__/
 *.py[cod]
+
+/t/00util/test_amt_transport
+/t/00util/test_amt_relay

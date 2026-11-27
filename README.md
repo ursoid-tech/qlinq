@@ -70,6 +70,19 @@ Delivery mode names are shared by `qlinq-app` and `qlinq-tun`:
 `datagram`, `reliable`, `fixedrate` (also accepted as `fec`), and `rateless`.
 Each tool keeps its existing default mode.
 
+## Network modes
+
+`qlinq-app --network-mode p2p|multicast-fanout|amt-relay` selects direct QUIC,
+shared encrypted multicast delivery, or a transparent classic AMT relay.
+Native and AMT receivers can share a publication; their control and repair
+connections remain attached to the original source. The relay embeds the pinned
+nanoamt submodule and needs no group keys or TLS identity. Native relay capture
+requires Linux and `CAP_NET_RAW`.
+
+See [network modes](docs/network-modes.md) for deployment commands, receiver
+configuration, relay limits and the embeddable `qlinq_relay.h` service API.
+`--mode` continues to select the record delivery policy.
+
 ## Managed packet tunnel
 
 See the [two-machine quickstart](docs/tun-tool.md) for installation, secure

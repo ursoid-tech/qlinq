@@ -678,17 +678,26 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
     return INT64_MAX;
   int64_t now = transport_now_ms(t);
   int64_t first_timeout = INT64_MAX;
+  if (t->drive_host.flexicast_io &&
+      t->drive_host.flexicast_io->tunnel_timeout) {
+    bool active = t->host_callback_active;
+    t->host_callback_active = true;
+    first_timeout = t->drive_host.flexicast_io->tunnel_timeout(t);
+    t->host_callback_active = active;
+  }
   for (size_t i = 0; i < t->flexicast.capacity; i++) {
     transport_flexicast_flow_t *flow = &t->flexicast.flows[i];
     if (!flow->active || flow->source)
       continue;
-    if ((flow->ready_pending && flow->crypto) ||
+    if (flow->tunnel_leave_pending || (flow->ready_pending && flow->crypto) ||
         (flow->binding_received && flow->announcement_received &&
          !flow->join_sent && !flow->multicast_unavailable)) {
       int64_t retry = now > INT64_MAX - 10 ? INT64_MAX : now + 10;
       if (retry < first_timeout)
         first_timeout = retry;
     }
+    if (flow->relay_retry_at_ms > 0 && flow->relay_retry_at_ms < first_timeout)
+      first_timeout = flow->relay_retry_at_ms;
     if (!flow->crypto)
       continue;
     int64_t deadline = quicly_flexicast_get_ack_deadline(flow->crypto);

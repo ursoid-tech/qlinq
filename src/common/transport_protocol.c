@@ -173,6 +173,7 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
                                  .flags = flags};
   strcpy(parsed_track.name, wire_track.name);
 
+  bool emit_event = true;
   if (type == QLINQ_WIRE_SUBSCRIBE) {
     moq_track_id_t aliased_track;
     if (transport_subscriptions_find_by_alias(&conn->send_subscriptions, alias,
@@ -184,6 +185,8 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
     }
     const track_subscription_t *existing = transport_subscriptions_find_const(
         &conn->send_subscriptions, &parsed_track);
+    if (existing && existing->active)
+      emit_event = false;
     bool already_same_alias = existing && existing->active &&
                               existing->track_id.flags == flags &&
                               existing->alias == alias;
@@ -230,9 +233,11 @@ static bool receive_track_command(transport_t *t, transport_conn_t *conn,
     ev_type = TRANSPORT_EVENT_KEYFRAME_REQUEST;
   }
 
-  transport_event_t ev = {
-      .type = ev_type, .conn = conn, .track_id = parsed_track};
-  transport_emit_event(t, &ev);
+  if (emit_event) {
+    transport_event_t ev = {
+        .type = ev_type, .conn = conn, .track_id = parsed_track};
+    transport_emit_event(t, &ev);
+  }
   return true;
 }
 

@@ -10,3 +10,6 @@
 	path = deps/nanorq
 	url = https://github.com/sleepybishop/nanorq
 	branch = stable
+[submodule "deps/nanoamt"]
+	path = deps/nanoamt
+	url = https://github.com/sleepybishop/nanoamt.git

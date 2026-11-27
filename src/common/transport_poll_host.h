@@ -18,6 +18,7 @@ typedef struct {
   ifmon_watcher_t ifmon_w;
   int ifmon_pipe[2];
   _Atomic(transport_interface_batch_t *) interface_updates;
+  struct transport_amt_host *amt;
   bool multihome;
   bool custom_iface_filter;
   transport_log_callback_t log_callback;

@@ -12,6 +12,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#ifdef QLINQ_TEST_AMT
+#include "amt_native_fixture.h"
+#include "transport_amt_host.h"
+#endif
 
 typedef struct {
   transport_t *transport;
@@ -58,11 +62,17 @@ static void on_client(void *user_data, const transport_event_t *event) {
 }
 
 static void drive(transport_t *server, transport_t *a, transport_t *b) {
+#ifdef QLINQ_TEST_AMT
+  fixture_pump();
+#endif
   transport_tick(server);
   if (a)
     transport_tick(a);
   if (b)
     transport_tick(b);
+#ifdef QLINQ_TEST_AMT
+  fixture_pump();
+#endif
 }
 
 static void test_mixed_group_retry(transport_t *server,
@@ -695,10 +705,32 @@ int main(int argc, char **argv) {
       (strcmp(mode, "--native") == 0 || native6 || native6_fallback ||
        strcmp(mode, "--join-fallback") == 0 ||
        strcmp(mode, "--ack-fallback") == 0 || strcmp(mode, "--pacing") == 0);
+#ifdef QLINQ_TEST_AMT
+  bool amtq =
+      mode && (!strcmp(mode, "--amtq") || !strcmp(mode, "--amtq-reliable") ||
+               !strcmp(mode, "--amtq-mixed"));
+  bool amtq_reliable = mode && !strcmp(mode, "--amtq-reliable");
+  bool auto_amt = mode && !strcmp(mode, "--auto-amt");
+  bool auto_amtq = mode && !strcmp(mode, "--auto-amtq");
+  bool auto_backend = auto_amt || auto_amtq;
+  bool amt = amtq || auto_backend ||
+             (mode && (!strcmp(mode, "--amt") || !strcmp(mode, "--amt-mixed") ||
+                       !strcmp(mode, "--amt-unavailable")));
+  bool unavailable = mode && !strcmp(mode, "--amt-unavailable");
+  bool mixed =
+      mode && (!strcmp(mode, "--amt-mixed") || !strcmp(mode, "--amtq-mixed"));
+  native_multicast |= amt;
+#else
+  bool amt = false;
+  bool auto_backend = false;
+#endif
   bool join_fallback = argc == 2 && strcmp(mode, "--join-fallback") == 0;
   bool ack_fallback = argc == 2 && strcmp(mode, "--ack-fallback") == 0;
   bool pacing = argc == 2 && strcmp(mode, "--pacing") == 0;
   bool control_flood = argc == 2 && strcmp(mode, "--control-flood") == 0;
+#ifdef QLINQ_TEST_AMT
+  join_fallback |= unavailable;
+#endif
   bool base = argc == 1 || (argc == 2 && strcmp(mode, "--base") == 0);
   bool ipv6 = native6 || native6_fallback;
   if (argc > 2 ||
@@ -765,9 +797,58 @@ int main(int argc, char **argv) {
     server_config.limits.max_udp_payload_size = 1452;
     client_a_config.limits.max_udp_payload_size = 1200;
   }
+#ifdef QLINQ_TEST_AMT
+  if (amt) {
+    if (!unavailable) {
+      if (amtq || auto_backend)
+        fixture_open_dual(true, "127.0.0.1", NULL);
+      else
+        fixture_open(true);
+    }
+    client_a_config.flexicast_interface = auto_backend ? "192.0.2.99" : NULL;
+    client_a_config.flexicast_receiver_backend =
+        auto_backend ? TRANSPORT_GROUP_AUTO
+                     : (amtq ? TRANSPORT_GROUP_AMTQ : TRANSPORT_GROUP_AMT);
+    client_a_config.flexicast_relay_address = "127.0.0.1";
+    if (amtq) {
+      client_a_config.flexicast_relay_port = 10169;
+      client_a_config.flexicast_relay_ca_file = "t/assets/verified.crt";
+      client_a_config.verify_peer = true;
+      client_a_config.allow_insecure_peer = false;
+      client_a_config.ca_file = "t/assets/verified.crt";
+      client_a_config.flexicast_amtq_reliable = amtq_reliable;
+    } else if (auto_backend) {
+      client_a_config.flexicast_relay_port = auto_amtq ? 10167 : 10168;
+      client_a_config.flexicast_relay_amtq_port = 10169;
+      client_a_config.flexicast_relay_ca_file = "t/assets/verified.crt";
+      client_a_config.verify_peer = true;
+      client_a_config.allow_insecure_peer = false;
+      client_a_config.ca_file = "t/assets/verified.crt";
+    } else {
+      client_a_config.flexicast_relay_port = unavailable ? 10169 : 10168;
+    }
+    if (client_a_config.verify_peer) {
+      server_config.cert_file = "t/assets/verified.crt";
+      server_config.key_file = "t/assets/verified.key";
+      client_a_config.cert_file = "t/assets/verified.crt";
+      client_a_config.key_file = "t/assets/verified.key";
+    }
+  }
+#endif
   transport_config_t client_b_config = client_a_config;
   if (mixed_retry)
     client_b_config.enable_flexicast = false;
+#ifdef QLINQ_TEST_AMT
+  if (mixed) {
+    client_b_config.flexicast_receiver_backend = TRANSPORT_GROUP_NATIVE;
+    client_b_config.flexicast_relay_address = NULL;
+    client_b_config.flexicast_relay_port = 0;
+    client_b_config.flexicast_relay_amtq_port = 0;
+    client_b_config.flexicast_relay_ca_file = NULL;
+    client_b_config.flexicast_amtq_reliable = false;
+    client_b_config.flexicast_interface = "127.0.0.1";
+  }
+#endif
   client_b_config.user_data = &client_b_state;
   if (ack_fallback) {
     client_b_config.simulated_flexicast_feedback_loss_rate = 100;
@@ -784,6 +865,9 @@ int main(int argc, char **argv) {
       transport_destroy(client_a);
     if (server)
       transport_destroy(server);
+#ifdef QLINQ_TEST_AMT
+    fixture_close();
+#endif
     return 1;
   }
   if (native6_fallback) {
@@ -844,9 +928,25 @@ int main(int argc, char **argv) {
 
   transport_stats_t source_stats = {0};
   const size_t expected_members = join_fallback ? 0U : mixed_retry ? 1U : 2U;
-  retries = 300;
+  retries = auto_backend ? 4000 : 300;
   while (retries-- > 0) {
     drive(server, client_a, client_b);
+#ifdef QLINQ_TEST_AMT
+    if (auto_amtq) {
+      transport_t *clients[] = {client_a, client_b};
+      for (size_t i = 0; i < 2; ++i) {
+        for (size_t f = 0; f < clients[i]->flexicast.capacity; ++f) {
+          transport_flexicast_flow_t *fl = &clients[i]->flexicast.flows[f];
+          if (fl->active && fl->relay_auto_stage == 1 && !fl->join_sent) {
+            clients[i]->drive_now_ns += UINT64_C(16000000000);
+            clients[i]->turn_active = true;
+            transport_amt_host_service(clients[i], NULL, 0);
+            clients[i]->turn_active = false;
+          }
+        }
+      }
+    }
+#endif
     (void)transport_get_stats(server, &source_stats);
     if (server_state.subscriptions == 2 &&
         source_stats.flexicast_active_flows == 1 &&
@@ -866,6 +966,33 @@ int main(int argc, char **argv) {
     goto Success;
   }
 
+#ifdef QLINQ_TEST_AMT
+  if (unavailable) {
+    transport_t *clients[] = {client_a, client_b};
+    for (size_t i = 0; i < 2; ++i) {
+      for (unsigned wait = 0; wait < 200; ++wait) {
+        bool offered = false;
+        for (size_t f = 0; f < clients[i]->flexicast.capacity; ++f)
+          offered |= clients[i]->flexicast.flows[f].announcement_received;
+        if (offered)
+          break;
+        drive(server, client_a, client_b);
+        usleep(1000);
+      }
+      clients[i]->drive_now_ns += UINT64_C(16000000000);
+      clients[i]->turn_active = true;
+      transport_amt_host_service(clients[i], NULL, 0);
+      clients[i]->turn_active = false;
+      clients[i]->drive_now_ns -= UINT64_C(16000000000);
+      for (size_t f = 0; f < clients[i]->flexicast.capacity; ++f)
+        if (clients[i]->flexicast.flows[f].active &&
+            (!clients[i]->flexicast.flows[f].multicast_unavailable ||
+             clients[i]->flexicast.flows[f].amt_tunnel ||
+             clients[i]->flexicast.flows[f].join_sent))
+          goto Fail;
+    }
+  }
+#endif
   static const uint8_t payload[] = "one ciphertext, two subscribers";
   moq_object_t object = {.track_id = track,
                          .group_id = 7,
@@ -892,7 +1019,10 @@ int main(int argc, char **argv) {
   (void)transport_get_stats(client_b, &client_b_stats);
   /* For native IPv6, both peers must receive a Flexicast packet and all
    * shared submissions must have used the multicast destination. */
-  if (!client_a_state.received || !client_b_state.received ||
+  if ((amt && !join_fallback &&
+       (!client_a_stats.flexicast_amt_packets_received ||
+        client_a_stats.flexicast_amt_packets_rejected)) ||
+      !client_a_state.received || !client_b_state.received ||
       client_a_state.payload_size != sizeof(payload) ||
       client_b_state.payload_size != sizeof(payload) ||
       memcmp(client_a_state.payload, payload, sizeof(payload)) != 0 ||
@@ -925,6 +1055,94 @@ int main(int argc, char **argv) {
             source_stats.flexicast_acks_received);
     goto Fail;
   }
+#ifdef QLINQ_TEST_AMT
+  if (amtq_reliable) {
+    qlinq_relay_stats_t relay_stats;
+    qlinq_relay_get_stats(fixture_relay, &relay_stats);
+    if (relay_stats.amtq_reliable_blocks == 0 ||
+        relay_stats.amtq_datagrams != 0) {
+      fprintf(stderr, "AMTQ reliable mode did not use reliable blocks\n");
+      goto Fail;
+    }
+  }
+  if (auto_backend) {
+    uint8_t expected_stage = auto_amtq ? 2 : 1;
+    transport_flexicast_flow_t *a_flow = NULL, *b_flow = NULL;
+    for (size_t f = 0; f < client_a->flexicast.capacity; ++f) {
+      transport_flexicast_flow_t *fl = &client_a->flexicast.flows[f];
+      if (fl->active && !fl->source) {
+        a_flow = fl;
+        if (fl->relay_auto_stage != expected_stage) {
+          fprintf(stderr, "AUTO settled on stage %u (expected %u)\n",
+                  fl->relay_auto_stage, expected_stage);
+          goto Fail;
+        }
+      }
+    }
+    for (size_t f = 0; f < client_b->flexicast.capacity; ++f) {
+      if (client_b->flexicast.flows[f].active &&
+          !client_b->flexicast.flows[f].source) {
+        b_flow = &client_b->flexicast.flows[f];
+        break;
+      }
+    }
+    /* repeated SUBSCRIBE refresh must not emit duplicate SUBSCRIBE events */
+    size_t subs_before = server_state.subscriptions;
+    if (!transport_subscribe(client_a, track)) {
+      fprintf(stderr, "repeat SUBSCRIBE failed\n");
+      goto Fail;
+    }
+    for (int i = 0; i < 40; ++i) {
+      drive(server, client_a, client_b);
+      usleep(2000);
+    }
+    if (server_state.subscriptions != subs_before) {
+      fprintf(stderr,
+              "repeat SUBSCRIBE inflated subscriber count (%zu != %zu)\n",
+              server_state.subscriptions, subs_before);
+      goto Fail;
+    }
+    /* native interface removal must leave active AUTO tunnel untouched */
+    const uint8_t removed_v4[4] = {192, 0, 2, 99};
+    client_a->turn_active = true;
+    transport_flexicast_interface_removed(client_a, 4, removed_v4, 0);
+    client_a->turn_active = false;
+    if (!a_flow || !a_flow->membership_acquired || !a_flow->amt_tunnel ||
+        a_flow->multicast_unavailable) {
+      fprintf(stderr, "native interface removal disabled active AUTO tunnel\n");
+      goto Fail;
+    }
+    /* delayed FC_KEY after tunnel failure must not clear retry deadline */
+    if (!b_flow || !b_flow->control_conn) {
+      fprintf(stderr, "missing client_b AUTO flow\n");
+      goto Fail;
+    }
+    client_b->turn_active = true;
+    transport_flexicast_tunnel_failed(client_b, b_flow);
+    int64_t scheduled_retry = b_flow->relay_retry_at_ms;
+    uint8_t dummy_secret[TRANSPORT_FLEXICAST_SECRET_SIZE] = {0x5a};
+    quicly_flexicast_frame_t late_key = {
+        .type = QUICLY_FRAME_TYPE_FC_KEY,
+        .data.key = {.sequence = b_flow->key_epoch,
+                     .algorithm = PTLS_CIPHER_SUITE_AES_128_GCM_SHA256,
+                     .first_packet_number = 0,
+                     .key =
+                         ptls_iovec_init(dummy_secret, sizeof(dummy_secret))}};
+    late_key.data.key.flow_id.len = 8;
+    for (size_t b = 0; b < 8; ++b)
+      late_key.data.key.flow_id.bytes[7 - b] =
+          (uint8_t)(b_flow->flow_id >> (b * 8));
+    bool key_ok = transport_flexicast_receive_quic_frame(
+        client_b, b_flow->control_conn, &late_key);
+    client_b->turn_active = false;
+    if (!key_ok || scheduled_retry <= 0 ||
+        b_flow->relay_retry_at_ms != scheduled_retry ||
+        !b_flow->multicast_unavailable || b_flow->membership_acquired) {
+      fprintf(stderr, "late FC_KEY canceled tunnel recovery\n");
+      goto Fail;
+    }
+  }
+#endif
 
   if (base) {
     transport_flexicast_flow_t *flow = NULL;
@@ -1191,6 +1409,9 @@ Success:
   transport_destroy(client_b);
   transport_destroy(client_a);
   transport_destroy(server);
+#ifdef QLINQ_TEST_AMT
+  fixture_close();
+#endif
   return 0;
 
 Fail:
@@ -1198,5 +1419,8 @@ Fail:
     transport_destroy(client_b);
   transport_destroy(client_a);
   transport_destroy(server);
+#ifdef QLINQ_TEST_AMT
+  fixture_close();
+#endif
   return 1;
 }

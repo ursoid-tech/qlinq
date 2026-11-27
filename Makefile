@@ -143,12 +143,27 @@ ENGINE_OBJS = src/common/transport_flexicast.o \
               $(NANORQ_OBJS)
 
 
-POLL_HOST_OBJS = src/common/transport_flexicast_host.o src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
+NANOAMT_SRCS = deps/nanoamt/lib/gateway.c deps/nanoamt/lib/packet.c \
+               deps/nanoamt/lib/igmp.c deps/nanoamt/lib/reassembly.c \
+               deps/nanoamt/lib/membership.c deps/nanoamt/lib/relay.c \
+               deps/nanoamt/lib/posix.c deps/nanoamt/lib/relay_posix.c \
+               deps/nanoamt/lib/openssl.c \
+               deps/nanoamt/lib/amtq/wire.c deps/nanoamt/lib/amtq/control.c \
+               deps/nanoamt/lib/amtq/gateway.c deps/nanoamt/lib/amtq/relay.c \
+               deps/nanoamt/lib/amtq/reassembly.c
+ifeq ($(UNAME_S),Linux)
+NANOAMT_SRCS += deps/nanoamt/lib/native_linux.c
+AMT_TESTS = t/00util/test_amt_transport t/00util/test_amt_relay
+endif
+NANOAMT_OBJS = $(patsubst deps/nanoamt/%.c,tmp/nanoamt/%.o,$(NANOAMT_SRCS))
+INCLUDES += -Ideps/nanoamt/include
+
+POLL_HOST_OBJS = src/common/qlinq_relay.o src/common/transport_amt_host.o src/common/amtq_quicly.o src/common/amtq_posix.o $(NANOAMT_OBJS) src/common/transport_flexicast_host.o src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
 TRANSPORT_OBJS = src/common/qlinq.o $(ENGINE_OBJS) $(POLL_HOST_OBJS)
 
 COMMON_OBJS = $(TRANSPORT_OBJS)
 
-APP_OBJS = src/app/main.o src/app/xfer.o src/app/xfer_file.o
+APP_OBJS = src/app/amt_relay.o src/app/main.o src/app/xfer.o src/app/xfer_file.o
 
 FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
@@ -175,6 +190,7 @@ FUSION_CFLAGS=$(FUSION_CFLAGS)
 LDFLAGS=$(LDFLAGS)
 ENGINE_OBJS=$(ENGINE_OBJS)
 POLL_HOST_OBJS=$(POLL_HOST_OBJS)
+NANOAMT_SRCS=$(NANOAMT_SRCS)
 TRANSPORT_OBJS=$(TRANSPORT_OBJS)
 endef
 
@@ -195,6 +211,11 @@ examples/%.o: examples/%.c .build-config
 
 t/%.o: t/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
+
+# Keep nanoamt build products outside its pinned submodule checkout.
+tmp/nanoamt/%.o: deps/nanoamt/%.c .build-config
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
 # Rule to compile third-party deps and suppress all warnings with -w
 
@@ -528,18 +549,18 @@ t/00util/transport_quicly_feedback.o: src/common/transport_quicly.c Makefile .bu
 t/00util/test_multipath_feedback: t/00util/test_multipath_feedback.o t/00util/transport_quicly_feedback.o $(filter-out src/common/transport_quicly.o,$(COMMON_OBJS))
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-check: all $(CHECK_BINARIES) gencerts check-reports
+check: all $(AMT_TESTS) $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean:
 	rm -f qlinq-app qlinq-tun libqlinq.a libqlinq.a.tmp .build-config .build-config.tmp tmp/fusion-config
-	rm -f $(CHECK_BINARIES) $(TRANSPORT_TESTS) $(API_TESTS)
+	rm -f $(AMT_TESTS) $(CHECK_BINARIES) $(TRANSPORT_TESTS) $(API_TESTS)
 	rm -f t/00util/test_tun_tx_kernel t/00util/test_tun_rx_kernel t/00util/fuzz_transport_wire
 	rm -f t/00util/test_transport_engine.map t/00util/test_recovery_latency.map
 	rm -f examples/data_multipath_benchmark examples/transit_benchmark examples/transit_udp_calibration
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
-	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
+	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) $(NANOAMT_OBJS) $(NANOAMT_OBJS:.o=.d) \
 		deps/nanors/rs.d \
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
@@ -587,7 +608,7 @@ indent:
 .PHONY: install-tun check-tun-tool check-tun-real package-tun
 
 -include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
-         $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
+         $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) $(NANOAMT_OBJS:.o=.d) \
          deps/nanors/rs.d \
          deps/nanors/deps/obl/oblas_common.d \
          deps/nanors/deps/obl/oblas_lite.d
@@ -605,3 +626,15 @@ t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
 
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
+
+ifeq ($(UNAME_S),Linux)
+AMT_NATIVE_WRAPS = -Wl,--wrap=nanoamt_native_open,--wrap=nanoamt_native_close,--wrap=nanoamt_native_fd,--wrap=nanoamt_native_reconcile,--wrap=nanoamt_native_authorize,--wrap=nanoamt_native_receive,--wrap=nanoamt_native_mtu_feedback,--wrap=nanoamt_native_get_stats
+t/00util/test_amt_transport.o: t/00util/test_flexicast_transport.c t/00util/amt_native_fixture.h .build-config
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -DQLINQ_TEST_AMT=1 -c $< -o $@
+
+t/00util/test_amt_transport: t/00util/test_amt_transport.o $(COMMON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS) $(AMT_NATIVE_WRAPS)
+
+t/00util/test_amt_relay: t/00util/test_amt_relay.o libqlinq.a
+	$(CC) -o $@ $^ $(LDFLAGS) $(AMT_NATIVE_WRAPS)
+endif

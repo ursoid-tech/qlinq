@@ -1,6 +1,7 @@
 /* default socket host for the explicit transport engine boundary */
 #include "transport_poll_host.h"
 #include "transport_flexicast.h"
+#include "transport_amt_host.h"
 #include "transport_protocol.h"
 extern const transport_flexicast_io_t transport_poll_flexicast_io;
 #include "portable_sockets.h"
@@ -412,6 +413,7 @@ static void host_dispose(void *context) {
     free(batch);
     batch = next;
   }
+  transport_amt_host_free(host->amt);
   free(host);
 }
 transport_drive_host_t
@@ -433,6 +435,20 @@ transport_t *transport_create(const transport_config_t *config) {
   transport_poll_host_t *host = calloc(1, sizeof(*host));
   if (!host)
     return NULL;
+  if (config->flexicast_receiver_backend != TRANSPORT_GROUP_NATIVE) {
+    host->amt = transport_amt_host_new(config);
+    if (!host->amt) {
+      free(host);
+      return NULL;
+    }
+  } else if (config->flexicast_relay_address || config->flexicast_relay_port ||
+             config->flexicast_relay_amtq_port ||
+             config->flexicast_relay_server_name ||
+             config->flexicast_relay_ca_file ||
+             config->flexicast_amtq_reliable) {
+    free(host);
+    return NULL;
+  }
   host->ifmon_pipe[0] = host->ifmon_pipe[1] = -1;
   atomic_init(&host->interface_updates, NULL);
   host->multihome = config->multihome;
@@ -636,6 +652,7 @@ void transport_tick_ready(transport_t *t, const struct pollfd *fds,
   if (socket_receive_ready(host->ifmon_pipe[0], fds, count) &&
       service_interfaces(t))
     fds = NULL;
+  transport_amt_host_service(t, fds, count);
   receive_packets(t, fds, count);
   transport_engine_end_turn(t);
 }
@@ -710,6 +727,7 @@ size_t transport_get_poll_fds(transport_t *t, struct pollfd *fds,
     if (t->flexicast_fds[i] >= 0)
       fds[count++] =
           (struct pollfd){.fd = t->flexicast_fds[i], .events = POLLIN};
+  count += transport_amt_host_poll(t, fds + count, max_fds - count);
   if (host->ifmon_pipe[0] >= 0 && count < max_fds) {
     fds[count++] = (struct pollfd){.fd = host->ifmon_pipe[0], .events = POLLIN};
   }

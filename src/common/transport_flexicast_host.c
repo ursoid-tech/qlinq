@@ -1,5 +1,6 @@
 /* native multicast I/O is composed only into the polling host */
 #include "transport_poll_host.h"
+#include "transport_amt_host.h"
 #include "transport_flexicast.h"
 #include "portable_sockets.h"
 #ifndef _WIN32
@@ -254,4 +255,9 @@ const transport_flexicast_io_t transport_poll_flexicast_io = {
     .open = open_receive_socket,
     .membership = change_source_group,
     .close = close_multicast,
-    .receive = receive_native};
+    .receive = receive_native,
+    .tunnel_join = transport_amt_host_join,
+    .tunnel_leave = transport_amt_host_leave,
+    .tunnel_ready = transport_amt_host_ready,
+    .tunnel_timeout = transport_amt_host_timeout,
+    .tunnel_memberships = transport_amt_host_memberships};
