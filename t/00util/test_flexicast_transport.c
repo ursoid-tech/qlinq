@@ -1,4 +1,7 @@
+#include "picotls/openssl.h"
 #include "portable_sockets.h"
+#include "quicly/defaults.h"
+#include "quicly/flexicast.h"
 #include "transport.h"
 #include "transport_internal.h"
 
@@ -677,8 +680,147 @@ static ssize_t fail_ipv6_multicast_send(
       ecn, max_gso_segments, datagrams, count);
 }
 
+static int run_untracked_send(void) {
+  uint8_t secret[PTLS_MAX_DIGEST_SIZE];
+  uint8_t flow_id_bytes[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+  const uint8_t payload[] = "silent-multicast-payload";
+  uint8_t packet[256], copy_a[256], copy_b[256];
+  size_t packet_size = 0;
+  uint64_t pn = 0, rx_pn = 0;
+  ptls_iovec_t received = {0};
+
+  memset(secret, 0x5a, sizeof(secret));
+  size_t secret_len = ptls_openssl_aes128gcmsha256.hash->digest_size;
+
+  /* default flow still rejects zero-member sends */
+  quicly_flexicast_config_t base_cfg = {
+      .flow_id =
+          quicly_flexicast_flow_id_init(flow_id_bytes, sizeof(flow_id_bytes)),
+      .first_packet_number = 0,
+      .cipher_suite = &ptls_openssl_aes128gcmsha256,
+      .crypto_engine = &quicly_default_crypto_engine,
+      .traffic_secret = ptls_iovec_init(secret, secret_len),
+  };
+  quicly_flexicast_flow_t *strict_sender = NULL;
+  if (quicly_flexicast_flow_create(&strict_sender, &base_cfg) !=
+          QUICLY_FLEXICAST_OK ||
+      quicly_flexicast_send_datagram(strict_sender,
+                                     ptls_iovec_init(payload, sizeof(payload)),
+                                     packet, sizeof(packet), &packet_size, &pn,
+                                     0) != QUICLY_FLEXICAST_ERROR_NO_MEMBERS) {
+    fprintf(stderr, "strict zero-member send was not rejected\n");
+    quicly_flexicast_flow_free(strict_sender);
+    return 1;
+  }
+  quicly_flexicast_flow_free(strict_sender);
+
+  /* untracked sender sends past QUICLY_FLEXICAST_SENT_WINDOW with no receivers
+   */
+  quicly_flexicast_config_t sender_cfg = base_cfg;
+  sender_cfg.allow_untracked_send = 1;
+  sender_cfg.max_packets_per_key = QUICLY_FLEXICAST_SENT_WINDOW + 132U;
+  quicly_flexicast_flow_t *sender = NULL;
+  if (quicly_flexicast_flow_create(&sender, &sender_cfg) !=
+      QUICLY_FLEXICAST_OK) {
+    fprintf(stderr, "failed to create untracked flexicast sender\n");
+    return 1;
+  }
+  if (quicly_flexicast_num_members(sender) != 0 ||
+      quicly_flexicast_flow_has_sender_state(sender)) {
+    fprintf(stderr, "unexpected sender tracking state\n");
+    quicly_flexicast_flow_free(sender);
+    return 1;
+  }
+  for (size_t i = 0; i < QUICLY_FLEXICAST_SENT_WINDOW + 128U; i++) {
+    int ret = quicly_flexicast_send_datagram(
+        sender, ptls_iovec_init(payload, sizeof(payload)), packet,
+        sizeof(packet), &packet_size, &pn, (int64_t)i);
+    if (ret != QUICLY_FLEXICAST_OK || pn != i) {
+      fprintf(stderr, "untracked send failed at %zu (ret=%d pn=%" PRIu64 ")\n",
+              i, ret, pn);
+      quicly_flexicast_flow_free(sender);
+      return 1;
+    }
+  }
+  if (quicly_flexicast_flow_has_sender_state(sender)) {
+    fprintf(stderr, "untracked send allocated ACK tracking state\n");
+    quicly_flexicast_flow_free(sender);
+    return 1;
+  }
+
+  /* two receivers join late after sender already passed SENT_WINDOW */
+  quicly_flexicast_flow_t *rx_a = NULL, *rx_b = NULL;
+  if (quicly_flexicast_flow_create(&rx_a, &base_cfg) != QUICLY_FLEXICAST_OK ||
+      quicly_flexicast_flow_create(&rx_b, &base_cfg) != QUICLY_FLEXICAST_OK) {
+    fprintf(stderr, "failed to create late silent receivers\n");
+    quicly_flexicast_flow_free(rx_a);
+    quicly_flexicast_flow_free(rx_b);
+    quicly_flexicast_flow_free(sender);
+    return 1;
+  }
+  for (size_t i = 0; i < 4U; i++) {
+    int ret = quicly_flexicast_send_datagram(
+        sender, ptls_iovec_init(payload, sizeof(payload)), packet,
+        sizeof(packet), &packet_size, &pn,
+        (int64_t)(QUICLY_FLEXICAST_SENT_WINDOW + 128U + i));
+    if (ret != QUICLY_FLEXICAST_OK) {
+      fprintf(stderr, "post-window send failed at %zu (ret=%d)\n", i, ret);
+      goto Fail;
+    }
+    memcpy(copy_a, packet, packet_size);
+    memcpy(copy_b, packet, packet_size);
+    if (quicly_flexicast_receive_datagram(rx_a, copy_a, packet_size, &received,
+                                          &rx_pn, 0,
+                                          0) != QUICLY_FLEXICAST_OK ||
+        rx_pn != pn || received.len != sizeof(payload) ||
+        memcmp(received.base, payload, sizeof(payload)) != 0) {
+      fprintf(stderr, "receiver a failed at pn=%" PRIu64 "\n", pn);
+      goto Fail;
+    }
+    if (quicly_flexicast_receive_datagram(rx_b, copy_b, packet_size, &received,
+                                          &rx_pn, 0,
+                                          0) != QUICLY_FLEXICAST_OK ||
+        rx_pn != pn || received.len != sizeof(payload) ||
+        memcmp(received.base, payload, sizeof(payload)) != 0) {
+      fprintf(stderr, "receiver b failed at pn=%" PRIu64 "\n", pn);
+      goto Fail;
+    }
+    /* replay is still rejected */
+    memcpy(copy_a, packet, packet_size);
+    if (quicly_flexicast_receive_datagram(rx_a, copy_a, packet_size, &received,
+                                          &rx_pn, 0,
+                                          0) != QUICLY_FLEXICAST_ERROR_REPLAY) {
+      fprintf(stderr, "replay was not rejected at pn=%" PRIu64 "\n", pn);
+      goto Fail;
+    }
+  }
+
+  /* crypto key packet limit is still enforced */
+  if (quicly_flexicast_send_datagram(
+          sender, ptls_iovec_init(payload, sizeof(payload)), packet,
+          sizeof(packet), &packet_size, &pn,
+          0) != QUICLY_FLEXICAST_ERROR_KEY_UPDATE_REQUIRED) {
+    fprintf(stderr, "max_packets_per_key limit was not enforced\n");
+    goto Fail;
+  }
+
+  printf("===FLEXICAST UNTRACKED OK===\n");
+  quicly_flexicast_flow_free(rx_b);
+  quicly_flexicast_flow_free(rx_a);
+  quicly_flexicast_flow_free(sender);
+  return 0;
+
+Fail:
+  quicly_flexicast_flow_free(rx_b);
+  quicly_flexicast_flow_free(rx_a);
+  quicly_flexicast_flow_free(sender);
+  return 1;
+}
+
 int main(int argc, char **argv) {
   const char *mode = argc == 2 ? argv[1] : NULL;
+  if (argc == 2 && strcmp(mode, "--untracked") == 0)
+    return run_untracked_send();
   if (argc == 2 && strcmp(mode, "--membership") == 0)
     return run_membership_lifecycle(false);
   if (argc == 2 && strcmp(mode, "--membership6") == 0)

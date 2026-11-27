@@ -6,7 +6,8 @@ use t::Util;
 for my $mode ('--base', '--native', '--native6', '--native6-fallback',
               '--mixed-retry', '--join-fallback',
               '--ack-fallback', '--pacing', '--control-flood',
-              '--membership', '--membership6', '--unsubscribe', '--unsubscribe6') {
+              '--membership', '--membership6', '--unsubscribe', '--unsubscribe6',
+              '--untracked') {
     subtest "Flexicast $mode" => sub {
         my ($stderr, $stdout) = run_prog("./t/00util/test_flexicast_transport $mode");
         if ($mode eq '--native6' && $stdout =~ /^SKIP (.+)$/m) {
