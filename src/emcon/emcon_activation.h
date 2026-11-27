@@ -6,19 +6,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-typedef struct qlinq_emcon_activation_t qlinq_emcon_activation_t;
+#define QLINQ_EMCON_ACTIVATION_SLOT_SIZE 88U
 
-typedef enum {
-  QLINQ_EMCON_ACTIVATION_OK = 0,
-  QLINQ_EMCON_ACTIVATION_INVALID = -1,
-  QLINQ_EMCON_ACTIVATION_IO = -2,
-  QLINQ_EMCON_ACTIVATION_LOCKED = -3,
-  QLINQ_EMCON_ACTIVATION_CORRUPT = -4,
-  QLINQ_EMCON_ACTIVATION_IDENTITY_MISMATCH = -5,
-  QLINQ_EMCON_ACTIVATION_EXHAUSTED = -6,
-  QLINQ_EMCON_ACTIVATION_REUSED = -7,
-  QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH = -8
-} qlinq_emcon_activation_result_t;
+typedef struct qlinq_emcon_activation_t qlinq_emcon_activation_t;
 
 typedef struct {
   uint8_t alias;

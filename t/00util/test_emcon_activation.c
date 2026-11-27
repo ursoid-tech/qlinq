@@ -20,7 +20,7 @@
     }                                                                          \
   } while (0)
 
-enum { SLOT_SIZE = 160 };
+enum { SLOT_SIZE = QLINQ_EMCON_ACTIVATION_SLOT_SIZE };
 
 #ifdef __linux__
 enum { EXIT_BEFORE_DIRECTORY_SYNC = 77 };
@@ -48,13 +48,10 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
   qlinq_emcon_manifest_t manifest = {
       .flow_id = 1200,
       .key_epoch = 4,
-      .cipher_suite = QLINQ_EMCON_CIPHER_AES_128_GCM_SHA256,
-      .initial_packet_number = 100,
       .valid_from_ms = 1000,
       .expires_at_ms = 9000,
       .source = {.family = 4, .port = 15000},
       .destination = {.family = 4, .port = 15001},
-      .replay_window_packets = QLINQ_EMCON_REPLAY_WINDOW_PACKETS,
       .rate_bytes_per_second = 1000000,
       .burst_bytes = 2048,
       .terminal_repeat_count = 2,
@@ -62,14 +59,11 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
       .repair_symbols = 4,
       .stream_count = 1,
   };
-  memset(manifest.session_id, 0x21, sizeof(manifest.session_id));
-  memset(manifest.sender_id, 0x32, sizeof(manifest.sender_id));
   inet_pton(AF_INET, "192.0.2.10", manifest.source.address);
   inet_pton(AF_INET, "192.0.2.11", manifest.destination.address);
   qlinq_emcon_traffic_key_id(secret, 32, manifest.traffic_key_id);
   manifest.streams[0] = (qlinq_emcon_manifest_stream_t){
       .alias = 8,
-      .delivery = QLINQ_EMCON_DELIVERY_RATELESS,
       .maximum_record_size = 4096,
   };
   memcpy(manifest.streams[0].name, "activation-test",
@@ -123,8 +117,8 @@ static int test_interrupted_creation(const char *directory,
     qlinq_emcon_activation_t *activation = NULL;
     uint64_t start, limit;
     exit_before_directory_sync = true;
-    if (qlinq_emcon_activation_open_managed(
-            &activation, directory, &manifest) == QLINQ_EMCON_ACTIVATION_OK)
+    if (qlinq_emcon_activation_open_managed(&activation, directory,
+                                            &manifest) == QLINQ_EMCON_OK)
       qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit);
     _exit(1);
   }
@@ -134,24 +128,24 @@ static int test_interrupted_creation(const char *directory,
         "exit after writing the first slot but before syncing its directory");
 
   qlinq_emcon_activation_t *activation = NULL;
-  CHECK(qlinq_emcon_activation_open_managed(
-            &activation, directory, &manifest) == QLINQ_EMCON_ACTIVATION_OK,
+  CHECK(qlinq_emcon_activation_open_managed(&activation, directory,
+                                            &manifest) == QLINQ_EMCON_OK,
         "recover a valid first slot after the interruption");
   uint64_t start = 0, limit = 0;
   directory_sync_calls = 0;
   fail_directory_sync = true;
   CHECK(qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_IO &&
+                QLINQ_EMCON_ERR_IO &&
             start == 0 && limit == 0 && directory_sync_calls == 1,
         "require parent sync before returning a usable range after reopen");
   fail_directory_sync = false;
   CHECK(qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == 108 && limit == 116 && directory_sync_calls == 2,
+                QLINQ_EMCON_OK &&
+            start == 8 && limit == 16 && directory_sync_calls == 2,
         "retry parent sync and skip the interrupted sender's range");
   CHECK(qlinq_emcon_activation_reserve(activation, 8, 8, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == 116 && limit == 124 && directory_sync_calls == 2,
+                QLINQ_EMCON_OK &&
+            start == 16 && limit == 24 && directory_sync_calls == 2,
         "sync the directory once per activation");
   qlinq_emcon_activation_close(activation);
   return 0;
@@ -174,25 +168,25 @@ int main(void) {
 
   qlinq_emcon_activation_t *first = NULL, *concurrent = NULL;
   CHECK(qlinq_emcon_activation_open_managed(&first, directory, &manifest) ==
-            QLINQ_EMCON_ACTIVATION_OK,
+            QLINQ_EMCON_OK,
         "open new activation");
   uint64_t start, limit;
   CHECK(qlinq_emcon_activation_reserve(first, 8, 8, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == 100 && limit == 108,
+                QLINQ_EMCON_OK &&
+            start == 0 && limit == 8,
         "reserve initial durable range");
   CHECK(qlinq_emcon_activation_open_managed(
-            &concurrent, directory, &manifest) == QLINQ_EMCON_ACTIVATION_LOCKED,
+            &concurrent, directory, &manifest) == QLINQ_EMCON_ERR_LOCKED,
         "reject concurrent activation");
   qlinq_emcon_activation_close(first);
 
   qlinq_emcon_activation_t *restarted = NULL;
   CHECK(qlinq_emcon_activation_open_managed(&restarted, directory, &manifest) ==
-            QLINQ_EMCON_ACTIVATION_OK,
+            QLINQ_EMCON_OK,
         "reopen activation after restart");
   CHECK(qlinq_emcon_activation_reserve(restarted, 8, 8, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == 108 && limit == 116,
+                QLINQ_EMCON_OK &&
+            start == 8 && limit == 16,
         "restart skips previously reserved range");
   qlinq_emcon_activation_close(restarted);
 
@@ -201,13 +195,11 @@ int main(void) {
   if (child == 0) {
     qlinq_emcon_activation_t *crashing = NULL;
     uint64_t child_start, child_limit;
-    int ok =
-        qlinq_emcon_activation_open_managed(&crashing, directory, &manifest) ==
-            QLINQ_EMCON_ACTIVATION_OK &&
-        qlinq_emcon_activation_reserve(crashing, 8, 8, &child_start,
-                                       &child_limit) ==
-            QLINQ_EMCON_ACTIVATION_OK &&
-        child_start == 116 && child_limit == 124;
+    int ok = qlinq_emcon_activation_open_managed(&crashing, directory,
+                                                 &manifest) == QLINQ_EMCON_OK &&
+             qlinq_emcon_activation_reserve(crashing, 8, 8, &child_start,
+                                            &child_limit) == QLINQ_EMCON_OK &&
+             child_start == 16 && child_limit == 24;
     _exit(ok ? 0 : 1);
   }
   int child_status;
@@ -215,63 +207,60 @@ int main(void) {
             WEXITSTATUS(child_status) == 0,
         "child reserves range before abrupt exit");
   qlinq_emcon_activation_t *after_crash = NULL;
-  CHECK(qlinq_emcon_activation_open_managed(
-            &after_crash, directory, &manifest) == QLINQ_EMCON_ACTIVATION_OK,
+  CHECK(qlinq_emcon_activation_open_managed(&after_crash, directory,
+                                            &manifest) == QLINQ_EMCON_OK,
         "release activation lock on process exit");
   CHECK(qlinq_emcon_activation_reserve(after_crash, 8, 8, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == 124 && limit == 132,
+                QLINQ_EMCON_OK &&
+            start == 24 && limit == 32,
         "crash restart skips child reservation");
   qlinq_emcon_activation_close(after_crash);
 
   qlinq_emcon_activation_t *managed = NULL;
   qlinq_emcon_manifest_t same_domain = manifest;
   same_domain.destination.port++;
-  CHECK(
-      qlinq_emcon_activation_open_managed(&managed, directory, &same_domain) ==
-          QLINQ_EMCON_ACTIVATION_IDENTITY_MISMATCH,
-      "alternate manifest cannot bypass nonce-domain state");
+  CHECK(qlinq_emcon_activation_open_managed(
+            &managed, directory, &same_domain) == QLINQ_EMCON_ERR_ACTIVATION,
+        "alternate manifest cannot bypass nonce-domain state");
   struct stat claim_info;
   char claim_path[512];
   CHECK(qlinq_emcon_receiver_activation_claim(directory, &manifest) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+                QLINQ_EMCON_OK &&
             find_prefixed_file(directory, "receiver-", claim_path,
                                sizeof(claim_path)) &&
             stat(claim_path, &claim_info) == 0 && claim_info.st_size == 0 &&
             (claim_info.st_mode & 0777) == 0600 &&
             qlinq_emcon_receiver_activation_claim(directory, &manifest) ==
-                QLINQ_EMCON_ACTIVATION_REUSED &&
+                QLINQ_EMCON_ERR_REUSED &&
             qlinq_emcon_receiver_activation_claim(directory, &same_domain) ==
-                QLINQ_EMCON_ACTIVATION_REUSED,
+                QLINQ_EMCON_ERR_REUSED,
         "receiver key epoch is claimed once via an empty protected marker");
 
   qlinq_emcon_manifest_t next_epoch = manifest;
   next_epoch.key_epoch++;
   CHECK(qlinq_emcon_activation_open_managed(&managed, directory, &next_epoch) ==
-            QLINQ_EMCON_ACTIVATION_OK,
+            QLINQ_EMCON_OK,
         "fresh epoch receives distinct sender state");
   qlinq_emcon_activation_close(managed);
   CHECK(qlinq_emcon_receiver_activation_claim(directory, &next_epoch) ==
-            QLINQ_EMCON_ACTIVATION_OK,
+            QLINQ_EMCON_OK,
         "fresh epoch receives distinct receiver claim");
   CHECK(chmod(directory, 0755) == 0 &&
-            qlinq_emcon_activation_open_managed(&managed, directory,
-                                                &next_epoch) ==
-                QLINQ_EMCON_ACTIVATION_IO &&
+            qlinq_emcon_activation_open_managed(
+                &managed, directory, &next_epoch) == QLINQ_EMCON_ERR_IO &&
             chmod(directory, 0700) == 0,
         "reject exposed state directory");
   CHECK(symlink(directory, directory_link) == 0 &&
-            qlinq_emcon_activation_open_managed(&managed, directory_link,
-                                                &next_epoch) ==
-                QLINQ_EMCON_ACTIVATION_IO,
+            qlinq_emcon_activation_open_managed(
+                &managed, directory_link, &next_epoch) == QLINQ_EMCON_ERR_IO,
         "reject state-directory symlink");
 
   qlinq_emcon_activation_t *corrupt = NULL;
   CHECK(qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir, &manifest) ==
-            QLINQ_EMCON_ACTIVATION_OK,
+            QLINQ_EMCON_OK,
         "open corruption fixture");
   CHECK(qlinq_emcon_activation_reserve(corrupt, 4, 4, &start, &limit) ==
-            QLINQ_EMCON_ACTIVATION_OK,
+            QLINQ_EMCON_OK,
         "write corruption fixture");
   qlinq_emcon_activation_close(corrupt);
   CHECK(find_prefixed_file(corrupt_dir, "sender-", state_path,
@@ -279,9 +268,8 @@ int main(void) {
         "locate canonical sender state file");
 
   CHECK(chmod(state_path, 0644) == 0 &&
-            qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir,
-                                                &manifest) ==
-                QLINQ_EMCON_ACTIVATION_IO &&
+            qlinq_emcon_activation_open_managed(
+                &corrupt, corrupt_dir, &manifest) == QLINQ_EMCON_ERR_IO &&
             chmod(state_path, 0600) == 0,
         "reject exposed state file");
 
@@ -291,46 +279,43 @@ int main(void) {
             fsync(corrupt_fd) == 0 && close(corrupt_fd) == 0,
         "damage activation checksum");
   CHECK(qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir, &manifest) ==
-            QLINQ_EMCON_ACTIVATION_CORRUPT,
+            QLINQ_EMCON_ERR_ACTIVATION,
         "corrupt state fails closed");
 
   CHECK(unlink(state_path) == 0 &&
-            qlinq_emcon_activation_open_managed(
-                &corrupt, corrupt_dir, &manifest) == QLINQ_EMCON_ACTIVATION_OK,
+            qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir,
+                                                &manifest) == QLINQ_EMCON_OK,
         "create empty activation for retry");
   qlinq_emcon_activation_close(corrupt);
   CHECK(qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir, &manifest) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+                QLINQ_EMCON_OK &&
             qlinq_emcon_activation_reserve(corrupt, 4, 4, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == 100,
+                QLINQ_EMCON_OK &&
+            start == 0,
         "reopen an empty activation after aborting before reservation");
   qlinq_emcon_activation_close(corrupt);
   CHECK(truncate(state_path, SLOT_SIZE + 1) == 0 &&
-            qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir,
-                                                &manifest) ==
-                QLINQ_EMCON_ACTIVATION_CORRUPT,
+            qlinq_emcon_activation_open_managed(
+                &corrupt, corrupt_dir, &manifest) == QLINQ_EMCON_ERR_ACTIVATION,
         "reject a partial second slot even when it is zero");
   CHECK(truncate(state_path, 2 * SLOT_SIZE) == 0 &&
-            qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir,
-                                                &manifest) ==
-                QLINQ_EMCON_ACTIVATION_CORRUPT,
+            qlinq_emcon_activation_open_managed(
+                &corrupt, corrupt_dir, &manifest) == QLINQ_EMCON_ERR_ACTIVATION,
         "reject a zeroed second slot even with a valid first slot");
   CHECK(truncate(state_path, 0) == 0 && truncate(state_path, SLOT_SIZE) == 0 &&
             qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir,
                                                 &manifest) ==
-                QLINQ_EMCON_ACTIVATION_CORRUPT &&
+                QLINQ_EMCON_ERR_ACTIVATION &&
             truncate(state_path, 2 * SLOT_SIZE) == 0 &&
-            qlinq_emcon_activation_open_managed(&corrupt, corrupt_dir,
-                                                &manifest) ==
-                QLINQ_EMCON_ACTIVATION_CORRUPT,
+            qlinq_emcon_activation_open_managed(
+                &corrupt, corrupt_dir, &manifest) == QLINQ_EMCON_ERR_ACTIVATION,
         "reject zeroed journals of either persisted size");
 
   int target_fd = open(target_path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
   CHECK(target_fd >= 0 && close(target_fd) == 0 && unlink(state_path) == 0 &&
             symlink(target_path, state_path) == 0 &&
             qlinq_emcon_activation_open_managed(
-                &corrupt, corrupt_dir, &manifest) == QLINQ_EMCON_ACTIVATION_IO,
+                &corrupt, corrupt_dir, &manifest) == QLINQ_EMCON_ERR_IO,
         "reject state-file symlink");
 #ifdef __linux__
   CHECK(test_interrupted_creation(directory, manifest) == 0,
@@ -340,72 +325,31 @@ int main(void) {
   qlinq_emcon_manifest_t budget_manifest = manifest;
   budget_manifest.key_epoch = 30;
   qlinq_emcon_activation_t *budget = NULL;
-  CHECK(qlinq_emcon_activation_open_managed(
-            &budget, directory, &budget_manifest) == QLINQ_EMCON_ACTIVATION_OK,
+  CHECK(qlinq_emcon_activation_open_managed(&budget, directory,
+                                            &budget_manifest) == QLINQ_EMCON_OK,
         "open key budget fixture");
-  uint64_t key_limit =
-      budget_manifest.initial_packet_number + QLINQ_EMCON_MAX_PACKETS_PER_KEY;
-  CHECK(qlinq_emcon_activation_reserve(
-            budget, 1, QLINQ_EMCON_MAX_PACKETS_PER_KEY - 3, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+  uint64_t key_limit = QLINQ_EMCON_MAX_PACKETS_PER_KEY;
+  CHECK(qlinq_emcon_activation_reserve(budget, 1,
+                                       QLINQ_EMCON_MAX_PACKETS_PER_KEY - 3,
+                                       &start, &limit) == QLINQ_EMCON_OK &&
             limit == key_limit - 3,
         "charge all reserved numbers to the key budget");
   qlinq_emcon_activation_close(budget);
-  CHECK(qlinq_emcon_activation_open_managed(
-            &budget, directory, &budget_manifest) == QLINQ_EMCON_ACTIVATION_OK,
+  CHECK(qlinq_emcon_activation_open_managed(&budget, directory,
+                                            &budget_manifest) == QLINQ_EMCON_OK,
         "reopen key budget fixture");
   CHECK(qlinq_emcon_activation_reserve(budget, 4, 65536, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_EXHAUSTED &&
+                QLINQ_EMCON_ERR_EXHAUSTED &&
             qlinq_emcon_activation_reserve(budget, 1, 65536, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+                QLINQ_EMCON_OK &&
             start == key_limit - 3 && limit == key_limit,
         "reserve a final partial block after restart");
   qlinq_emcon_activation_close(budget);
-  CHECK(qlinq_emcon_activation_open_managed(&budget, directory,
-                                            &budget_manifest) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+  CHECK(qlinq_emcon_activation_open_managed(
+            &budget, directory, &budget_manifest) == QLINQ_EMCON_OK &&
             qlinq_emcon_activation_reserve(budget, 1, 1, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_EXHAUSTED,
+                QLINQ_EMCON_ERR_EXHAUSTED,
         "restarting an exhausted key fails closed");
-  qlinq_emcon_activation_close(budget);
-
-  const uint64_t rollover = UINT64_C(1) << 32;
-  qlinq_emcon_manifest_t rollover_manifest = manifest;
-  rollover_manifest.key_epoch = 31;
-  rollover_manifest.initial_packet_number = rollover - 3;
-  CHECK(qlinq_emcon_activation_open_managed(&budget, directory,
-                                            &rollover_manifest) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            qlinq_emcon_activation_reserve(budget, 4, 4, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == rollover - 3 && limit == rollover + 1,
-        "reserve a durable range spanning 32-bit rollover");
-  qlinq_emcon_activation_close(budget);
-  CHECK(qlinq_emcon_activation_open_managed(&budget, directory,
-                                            &rollover_manifest) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            qlinq_emcon_activation_reserve(budget, 1, 1, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == rollover + 1 && limit == rollover + 2,
-        "restart from a persisted range above 32 bits");
-  qlinq_emcon_activation_close(budget);
-
-  const uint64_t quic_limit = UINT64_C(1) << 62;
-  qlinq_emcon_manifest_t near_ceiling = manifest;
-  near_ceiling.key_epoch = 32;
-  near_ceiling.initial_packet_number = quic_limit - 3;
-  CHECK(qlinq_emcon_activation_open_managed(
-            &budget, directory, &near_ceiling) == QLINQ_EMCON_ACTIVATION_OK &&
-            qlinq_emcon_activation_reserve(budget, 1, 65536, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
-            start == near_ceiling.initial_packet_number && limit == quic_limit,
-        "clip durable reservations to the QUIC packet-number ceiling");
-  qlinq_emcon_activation_close(budget);
-  CHECK(qlinq_emcon_activation_open_managed(
-            &budget, directory, &near_ceiling) == QLINQ_EMCON_ACTIVATION_OK &&
-            qlinq_emcon_activation_reserve(budget, 1, 1, &start, &limit) ==
-                QLINQ_EMCON_ACTIVATION_EXHAUSTED,
-        "reopen a journal exhausted at the QUIC packet-number ceiling");
   qlinq_emcon_activation_close(budget);
 
   qlinq_emcon_manifest_t transfer_manifest = manifest;
@@ -419,22 +363,20 @@ int main(void) {
       .resumable = true,
   };
   memset(bound.input_digest, 0xa5, sizeof(bound.input_digest));
-  CHECK(qlinq_emcon_activation_open_managed(&transfer_act, directory,
-                                            &transfer_manifest) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+  CHECK(qlinq_emcon_activation_open_managed(
+            &transfer_act, directory, &transfer_manifest) == QLINQ_EMCON_OK &&
             qlinq_emcon_activation_check_transfer(transfer_act, &bound) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+                QLINQ_EMCON_OK &&
             qlinq_emcon_activation_bind_transfer(transfer_act, &bound) ==
-                QLINQ_EMCON_ACTIVATION_OK,
+                QLINQ_EMCON_OK,
         "bind group transfer to input identity and block size");
   qlinq_emcon_activation_close(transfer_act);
-  CHECK(qlinq_emcon_activation_open_managed(&transfer_act, directory,
-                                            &transfer_manifest) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+  CHECK(qlinq_emcon_activation_open_managed(
+            &transfer_act, directory, &transfer_manifest) == QLINQ_EMCON_OK &&
             qlinq_emcon_activation_check_transfer(transfer_act, &bound) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+                QLINQ_EMCON_OK &&
             qlinq_emcon_activation_bind_transfer(transfer_act, &bound) ==
-                QLINQ_EMCON_ACTIVATION_OK,
+                QLINQ_EMCON_OK,
         "matching input identity and block size may resume group");
   qlinq_emcon_transfer_t wrong_block = bound;
   wrong_block.block_size = 4096;
@@ -444,22 +386,22 @@ int main(void) {
   wrong_size.input_size = 8192;
   CHECK(
       qlinq_emcon_activation_check_transfer(transfer_act, &wrong_block) ==
-              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+              QLINQ_EMCON_ERR_TRANSFER_MISMATCH &&
           qlinq_emcon_activation_bind_transfer(transfer_act, &wrong_block) ==
-              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+              QLINQ_EMCON_ERR_TRANSFER_MISMATCH &&
           qlinq_emcon_activation_check_transfer(transfer_act, &wrong_digest) ==
-              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+              QLINQ_EMCON_ERR_TRANSFER_MISMATCH &&
           qlinq_emcon_activation_check_transfer(transfer_act, &wrong_size) ==
-              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH,
+              QLINQ_EMCON_ERR_TRANSFER_MISMATCH,
       "reject group reuse with altered block size or input");
   qlinq_emcon_transfer_t stream_only = {
       .alias = 8, .group_id = 8, .block_size = 4096, .resumable = false};
   CHECK(qlinq_emcon_activation_bind_transfer(transfer_act, &stream_only) ==
-                QLINQ_EMCON_ACTIVATION_OK &&
+                QLINQ_EMCON_OK &&
             qlinq_emcon_activation_check_transfer(transfer_act, &stream_only) ==
-                QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+                QLINQ_EMCON_ERR_TRANSFER_MISMATCH &&
             qlinq_emcon_activation_bind_transfer(transfer_act, &stream_only) ==
-                QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH,
+                QLINQ_EMCON_ERR_TRANSFER_MISMATCH,
         "non-seekable stream group cannot be reused");
   qlinq_emcon_activation_close(transfer_act);
 

@@ -1,6 +1,7 @@
 #include "cli_parse.h"
 #include "transport.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,25 +62,32 @@ bool cli_parse_congestion_control(const char *text,
   return true;
 }
 
-bool cli_parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
+bool cli_parse_u64_base(const char *text, uint64_t maximum, int base,
+                        uint64_t *value) {
   char *end = NULL;
   if (!text || !text[0] || text[0] < '0' || text[0] > '9' || !value)
     return false;
   errno = 0;
-  unsigned long long parsed = strtoull(text, &end, 10);
+  unsigned long long parsed = strtoull(text, &end, base);
   if (errno != 0 || !end || *end != '\0' || parsed > maximum)
     return false;
   *value = (uint64_t)parsed;
   return true;
 }
 
-bool cli_parse_endpoint(const char *text, char *host, size_t host_capacity,
-                        uint16_t *port, bool *has_port) {
-  if (!text || !text[0] || !host || host_capacity == 0 || !port)
+bool cli_parse_u64(const char *text, uint64_t maximum, uint64_t *value) {
+  return cli_parse_u64_base(text, maximum, 10, value);
+}
+
+static bool split_endpoint_host_port(const char *text, char *host,
+                                     size_t host_capacity,
+                                     const char **port_out, bool *bracketed) {
+  if (!text || !text[0] || !host || host_capacity == 0)
     return false;
-  const char *start = text;
-  const char *port_text = NULL;
+  const char *start = text, *port_text = NULL;
   size_t host_size = strlen(text);
+  if (bracketed)
+    *bracketed = text[0] == '[';
   if (text[0] == '[') {
     const char *closing = strchr(text + 1, ']');
     if (!closing || (closing[1] != '\0' && closing[1] != ':'))
@@ -97,6 +105,18 @@ bool cli_parse_endpoint(const char *text, char *host, size_t host_capacity,
   }
   if (host_size == 0 || host_size >= host_capacity)
     return false;
+  memcpy(host, start, host_size);
+  host[host_size] = '\0';
+  *port_out = port_text;
+  return true;
+}
+
+bool cli_parse_endpoint(const char *text, char *host, size_t host_capacity,
+                        uint16_t *port, bool *has_port) {
+  const char *port_text = NULL;
+  if (!port ||
+      !split_endpoint_host_port(text, host, host_capacity, &port_text, NULL))
+    return false;
   if (has_port)
     *has_port = port_text != NULL;
   if (port_text) {
@@ -105,7 +125,26 @@ bool cli_parse_endpoint(const char *text, char *host, size_t host_capacity,
       return false;
     *port = (uint16_t)parsed;
   }
-  memcpy(host, start, host_size);
-  host[host_size] = '\0';
+  return true;
+}
+
+bool cli_parse_ip_endpoint(const char *text, int port_base, uint8_t *family,
+                           uint8_t address[16], uint16_t *port) {
+  char host[INET6_ADDRSTRLEN];
+  const char *port_text = NULL;
+  bool bracketed = false;
+  uint64_t parsed_port = 0;
+  if (!family || !address || !port ||
+      !split_endpoint_host_port(text, host, sizeof(host), &port_text,
+                                &bracketed) ||
+      !port_text ||
+      !cli_parse_u64_base(port_text, UINT16_MAX, port_base, &parsed_port) ||
+      parsed_port == 0)
+    return false;
+  memset(address, 0, 16);
+  if (inet_pton(bracketed ? AF_INET6 : AF_INET, host, address) != 1)
+    return false;
+  *family = bracketed ? 6U : 4U;
+  *port = (uint16_t)parsed_port;
   return true;
 }

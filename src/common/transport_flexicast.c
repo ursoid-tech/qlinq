@@ -209,7 +209,7 @@ static void dispose_flow(transport_flexicast_flow_t *flow) {
   quicly_flexicast_flow_free(flow->crypto);
   quicly_flexicast_cc_free_multicast(flow->cc);
   free(flow->members);
-  free(flow->member_map);
+  flexicast_member_map_dispose(&flow->member_map);
   ptls_clear_memory(flow->secret, sizeof(flow->secret));
   memset(flow, 0, sizeof(*flow));
 }
@@ -621,119 +621,30 @@ join_announced_group(transport_t *t, transport_flexicast_flow_t *flow,
   return true;
 }
 
-#define FLEXICAST_MEMBER_MAP_EMPTY 0U
-#define FLEXICAST_MEMBER_MAP_OCCUPIED 1U
-
-static uintptr_t member_pointer_hash(const transport_conn_t *conn) {
-  uintptr_t value = (uintptr_t)conn;
-  value ^= value >> 17;
-  value *= (uintptr_t)UINT64_C(0xed5ad4bb);
-  return value ^ (value >> 11);
-}
-
 static bool member_table_init(transport_flexicast_flow_t *flow) {
   if (flow->members)
     return true;
   if (flow->member_capacity == 0 || flow->member_capacity > SIZE_MAX / 2U)
     return false;
-  size_t map_capacity = 2;
-  size_t required_capacity = flow->member_capacity * 2U;
-  while (map_capacity < required_capacity) {
-    if (map_capacity > SIZE_MAX / 2U)
-      return false;
-    map_capacity *= 2U;
-  }
   flow->members = calloc(flow->member_capacity, sizeof(*flow->members));
-  flow->member_map = calloc(map_capacity, sizeof(*flow->member_map));
-  if (!flow->members || !flow->member_map) {
+  if (!flow->members || flexicast_member_map_reserve(
+                            &flow->member_map, flow->member_capacity) != 0) {
     free(flow->members);
-    free(flow->member_map);
     flow->members = NULL;
-    flow->member_map = NULL;
+    flexicast_member_map_dispose(&flow->member_map);
     return false;
   }
-  flow->member_map_capacity = map_capacity;
   return true;
 }
 
 static bool member_map_find(const transport_flexicast_flow_t *flow,
                             const transport_conn_t *conn, size_t *slot) {
-  if (!flow->member_map)
+  int found =
+      flexicast_member_map_find(&flow->member_map, (uint64_t)(uintptr_t)conn);
+  if (found < 0)
     return false;
-  size_t index = member_pointer_hash(conn) & (flow->member_map_capacity - 1U);
-  for (size_t probe = 0; probe < flow->member_map_capacity; probe++) {
-    const transport_flexicast_member_map_entry_t *entry =
-        &flow->member_map[index];
-    if (entry->state == FLEXICAST_MEMBER_MAP_EMPTY)
-      return false;
-    if (entry->state == FLEXICAST_MEMBER_MAP_OCCUPIED && entry->conn == conn) {
-      *slot = entry->slot;
-      return true;
-    }
-    index = (index + 1U) & (flow->member_map_capacity - 1U);
-  }
-  return false;
-}
-
-static bool member_map_insert(transport_flexicast_flow_t *flow,
-                              const transport_conn_t *conn, size_t slot) {
-  size_t mask = flow->member_map_capacity - 1U;
-  size_t index = member_pointer_hash(conn) & mask;
-  for (size_t probe = 0; probe < flow->member_map_capacity; probe++) {
-    transport_flexicast_member_map_entry_t *entry = &flow->member_map[index];
-    if (entry->state == FLEXICAST_MEMBER_MAP_EMPTY) {
-      *entry = (transport_flexicast_member_map_entry_t){
-          .conn = conn, .slot = slot, .state = FLEXICAST_MEMBER_MAP_OCCUPIED};
-      return true;
-    }
-    if (entry->conn == conn)
-      return false;
-    index = (index + 1U) & mask;
-  }
-  return false;
-}
-
-static void member_map_remove(transport_flexicast_flow_t *flow,
-                              const transport_conn_t *conn) {
-  size_t mask = flow->member_map_capacity - 1U;
-  size_t hole = member_pointer_hash(conn) & mask;
-  for (size_t probe = 0; probe < flow->member_map_capacity; probe++) {
-    if (flow->member_map[hole].state == FLEXICAST_MEMBER_MAP_EMPTY)
-      return;
-    if (flow->member_map[hole].conn == conn) {
-      /* close probe chain without leaving tombstones */
-      size_t index = (hole + 1U) & mask;
-      for (size_t moved = 0; moved + 1U < flow->member_map_capacity; moved++) {
-        if (flow->member_map[index].state == FLEXICAST_MEMBER_MAP_EMPTY)
-          break;
-        size_t home = member_pointer_hash(flow->member_map[index].conn) & mask;
-        if (((hole - home) & mask) < ((index - home) & mask)) {
-          flow->member_map[hole] = flow->member_map[index];
-          hole = index;
-        }
-        index = (index + 1U) & mask;
-      }
-      flow->member_map[hole] = (transport_flexicast_member_map_entry_t){0};
-      return;
-    }
-    hole = (hole + 1U) & mask;
-  }
-}
-
-static void member_map_update(transport_flexicast_flow_t *flow,
-                              const transport_conn_t *conn, size_t slot) {
-  size_t mask = flow->member_map_capacity - 1U;
-  size_t index = member_pointer_hash(conn) & mask;
-  for (size_t probe = 0; probe < flow->member_map_capacity; probe++) {
-    transport_flexicast_member_map_entry_t *entry = &flow->member_map[index];
-    if (entry->state == FLEXICAST_MEMBER_MAP_EMPTY)
-      return;
-    if (entry->conn == conn) {
-      entry->slot = slot;
-      return;
-    }
-    index = (index + 1U) & mask;
-  }
+  *slot = (size_t)found;
+  return true;
 }
 
 static transport_flexicast_member_t *
@@ -750,9 +661,10 @@ member_add(transport_flexicast_flow_t *flow, transport_conn_t *conn) {
   if (member)
     return member;
   if (!flow || !conn || flow->member_count == flow->member_capacity ||
-      !member_table_init(flow) ||
-      !member_map_insert(flow, conn, flow->member_count))
+      !member_table_init(flow))
     return NULL;
+  flexicast_member_map_set(&flow->member_map, (uint64_t)(uintptr_t)conn,
+                           flow->member_count);
   member = &flow->members[flow->member_count++];
   member->conn = conn;
   return member;
@@ -905,10 +817,12 @@ static bool member_remove(transport_flexicast_flow_t *flow,
         flow->feedback_outstanding_count--;
     }
   }
-  member_map_remove(flow, member->conn);
+  flexicast_member_map_remove(&flow->member_map,
+                              (uint64_t)(uintptr_t)member->conn);
   if (slot != last) {
     flow->members[slot] = flow->members[last];
-    member_map_update(flow, flow->members[slot].conn, slot);
+    flexicast_member_map_set(
+        &flow->member_map, (uint64_t)(uintptr_t)flow->members[slot].conn, slot);
   }
   memset(&flow->members[last], 0, sizeof(flow->members[last]));
   flow->member_count--;

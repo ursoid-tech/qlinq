@@ -29,17 +29,19 @@ static int open_and_ingest_record(qlinq_emcon_ingress_t *ingress,
                                   qlinq_emcon_receiver_t *receiver,
                                   uint8_t *packet, size_t packet_size,
                                   qlinq_emcon_record_t *record) {
-  qlinq_emcon_message_t message;
+  ptls_iovec_t datagram;
+  uint64_t pn;
   qlinq_emcon_event_t event;
   memset(record, 0, sizeof(*record));
-  int ret = qlinq_emcon_flexicast_open(ingress, packet, packet_size, &message);
+  int ret =
+      qlinq_emcon_flexicast_open(ingress, packet, packet_size, &datagram, &pn);
   if (ret != QLINQ_EMCON_OK)
     return ret;
-  ret = qlinq_emcon_receiver_ingest_message(receiver, &message, &event);
+  ret = qlinq_emcon_receiver_ingest(receiver, pn, datagram, &event);
   if (ret != QLINQ_EMCON_OK)
     return ret;
   if (event.type != QLINQ_EMCON_EVENT_RECORD)
-    return QLINQ_EMCON_INVALID;
+    return QLINQ_EMCON_ERR_INVALID;
   *record = event.value.record;
   return QLINQ_EMCON_OK;
 }
@@ -58,13 +60,10 @@ static int ingest_symbol(qlinq_emcon_receiver_t *receiver, uint64_t pn,
                                     .original_size = 3};
   if (qlinq_wire_encode_fec_header(wire, sizeof(wire), &header) !=
       QLINQ_WIRE_OK)
-    return QLINQ_EMCON_INVALID;
+    return QLINQ_EMCON_ERR_INVALID;
   wire[QLINQ_WIRE_FEC_HEADER_SIZE] = (uint8_t)('A' + index);
-  qlinq_emcon_message_t message = {.type = QLINQ_EMCON_RECORD_DATA,
-                                   .packet_number = pn,
-                                   .payload =
-                                       ptls_iovec_init(wire, sizeof(wire))};
-  return qlinq_emcon_receiver_ingest_message(receiver, &message, event);
+  return qlinq_emcon_receiver_ingest(
+      receiver, pn, ptls_iovec_init(wire, sizeof(wire)), event);
 }
 
 static int test_partial_objects(void) {
@@ -109,7 +108,6 @@ static int test_partial_objects(void) {
         "deliver a complete record from the newer group");
   qlinq_emcon_event_release(&event);
 
-  /* enforce signed FEC geometry, v2 tail omission, tight k, and record cap */
   uint8_t bad_wire[QLINQ_WIRE_FEC_HEADER_SIZE + 1500] = {0};
   qlinq_wire_fec_header_t wrong_sym = {.alias = 7,
                                        .group_id = 9,
@@ -120,14 +118,11 @@ static int test_partial_objects(void) {
                                        .symbol_size = 64,
                                        .original_size = 64};
   CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire), &wrong_sym) ==
-            QLINQ_WIRE_OK,
-        "encode mismatched symbol_size fixture");
-  qlinq_emcon_message_t bad_msg = {
-      .type = QLINQ_EMCON_RECORD_DATA,
-      .packet_number = 498,
-      .payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64)};
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
-            QLINQ_EMCON_INVALID,
+                QLINQ_WIRE_OK &&
+            qlinq_emcon_receiver_ingest(
+                receiver, 498,
+                ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64),
+                &event) == QLINQ_EMCON_ERR_INVALID,
         "reject symbol_size exceeding manifest FEC geometry");
 
   qlinq_wire_fec_header_t wrong_repairs = {.alias = 7,
@@ -139,12 +134,11 @@ static int test_partial_objects(void) {
                                            .symbol_size = 1,
                                            .original_size = 1};
   CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire),
-                                     &wrong_repairs) == QLINQ_WIRE_OK,
-        "encode inflated repair count fixture");
-  bad_msg.packet_number = 499;
-  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 1);
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
-            QLINQ_EMCON_INVALID,
+                                     &wrong_repairs) == QLINQ_WIRE_OK &&
+            qlinq_emcon_receiver_ingest(
+                receiver, 499,
+                ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 1),
+                &event) == QLINQ_EMCON_ERR_INVALID,
         "reject repair_symbols exceeding manifest FEC geometry");
 
   qlinq_emcon_receiver_t *receiver64 =
@@ -165,12 +159,11 @@ static int test_partial_objects(void) {
                                          .symbol_size = 64,
                                          .original_size = 20};
   CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire),
-                                     &padded_tail) == QLINQ_WIRE_OK,
-        "encode padded-tail fixture");
-  bad_msg.packet_number = 500;
-  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64);
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver64, &bad_msg, &event) ==
-            QLINQ_EMCON_INVALID,
+                                     &padded_tail) == QLINQ_WIRE_OK &&
+            qlinq_emcon_receiver_ingest(
+                receiver64, 500,
+                ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64),
+                &event) == QLINQ_EMCON_ERR_INVALID,
         "reject zero-padded v2 final source symbol");
 
   qlinq_wire_fec_header_t loose_k = {.alias = 7,
@@ -182,11 +175,11 @@ static int test_partial_objects(void) {
                                      .symbol_size = 32,
                                      .original_size = 32};
   CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire), &loose_k) ==
-            QLINQ_WIRE_OK,
-        "encode non-minimal data_symbols fixture");
-  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 32);
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver32, &bad_msg, &event) ==
-            QLINQ_EMCON_INVALID,
+                QLINQ_WIRE_OK &&
+            qlinq_emcon_receiver_ingest(
+                receiver32, 501,
+                ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 32),
+                &event) == QLINQ_EMCON_ERR_INVALID,
         "reject empty trailing source symbols");
 
   qlinq_wire_fec_header_t oversize = {.alias = 7,
@@ -198,11 +191,11 @@ static int test_partial_objects(void) {
                                       .symbol_size = 65,
                                       .original_size = 65};
   CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire), &oversize) ==
-            QLINQ_WIRE_OK,
-        "encode oversize record fixture");
-  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 65);
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver65, &bad_msg, &event) ==
-            QLINQ_EMCON_INVALID,
+                QLINQ_WIRE_OK &&
+            qlinq_emcon_receiver_ingest(
+                receiver65, 502,
+                ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 65),
+                &event) == QLINQ_EMCON_ERR_INVALID,
         "reject object exceeding stream maximum_record_size");
 
   qlinq_emcon_receiver_free(receiver65);
@@ -231,144 +224,78 @@ static int test_receive_packet_hardening(void) {
   const uint8_t secret[32] = {0x49};
   const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x91};
   const uint8_t other_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x92};
-  const uint64_t start = 500;
-  qlinq_emcon_ingress_t *receiver = NULL, *other_receiver = NULL,
-                        *limited_receiver = NULL;
-  CHECK(qlinq_emcon_ingress_create(&receiver, 77, 1, digest, start, 0, secret,
-                                   sizeof(secret)) == QLINQ_EMCON_OK &&
-            qlinq_emcon_ingress_create(&other_receiver, 77, 1, other_digest,
-                                       start, 0, secret,
+  qlinq_emcon_sender_t *sender = NULL;
+  qlinq_emcon_ingress_t *other_rx = NULL, *limited_rx = NULL, *strict_rx = NULL;
+  CHECK(qlinq_emcon_sender_create(&sender, 77, 1, digest, 0, 64, 1, 64, secret,
+                                  sizeof(secret)) == QLINQ_EMCON_OK &&
+            qlinq_emcon_ingress_create(&other_rx, 77, 1, other_digest, 0,
+                                       secret,
                                        sizeof(secret)) == QLINQ_EMCON_OK &&
-            qlinq_emcon_ingress_create(&limited_receiver, 77, 1, other_digest,
-                                       start, 1, secret,
+            qlinq_emcon_ingress_create(&limited_rx, 77, 1, other_digest, 1,
+                                       secret,
+                                       sizeof(secret)) == QLINQ_EMCON_OK &&
+            qlinq_emcon_ingress_create(&strict_rx, 77, 1, digest, 1, secret,
                                        sizeof(secret)) == QLINQ_EMCON_OK,
         "create hardened receive flows");
 
-  /* derive the same manifest-bound epoch secret to craft raw packets */
-  ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
-  uint8_t derived[PTLS_MAX_DIGEST_SIZE];
-  uint8_t context[4 + QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
-  quicly_encode32(context, 1);
-  memcpy(context + 4, digest, sizeof(digest));
-  CHECK(ptls_hkdf_expand_label(
-            suite->hash, derived, suite->hash->digest_size,
-            ptls_iovec_init(secret, sizeof(secret)), "qlinq emcon epoch",
-            ptls_iovec_init(context, sizeof(context)), NULL) == 0,
-        "derive test epoch secret");
-  quicly_flexicast_egress_t egress = {.crypto_engine =
-                                          &quicly_default_crypto_engine};
-  CHECK(egress.crypto_engine->setup_cipher(
-            egress.crypto_engine, NULL, QUICLY_EPOCH_1RTT, 1,
-            &egress.header_protection, &egress.aead, suite->aead, suite->hash,
-            derived) == 0,
-        "setup raw egress cipher");
-  ptls_clear_memory(derived, sizeof(derived));
-
-  uint8_t flow_bytes[8];
-  quicly_encode64(flow_bytes, 77);
-  quicly_flexicast_flow_id_t flow_id =
-      quicly_flexicast_flow_id_init(flow_bytes, sizeof(flow_bytes));
-  uint8_t framed[1 + QLINQ_WIRE_TRACK_END_SIZE] = {QLINQ_EMCON_RECORD_END};
-  qlinq_wire_track_end_t end = {
-      .alias = 7, .group_id = 3, .final_object_id = 42};
-  CHECK(qlinq_wire_encode_track_end(framed + 1, QLINQ_WIRE_TRACK_END_SIZE,
-                                    &end) == QLINQ_WIRE_OK,
-        "encode terminal metadata");
-  uint8_t packet[128];
+  uint8_t packet[128], copy[128];
   size_t packet_size = 0;
-  qlinq_emcon_message_t message;
-
-  /* 2-byte truncated wire packet number must fail without replay commit */
-  CHECK(quicly_flexicast_encode_datagram_packet(
-            &egress, &flow_id, start, QUICLY_SEND_PN_SIZE,
-            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-            &packet_size) == QUICLY_FLEXICAST_OK &&
-            qlinq_emcon_flexicast_open(receiver, packet, packet_size,
-                                       &message) == QLINQ_EMCON_INVALID,
-        "reject 2-byte wire packet number");
-
-  /* packet number at or above the epoch's 2^23 limit must not advance replay */
-  uint64_t past_limit = qlinq_emcon_packet_number_limit(start);
-  CHECK(quicly_flexicast_encode_datagram_packet(
-            &egress, &flow_id, past_limit, 4,
-            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-            &packet_size) == QUICLY_FLEXICAST_OK &&
-            qlinq_emcon_flexicast_open(receiver, packet, packet_size,
-                                       &message) == QLINQ_EMCON_INVALID,
-        "reject packet number at epoch upper bound");
-
-  /* valid 4-byte PN at start still opens because invalid PNs were not committed
-   */
+  uint64_t pn = 0;
+  ptls_iovec_t datagram;
   qlinq_emcon_receiver_t *assembler = qlinq_emcon_receiver_create(7, 64, 1, 64);
   qlinq_emcon_event_t event;
   CHECK(assembler &&
-            quicly_flexicast_encode_datagram_packet(
-                &egress, &flow_id, start, 4,
-                ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-                &packet_size) == QUICLY_FLEXICAST_OK &&
-            qlinq_emcon_flexicast_open(receiver, packet, packet_size,
-                                       &message) == QLINQ_EMCON_OK &&
-            qlinq_emcon_receiver_ingest_message(assembler, &message, &event) ==
+            qlinq_emcon_seal_end(sender, 7, 3, 42, packet, sizeof(packet),
+                                 &packet_size, &pn) == QLINQ_EMCON_OK,
+        "seal terminal metadata packet");
+  memcpy(copy, packet, packet_size);
+  CHECK(qlinq_emcon_flexicast_open(strict_rx, copy, packet_size, &datagram,
+                                   &pn) == QLINQ_EMCON_OK &&
+            qlinq_emcon_receiver_ingest(assembler, pn, datagram, &event) ==
                 QLINQ_EMCON_OK &&
             event.type == QLINQ_EMCON_EVENT_END && event.value.end.alias == 7 &&
             event.value.end.group_id == 3 &&
             event.value.end.final_object_id == 42,
-        "authenticate start packet after rejecting invalid packet numbers");
+        "authenticate and decode TRACK_END frame");
   qlinq_emcon_event_release(&event);
   qlinq_emcon_receiver_free(assembler);
 
   /* valid packets must not consume max_authentication_failures budget */
-  qlinq_emcon_ingress_t *strict_valid = NULL;
-  CHECK(qlinq_emcon_ingress_create(&strict_valid, 77, 1, digest, start, 1,
-                                   secret, sizeof(secret)) == QLINQ_EMCON_OK,
-        "create ingress with max_authentication_failures=1");
-  CHECK(quicly_flexicast_encode_datagram_packet(
-            &egress, &flow_id, start, 4,
-            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-            &packet_size) == QUICLY_FLEXICAST_OK &&
-            qlinq_emcon_flexicast_open(strict_valid, packet, packet_size,
-                                       &message) == QLINQ_EMCON_OK &&
-            quicly_flexicast_encode_datagram_packet(
-                &egress, &flow_id, start + 1, 4,
-                ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-                &packet_size) == QUICLY_FLEXICAST_OK &&
-            qlinq_emcon_flexicast_open(strict_valid, packet, packet_size,
-                                       &message) == QLINQ_EMCON_OK &&
-            qlinq_emcon_ingress_authentication_failures(strict_valid) == 0,
+  uint8_t second_pkt[128];
+  size_t second_size = 0;
+  CHECK(qlinq_emcon_seal_end(sender, 7, 3, 42, second_pkt, sizeof(second_pkt),
+                             &second_size, &pn) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_open(strict_rx, second_pkt, second_size,
+                                       &datagram, &pn) == QLINQ_EMCON_OK &&
+            qlinq_emcon_ingress_authentication_failures(strict_rx) == 0,
         "multiple valid packets succeed with max_authentication_failures=1");
-  CHECK(quicly_flexicast_encode_datagram_packet(
-            &egress, &flow_id, start + 2, 4,
-            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-            &packet_size) == QUICLY_FLEXICAST_OK,
+
+  uint8_t bad_pkt[128];
+  size_t bad_size = 0;
+  CHECK(qlinq_emcon_seal_end(sender, 7, 3, 42, bad_pkt, sizeof(bad_pkt),
+                             &bad_size, &pn) == QLINQ_EMCON_OK,
         "encode packet for tag corruption");
-  packet[packet_size - 1] ^= 0x01U;
-  CHECK(qlinq_emcon_flexicast_open(strict_valid, packet, packet_size,
-                                   &message) == QLINQ_EMCON_CRYPTO &&
-            qlinq_emcon_ingress_authentication_failures(strict_valid) == 1,
+  bad_pkt[bad_size - 1] ^= 0x01U;
+  CHECK(qlinq_emcon_flexicast_open(strict_rx, bad_pkt, bad_size, &datagram,
+                                   &pn) == QLINQ_EMCON_ERR_CRYPTO &&
+            qlinq_emcon_ingress_authentication_failures(strict_rx) == 1,
         "first failed authentication trips max_authentication_failures=1");
-  qlinq_emcon_ingress_free(strict_valid);
 
   /* manifest digest mismatch must fail AEAD and trip failure limit */
-  CHECK(quicly_flexicast_encode_datagram_packet(
-            &egress, &flow_id, start, 4,
-            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-            &packet_size) == QUICLY_FLEXICAST_OK &&
-            qlinq_emcon_flexicast_open(other_receiver, packet, packet_size,
-                                       &message) == QLINQ_EMCON_DISCARDED &&
-            qlinq_emcon_ingress_authentication_failures(other_receiver) == 1 &&
-            quicly_flexicast_encode_datagram_packet(
-                &egress, &flow_id, start, 4,
-                ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
-                &packet_size) == QUICLY_FLEXICAST_OK &&
-            qlinq_emcon_flexicast_open(limited_receiver, packet, packet_size,
-                                       &message) == QLINQ_EMCON_CRYPTO,
-        "reject packet bound to a different manifest digest");
+  memcpy(copy, packet, packet_size);
+  CHECK(qlinq_emcon_flexicast_open(other_rx, copy, packet_size, &datagram,
+                                   &pn) == QLINQ_EMCON_DISCARDED &&
+            qlinq_emcon_ingress_authentication_failures(other_rx) == 1,
+        "discard packet bound to another manifest digest");
+  memcpy(copy, packet, packet_size);
+  CHECK(qlinq_emcon_flexicast_open(limited_rx, copy, packet_size, &datagram,
+                                   &pn) == QLINQ_EMCON_ERR_CRYPTO,
+        "trip failure limit on wrong manifest digest");
 
-  ptls_cipher_free(egress.header_protection);
-  ptls_aead_free(egress.aead);
-  qlinq_emcon_ingress_free(limited_receiver);
-  qlinq_emcon_ingress_free(other_receiver);
-  qlinq_emcon_ingress_free(receiver);
+  qlinq_emcon_ingress_free(strict_rx);
+  qlinq_emcon_ingress_free(limited_rx);
+  qlinq_emcon_ingress_free(other_rx);
+  qlinq_emcon_sender_free(sender);
   return 0;
 }
 
@@ -376,44 +303,43 @@ static int test_late_join(void) {
   const uint8_t secret[32] = {0x37};
   const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x55};
   const uint8_t payload[] = "late multicast delivery";
-  const uint64_t first = UINT32_MAX - 3;
-  const uint64_t last = first + QUICLY_FLEXICAST_SENT_WINDOW + 1;
+  const uint64_t start_pn = 70000;
+  const uint64_t last = start_pn + QUICLY_FLEXICAST_SENT_WINDOW + 5;
   uint8_t packet[128];
   size_t packet_size;
   uint64_t number;
   qlinq_emcon_sender_t *sender = NULL;
-  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, digest, first, first, secret,
-                                  sizeof(secret)) == QLINQ_EMCON_OK,
-        "create EMCON sender before listeners exist");
-  for (uint64_t expected = first; expected <= last; ++expected) {
-    CHECK(qlinq_emcon_flexicast_seal(sender, QLINQ_EMCON_RECORD_DATA,
-                                     ptls_iovec_init(payload, sizeof(payload)),
-                                     packet, sizeof(packet), &packet_size,
-                                     &number) == QLINQ_EMCON_OK &&
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, digest, start_pn, 64, 1, 64,
+                                  secret, sizeof(secret)) == QLINQ_EMCON_OK,
+        "create EMCON sender past 16-bit PN range");
+  for (uint64_t expected = start_pn; expected <= last; ++expected) {
+    CHECK(qlinq_emcon_flexicast_seal(
+              sender, ptls_iovec_init(payload, sizeof(payload)), packet,
+              sizeof(packet), &packet_size, &number) == QLINQ_EMCON_OK &&
               number == expected,
-          "continue sending past the connected flow's history window");
+          "continue sending past connected flow history window");
   }
   qlinq_emcon_sender_free(sender);
 
   for (size_t i = 0; i < 2; ++i) {
     qlinq_emcon_ingress_t *receiver = NULL;
-    CHECK(qlinq_emcon_ingress_create(&receiver, 44, 3, digest, first, 0, secret,
+    CHECK(qlinq_emcon_ingress_create(&receiver, 44, 3, digest, 0, secret,
                                      sizeof(secret)) == QLINQ_EMCON_OK,
-          "initialize a late listener from the initial epoch");
+          "initialize late listener at epoch start");
     uint8_t copy[sizeof(packet)];
     memcpy(copy, packet, packet_size);
-    qlinq_emcon_message_t message;
-    CHECK(qlinq_emcon_flexicast_open(receiver, copy, packet_size, &message) ==
-                  QLINQ_EMCON_OK &&
-              (copy[0] & 3U) == 3U && message.packet_number == last &&
-              message.type == QLINQ_EMCON_RECORD_DATA &&
-              message.payload.len == sizeof(payload) &&
-              memcmp(message.payload.base, payload, sizeof(payload)) == 0,
-          "late Flexicast listener authenticates after 32-bit rollover");
+    ptls_iovec_t datagram;
+    uint64_t opened_pn;
+    CHECK(qlinq_emcon_flexicast_open(receiver, copy, packet_size, &datagram,
+                                     &opened_pn) == QLINQ_EMCON_OK &&
+              (copy[0] & 3U) == 3U && opened_pn == last &&
+              datagram.len == sizeof(payload) &&
+              memcmp(datagram.base, payload, sizeof(payload)) == 0,
+          "late listener authenticates 4-byte PN directly");
     memcpy(copy, packet, packet_size);
-    CHECK(qlinq_emcon_flexicast_open(receiver, copy, packet_size, &message) ==
-              QLINQ_EMCON_DUPLICATE,
-          "EMCON ingress decoder rejects a replay");
+    CHECK(qlinq_emcon_flexicast_open(receiver, copy, packet_size, &datagram,
+                                     &opened_pn) == QLINQ_EMCON_DUPLICATE,
+          "ingress decoder rejects replay");
     qlinq_emcon_ingress_free(receiver);
   }
   return 0;
@@ -422,40 +348,36 @@ static int test_late_join(void) {
 static int test_packet_number_ceiling(void) {
   const uint8_t secret[32] = {0x38};
   const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x56};
-  const uint64_t ceiling = (UINT64_C(1) << 62) - 1;
+  const uint64_t ceiling = QLINQ_EMCON_MAX_PACKETS_PER_KEY - 1;
   uint8_t payload[] = "last packet";
   qlinq_emcon_sender_t *sender = NULL;
   qlinq_emcon_ingress_t *receiver = NULL;
-  CHECK(qlinq_emcon_sender_create(&sender, 44, 4, digest, ceiling, ceiling,
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 4, digest, ceiling, 64, 1, 64,
                                   secret, sizeof(secret)) == QLINQ_EMCON_OK &&
-            qlinq_emcon_ingress_create(&receiver, 44, 4, digest, ceiling, 0,
-                                       secret,
+            qlinq_emcon_ingress_create(&receiver, 44, 4, digest, 0, secret,
                                        sizeof(secret)) == QLINQ_EMCON_OK,
-        "initialize sender and receiver at the last QUIC packet number");
+        "initialize sender at final epoch packet number");
   uint8_t packet[128], replay[sizeof(packet)];
   size_t packet_size;
-  uint64_t number;
-  ptls_iovec_t data = ptls_iovec_init(payload, sizeof(payload));
-  CHECK(qlinq_emcon_flexicast_seal(sender, QLINQ_EMCON_RECORD_DATA, data,
-                                   packet, sizeof(packet), &packet_size,
-                                   &number) == QLINQ_EMCON_OK &&
+  uint64_t number, opened_pn;
+  ptls_iovec_t data = ptls_iovec_init(payload, sizeof(payload)), opened;
+  CHECK(qlinq_emcon_flexicast_seal(sender, data, packet, sizeof(packet),
+                                   &packet_size, &number) == QLINQ_EMCON_OK &&
             number == ceiling &&
             qlinq_emcon_sender_next_packet_number(sender) == ceiling + 1,
-        "seal the final QUIC packet number");
+        "seal final epoch packet number");
   memcpy(replay, packet, packet_size);
-  qlinq_emcon_message_t message;
-  CHECK(qlinq_emcon_flexicast_open(receiver, packet, packet_size, &message) ==
-                QLINQ_EMCON_OK &&
-            message.packet_number == ceiling &&
-            message.payload.len == sizeof(payload) &&
-            memcmp(message.payload.base, payload, sizeof(payload)) == 0 &&
-            qlinq_emcon_flexicast_open(receiver, replay, packet_size,
-                                       &message) == QLINQ_EMCON_DUPLICATE,
-        "authenticate the final packet and reject its replay");
-  CHECK(qlinq_emcon_flexicast_seal(
-            sender, QLINQ_EMCON_RECORD_DATA, data, packet, sizeof(packet),
-            &packet_size, &number) == QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED,
-        "refuse to seal past the QUIC packet-number ceiling");
+  CHECK(qlinq_emcon_flexicast_open(receiver, packet, packet_size, &opened,
+                                   &opened_pn) == QLINQ_EMCON_OK &&
+            opened_pn == ceiling && opened.len == sizeof(payload) &&
+            memcmp(opened.base, payload, sizeof(payload)) == 0 &&
+            qlinq_emcon_flexicast_open(receiver, replay, packet_size, &opened,
+                                       &opened_pn) == QLINQ_EMCON_DUPLICATE,
+        "authenticate final epoch packet and reject replay");
+  CHECK(qlinq_emcon_flexicast_seal(sender, data, packet, sizeof(packet),
+                                   &packet_size,
+                                   &number) == QLINQ_EMCON_ERR_EXHAUSTED,
+        "refuse to seal past per-key packet limit");
   qlinq_emcon_ingress_free(receiver);
   qlinq_emcon_sender_free(sender);
   return 0;
@@ -488,21 +410,18 @@ int main(int argc, char **argv) {
     second[i] = (uint8_t)(i * 17U + 3U);
     third[i] = (uint8_t)(i * 29U + 5U);
   }
-  memset(secret, 0xa6, ptls_openssl_aes128gcmsha256.hash->digest_size);
+  size_t secret_size = ptls_openssl_aes128gcmsha256.hash->digest_size;
+  memset(secret, 0xa6, secret_size);
   const uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE] = {0x57};
   qlinq_emcon_sender_t *sender = NULL;
   qlinq_emcon_ingress_t *receiver_protection = NULL;
-  size_t secret_size = ptls_openssl_aes128gcmsha256.hash->digest_size;
-  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, digest, 1000, 1000, secret,
-                                  secret_size) == QLINQ_EMCON_OK &&
-            qlinq_emcon_ingress_create(&receiver_protection, 44, 3, digest,
-                                       1000, 0, secret,
-                                       secret_size) == QLINQ_EMCON_OK,
+  CHECK(qlinq_emcon_sender_create(&sender, 44, 3, digest, 1000, 256, 10, 8192,
+                                  secret, secret_size) == QLINQ_EMCON_OK &&
+            qlinq_emcon_ingress_create(&receiver_protection, 44, 3, digest, 0,
+                                       secret, secret_size) == QLINQ_EMCON_OK,
         "protection setup");
 
-  qlinq_emcon_rateless_config_t config = {
-      .alias = 7, .symbol_size = 256, .repair_symbols = 10};
-  CHECK(qlinq_emcon_send_object(sender, &config, 12, 34, true, 2, input,
+  CHECK(qlinq_emcon_send_object(sender, 7, 12, 34, true, 2, input,
                                 sizeof(input), capture_packet,
                                 &capture) == QLINQ_EMCON_OK,
         "encode object");
@@ -513,10 +432,10 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < capture.count; i++) {
     CHECK(symbols[i] == i, "emit source symbols before repair symbols");
     if (symbols[i] == 19) {
-      CHECK(sizes[i] == 213, "final source symbol omits implicit zero tail");
+      CHECK(sizes[i] == 212, "final source symbol omits implicit zero tail");
       short_symbols++;
     } else {
-      CHECK(sizes[i] == 333, "full source and repair symbols use symbol_size");
+      CHECK(sizes[i] == 332, "full source and repair symbols use symbol_size");
     }
   }
   CHECK(short_symbols == 1, "exactly one short final source symbol");
@@ -543,14 +462,13 @@ int main(int argc, char **argv) {
             record.size == sizeof(input) &&
             memcmp(record.data, input, sizeof(input)) == 0,
         "exact reconstructed record");
-
   qlinq_emcon_record_release(&record);
 
   /* interleave two active objects to verify FEC receive window retention */
-  CHECK(qlinq_emcon_send_object(sender, &config, 12, 35, false, 1, second,
+  CHECK(qlinq_emcon_send_object(sender, 7, 12, 35, false, 1, second,
                                 sizeof(second), capture_packet,
                                 &capture) == QLINQ_EMCON_OK &&
-            qlinq_emcon_send_object(sender, &config, 12, 36, false, 1, third,
+            qlinq_emcon_send_object(sender, 7, 12, 36, false, 1, third,
                                     sizeof(third), capture_packet,
                                     &capture) == QLINQ_EMCON_OK &&
             capture.count == 90,
@@ -588,40 +506,37 @@ int main(int argc, char **argv) {
   CHECK(second_complete && third_complete,
         "both interleaved objects reconstructed");
 
-  uint8_t replay_packets[3][64];
+  uint8_t replay_packets[3][96];
   size_t replay_sizes[3];
-  uint8_t payload = 0;
-  uint64_t number;
+  uint64_t number, opened_pn;
+  ptls_iovec_t opened;
   for (size_t i = 0; i <= QLINQ_EMCON_REPLAY_WINDOW_PACKETS; i++) {
     size_t slot = i < 2 ? i : 2;
-    CHECK(qlinq_emcon_flexicast_seal(
-              sender, QLINQ_EMCON_RECORD_END, ptls_iovec_init(&payload, 1),
-              replay_packets[slot], sizeof(replay_packets[slot]),
-              &replay_sizes[slot], &number) == QLINQ_EMCON_OK,
+    CHECK(qlinq_emcon_seal_end(sender, 7, 12, 36, replay_packets[slot],
+                               sizeof(replay_packets[slot]),
+                               &replay_sizes[slot], &number) == QLINQ_EMCON_OK,
           "seal replay-window test packet");
   }
-  qlinq_emcon_message_t replay_message;
   CHECK(qlinq_emcon_flexicast_open(receiver_protection, replay_packets[2],
-                                   replay_sizes[2],
-                                   &replay_message) == QLINQ_EMCON_OK &&
+                                   replay_sizes[2], &opened,
+                                   &opened_pn) == QLINQ_EMCON_OK &&
             qlinq_emcon_flexicast_open(receiver_protection, replay_packets[1],
-                                       replay_sizes[1],
-                                       &replay_message) == QLINQ_EMCON_OK &&
+                                       replay_sizes[1], &opened,
+                                       &opened_pn) == QLINQ_EMCON_OK &&
             qlinq_emcon_flexicast_open(receiver_protection, replay_packets[0],
-                                       replay_sizes[0], &replay_message) ==
-                QLINQ_EMCON_DUPLICATE,
+                                       replay_sizes[0], &opened,
+                                       &opened_pn) == QLINQ_EMCON_DUPLICATE,
         "accept reordering within the advertised window and reject older "
         "packets");
 
   uint64_t before_failed_emit = qlinq_emcon_sender_next_packet_number(sender);
   capture_t rejected = {0};
-  CHECK(qlinq_emcon_send_object(sender, &config, 12, 37, false, 1, input,
+  CHECK(qlinq_emcon_send_object(sender, 7, 12, 37, false, 1, input,
                                 sizeof(input), capture_packet,
-                                &rejected) == QLINQ_EMCON_EMIT_FAILED &&
-            qlinq_emcon_flexicast_seal(
-                sender, QLINQ_EMCON_RECORD_END, ptls_iovec_init(&payload, 1),
-                replay_packets[0], sizeof(replay_packets[0]), &replay_sizes[0],
-                &number) == QLINQ_EMCON_OK &&
+                                &rejected) == QLINQ_EMCON_ERR_EMIT_FAILED &&
+            qlinq_emcon_seal_end(sender, 7, 12, 37, replay_packets[0],
+                                 sizeof(replay_packets[0]), &replay_sizes[0],
+                                 &number) == QLINQ_EMCON_OK &&
             number == before_failed_emit + 1,
         "a failed FEC emission still consumes its protected packet number");
 

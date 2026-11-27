@@ -4,33 +4,13 @@
 #include "emcon_activation.h"
 #include "emcon_manifest.h"
 #include "emcon_rateless.h"
-#include "emcon_send_socket.h"
+#include "emcon_socket.h"
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 typedef struct qlinq_emcon_session_t qlinq_emcon_session_t;
-
-typedef enum {
-  QLINQ_EMCON_SESSION_OK = 0,
-  QLINQ_EMCON_SESSION_INCOMPLETE = 1,
-  QLINQ_EMCON_SESSION_DUPLICATE = 2,
-  QLINQ_EMCON_SESSION_WOULD_BLOCK = 3,
-  QLINQ_EMCON_SESSION_DISCARDED = 4,
-  QLINQ_EMCON_SESSION_INVALID = -1,
-  QLINQ_EMCON_SESSION_NO_MEMORY = -2,
-  QLINQ_EMCON_SESSION_CRYPTO = -3,
-  QLINQ_EMCON_SESSION_IO = -4,
-  QLINQ_EMCON_SESSION_UNKNOWN_ALIAS = -5,
-  QLINQ_EMCON_SESSION_EXPIRED = -6,
-  QLINQ_EMCON_SESSION_ACTIVATION = -7,
-  QLINQ_EMCON_SESSION_ACTIVATION_LOCKED = -8,
-  QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED = -9,
-  QLINQ_EMCON_SESSION_ACTIVATION_REUSED = -10,
-  QLINQ_EMCON_SESSION_INTERRUPTED = -11,
-  QLINQ_EMCON_SESSION_TRANSFER_MISMATCH = -12
-} qlinq_emcon_session_result_t;
 
 typedef struct {
   uint64_t packets_received;
@@ -47,26 +27,19 @@ typedef struct {
   qlinq_emcon_send_stats_t send;
 } qlinq_emcon_session_stats_t;
 
-const char *qlinq_emcon_session_strerror(int error);
-
-/* production sender with durable nonce reservations and exclusive lock */
-int qlinq_emcon_session_create_sender_persistent(
-    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
-    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
-    const char *state_directory, uint64_t reservation_packets);
-/* binds (alias, group_id) to input identity and block size before reserving */
-int qlinq_emcon_session_create_sender_bound(
+/* creates persistent sender; optional transfer binds (alias, group_id) first */
+int qlinq_emcon_session_create_sender(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory, uint64_t reservation_packets,
     const qlinq_emcon_transfer_t *transfer);
+
 /* prepares receiver socket before committing the one-shot epoch claim */
 int qlinq_emcon_session_prepare_receiver(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory, unsigned int interface_index, bool join_group);
 int qlinq_emcon_session_claim_receiver(qlinq_emcon_session_t *session);
-/* discards authenticated packets for other aliases or groups before FEC */
 int qlinq_emcon_session_set_receive_filter(qlinq_emcon_session_t *session,
                                            uint8_t alias, uint64_t group_id);
 void qlinq_emcon_session_set_cancel(qlinq_emcon_session_t *session,

@@ -1,10 +1,6 @@
 #include "emcon_session.h"
 
-#include "emcon_activation.h"
-#include "emcon_receive_socket.h"
-#include "emcon_send_socket.h"
-#include "transport_wire.h"
-
+#include "fs_util.h"
 #include "picotls/openssl.h"
 
 #include <netinet/in.h>
@@ -30,91 +26,48 @@ struct qlinq_emcon_session_t {
   qlinq_emcon_session_stats_t stats;
 };
 
-const char *qlinq_emcon_session_strerror(int error) {
-  switch (error) {
-  case QLINQ_EMCON_SESSION_OK:
-    return "ok";
-  case QLINQ_EMCON_SESSION_INCOMPLETE:
-    return "incomplete object";
-  case QLINQ_EMCON_SESSION_DUPLICATE:
-    return "duplicate packet";
-  case QLINQ_EMCON_SESSION_WOULD_BLOCK:
-    return "would block";
-  case QLINQ_EMCON_SESSION_DISCARDED:
-    return "packet discarded";
-  case QLINQ_EMCON_SESSION_INVALID:
-    return "invalid session input";
-  case QLINQ_EMCON_SESSION_NO_MEMORY:
-    return "out of memory";
-  case QLINQ_EMCON_SESSION_CRYPTO:
-    return "cryptographic failure";
-  case QLINQ_EMCON_SESSION_IO:
-    return "socket or file I/O failed";
-  case QLINQ_EMCON_SESSION_UNKNOWN_ALIAS:
-    return "unknown stream alias";
-  case QLINQ_EMCON_SESSION_EXPIRED:
-    return "manifest validity window expired";
-  case QLINQ_EMCON_SESSION_ACTIVATION:
-    return "activation state error";
-  case QLINQ_EMCON_SESSION_ACTIVATION_LOCKED:
-    return "sender activation already locked";
-  case QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED:
-    return "epoch packet numbers exhausted";
-  case QLINQ_EMCON_SESSION_ACTIVATION_REUSED:
-    return "receiver key epoch already claimed";
-  case QLINQ_EMCON_SESSION_INTERRUPTED:
-    return "interrupted";
-  case QLINQ_EMCON_SESSION_TRANSFER_MISMATCH:
-    return "group already bound to an incompatible transfer";
-  default:
-    return "unknown session error";
-  }
-}
-
-static int endpoint_sockaddr(const qlinq_emcon_manifest_endpoint_t *endpoint,
-                             struct sockaddr_storage *address,
-                             socklen_t *address_len) {
-  memset(address, 0, sizeof(*address));
-  if (endpoint->family == 4) {
-    struct sockaddr_in *v4 = (struct sockaddr_in *)address;
+static int endpoint_sockaddr(const qlinq_emcon_manifest_endpoint_t *ep,
+                             uint32_t scope_id, struct sockaddr_storage *addr,
+                             socklen_t *addr_len) {
+  memset(addr, 0, sizeof(*addr));
+  if (ep->family == 4) {
+    struct sockaddr_in *v4 = (struct sockaddr_in *)addr;
     v4->sin_family = AF_INET;
-    v4->sin_port = htons(endpoint->port);
-    memcpy(&v4->sin_addr, endpoint->address, 4);
-    *address_len = sizeof(*v4);
+    v4->sin_port = htons(ep->port);
+    memcpy(&v4->sin_addr, ep->address, 4);
+    *addr_len = sizeof(*v4);
     return 0;
   }
-  if (endpoint->family == 6) {
-    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)address;
+  if (ep->family == 6) {
+    struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)addr;
     v6->sin6_family = AF_INET6;
-    v6->sin6_port = htons(endpoint->port);
-    memcpy(&v6->sin6_addr, endpoint->address, 16);
-    *address_len = sizeof(*v6);
+    v6->sin6_port = htons(ep->port);
+    v6->sin6_scope_id = scope_id;
+    memcpy(&v6->sin6_addr, ep->address, 16);
+    *addr_len = sizeof(*v6);
     return 0;
   }
   return -1;
 }
 
 static bool find_manifest_stream(const qlinq_emcon_manifest_t *manifest,
-                                 uint8_t alias, size_t *manifest_index) {
+                                 uint8_t alias, size_t *index) {
   for (size_t i = 0; i < manifest->stream_count; i++) {
     if (manifest->streams[i].alias == alias) {
-      if (manifest_index)
-        *manifest_index = i;
+      if (index)
+        *index = i;
       return true;
     }
   }
   return false;
 }
 
-static bool find_stream(const qlinq_emcon_session_t *session, uint8_t alias,
-                        size_t *manifest_index) {
-  return find_manifest_stream(&session->manifest, alias, manifest_index);
-}
-
-static qlinq_emcon_receiver_t *find_alias(qlinq_emcon_session_t *session,
-                                          uint8_t alias) {
-  size_t index;
-  return find_stream(session, alias, &index) ? session->aliases[index] : NULL;
+static uint32_t max_manifest_record_size(const qlinq_emcon_manifest_t *m) {
+  uint32_t max_rec = 0;
+  for (size_t i = 0; i < m->stream_count; i++)
+    if (m->streams[i].maximum_record_size > max_rec)
+      max_rec = m->streams[i].maximum_record_size;
+  return max_rec;
 }
 
 static int validate_session_manifest(const qlinq_emcon_manifest_t *manifest,
@@ -123,58 +76,44 @@ static int validate_session_manifest(const qlinq_emcon_manifest_t *manifest,
                                      uint64_t now_ms) {
   if (!manifest || !traffic_secret ||
       traffic_secret_size != ptls_openssl_aes128gcmsha256.hash->digest_size)
-    return QLINQ_EMCON_SESSION_INVALID;
-  int validated = qlinq_emcon_manifest_validate(manifest, now_ms);
-  if (validated == QLINQ_EMCON_MANIFEST_EXPIRED ||
-      validated == QLINQ_EMCON_MANIFEST_NOT_YET_VALID)
-    return QLINQ_EMCON_SESSION_EXPIRED;
-  if (validated != QLINQ_EMCON_MANIFEST_OK ||
-      qlinq_emcon_manifest_check_traffic_key(manifest, traffic_secret,
-                                             traffic_secret_size) !=
-          QLINQ_EMCON_MANIFEST_OK)
-    return QLINQ_EMCON_SESSION_INVALID;
-  return QLINQ_EMCON_SESSION_OK;
+    return QLINQ_EMCON_ERR_INVALID;
+  int ret = qlinq_emcon_manifest_validate(manifest, now_ms);
+  if (ret == QLINQ_EMCON_ERR_NOT_YET_VALID)
+    return QLINQ_EMCON_ERR_EXPIRED;
+  if (ret != QLINQ_EMCON_OK)
+    return ret;
+  return qlinq_emcon_manifest_check_traffic_key(
+             manifest, traffic_secret, traffic_secret_size) == QLINQ_EMCON_OK
+             ? QLINQ_EMCON_OK
+             : QLINQ_EMCON_ERR_INVALID;
 }
 
 static int create_common(qlinq_emcon_session_t **session,
                          const qlinq_emcon_manifest_t *manifest,
                          const uint8_t *traffic_secret,
-                         size_t traffic_secret_size, uint64_t now_ms,
-                         bool send_mode, uint64_t first_packet_number) {
-  uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
-  if (!session)
-    return QLINQ_EMCON_SESSION_INVALID;
-  *session = NULL;
-  int valid = validate_session_manifest(manifest, traffic_secret,
-                                        traffic_secret_size, now_ms);
-  if (valid != QLINQ_EMCON_SESSION_OK)
-    return valid;
-  if (qlinq_emcon_manifest_digest(manifest, manifest_digest) !=
-      QLINQ_EMCON_MANIFEST_OK)
-    return QLINQ_EMCON_SESSION_INVALID;
-
+                         size_t traffic_secret_size, bool send_mode,
+                         uint64_t first_packet_number) {
+  uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
+  if (qlinq_emcon_manifest_digest(manifest, digest) != QLINQ_EMCON_OK)
+    return QLINQ_EMCON_ERR_INVALID;
   qlinq_emcon_session_t *created = calloc(1, sizeof(*created));
   if (!created)
-    return QLINQ_EMCON_SESSION_NO_MEMORY;
+    return QLINQ_EMCON_ERR_NO_MEMORY;
   created->manifest = *manifest;
   int ret =
       send_mode
           ? qlinq_emcon_sender_create(
                 &created->send_crypto, manifest->flow_id, manifest->key_epoch,
-                manifest_digest, manifest->initial_packet_number,
-                first_packet_number, traffic_secret, traffic_secret_size)
+                digest, first_packet_number, manifest->symbol_size,
+                manifest->repair_symbols, max_manifest_record_size(manifest),
+                traffic_secret, traffic_secret_size)
           : qlinq_emcon_ingress_create(&created->receive_crypto,
                                        manifest->flow_id, manifest->key_epoch,
-                                       manifest_digest,
-                                       manifest->initial_packet_number, 0,
-                                       traffic_secret, traffic_secret_size);
+                                       digest, 0, traffic_secret,
+                                       traffic_secret_size);
   if (ret != QLINQ_EMCON_OK) {
     qlinq_emcon_session_free(created);
-    if (ret == QLINQ_EMCON_NO_MEMORY)
-      return QLINQ_EMCON_SESSION_NO_MEMORY;
-    if (ret == QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED)
-      return QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED;
-    return QLINQ_EMCON_SESSION_CRYPTO;
+    return ret;
   }
   for (size_t i = 0; !send_mode && i < manifest->stream_count; i++) {
     created->aliases[i] = qlinq_emcon_receiver_create(
@@ -182,105 +121,82 @@ static int create_common(qlinq_emcon_session_t **session,
         manifest->repair_symbols, manifest->streams[i].maximum_record_size);
     if (!created->aliases[i]) {
       qlinq_emcon_session_free(created);
-      return QLINQ_EMCON_SESSION_NO_MEMORY;
+      return QLINQ_EMCON_ERR_NO_MEMORY;
     }
   }
   *session = created;
-  return QLINQ_EMCON_SESSION_OK;
+  return QLINQ_EMCON_OK;
 }
 
-static int create_sender_socket(qlinq_emcon_send_socket_t **sender,
-                                const qlinq_emcon_manifest_t *manifest) {
-  struct sockaddr_storage source, destination;
-  socklen_t source_len, destination_len;
-  if (endpoint_sockaddr(&manifest->source, &source, &source_len) != 0 ||
-      endpoint_sockaddr(&manifest->destination, &destination,
-                        &destination_len) != 0)
-    return QLINQ_EMCON_SESSION_IO;
-  if (manifest->source.family == 6) {
-    ((struct sockaddr_in6 *)&source)->sin6_scope_id = manifest->interface_index;
-    ((struct sockaddr_in6 *)&destination)->sin6_scope_id =
-        manifest->interface_index;
-  }
-  return qlinq_emcon_send_socket_create(
-             sender, (struct sockaddr *)&source, source_len,
-             (struct sockaddr *)&destination, destination_len,
-             manifest->rate_bytes_per_second, manifest->burst_bytes,
-             manifest->expires_at_ms) == 0
-             ? QLINQ_EMCON_SESSION_OK
-             : QLINQ_EMCON_SESSION_IO;
-}
-
-static int create_sender_persistent_internal(
+int qlinq_emcon_session_create_sender(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory, uint64_t reservation_packets,
     const qlinq_emcon_transfer_t *transfer) {
   if (!session || !state_directory || reservation_packets == 0)
-    return QLINQ_EMCON_SESSION_INVALID;
+    return QLINQ_EMCON_ERR_INVALID;
   *session = NULL;
-  int valid = validate_session_manifest(manifest, traffic_secret,
-                                        traffic_secret_size, now_ms);
-  if (valid != QLINQ_EMCON_SESSION_OK)
-    return valid;
+  int ret = validate_session_manifest(manifest, traffic_secret,
+                                      traffic_secret_size, now_ms);
+  if (ret != QLINQ_EMCON_OK)
+    return ret;
   if (transfer) {
-    size_t stream_index;
-    if (!find_manifest_stream(manifest, transfer->alias, &stream_index))
-      return QLINQ_EMCON_SESSION_UNKNOWN_ALIAS;
+    size_t idx;
+    if (!find_manifest_stream(manifest, transfer->alias, &idx))
+      return QLINQ_EMCON_ERR_UNKNOWN_ALIAS;
     if (transfer->block_size == 0 ||
-        transfer->block_size >
-            manifest->streams[stream_index].maximum_record_size)
-      return QLINQ_EMCON_SESSION_INVALID;
+        transfer->block_size > manifest->streams[idx].maximum_record_size)
+      return QLINQ_EMCON_ERR_INVALID;
   }
 
   qlinq_emcon_activation_t *activation = NULL;
-  int activated = qlinq_emcon_activation_open_managed(
-      &activation, state_directory, manifest);
-  if (activated == QLINQ_EMCON_ACTIVATION_LOCKED)
-    return QLINQ_EMCON_SESSION_ACTIVATION_LOCKED;
-  if (activated != QLINQ_EMCON_ACTIVATION_OK)
-    return QLINQ_EMCON_SESSION_ACTIVATION;
-  if (transfer) {
-    int checked = qlinq_emcon_activation_check_transfer(activation, transfer);
-    if (checked != QLINQ_EMCON_ACTIVATION_OK) {
-      qlinq_emcon_activation_close(activation);
-      if (checked == QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH)
-        return QLINQ_EMCON_SESSION_TRANSFER_MISMATCH;
-      if (checked == QLINQ_EMCON_ACTIVATION_INVALID)
-        return QLINQ_EMCON_SESSION_INVALID;
-      return QLINQ_EMCON_SESSION_ACTIVATION;
-    }
-  }
-  qlinq_emcon_send_socket_t *sender = NULL;
-  int ret = create_sender_socket(&sender, manifest);
-  if (ret != QLINQ_EMCON_SESSION_OK) {
+  ret = qlinq_emcon_activation_open_managed(&activation, state_directory,
+                                            manifest);
+  if (ret != QLINQ_EMCON_OK)
+    return ret == QLINQ_EMCON_ERR_LOCKED ? ret : QLINQ_EMCON_ERR_ACTIVATION;
+  if (transfer && (ret = qlinq_emcon_activation_check_transfer(
+                       activation, transfer)) != QLINQ_EMCON_OK) {
     qlinq_emcon_activation_close(activation);
-    return ret;
+    return (ret == QLINQ_EMCON_ERR_TRANSFER_MISMATCH ||
+            ret == QLINQ_EMCON_ERR_INVALID)
+               ? ret
+               : QLINQ_EMCON_ERR_ACTIVATION;
   }
-  if (transfer) {
-    int bound = qlinq_emcon_activation_bind_transfer(activation, transfer);
-    if (bound != QLINQ_EMCON_ACTIVATION_OK) {
-      qlinq_emcon_send_socket_free(sender);
-      qlinq_emcon_activation_close(activation);
-      return bound == QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH
-                 ? QLINQ_EMCON_SESSION_TRANSFER_MISMATCH
-                 : QLINQ_EMCON_SESSION_ACTIVATION;
-    }
+
+  struct sockaddr_storage source, destination;
+  socklen_t source_len, destination_len;
+  qlinq_emcon_send_socket_t *sender = NULL;
+  if (endpoint_sockaddr(&manifest->source, manifest->interface_index, &source,
+                        &source_len) != 0 ||
+      endpoint_sockaddr(&manifest->destination, manifest->interface_index,
+                        &destination, &destination_len) != 0 ||
+      qlinq_emcon_send_socket_create(
+          &sender, (struct sockaddr *)&source, source_len,
+          (struct sockaddr *)&destination, destination_len,
+          manifest->rate_bytes_per_second, manifest->burst_bytes,
+          manifest->expires_at_ms) != QLINQ_EMCON_OK) {
+    qlinq_emcon_activation_close(activation);
+    return QLINQ_EMCON_ERR_IO;
   }
-  uint64_t first_packet_number, reserved_until;
-  activated =
-      qlinq_emcon_activation_reserve(activation, 1, reservation_packets,
-                                     &first_packet_number, &reserved_until);
-  if (activated != QLINQ_EMCON_ACTIVATION_OK) {
+  if (transfer && (ret = qlinq_emcon_activation_bind_transfer(
+                       activation, transfer)) != QLINQ_EMCON_OK) {
     qlinq_emcon_send_socket_free(sender);
     qlinq_emcon_activation_close(activation);
-    return activated == QLINQ_EMCON_ACTIVATION_EXHAUSTED
-               ? QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED
-               : QLINQ_EMCON_SESSION_ACTIVATION;
+    return ret == QLINQ_EMCON_ERR_TRANSFER_MISMATCH
+               ? ret
+               : QLINQ_EMCON_ERR_ACTIVATION;
+  }
+  uint64_t first_pn, reserved_until;
+  ret = qlinq_emcon_activation_reserve(activation, 1, reservation_packets,
+                                       &first_pn, &reserved_until);
+  if (ret != QLINQ_EMCON_OK) {
+    qlinq_emcon_send_socket_free(sender);
+    qlinq_emcon_activation_close(activation);
+    return ret == QLINQ_EMCON_ERR_EXHAUSTED ? ret : QLINQ_EMCON_ERR_ACTIVATION;
   }
   ret = create_common(session, manifest, traffic_secret, traffic_secret_size,
-                      now_ms, true, first_packet_number);
-  if (ret != QLINQ_EMCON_SESSION_OK) {
+                      true, first_pn);
+  if (ret != QLINQ_EMCON_OK) {
     qlinq_emcon_send_socket_free(sender);
     qlinq_emcon_activation_close(activation);
     return ret;
@@ -289,64 +205,7 @@ static int create_sender_persistent_internal(
   (*session)->reservation_packets = reservation_packets;
   (*session)->reserved_until = reserved_until;
   (*session)->sender = sender;
-  return QLINQ_EMCON_SESSION_OK;
-}
-
-int qlinq_emcon_session_create_sender_persistent(
-    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
-    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
-    const char *state_directory, uint64_t reservation_packets) {
-  return create_sender_persistent_internal(
-      session, manifest, traffic_secret, traffic_secret_size, now_ms,
-      state_directory, reservation_packets, NULL);
-}
-
-int qlinq_emcon_session_create_sender_bound(
-    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
-    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
-    const char *state_directory, uint64_t reservation_packets,
-    const qlinq_emcon_transfer_t *transfer) {
-  if (!transfer) {
-    if (session)
-      *session = NULL;
-    return QLINQ_EMCON_SESSION_INVALID;
-  }
-  return create_sender_persistent_internal(
-      session, manifest, traffic_secret, traffic_secret_size, now_ms,
-      state_directory, reservation_packets, transfer);
-}
-
-static bool
-endpoint_is_multicast(const qlinq_emcon_manifest_endpoint_t *endpoint) {
-  return endpoint->family == 4 ? (endpoint->address[0] & 0xf0U) == 0xe0U
-                               : endpoint->address[0] == 0xffU;
-}
-
-static int create_receiver_socket(qlinq_emcon_session_t *session,
-                                  unsigned int interface_index,
-                                  bool join_group) {
-  const qlinq_emcon_manifest_t *manifest = &session->manifest;
-  struct sockaddr_storage source, destination;
-  socklen_t source_len, destination_len;
-  if (endpoint_sockaddr(&manifest->source, &source, &source_len) != 0 ||
-      endpoint_sockaddr(&manifest->destination, &destination,
-                        &destination_len) != 0)
-    return QLINQ_EMCON_SESSION_IO;
-  bool effective_join =
-      endpoint_is_multicast(&manifest->destination) && join_group;
-  unsigned int socket_interface =
-      interface_index ? interface_index
-                      : (effective_join ? manifest->interface_index : 0);
-  if (manifest->source.family == 6) {
-    ((struct sockaddr_in6 *)&source)->sin6_scope_id = socket_interface;
-    ((struct sockaddr_in6 *)&destination)->sin6_scope_id = socket_interface;
-  }
-  if (qlinq_emcon_receive_socket_create_multicast(
-          &session->receiver, (struct sockaddr *)&destination, destination_len,
-          (struct sockaddr *)&source, source_len, socket_interface,
-          effective_join) != QLINQ_EMCON_SOCKET_OK)
-    return QLINQ_EMCON_SESSION_IO;
-  return QLINQ_EMCON_SESSION_OK;
+  return QLINQ_EMCON_OK;
 }
 
 int qlinq_emcon_session_prepare_receiver(
@@ -355,27 +214,43 @@ int qlinq_emcon_session_prepare_receiver(
     const char *state_directory, unsigned int interface_index,
     bool join_group) {
   if (!session || !state_directory)
-    return QLINQ_EMCON_SESSION_INVALID;
+    return QLINQ_EMCON_ERR_INVALID;
   *session = NULL;
-  int ret = create_common(session, manifest, traffic_secret,
-                          traffic_secret_size, now_ms, false,
-                          manifest ? manifest->initial_packet_number : 0);
-  if (ret != QLINQ_EMCON_SESSION_OK)
+  int ret = validate_session_manifest(manifest, traffic_secret,
+                                      traffic_secret_size, now_ms);
+  if (ret == QLINQ_EMCON_OK)
+    ret = create_common(session, manifest, traffic_secret, traffic_secret_size,
+                        false, 0);
+  if (ret != QLINQ_EMCON_OK)
     return ret;
 
-  int available = qlinq_emcon_receiver_activation_check_available(
-      state_directory, manifest);
-  if (available == QLINQ_EMCON_ACTIVATION_OK) {
-    (*session)->receiver_claim_directory = strdup(state_directory);
-    ret = (*session)->receiver_claim_directory
-              ? create_receiver_socket(*session, interface_index, join_group)
-              : QLINQ_EMCON_SESSION_NO_MEMORY;
+  int avail = qlinq_emcon_receiver_activation_check_available(state_directory,
+                                                              manifest);
+  if (avail != QLINQ_EMCON_OK) {
+    ret = avail == QLINQ_EMCON_ERR_REUSED ? avail : QLINQ_EMCON_ERR_ACTIVATION;
+  } else if (!((*session)->receiver_claim_directory =
+                   strdup(state_directory))) {
+    ret = QLINQ_EMCON_ERR_NO_MEMORY;
   } else {
-    ret = available == QLINQ_EMCON_ACTIVATION_REUSED
-              ? QLINQ_EMCON_SESSION_ACTIVATION_REUSED
-              : QLINQ_EMCON_SESSION_ACTIVATION;
+    bool eff_join = qlinq_ip_is_multicast(manifest->destination.family,
+                                          manifest->destination.address) &&
+                    join_group;
+    unsigned int sock_if = interface_index
+                               ? interface_index
+                               : (eff_join ? manifest->interface_index : 0);
+    struct sockaddr_storage source, destination;
+    socklen_t source_len, destination_len;
+    if (endpoint_sockaddr(&manifest->source, sock_if, &source, &source_len) !=
+            0 ||
+        endpoint_sockaddr(&manifest->destination, sock_if, &destination,
+                          &destination_len) != 0 ||
+        qlinq_emcon_receive_socket_create_multicast(
+            &(*session)->receiver, (struct sockaddr *)&destination,
+            destination_len, (struct sockaddr *)&source, source_len, sock_if,
+            eff_join) != QLINQ_EMCON_OK)
+      ret = QLINQ_EMCON_ERR_IO;
   }
-  if (ret != QLINQ_EMCON_SESSION_OK) {
+  if (ret != QLINQ_EMCON_OK) {
     qlinq_emcon_session_free(*session);
     *session = NULL;
   }
@@ -384,28 +259,26 @@ int qlinq_emcon_session_prepare_receiver(
 
 int qlinq_emcon_session_claim_receiver(qlinq_emcon_session_t *session) {
   if (!session || !session->receiver_claim_directory)
-    return QLINQ_EMCON_SESSION_INVALID;
-  int claimed = qlinq_emcon_receiver_activation_claim(
+    return QLINQ_EMCON_ERR_INVALID;
+  int ret = qlinq_emcon_receiver_activation_claim(
       session->receiver_claim_directory, &session->manifest);
-  if (claimed == QLINQ_EMCON_ACTIVATION_REUSED)
-    return QLINQ_EMCON_SESSION_ACTIVATION_REUSED;
-  if (claimed != QLINQ_EMCON_ACTIVATION_OK)
-    return QLINQ_EMCON_SESSION_ACTIVATION;
+  if (ret != QLINQ_EMCON_OK)
+    return ret == QLINQ_EMCON_ERR_REUSED ? ret : QLINQ_EMCON_ERR_ACTIVATION;
   free(session->receiver_claim_directory);
   session->receiver_claim_directory = NULL;
-  return QLINQ_EMCON_SESSION_OK;
+  return QLINQ_EMCON_OK;
 }
 
 int qlinq_emcon_session_set_receive_filter(qlinq_emcon_session_t *session,
                                            uint8_t alias, uint64_t group_id) {
   if (!session || !session->receive_crypto)
-    return QLINQ_EMCON_SESSION_INVALID;
-  if (!find_stream(session, alias, NULL))
-    return QLINQ_EMCON_SESSION_UNKNOWN_ALIAS;
+    return QLINQ_EMCON_ERR_INVALID;
+  if (!find_manifest_stream(&session->manifest, alias, NULL))
+    return QLINQ_EMCON_ERR_UNKNOWN_ALIAS;
   session->filter_active = true;
   session->filter_alias = alias;
   session->filter_group_id = group_id;
-  return QLINQ_EMCON_SESSION_OK;
+  return QLINQ_EMCON_OK;
 }
 
 void qlinq_emcon_session_set_cancel(qlinq_emcon_session_t *session,
@@ -438,54 +311,46 @@ void qlinq_emcon_session_free(qlinq_emcon_session_t *session) {
   free(session);
 }
 
-static int ensure_packet_capacity(qlinq_emcon_session_t *session,
-                                  uint64_t packets) {
+static int prepare_send(qlinq_emcon_session_t *session, uint64_t packets) {
+  if (!session->send_crypto || !session->sender)
+    return QLINQ_EMCON_ERR_INVALID;
+  if (session->should_cancel && session->should_cancel(session->cancel_data))
+    return QLINQ_EMCON_ERR_INTERRUPTED;
+  uint64_t now = qlinq_emcon_realtime_ms();
+  if (!now || now >= session->manifest.expires_at_ms)
+    return QLINQ_EMCON_ERR_EXPIRED;
   if (!qlinq_emcon_sender_has_capacity(session->send_crypto, packets))
-    return QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED;
+    return QLINQ_EMCON_ERR_EXHAUSTED;
   if (!session->activation)
-    return QLINQ_EMCON_SESSION_OK;
+    return QLINQ_EMCON_OK;
   uint64_t next = qlinq_emcon_sender_next_packet_number(session->send_crypto);
   if (next > session->reserved_until)
-    return QLINQ_EMCON_SESSION_ACTIVATION;
-  uint64_t available = session->reserved_until - next;
-  if (available >= packets)
-    return QLINQ_EMCON_SESSION_OK;
-  uint64_t additional = packets - available;
-  uint64_t reserve = session->reservation_packets > additional
-                         ? session->reservation_packets
-                         : additional;
+    return QLINQ_EMCON_ERR_ACTIVATION;
+  uint64_t avail = session->reserved_until - next;
+  if (avail >= packets)
+    return QLINQ_EMCON_OK;
+  uint64_t add = packets - avail;
+  uint64_t pref =
+      session->reservation_packets > add ? session->reservation_packets : add;
   uint64_t first, limit;
-  int ret = qlinq_emcon_activation_reserve(session->activation, additional,
-                                           reserve, &first, &limit);
-  if (ret == QLINQ_EMCON_ACTIVATION_EXHAUSTED)
-    return QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED;
-  if (ret != QLINQ_EMCON_ACTIVATION_OK || first != session->reserved_until ||
+  int ret = qlinq_emcon_activation_reserve(session->activation, add, pref,
+                                           &first, &limit);
+  if (ret == QLINQ_EMCON_ERR_EXHAUSTED)
+    return ret;
+  if (ret != QLINQ_EMCON_OK || first != session->reserved_until ||
       limit <= first)
-    return QLINQ_EMCON_SESSION_ACTIVATION;
+    return QLINQ_EMCON_ERR_ACTIVATION;
   session->reserved_until = limit;
-  return QLINQ_EMCON_SESSION_OK;
+  return QLINQ_EMCON_OK;
 }
 
 static int send_packet(qlinq_emcon_send_socket_t *sender, const uint8_t *packet,
                        size_t packet_size) {
   int ret = qlinq_emcon_send_socket_send(sender, packet, packet_size);
-  if (ret == QLINQ_EMCON_SOCKET_INTERRUPTED)
-    return QLINQ_EMCON_SESSION_INTERRUPTED;
-  if (ret == QLINQ_EMCON_SOCKET_EXPIRED)
-    return QLINQ_EMCON_SESSION_EXPIRED;
-  return ret == QLINQ_EMCON_SOCKET_OK ? QLINQ_EMCON_SESSION_OK
-                                      : QLINQ_EMCON_SESSION_IO;
-}
-
-static int prepare_send(qlinq_emcon_session_t *session, uint64_t packets) {
-  if (!session->send_crypto || !session->sender)
-    return QLINQ_EMCON_SESSION_INVALID;
-  if (session->should_cancel && session->should_cancel(session->cancel_data))
-    return QLINQ_EMCON_SESSION_INTERRUPTED;
-  uint64_t now = qlinq_emcon_realtime_ms();
-  if (now == 0 || now >= session->manifest.expires_at_ms)
-    return QLINQ_EMCON_SESSION_EXPIRED;
-  return ensure_packet_capacity(session, packets);
+  return (ret == QLINQ_EMCON_OK || ret == QLINQ_EMCON_ERR_INTERRUPTED ||
+          ret == QLINQ_EMCON_ERR_EXPIRED)
+             ? ret
+             : QLINQ_EMCON_ERR_IO;
 }
 
 struct emcon_object_emitter {
@@ -496,9 +361,9 @@ struct emcon_object_emitter {
 static bool emit_symbol(void *user_data, uint16_t symbol_index,
                         const uint8_t *packet, size_t packet_size) {
   (void)symbol_index;
-  struct emcon_object_emitter *emitter = user_data;
-  emitter->result = send_packet(emitter->sender, packet, packet_size);
-  return emitter->result == QLINQ_EMCON_SESSION_OK;
+  struct emcon_object_emitter *em = user_data;
+  em->result = send_packet(em->sender, packet, packet_size);
+  return em->result == QLINQ_EMCON_OK;
 }
 
 int qlinq_emcon_session_send_object(qlinq_emcon_session_t *session,
@@ -508,58 +373,45 @@ int qlinq_emcon_session_send_object(qlinq_emcon_session_t *session,
                                     size_t size) {
   size_t index;
   if (!session || !session->send_crypto || !data)
-    return QLINQ_EMCON_SESSION_INVALID;
-  if (!find_stream(session, alias, &index))
-    return QLINQ_EMCON_SESSION_UNKNOWN_ALIAS;
+    return QLINQ_EMCON_ERR_INVALID;
+  if (!find_manifest_stream(&session->manifest, alias, &index))
+    return QLINQ_EMCON_ERR_UNKNOWN_ALIAS;
   if (size == 0 || size > session->manifest.streams[index].maximum_record_size)
-    return QLINQ_EMCON_SESSION_INVALID;
-  uint64_t data_symbols = (size + session->manifest.symbol_size - 1) /
+    return QLINQ_EMCON_ERR_INVALID;
+  uint64_t data_symbols = (size + session->manifest.symbol_size - 1U) /
                           session->manifest.symbol_size;
   int ret =
       prepare_send(session, data_symbols + session->manifest.repair_symbols);
-  if (ret != QLINQ_EMCON_SESSION_OK)
+  if (ret != QLINQ_EMCON_OK)
     return ret;
-  qlinq_emcon_rateless_config_t config = {
-      .alias = alias,
-      .symbol_size = session->manifest.symbol_size,
-      .repair_symbols = session->manifest.repair_symbols,
-  };
   struct emcon_object_emitter emitter = {.sender = session->sender};
-  int sent = qlinq_emcon_send_object(session->send_crypto, &config, group_id,
+  int sent = qlinq_emcon_send_object(session->send_crypto, alias, group_id,
                                      object_id, keyframe, priority, data, size,
                                      emit_symbol, &emitter);
-  if (sent == QLINQ_EMCON_EMIT_FAILED)
+  if (sent == QLINQ_EMCON_ERR_EMIT_FAILED)
     return emitter.result;
-  return sent == QLINQ_EMCON_OK ? QLINQ_EMCON_SESSION_OK
-                                : QLINQ_EMCON_SESSION_IO;
+  return sent == QLINQ_EMCON_OK ? QLINQ_EMCON_OK : QLINQ_EMCON_ERR_IO;
 }
 
 int qlinq_emcon_session_send_end(qlinq_emcon_session_t *session, uint8_t alias,
                                  uint64_t group_id, uint64_t final_object_id) {
-  uint8_t encoded[QLINQ_WIRE_TRACK_END_SIZE];
-  qlinq_wire_track_end_t end = {
-      .alias = alias, .group_id = group_id, .final_object_id = final_object_id};
-  if (!session || !find_stream(session, alias, NULL) ||
-      qlinq_wire_encode_track_end(encoded, sizeof(encoded), &end) !=
-          QLINQ_WIRE_OK)
-    return QLINQ_EMCON_SESSION_INVALID;
+  if (!session || !find_manifest_stream(&session->manifest, alias, NULL))
+    return QLINQ_EMCON_ERR_INVALID;
   int ret = prepare_send(session, session->manifest.terminal_repeat_count);
-  for (size_t i = 0; ret == QLINQ_EMCON_SESSION_OK &&
-                     i < session->manifest.terminal_repeat_count;
+  for (size_t i = 0;
+       ret == QLINQ_EMCON_OK && i < session->manifest.terminal_repeat_count;
        i++) {
     if (session->should_cancel && session->should_cancel(session->cancel_data))
-      return QLINQ_EMCON_SESSION_INTERRUPTED;
-    uint8_t packet[QLINQ_EMCON_FLEXICAST_OVERHEAD + QLINQ_WIRE_TRACK_END_SIZE];
+      return QLINQ_EMCON_ERR_INTERRUPTED;
+    uint8_t packet[QLINQ_EMCON_FLEXICAST_OVERHEAD +
+                   QLINQ_WIRE_FRAME_HEADER_SIZE + QLINQ_WIRE_TRACK_END_SIZE];
     size_t packet_size;
-    uint64_t packet_number;
-    if (qlinq_emcon_flexicast_seal(session->send_crypto, QLINQ_EMCON_RECORD_END,
-                                   ptls_iovec_init(encoded, sizeof(encoded)),
-                                   packet, sizeof(packet), &packet_size,
-                                   &packet_number) != QLINQ_EMCON_OK)
-      return QLINQ_EMCON_SESSION_CRYPTO;
-    (void)packet_number;
+    if (qlinq_emcon_seal_end(session->send_crypto, alias, group_id,
+                             final_object_id, packet, sizeof(packet),
+                             &packet_size, NULL) != QLINQ_EMCON_OK)
+      return QLINQ_EMCON_ERR_CRYPTO;
     ret = send_packet(session->sender, packet, packet_size);
-    if (ret == QLINQ_EMCON_SESSION_OK)
+    if (ret == QLINQ_EMCON_OK)
       session->stats.metadata_sent++;
   }
   return ret;
@@ -570,89 +422,68 @@ int qlinq_emcon_session_receive(qlinq_emcon_session_t *session,
   uint8_t packet[QLINQ_EMCON_MAX_PACKET_SIZE];
   size_t packet_size;
   if (!session || !session->receive_crypto || !session->receiver || !event)
-    return QLINQ_EMCON_SESSION_INVALID;
+    return QLINQ_EMCON_ERR_INVALID;
   if (session->receiver_claim_directory)
-    return QLINQ_EMCON_SESSION_ACTIVATION;
-  int received = qlinq_emcon_receive_socket_receive(
+    return QLINQ_EMCON_ERR_ACTIVATION;
+  int ret = qlinq_emcon_receive_socket_receive(
       session->receiver, packet, sizeof(packet), &packet_size, nonblocking,
       session->manifest.expires_at_ms);
-  if (received == QLINQ_EMCON_SOCKET_INTERRUPTED)
-    return QLINQ_EMCON_SESSION_INTERRUPTED;
-  if (received == QLINQ_EMCON_SOCKET_EXPIRED)
-    return QLINQ_EMCON_SESSION_EXPIRED;
-  if (received == QLINQ_EMCON_SOCKET_WOULD_BLOCK)
-    return QLINQ_EMCON_SESSION_WOULD_BLOCK;
-  if (received == QLINQ_EMCON_SOCKET_TOO_LARGE)
-    return QLINQ_EMCON_SESSION_DISCARDED;
-  if (received != QLINQ_EMCON_SOCKET_OK)
-    return QLINQ_EMCON_SESSION_IO;
+  if (ret == QLINQ_EMCON_ERR_TOO_LARGE)
+    return QLINQ_EMCON_DISCARDED;
+  if (ret != QLINQ_EMCON_OK)
+    return ret;
   session->stats.packets_received++;
   session->stats.bytes_received += packet_size;
 
-  qlinq_emcon_message_t message;
-  int opened = qlinq_emcon_flexicast_open(session->receive_crypto, packet,
-                                          packet_size, &message);
-  if (opened == QLINQ_EMCON_DUPLICATE) {
+  ptls_iovec_t datagram;
+  uint64_t pn;
+  ret = qlinq_emcon_flexicast_open(session->receive_crypto, packet, packet_size,
+                                   &datagram, &pn);
+  if (ret == QLINQ_EMCON_DUPLICATE)
     session->stats.replay_rejections++;
-    return QLINQ_EMCON_SESSION_DUPLICATE;
-  }
-  if (opened == QLINQ_EMCON_DISCARDED)
-    return QLINQ_EMCON_SESSION_DISCARDED;
-  if (opened == QLINQ_EMCON_NO_MEMORY)
-    return QLINQ_EMCON_SESSION_NO_MEMORY;
-  if (opened != QLINQ_EMCON_OK)
-    return opened == QLINQ_EMCON_INVALID ? QLINQ_EMCON_SESSION_INVALID
-                                         : QLINQ_EMCON_SESSION_CRYPTO;
-  qlinq_emcon_frame_t frame;
-  if (qlinq_emcon_decode_frame(&message, &frame) != QLINQ_EMCON_OK)
-    return QLINQ_EMCON_SESSION_INVALID;
-  uint8_t alias = frame.type == QLINQ_EMCON_RECORD_DATA
-                      ? frame.value.data.header.alias
-                      : frame.value.end.alias;
-  uint64_t group_id = frame.type == QLINQ_EMCON_RECORD_DATA
-                          ? frame.value.data.header.group_id
-                          : frame.value.end.group_id;
-  qlinq_emcon_receiver_t *receiver = find_alias(session, alias);
-  if (!receiver) {
+  if (ret != QLINQ_EMCON_OK)
+    return ret;
+
+  uint8_t alias;
+  uint64_t group_id;
+  ret = qlinq_emcon_datagram_target(datagram, &alias, &group_id);
+  if (ret != QLINQ_EMCON_OK)
+    return ret;
+  size_t stream_idx;
+  if (!find_manifest_stream(&session->manifest, alias, &stream_idx)) {
     session->stats.unknown_aliases++;
-    return QLINQ_EMCON_SESSION_UNKNOWN_ALIAS;
+    return QLINQ_EMCON_ERR_UNKNOWN_ALIAS;
   }
   if (session->filter_active &&
       (alias != session->filter_alias || group_id != session->filter_group_id))
-    return QLINQ_EMCON_SESSION_DISCARDED;
-  int ingested = qlinq_emcon_receiver_ingest_frame(receiver, &frame, event);
-  if (ingested == QLINQ_EMCON_INCOMPLETE)
-    return QLINQ_EMCON_SESSION_INCOMPLETE;
-  if (ingested == QLINQ_EMCON_DUPLICATE)
-    return QLINQ_EMCON_SESSION_DUPLICATE;
-  if (ingested == QLINQ_EMCON_NO_MEMORY)
-    return QLINQ_EMCON_SESSION_NO_MEMORY;
-  if (ingested != QLINQ_EMCON_OK)
-    return QLINQ_EMCON_SESSION_INVALID;
-
-  if (event->type == QLINQ_EMCON_EVENT_RECORD)
-    session->stats.records_completed++;
-  else
-    session->stats.metadata_received++;
-  return QLINQ_EMCON_SESSION_OK;
+    return QLINQ_EMCON_DISCARDED;
+  ret = qlinq_emcon_receiver_ingest(session->aliases[stream_idx], pn, datagram,
+                                    event);
+  if (ret == QLINQ_EMCON_OK) {
+    if (event->type == QLINQ_EMCON_EVENT_RECORD)
+      session->stats.records_completed++;
+    else
+      session->stats.metadata_received++;
+  }
+  return ret;
 }
 
 qlinq_emcon_session_stats_t
 qlinq_emcon_session_stats(const qlinq_emcon_session_t *session) {
   qlinq_emcon_session_stats_t stats =
       session ? session->stats : (qlinq_emcon_session_stats_t){0};
-  if (session && session->sender)
+  if (!session)
+    return stats;
+  if (session->sender)
     stats.send = qlinq_emcon_send_socket_stats(session->sender);
-  if (session && session->receive_crypto)
+  if (session->receive_crypto)
     stats.authentication_failures =
         qlinq_emcon_ingress_authentication_failures(session->receive_crypto);
-  if (session) {
-    stats.next_packet_number =
-        session->send_crypto
-            ? qlinq_emcon_sender_next_packet_number(session->send_crypto)
-            : session->manifest.initial_packet_number;
-    stats.reserved_until = session->reserved_until;
-    stats.persistent_activation = session->activation != NULL;
-  }
+  stats.next_packet_number =
+      session->send_crypto
+          ? qlinq_emcon_sender_next_packet_number(session->send_crypto)
+          : 0;
+  stats.reserved_until = session->reserved_until;
+  stats.persistent_activation = session->activation != NULL;
   return stats;
 }

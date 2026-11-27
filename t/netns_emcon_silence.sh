@@ -184,16 +184,12 @@ check_family() {
   local directory="$work_dir/ip$family"
   mkdir -p "$directory/"{sender,rx1,rx2}
   cat >"$directory/session.conf" <<CONF
-session_id=random
-sender_id=random
 flow_id=random
 key_epoch=1
-initial_packet_number=100
 valid_for_seconds=120
 source=$sender_endpoint
 destination=$group_endpoint
 interface_index=$source_index
-replay_window_packets=64
 rate_bytes_per_second=1000000
 burst_bytes=4096
 terminal_repeat_count=3

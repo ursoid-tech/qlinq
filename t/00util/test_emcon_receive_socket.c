@@ -1,4 +1,4 @@
-#include "../../src/emcon/emcon_receive_socket.h"
+#include "../../src/emcon/emcon_socket.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -53,7 +53,7 @@ int main(void) {
   CHECK(qlinq_emcon_receive_socket_create_multicast(
             &receiver, (struct sockaddr *)&multicast_address,
             sizeof(multicast_address), (struct sockaddr *)&sender_address,
-            sizeof(sender_address), 0, false) == QLINQ_EMCON_SOCKET_INVALID,
+            sizeof(sender_address), 0, false) == QLINQ_EMCON_ERR_INVALID,
         "preprovisioned multicast requires an interface");
 
   struct sockaddr_in receiver_address = {.sin_family = AF_INET,
@@ -64,13 +64,12 @@ int main(void) {
             qlinq_emcon_receive_socket_create_multicast(
                 &receiver, (struct sockaddr *)&receiver_address,
                 sizeof(receiver_address), (struct sockaddr *)&sender_address,
-                sizeof(sender_address), UINT32_MAX,
-                true) == QLINQ_EMCON_SOCKET_SYSTEM,
+                sizeof(sender_address), UINT32_MAX, true) == QLINQ_EMCON_ERR_IO,
         "unicast receive honors an explicit interface index");
   CHECK(qlinq_emcon_receive_socket_create_multicast(
             &receiver, (struct sockaddr *)&receiver_address,
             sizeof(receiver_address), (struct sockaddr *)&sender_address,
-            sizeof(sender_address), 0, true) == QLINQ_EMCON_SOCKET_OK,
+            sizeof(sender_address), 0, true) == QLINQ_EMCON_OK,
         "create UDP receive socket");
 
   const uint8_t payload[] = "protected symbol";
@@ -81,14 +80,14 @@ int main(void) {
   uint8_t packet[64];
   size_t packet_size = 0;
   CHECK(qlinq_emcon_receive_socket_receive(receiver, packet, sizeof(packet),
-                                           &packet_size, false, UINT64_MAX) ==
-                QLINQ_EMCON_SOCKET_OK &&
+                                           &packet_size, false,
+                                           UINT64_MAX) == QLINQ_EMCON_OK &&
             packet_size == sizeof(payload) &&
             memcmp(packet, payload, sizeof(payload)) == 0,
         "receive datagram");
   CHECK(qlinq_emcon_receive_socket_receive(receiver, packet, sizeof(packet),
                                            &packet_size, true, UINT64_MAX) ==
-            QLINQ_EMCON_SOCKET_WOULD_BLOCK,
+            QLINQ_EMCON_WOULD_BLOCK,
         "no receiver feedback datagram");
   CHECK(recv(sender, packet, sizeof(packet), MSG_DONTWAIT) < 0 &&
             (errno == EAGAIN || errno == EWOULDBLOCK),
@@ -100,7 +99,7 @@ int main(void) {
                sizeof(receiver_address)) == (ssize_t)sizeof(oversize) &&
             qlinq_emcon_receive_socket_receive(
                 receiver, packet, sizeof(packet), &packet_size, false,
-                UINT64_MAX) == QLINQ_EMCON_SOCKET_TOO_LARGE,
+                UINT64_MAX) == QLINQ_EMCON_ERR_TOO_LARGE,
         "oversized datagram reports truncation");
 
   bool cancelled = true;
@@ -108,7 +107,7 @@ int main(void) {
                                         &cancelled);
   CHECK(qlinq_emcon_receive_socket_receive(receiver, packet, sizeof(packet),
                                            &packet_size, false, UINT64_MAX) ==
-            QLINQ_EMCON_SOCKET_INTERRUPTED,
+            QLINQ_EMCON_ERR_INTERRUPTED,
         "blocking receive wakes on cancellation");
   cancelled = false;
 
@@ -119,7 +118,7 @@ int main(void) {
   packet_size = 0;
   CHECK(qlinq_emcon_receive_socket_receive(
             receiver, packet, sizeof(packet), &packet_size, false,
-            qlinq_emcon_realtime_ms()) == QLINQ_EMCON_SOCKET_EXPIRED &&
+            qlinq_emcon_realtime_ms()) == QLINQ_EMCON_ERR_EXPIRED &&
             packet_size == 0,
         "never accept queued data after expiry");
 

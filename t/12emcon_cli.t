@@ -54,16 +54,12 @@ chmod 0600, $signing_key;
 
 open my $config_file, '>', $config or die "open config: $!";
 print {$config_file} <<"CONFIG";
-session_id=random
-sender_id=random
 flow_id=0x5b
 key_epoch=1
-initial_packet_number=4611686018427383808
 valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
 interface_index=0
-replay_window_packets=64
 rate_bytes_per_second=100000000
 burst_bytes=4096
 terminal_repeat_count=3
@@ -78,7 +74,10 @@ ok(run_command($qlinq_emcon, 'manifest', 'create', $config,
                '--signature', $signature, '--generate-traffic-key',
                $traffic_key, '--public-key-output', $public_key),
    'create signed manifest provisioning set');
-is(-s $manifest, 280, 'manifest has canonical one-stream size');
+open my $manifest_fh, '<', $manifest or die "open manifest: $!";
+my $manifest_text = do { local $/; <$manifest_fh> };
+close $manifest_fh;
+like($manifest_text, qr/\AQEMCON1\n/, 'manifest has canonical QEMCON1 text format');
 is(-s $signature, 64, 'signature has Ed25519 size');
 is(-s $traffic_key, 32, 'generated traffic key has AES-SHA256 secret size');
 is((stat($traffic_key))[2] & 0777, 0600, 'generated traffic key is protected');
@@ -228,16 +227,12 @@ my $reorder_manifest = "$directory/reorder.bin";
 my $reorder_sig = "$directory/reorder.sig";
 open my $reorder_cf, '>', $reorder_conf or die "reorder config: $!";
 print {$reorder_cf} <<"REORDER_CONFIG";
-session_id=random
-sender_id=random
 flow_id=92
 key_epoch=3
-initial_packet_number=10
 valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
 interface_index=0
-replay_window_packets=64
 rate_bytes_per_second=100000000
 burst_bytes=4096
 terminal_repeat_count=2
@@ -324,16 +319,12 @@ my $slow_manifest = "$directory/slow.bin";
 my $slow_sig = "$directory/slow.sig";
 open my $slow_cf, '>', $slow_conf or die "slow config: $!";
 print {$slow_cf} <<"SLOW_CONFIG";
-session_id=random
-sender_id=random
 flow_id=93
 key_epoch=4
-initial_packet_number=0
 valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
 interface_index=0
-replay_window_packets=64
 rate_bytes_per_second=500
 burst_bytes=1200
 terminal_repeat_count=4
@@ -456,16 +447,12 @@ my $restart_manifest = "$directory/restart.bin";
 my $restart_sig = "$directory/restart.sig";
 open my $restart_cf, '>', $restart_conf or die "restart config: $!";
 print {$restart_cf} <<"RESTART_CONFIG";
-session_id=random
-sender_id=random
 flow_id=94
 key_epoch=5
-initial_packet_number=0
 valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
 interface_index=0
-replay_window_packets=64
 rate_bytes_per_second=100000000
 burst_bytes=4096
 terminal_repeat_count=2
@@ -584,16 +571,12 @@ my $end_manifest = "$directory/end-bound.bin";
 my $end_sig = "$directory/end-bound.sig";
 open my $end_cf, '>', $end_conf or die "end-bound config: $!";
 print {$end_cf} <<"END_CONFIG";
-session_id=random
-sender_id=random
 flow_id=95
 key_epoch=6
-initial_packet_number=0
 valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
 interface_index=0
-replay_window_packets=64
 rate_bytes_per_second=100000000
 burst_bytes=4096
 terminal_repeat_count=1
@@ -722,16 +705,12 @@ my $mutate_manifest = "$directory/mutate.bin";
 my $mutate_sig = "$directory/mutate.sig";
 open my $mutate_cf, '>', $mutate_conf or die "mutate config: $!";
 print {$mutate_cf} <<"MUTATE_CONFIG";
-session_id=random
-sender_id=random
 flow_id=96
 key_epoch=7
-initial_packet_number=0
 valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
 interface_index=0
-replay_window_packets=64
 rate_bytes_per_second=40000
 burst_bytes=2048
 terminal_repeat_count=2

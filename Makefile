@@ -58,7 +58,7 @@ endif
 endif
 
 # Include paths: use -isystem for quicly and picotls to suppress warning headers
-INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
+INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -isystem deps/quicly/include -isystem deps/quicly/lib -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/flexicast.c \
@@ -153,9 +153,10 @@ APP_OBJS = src/app/main.o src/app/xfer.o src/app/xfer_file.o
 EMCON_OBJS = src/emcon/emcon_activation.o \
              src/emcon/emcon_manifest.o \
              src/emcon/emcon_rateless.o \
-             src/emcon/emcon_receive_socket.o \
-             src/emcon/emcon_send_socket.o \
+             src/emcon/emcon_socket.o \
              src/emcon/emcon_session.o \
+             src/common/cli_parse.o \
+             src/common/transport_memory.o \
              src/common/transport_wire.o \
              $(FEC_OBJS) $(QUICLY_OBJS)
 
@@ -230,7 +231,7 @@ libqlinq.a: $(TRANSPORT_OBJS) .build-config
 qlinq-app: $(APP_OBJS) libqlinq.a
 	$(CC) -o $@ $(APP_OBJS) libqlinq.a $(LDFLAGS)
 
-qlinq-emcon: src/emcon/main.o src/emcon/manifest_create.o src/common/cli_parse.o $(EMCON_OBJS)
+qlinq-emcon: src/emcon/main.o $(EMCON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
@@ -625,16 +626,16 @@ t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_
 ifeq ($(UNAME_S),Linux)
 t/00util/test_emcon_activation: private EMCON_ACTIVATION_TEST_LDFLAGS = -Wl,--wrap=fsync
 endif
-t/00util/test_emcon_activation: t/00util/test_emcon_activation.o src/emcon/emcon_activation.o src/emcon/emcon_manifest.o
+t/00util/test_emcon_activation: t/00util/test_emcon_activation.o src/emcon/emcon_activation.o src/emcon/emcon_manifest.o src/common/cli_parse.o
 	$(CC) -o $@ $^ $(LDFLAGS) $(EMCON_ACTIVATION_TEST_LDFLAGS)
 
-t/00util/test_emcon_manifest: t/00util/test_emcon_manifest.o src/emcon/emcon_manifest.o
+t/00util/test_emcon_manifest: t/00util/test_emcon_manifest.o src/emcon/emcon_manifest.o src/common/cli_parse.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_emcon_rateless: t/00util/test_emcon_rateless.o $(EMCON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_emcon_receive_socket: t/00util/test_emcon_receive_socket.o src/emcon/emcon_receive_socket.o
+t/00util/test_emcon_receive_socket: t/00util/test_emcon_receive_socket.o src/emcon/emcon_socket.o src/emcon/emcon_manifest.o src/common/cli_parse.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 t/00util/test_emcon_session: t/00util/test_emcon_session.o $(EMCON_OBJS)
