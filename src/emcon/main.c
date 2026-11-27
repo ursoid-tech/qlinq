@@ -205,42 +205,111 @@ static FILE *open_data_file(const char *path, const char *mode,
   return strcmp(path, "-") == 0 ? standard_stream : fopen(path, mode);
 }
 
-static bool
-hash_regular_file(int fd, uint8_t *scratch, size_t scratch_size,
-                  uint64_t *total_bytes,
-                  uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE]) {
+typedef uint8_t emcon_digest_t[QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
+
+static bool sha256_bytes(const uint8_t *data, size_t size,
+                         emcon_digest_t digest) {
+  unsigned int digest_len = 0;
+  return EVP_Digest(data, size, digest, &digest_len, EVP_sha256(), NULL) == 1 &&
+         digest_len == sizeof(emcon_digest_t);
+}
+
+static bool pread_full(int fd, uint8_t *buffer, size_t capacity,
+                       uint64_t offset, size_t *bytes_read) {
+  const uint64_t max_offset = sizeof(off_t) >= sizeof(int64_t)
+                                  ? (uint64_t)INT64_MAX
+                                  : (uint64_t)INT32_MAX;
+  size_t total = 0;
+  while (total < capacity && emcon_running) {
+    if (offset > max_offset || total > max_offset - offset)
+      return false;
+    ssize_t got =
+        pread(fd, buffer + total, capacity - total, (off_t)(offset + total));
+    if (got < 0 && errno == EINTR)
+      continue;
+    if (got < 0)
+      return false;
+    if (got == 0)
+      break;
+    total += (size_t)got;
+  }
+  if (!emcon_running)
+    return false;
+  *bytes_read = total;
+  return true;
+}
+
+static void free_record_digests(emcon_digest_t *digests, size_t capacity) {
+  if (!digests)
+    return;
+  OPENSSL_cleanse(digests, capacity * sizeof(*digests));
+  free(digests);
+}
+
+/* hashes both the full input and each fixed-size record slice */
+static bool hash_regular_file(int fd, uint8_t *scratch, size_t block_size,
+                              uint64_t *total_bytes, emcon_digest_t digest,
+                              emcon_digest_t **record_digests,
+                              size_t *record_count, size_t *record_capacity) {
+  *record_digests = NULL;
+  *record_count = 0;
+  *record_capacity = 0;
   EVP_MD_CTX *context = EVP_MD_CTX_new();
   if (!context)
     return false;
   bool ok = EVP_DigestInit_ex(context, EVP_sha256(), NULL) == 1;
+  emcon_digest_t *digests = NULL;
+  size_t count = 0, capacity = 0;
   uint64_t offset = 0;
   while (ok && emcon_running) {
-    if (offset > (uint64_t)INT64_MAX) {
-      ok = false;
-      break;
-    }
-    ssize_t got = pread(fd, scratch, scratch_size, (off_t)offset);
-    if (got < 0 && errno == EINTR)
-      continue;
-    if (got < 0) {
+    size_t got = 0;
+    if (!pread_full(fd, scratch, block_size, offset, &got)) {
       ok = false;
       break;
     }
     if (got == 0)
       break;
-    ok = EVP_DigestUpdate(context, scratch, (size_t)got) == 1;
-    offset += (uint64_t)got;
+    if (count == capacity) {
+      size_t next_capacity = capacity ? capacity * 2U : 64U;
+      if (next_capacity <= capacity ||
+          next_capacity > SIZE_MAX / sizeof(*digests)) {
+        ok = false;
+        break;
+      }
+      emcon_digest_t *grown =
+          realloc(digests, next_capacity * sizeof(*digests));
+      if (!grown) {
+        ok = false;
+        break;
+      }
+      digests = grown;
+      capacity = next_capacity;
+    }
+    ok = sha256_bytes(scratch, got, digests[count]) &&
+         EVP_DigestUpdate(context, scratch, got) == 1;
+    if (!ok)
+      break;
+    count++;
+    offset += got;
+    if (got < block_size)
+      break;
   }
   unsigned int digest_len = 0;
   if (ok && emcon_running)
     ok = EVP_DigestFinal_ex(context, digest, &digest_len) == 1 &&
-         digest_len == QLINQ_EMCON_MANIFEST_DIGEST_SIZE;
+         digest_len == sizeof(emcon_digest_t);
   else
     ok = false;
   EVP_MD_CTX_free(context);
-  if (ok)
-    *total_bytes = offset;
-  return ok;
+  if (!ok) {
+    free_record_digests(digests, capacity);
+    return false;
+  }
+  *total_bytes = offset;
+  *record_digests = digests;
+  *record_count = count;
+  *record_capacity = capacity;
+  return true;
 }
 
 static int run_sender(const emcon_options_t *options,
@@ -274,17 +343,21 @@ static int run_sender(const emcon_options_t *options,
       fclose(input);
     return 1;
   }
-  bool regular_input = S_ISREG(input_info.st_mode);
+  bool regular_input =
+      S_ISREG(input_info.st_mode) &&
+      (input != stdin || lseek(fileno(input), 0, SEEK_CUR) == 0);
   qlinq_emcon_transfer_t transfer = {
       .alias = options->alias,
       .group_id = options->group_id,
       .block_size = (uint32_t)block_size,
       .resumable = regular_input,
   };
-  EVP_MD_CTX *live_hash = NULL;
+  emcon_digest_t *record_digests = NULL;
+  size_t record_count = 0, record_capacity = 0;
   if (regular_input) {
     if (!hash_regular_file(fileno(input), block, block_size,
-                           &transfer.input_size, transfer.input_digest)) {
+                           &transfer.input_size, transfer.input_digest,
+                           &record_digests, &record_count, &record_capacity)) {
       fprintf(stderr, emcon_running ? "qlinq-emcon: input read failed\n"
                                     : "qlinq-emcon: interrupted\n");
       OPENSSL_cleanse(block, block_size);
@@ -295,16 +368,7 @@ static int run_sender(const emcon_options_t *options,
     }
     if (transfer.input_size == 0) {
       fprintf(stderr, "qlinq-emcon: empty input has no finite object range\n");
-      OPENSSL_cleanse(block, block_size);
-      free(block);
-      if (input != stdin)
-        fclose(input);
-      return 1;
-    }
-    live_hash = EVP_MD_CTX_new();
-    if (!live_hash || EVP_DigestInit_ex(live_hash, EVP_sha256(), NULL) != 1) {
-      EVP_MD_CTX_free(live_hash);
-      fprintf(stderr, "qlinq-emcon: cannot initialize input digest\n");
+      free_record_digests(record_digests, record_capacity);
       OPENSSL_cleanse(block, block_size);
       free(block);
       if (input != stdin)
@@ -317,18 +381,64 @@ static int run_sender(const emcon_options_t *options,
   uint64_t bytes = 0;
   bool failed = false;
   while (emcon_running) {
-    size_t size = fread(block, 1, block_size, input);
-    if (ferror(input)) {
-      fprintf(stderr, "qlinq-emcon: input read failed\n");
-      failed = true;
-      break;
-    }
-    if (size == 0 || !emcon_running)
-      break;
-    if (live_hash && EVP_DigestUpdate(live_hash, block, size) != 1) {
-      fprintf(stderr, "qlinq-emcon: input digest update failed\n");
-      failed = true;
-      break;
+    size_t size = 0;
+    if (regular_input) {
+      if (object_id >= record_count)
+        break;
+      uint64_t remaining = transfer.input_size - bytes;
+      size_t expected_size =
+          remaining > block_size ? block_size : (size_t)remaining;
+      if (!pread_full(fileno(input), block, expected_size, bytes, &size)) {
+        if (emcon_running)
+          fprintf(stderr, "qlinq-emcon: input read failed\n");
+        failed = true;
+        break;
+      }
+      if (size != expected_size) {
+        fprintf(stderr, "qlinq-emcon: input changed during transmission\n");
+        failed = true;
+        break;
+      }
+      emcon_digest_t record_digest;
+      if (!sha256_bytes(block, size, record_digest)) {
+        fprintf(stderr, "qlinq-emcon: input digest update failed\n");
+        failed = true;
+        break;
+      }
+      bool unchanged = CRYPTO_memcmp(record_digest, record_digests[object_id],
+                                     sizeof(record_digest)) == 0;
+      OPENSSL_cleanse(record_digest, sizeof(record_digest));
+      if (!unchanged) {
+        fprintf(stderr, "qlinq-emcon: input changed during transmission\n");
+        failed = true;
+        break;
+      }
+      if (object_id + 1 == record_count) {
+        uint8_t extra = 0;
+        size_t extra_size = 0;
+        if (!pread_full(fileno(input), &extra, 1, transfer.input_size,
+                        &extra_size)) {
+          if (emcon_running)
+            fprintf(stderr, "qlinq-emcon: input read failed\n");
+          failed = true;
+          break;
+        }
+        if (extra_size != 0) {
+          fprintf(stderr, "qlinq-emcon: input changed during transmission\n");
+          failed = true;
+          break;
+        }
+      }
+    } else {
+      size = fread(block, 1, block_size, input);
+      if (ferror(input)) {
+        if (emcon_running)
+          fprintf(stderr, "qlinq-emcon: input read failed\n");
+        failed = true;
+        break;
+      }
+      if (size == 0 || !emcon_running)
+        break;
     }
     int ret;
     if (!session) {
@@ -363,7 +473,7 @@ static int run_sender(const emcon_options_t *options,
       break;
     }
     object_id++;
-    if (size != block_size)
+    if (!regular_input && size != block_size)
       break;
   }
   if (!emcon_running) {
@@ -375,23 +485,25 @@ static int run_sender(const emcon_options_t *options,
     failed = true;
   }
   if (!failed && regular_input) {
-    uint8_t live_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
-    unsigned int live_len = 0;
-    if (bytes != transfer.input_size ||
-        EVP_DigestFinal_ex(live_hash, live_digest, &live_len) != 1 ||
-        live_len != sizeof(live_digest) ||
-        CRYPTO_memcmp(live_digest, transfer.input_digest,
-                      sizeof(live_digest)) != 0) {
+    struct stat final_info;
+    if (fstat(fileno(input), &final_info) != 0) {
+      fprintf(stderr, "qlinq-emcon: input read failed\n");
+      failed = true;
+    } else if (!S_ISREG(final_info.st_mode) || final_info.st_size < 0 ||
+               (uint64_t)final_info.st_size != transfer.input_size ||
+               bytes != transfer.input_size) {
       fprintf(stderr, "qlinq-emcon: input changed during transmission\n");
       failed = true;
     }
   }
-  EVP_MD_CTX_free(live_hash);
+  free_record_digests(record_digests, record_capacity);
   if (!failed) {
     int end_ret = qlinq_emcon_session_send_end(
         session, options->alias, options->group_id, object_id - 1);
     if (end_ret != QLINQ_EMCON_SESSION_OK) {
-      if (end_ret != QLINQ_EMCON_SESSION_INTERRUPTED)
+      if (end_ret == QLINQ_EMCON_SESSION_INTERRUPTED)
+        fprintf(stderr, "qlinq-emcon: interrupted\n");
+      else
         fprintf(stderr, "qlinq-emcon: terminal metadata failed: %s\n",
                 qlinq_emcon_session_strerror(end_ret));
       failed = true;

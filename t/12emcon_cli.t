@@ -716,4 +716,181 @@ for my $case (
          "receiver reports terminal range violation for $label");
 }
 
+# Verify mid-transmission input mutation emits no altered records and retries cleanly once restored.
+my $mutate_conf = "$directory/mutate.conf";
+my $mutate_manifest = "$directory/mutate.bin";
+my $mutate_sig = "$directory/mutate.sig";
+open my $mutate_cf, '>', $mutate_conf or die "mutate config: $!";
+print {$mutate_cf} <<"MUTATE_CONFIG";
+session_id=random
+sender_id=random
+flow_id=96
+key_epoch=7
+initial_packet_number=0
+valid_for_seconds=120
+source=127.0.0.1:$source_port
+destination=127.0.0.1:$destination_port
+interface_index=0
+replay_window_packets=64
+rate_bytes_per_second=40000
+burst_bytes=2048
+terminal_repeat_count=2
+symbol_size=512
+repair_symbols=20
+stream=7,data,65536,mutate-test
+MUTATE_CONFIG
+close $mutate_cf;
+ok(run_command($qlinq_emcon, 'manifest', 'create', $mutate_conf,
+               '--signing-key', $signing_key, '--output', $mutate_manifest,
+               '--signature', $mutate_sig, '--traffic-key', $traffic_key),
+   'create paced manifest for mid-transmission mutation test');
+
+my $mutate_in = "$directory/mutate-in.bin";
+my $mutate_out = "$directory/mutate-out.bin";
+my $mutate_orig = join '', map { chr((($_ * 37 + ($_ >> 8) * 19 + 5) & 0xff)) } 0 .. 32_767;
+open my $mutate_in_fh, '>', $mutate_in or die "write mutate input: $!";
+binmode $mutate_in_fh;
+print {$mutate_in_fh} $mutate_orig;
+close $mutate_in_fh;
+open my $mutate_seed, '>', $mutate_out or die "seed mutate out: $!";
+print {$mutate_seed} 'seed';
+close $mutate_seed;
+
+mkdir "$directory/mutate-tx-state", 0700 or die "mutate tx state: $!";
+mkdir "$directory/mutate-rx-state", 0700 or die "mutate rx state: $!";
+my $mutate_rx = fork();
+die "fork mutate receiver: $!" unless defined $mutate_rx;
+if ($mutate_rx == 0) {
+    open STDOUT, '>', "$directory/mutate-rx.stdout" or exit 127;
+    open STDERR, '>', "$directory/mutate-rx.stderr" or exit 127;
+    exec $qlinq_emcon, 'receive', '--manifest', $mutate_manifest,
+      '--signature', $mutate_sig, '--public-key', $public_key,
+      '--traffic-key', $traffic_key, '--alias', '7', '--group', '1',
+      '--state-dir', "$directory/mutate-rx-state", $mutate_out;
+    exit 127;
+}
+for (1 .. 200) {
+    last if -z $mutate_out;
+    select undef, undef, undef, 0.01;
+}
+ok(-z $mutate_out, 'mutation receiver ready');
+
+my $mutate_tx = fork();
+die "fork mutate sender: $!" unless defined $mutate_tx;
+if ($mutate_tx == 0) {
+    open STDOUT, '>', "$directory/mutate-tx.stdout" or exit 127;
+    open STDERR, '>', "$directory/mutate-tx.stderr" or exit 127;
+    exec $qlinq_emcon, 'send', '--manifest', $mutate_manifest,
+      '--signature', $mutate_sig, '--public-key', $public_key,
+      '--traffic-key', $traffic_key, '--alias', '7', '--group', '1',
+      '--state-dir', "$directory/mutate-tx-state", '--block-size', '8192',
+      $mutate_in;
+    exit 127;
+}
+for (1 .. 300) {
+    last if (-s $mutate_out // 0) >= 8192;
+    select undef, undef, undef, 0.005;
+}
+is(-s $mutate_out, 8192,
+   'receiver completed initial 8 KiB record while repair symbols still pace');
+
+# Corrupt the second 8 KiB record in-place before the sender reads object 1.
+open my $corrupt_fh, '+<', $mutate_in or die "open mutate input in-place: $!";
+binmode $corrupt_fh;
+seek $corrupt_fh, 8192, 0 or die "seek mutate input: $!";
+print {$corrupt_fh} ("\xff" x 8192);
+close $corrupt_fh;
+
+ok(!wait_child($mutate_tx), 'sender fails when input changes during transmission');
+open my $mutate_tx_err_fh, '<', "$directory/mutate-tx.stderr"
+  or die "open mutate tx stderr: $!";
+my $mutate_tx_err = do { local $/; <$mutate_tx_err_fh> };
+close $mutate_tx_err_fh;
+like($mutate_tx_err, qr/input changed during transmission/,
+     'sender reports mid-transmission input modification');
+is(-s $mutate_out, 8192,
+   'sender emitted no altered record after mid-transmission modification');
+is(waitpid($mutate_rx, WNOHANG), 0,
+   'receiver remains active without terminal metadata');
+
+ok(!run_command($qlinq_emcon, 'send', '--manifest', $mutate_manifest,
+                '--signature', $mutate_sig, '--public-key', $public_key,
+                '--traffic-key', $traffic_key, '--alias', '7', '--group', '1',
+                '--state-dir', "$directory/mutate-tx-state",
+                '--block-size', '8192', $mutate_in),
+   'reject retry while input remains altered');
+
+open $mutate_in_fh, '>', $mutate_in or die "restore mutate input: $!";
+binmode $mutate_in_fh;
+print {$mutate_in_fh} $mutate_orig;
+close $mutate_in_fh;
+
+ok(run_command($qlinq_emcon, 'send', '--manifest', $mutate_manifest,
+               '--signature', $mutate_sig, '--public-key', $public_key,
+               '--traffic-key', $traffic_key, '--alias', '7', '--group', '1',
+               '--state-dir', "$directory/mutate-tx-state",
+               '--block-size', '8192', $mutate_in),
+   'restored original input retries cleanly on the same group');
+ok(wait_child($mutate_rx), 'receiver completes after restored retry');
+open my $mutate_out_fh, '<', $mutate_out or die "open mutate output: $!";
+binmode $mutate_out_fh;
+my $mutate_received = do { local $/; <$mutate_out_fh> };
+close $mutate_out_fh;
+is($mutate_received, $mutate_orig,
+   'restored 32 KiB output matches original byte-for-byte with zero corrupted records');
+
+# Verify mid-transmission file extension aborts without emitting trailing records or END.
+my $grow_in = "$directory/grow-in.bin";
+open my $grow_fh, '>', $grow_in or die "write grow input: $!";
+binmode $grow_fh;
+print {$grow_fh} substr($mutate_orig, 0, 16_384);
+close $grow_fh;
+
+my $grow_cap = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1', LocalPort => $destination_port, Proto => 'udp'
+) or die "grow capture socket: $!";
+my $grow_tx = fork();
+die "fork grow sender: $!" unless defined $grow_tx;
+if ($grow_tx == 0) {
+    close $grow_cap;
+    open STDOUT, '>', "$directory/grow-tx.stdout" or exit 127;
+    open STDERR, '>', "$directory/grow-tx.stderr" or exit 127;
+    exec $qlinq_emcon, 'send', '--manifest', $mutate_manifest,
+      '--signature', $mutate_sig, '--public-key', $public_key,
+      '--traffic-key', $traffic_key, '--alias', '7', '--group', '2',
+      '--state-dir', "$directory/mutate-tx-state", '--block-size', '8192',
+      $grow_in;
+    exit 127;
+}
+my $grow_rin = '';
+vec($grow_rin, fileno($grow_cap), 1) = 1;
+my $grow_packets = 0;
+if (select($grow_rin, undef, undef, 3.0) > 0) {
+    my $datagram = '';
+    $grow_cap->recv($datagram, 2048);
+    $grow_packets++;
+}
+open my $append_fh, '>>', $grow_in or die "append grow input: $!";
+binmode $append_fh;
+print {$append_fh} ('Z' x 8192);
+close $append_fh;
+
+ok(!wait_child($grow_tx), 'sender fails when input grows during transmission');
+while (1) {
+    my $rin = '';
+    vec($rin, fileno($grow_cap), 1) = 1;
+    last unless select($rin, undef, undef, 0.05);
+    my $datagram = '';
+    $grow_cap->recv($datagram, 2048);
+    $grow_packets++;
+}
+close $grow_cap;
+open my $grow_err_fh, '<', "$directory/grow-tx.stderr" or die "grow stderr: $!";
+my $grow_err = do { local $/; <$grow_err_fh> };
+close $grow_err_fh;
+like($grow_err, qr/input changed during transmission/,
+     'sender reports mid-transmission input extension');
+cmp_ok($grow_packets, '<=', 36,
+       'sender stops before emitting final or appended records after growth');
+
 done_testing();
