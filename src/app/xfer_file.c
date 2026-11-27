@@ -4,6 +4,8 @@
 #endif
 #include "xfer_file.h"
 
+#include "fs_util.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -497,12 +499,8 @@ static bool load_metadata(xfer_file_t *file, uint8_t prefix[32], bool *exists,
 }
 
 static bool sync_data(int fd, char *error, size_t cap) {
-#if defined(__APPLE__)
-  int result = fsync(fd);
-#else
-  int result = fdatasync(fd);
-#endif
-  return result == 0 || syserr(error, cap, "sync transfer data");
+  return qlinq_sync_file_data(fd) == 0 ||
+         syserr(error, cap, "sync transfer data");
 }
 
 static bool save_metadata(xfer_file_t *file, char *error, size_t cap) {
@@ -531,18 +529,8 @@ static bool save_metadata(xfer_file_t *file, char *error, size_t cap) {
     free(temporary);
     return syserr(error, cap, "create resume metadata");
   }
-  bool ok = true;
-  size_t offset = 0;
-  while (offset < sizeof(data)) {
-    ssize_t count = write(fd, data + offset, sizeof(data) - offset);
-    if (count < 0 && errno == EINTR)
-      continue;
-    if (count <= 0) {
-      ok = syserr(error, cap, "write resume metadata");
-      break;
-    }
-    offset += (size_t)count;
-  }
+  bool ok = qlinq_write_exact(fd, data, sizeof(data)) == 0 ||
+            syserr(error, cap, "write resume metadata");
   if (ok && fsync(fd) != 0)
     ok = syserr(error, cap, "sync resume metadata");
   if (close(fd) != 0 && ok)

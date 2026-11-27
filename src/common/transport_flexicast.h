@@ -5,6 +5,7 @@
 #include "transport_tracks.h"
 #include "transport_wire.h"
 
+#include "flexicast_member_map.h"
 #include "quicly/flexicast.h"
 
 #define TRANSPORT_FLEXICAST_MAX_FLOWS 256U
@@ -47,12 +48,6 @@ typedef struct transport_flexicast_member_t {
   uint64_t payload_delivery_id;
   int64_t ready_deadline_ms;
 } transport_flexicast_member_t;
-
-typedef struct transport_flexicast_member_map_entry_t {
-  const transport_conn_t *conn;
-  size_t slot;
-  uint8_t state;
-} transport_flexicast_member_map_entry_t;
 
 typedef struct transport_flexicast_queued_payload_t {
   uint8_t *storage;
@@ -118,12 +113,11 @@ typedef struct transport_flexicast_flow_t {
   int64_t last_payload_sent_ms;
   quicly_flexicast_cc_config_t cc_config;
   transport_flexicast_member_t *members;
-  transport_flexicast_member_map_entry_t *member_map;
+  flexicast_member_map_t member_map;
   size_t member_count;
   size_t listening_count;
   size_t feedback_outstanding_count;
   size_t member_capacity;
-  size_t member_map_capacity;
   bool rekey_pending;
   int64_t rekey_ready_at_ms;
   uint64_t delivery_epoch;

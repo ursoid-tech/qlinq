@@ -58,7 +58,7 @@ endif
 endif
 
 # Include paths: use -isystem for quicly and picotls to suppress warning headers
-INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
+INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -isystem deps/quicly/include -isystem deps/quicly/lib -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/flexicast.c \
@@ -150,6 +150,16 @@ COMMON_OBJS = $(TRANSPORT_OBJS)
 
 APP_OBJS = src/app/main.o src/app/xfer.o src/app/xfer_file.o
 
+EMCON_OBJS = src/emcon/emcon_activation.o \
+             src/emcon/emcon_manifest.o \
+             src/emcon/emcon_rateless.o \
+             src/emcon/emcon_socket.o \
+             src/emcon/emcon_session.o \
+             src/common/cli_parse.o \
+             src/common/transport_memory.o \
+             src/common/transport_wire.o \
+             $(FEC_OBJS) $(QUICLY_OBJS)
+
 FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
            deps/nanors/deps/obl/oblas_common.o \
@@ -203,7 +213,7 @@ deps/nanors/%.o deps/nanorq/%.o: private CODEC_CFLAGS = $(FEC_CFLAGS) $(FEC_NATI
 deps/%.o: deps/%.c .build-config
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) $(CODEC_CFLAGS) -w -c $< -o $@
 
-all: qlinq-app qlinq-tun
+all: qlinq-app qlinq-emcon qlinq-tun
 
 src/common/transport_tls.o t/00util/test_crypto_backend.o: .build-config Makefile
 
@@ -220,6 +230,9 @@ libqlinq.a: $(TRANSPORT_OBJS) .build-config
 
 qlinq-app: $(APP_OBJS) libqlinq.a
 	$(CC) -o $@ $(APP_OBJS) libqlinq.a $(LDFLAGS)
+
+qlinq-emcon: src/emcon/main.o $(EMCON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 qlinq-tun: src/host/linux/tun_metrics.o src/host/linux/tun_control.o src/host/linux/tun_config.o src/host/linux/tun_json.o src/host/linux/tun_direct.o src/host/linux/tun_device.o src/common/tun_packet.o src/common/tun_segment.o src/common/tun_coalesce.o src/common/tun_receive_batch.o libqlinq.a
 	$(CC) -o $@ $^ $(LDFLAGS)
@@ -482,7 +495,11 @@ t/00util/test_recovery_latency: t/00util/test_recovery_latency.o $(ENGINE_OBJS)
 t/00util/test_publication_deadlines: t/00util/test_publication_deadlines.o $(ENGINE_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-CHECK_BINARIES = t/00util/test_flexicast_transport $(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
+CHECK_BINARIES = t/00util/test_flexicast_transport \
+	t/00util/test_emcon_activation t/00util/test_emcon_manifest \
+	t/00util/test_emcon_rateless \
+	t/00util/test_emcon_receive_socket t/00util/test_emcon_session \
+	$(TLS_BARRIER_TEST) t/00util/test_tls_groups t/00util/test_recovery_latency t/00util/test_transport_engine t/00util/test_transport_drive $(QUICLY_INTEGRATION_TEST) t/00util/test_repair_policy t/00util/test_xfer_file t/00util/test_xfer_protocol t/00util/test_fec t/00util/test_tun_json t/00util/test_tun_names t/00util/test_tun_queue t/00util/test_tun_packet t/00util/test_tun_receive_batch t/00util/test_tun_segment t/00util/test_tun_coalesce $(TUN_VNET_TEST) \
 	t/00util/test_publication_deadlines \
 	t/00util/test_datagram_mtu \
 	t/00util/test_path_probe \
@@ -532,7 +549,7 @@ check: all $(CHECK_BINARIES) gencerts check-reports
 	prove -I. -v t/*.t
 
 clean:
-	rm -f qlinq-app qlinq-tun libqlinq.a libqlinq.a.tmp .build-config .build-config.tmp tmp/fusion-config
+	rm -f qlinq-app qlinq-emcon qlinq-tun libqlinq.a libqlinq.a.tmp .build-config .build-config.tmp tmp/fusion-config
 	rm -f $(CHECK_BINARIES) $(TRANSPORT_TESTS) $(API_TESTS)
 	rm -f t/00util/test_tun_tx_kernel t/00util/test_tun_rx_kernel t/00util/fuzz_transport_wire
 	rm -f t/00util/test_transport_engine.map t/00util/test_recovery_latency.map
@@ -605,3 +622,25 @@ t/00util/test_tls_barrier: t/00util/test_tls_barrier.o $(COMMON_OBJS)
 
 t/00util/test_flexicast_transport: t/00util/test_flexicast_transport.o $(COMMON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
+
+ifeq ($(UNAME_S),Linux)
+t/00util/test_emcon_activation: private EMCON_ACTIVATION_TEST_LDFLAGS = -Wl,--wrap=fsync
+endif
+t/00util/test_emcon_activation: t/00util/test_emcon_activation.o src/emcon/emcon_activation.o src/emcon/emcon_manifest.o src/common/cli_parse.o
+	$(CC) -o $@ $^ $(LDFLAGS) $(EMCON_ACTIVATION_TEST_LDFLAGS)
+
+t/00util/test_emcon_manifest: t/00util/test_emcon_manifest.o src/emcon/emcon_manifest.o src/common/cli_parse.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_emcon_rateless: t/00util/test_emcon_rateless.o $(EMCON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_emcon_receive_socket: t/00util/test_emcon_receive_socket.o src/emcon/emcon_socket.o src/emcon/emcon_manifest.o src/common/cli_parse.o
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+t/00util/test_emcon_session: t/00util/test_emcon_session.o $(EMCON_OBJS)
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+.PHONY: check-emcon-netns
+check-emcon-netns: qlinq-emcon
+	./t/netns_emcon_silence.sh
