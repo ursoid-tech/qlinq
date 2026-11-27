@@ -22,7 +22,6 @@
 
 #define GENERATED_TRAFFIC_KEY_SIZE 32U
 #define CONFIG_LINE_LIMIT 1024U
-#define DEFAULT_REPLAY_WINDOW_PACKETS 4096U
 
 enum config_field {
   FIELD_SESSION_ID = 1U << 0,
@@ -382,7 +381,7 @@ static int read_config(const char *path, qlinq_emcon_manifest_t *manifest) {
     return -1;
   memset(manifest, 0, sizeof(*manifest));
   manifest->cipher_suite = QLINQ_EMCON_CIPHER_AES_128_GCM_SHA256;
-  manifest->replay_window_packets = DEFAULT_REPLAY_WINDOW_PACKETS;
+  manifest->replay_window_packets = QLINQ_EMCON_REPLAY_WINDOW_PACKETS;
   if (RAND_bytes(manifest->session_id, sizeof(manifest->session_id)) != 1 ||
       RAND_bytes(manifest->sender_id, sizeof(manifest->sender_id)) != 1) {
     fclose(file);

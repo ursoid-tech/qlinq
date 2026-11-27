@@ -63,7 +63,7 @@ valid_for_seconds=120
 source=127.0.0.1:$source_port
 destination=127.0.0.1:$destination_port
 interface_index=0
-replay_window_packets=4096
+replay_window_packets=64
 rate_bytes_per_second=100000000
 burst_bytes=4096
 metadata_repeat_interval_ms=10000
@@ -129,6 +129,15 @@ mkdir "$directory/receiver-state", 0700 or die "receiver state: $!";
 my @common = ('--manifest', $manifest, '--signature', $signature,
               '--public-key', $public_key, '--traffic-key', $traffic_key,
               '--alias', '7', '--group', '42');
+ok(!run_command($qlinq_emcon, 'receive', @common, '--state-dir',
+                "$directory/receiver-state", "$directory/missing/output.bin"),
+   'receiver startup fails when the output cannot be opened');
+is_deeply([glob "$directory/receiver-state/*"], [],
+          'output open failure leaves receiver epoch available');
+
+open my $old_output, '>', $output or die "seed output: $!";
+print {$old_output} $payload, 'stale output suffix';
+close $old_output;
 my $receiver = fork();
 die "fork receiver: $!" unless defined $receiver;
 if ($receiver == 0) {
@@ -152,6 +161,15 @@ is($received, $payload, 'receiver reconstructs the input byte-for-byte');
 ok(!run_command($qlinq_emcon, 'receive', @common, '--state-dir',
                 "$directory/receiver-state", "$directory/reused.bin"),
    'consumed receiver epoch cannot be reopened');
+ok(!-e "$directory/reused.bin", 'reused epoch creates no fresh output');
+ok(!run_command($qlinq_emcon, 'receive', @common, '--state-dir',
+                "$directory/receiver-state", $output),
+   'consumed receiver epoch is rejected with an existing output path');
+open $output_file, '<', $output or die "reopen output: $!";
+binmode $output_file;
+my $output_after_reuse = <$output_file>;
+close $output_file;
+is($output_after_reuse, $payload, 'reused epoch preserves existing output');
 
 chmod 0644, $signing_key;
 ok(!run_command($qlinq_emcon, 'manifest', 'create', $config,

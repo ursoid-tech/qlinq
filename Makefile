@@ -550,7 +550,7 @@ check: all $(CHECK_BINARIES) gencerts check-reports
 
 clean:
 	rm -f qlinq-app qlinq-emcon qlinq-tun libqlinq.a libqlinq.a.tmp .build-config .build-config.tmp tmp/fusion-config
-	rm -f $(CHECK_BINARIES) $(TRANSPORT_TESTS) $(API_TESTS) t/00util/test_emcon_netns
+	rm -f $(CHECK_BINARIES) $(TRANSPORT_TESTS) $(API_TESTS)
 	rm -f t/00util/test_tun_tx_kernel t/00util/test_tun_rx_kernel t/00util/fuzz_transport_wire
 	rm -f t/00util/test_transport_engine.map t/00util/test_recovery_latency.map
 	rm -f examples/data_multipath_benchmark examples/transit_benchmark examples/transit_udp_calibration
@@ -641,9 +641,6 @@ t/00util/test_emcon_receive_socket: t/00util/test_emcon_receive_socket.o src/com
 t/00util/test_emcon_session: t/00util/test_emcon_session.o $(EMCON_OBJS)
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-t/00util/test_emcon_netns: t/00util/test_emcon_netns.o $(EMCON_OBJS)
-	$(CC) -o $@ $^ $(LDFLAGS)
-
 .PHONY: check-emcon-netns
-check-emcon-netns: t/00util/test_emcon_netns
+check-emcon-netns: qlinq-emcon
 	./t/netns_emcon_silence.sh

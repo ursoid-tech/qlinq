@@ -376,6 +376,24 @@ int qlinq_emcon_activation_open_managed(
                                 created_file, manifest);
 }
 
+int qlinq_emcon_receiver_activation_check_available(
+    const char *state_directory, const qlinq_emcon_manifest_t *manifest) {
+  char filename[ACTIVATION_FILENAME_SIZE];
+  if (!manifest ||
+      activation_filename(filename, "receiver", "claim", manifest) != 0)
+    return QLINQ_EMCON_ACTIVATION_INVALID;
+  int directory_fd = open_state_directory(state_directory);
+  if (directory_fd < 0)
+    return QLINQ_EMCON_ACTIVATION_IO;
+  struct stat info;
+  int ret = QLINQ_EMCON_ACTIVATION_REUSED;
+  if (fstatat(directory_fd, filename, &info, AT_SYMLINK_NOFOLLOW) != 0)
+    ret =
+        errno == ENOENT ? QLINQ_EMCON_ACTIVATION_OK : QLINQ_EMCON_ACTIVATION_IO;
+  close(directory_fd);
+  return ret;
+}
+
 int qlinq_emcon_receiver_activation_claim(
     const char *state_directory, const qlinq_emcon_manifest_t *manifest) {
   if (!manifest ||
@@ -439,15 +457,23 @@ int qlinq_emcon_receiver_activation_claim(
 }
 
 int qlinq_emcon_activation_reserve(qlinq_emcon_activation_t *activation,
-                                   uint64_t packet_count,
+                                   uint64_t minimum_packets,
+                                   uint64_t preferred_packets,
                                    uint64_t *first_packet_number,
                                    uint64_t *reserved_until) {
-  if (!activation || packet_count == 0 || !first_packet_number ||
+  if (!activation || minimum_packets == 0 ||
+      preferred_packets < minimum_packets || !first_packet_number ||
       !reserved_until)
     return QLINQ_EMCON_ACTIVATION_INVALID;
+  uint64_t limit =
+      qlinq_emcon_manifest_packet_number_limit(&activation->manifest);
   if (activation->generation == UINT64_MAX ||
-      packet_count > UINT64_MAX - activation->next_packet_number)
+      activation->next_packet_number >= limit ||
+      minimum_packets > limit - activation->next_packet_number)
     return QLINQ_EMCON_ACTIVATION_EXHAUSTED;
+  uint64_t remaining = limit - activation->next_packet_number;
+  uint64_t packet_count =
+      preferred_packets < remaining ? preferred_packets : remaining;
   uint64_t next = activation->next_packet_number + packet_count;
   uint64_t generation = activation->generation + 1;
   size_t slot_index = (size_t)((generation - 1) % ACTIVATION_SLOT_COUNT);

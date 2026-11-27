@@ -2,14 +2,15 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 struct qlinq_emcon_receive_socket_t {
   int fd;
-  bool egress_disabled;
 };
 
 static bool address_length_valid(const struct sockaddr *address,
@@ -50,6 +51,8 @@ int qlinq_emcon_receive_socket_create_multicast(
     return QLINQ_EMCON_SOCKET_INVALID;
   *receiver = NULL;
   multicast = address_is_multicast(local_address);
+  if (multicast && !join_group && interface_index == 0)
+    return QLINQ_EMCON_SOCKET_INVALID;
 #ifdef SOCK_CLOEXEC
   fd = socket(local_address->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 #else
@@ -61,6 +64,13 @@ int qlinq_emcon_receive_socket_create_multicast(
   if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0)
     goto SystemError;
 #endif
+  if (interface_index != 0) {
+    char interface_name[IF_NAMESIZE];
+    if (!if_indextoname(interface_index, interface_name) ||
+        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, interface_name,
+                   strlen(interface_name) + 1) != 0)
+      goto SystemError;
+  }
   if (multicast) {
     int one = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
@@ -107,7 +117,6 @@ int qlinq_emcon_receive_socket_create_multicast(
     return QLINQ_EMCON_SOCKET_SYSTEM;
   }
   created->fd = fd;
-  created->egress_disabled = true;
   *receiver = created;
   return QLINQ_EMCON_SOCKET_OK;
 
@@ -133,8 +142,6 @@ void qlinq_emcon_receive_socket_free(qlinq_emcon_receive_socket_t *receiver) {
   if (!receiver)
     return;
   close(receiver->fd);
-  receiver->fd = -1;
-  receiver->egress_disabled = false;
   free(receiver);
 }
 
@@ -146,11 +153,6 @@ int qlinq_emcon_receive_socket_local_address(
   return getsockname(receiver->fd, address, address_len) == 0
              ? QLINQ_EMCON_SOCKET_OK
              : QLINQ_EMCON_SOCKET_SYSTEM;
-}
-
-bool qlinq_emcon_receive_socket_egress_disabled(
-    const qlinq_emcon_receive_socket_t *receiver) {
-  return receiver && receiver->fd >= 0 && receiver->egress_disabled;
 }
 
 int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,

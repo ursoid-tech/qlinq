@@ -1,4 +1,5 @@
 #include "emcon_rateless.h"
+#include "emcon_manifest.h"
 
 #include "picotls/openssl.h"
 
@@ -147,6 +148,31 @@ int main(void) {
   }
   CHECK(second_complete && third_complete,
         "both interleaved objects reconstructed");
+
+  uint8_t replay_packets[3][64];
+  size_t replay_sizes[3];
+  uint8_t payload = 0;
+  uint64_t number;
+  for (size_t i = 0; i <= QLINQ_EMCON_REPLAY_WINDOW_PACKETS; i++) {
+    size_t slot = i < 2 ? i : 2;
+    CHECK(qlinq_emcon_flexicast_seal(
+              sender, QLINQ_EMCON_RECORD_SESSION, ptls_iovec_init(&payload, 1),
+              replay_packets[slot], sizeof(replay_packets[slot]),
+              &replay_sizes[slot], &number) == QLINQ_EMCON_OK,
+          "seal replay-window test packet");
+  }
+  qlinq_emcon_message_t replay_message;
+  CHECK(qlinq_emcon_flexicast_open(receiver_protection, replay_packets[2],
+                                   replay_sizes[2],
+                                   &replay_message) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_open(receiver_protection, replay_packets[1],
+                                       replay_sizes[1],
+                                       &replay_message) == QLINQ_EMCON_OK &&
+            qlinq_emcon_flexicast_open(receiver_protection, replay_packets[0],
+                                       replay_sizes[0], &replay_message) ==
+                QLINQ_EMCON_DUPLICATE,
+        "accept reordering within the advertised window and reject older "
+        "packets");
 
   qlinq_emcon_receiver_free(receiver);
   quicly_flexicast_flow_free(receiver_protection);

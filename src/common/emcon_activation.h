@@ -31,15 +31,23 @@ int qlinq_emcon_activation_open_managed(qlinq_emcon_activation_t **activation,
                                         const char *state_directory,
                                         const qlinq_emcon_manifest_t *manifest);
 
-/* Permanently claims one receiver key epoch before its socket is opened.
+/* Checks for an existing receiver claim without creating state. Concurrent
+ * use is resolved by the exclusive creation in the claim operation. */
+int qlinq_emcon_receiver_activation_check_available(
+    const char *state_directory, const qlinq_emcon_manifest_t *manifest);
+
+/* Permanently claims one receiver key epoch before packet consumption.
  * Reopening the same nonce domain returns QLINQ_EMCON_ACTIVATION_REUSED. */
 int qlinq_emcon_receiver_activation_claim(
     const char *state_directory, const qlinq_emcon_manifest_t *manifest);
 
-/* Durably reserves [first_packet_number, reserved_until). A successful return
- * is the point after which this range may be used for AEAD packet numbers. */
+/* Durably reserves [first_packet_number, reserved_until). The range contains
+ * preferred_packets unless the key epoch has fewer remaining, and fails if
+ * minimum_packets cannot be met. All reserved numbers consume the key budget.
+ */
 int qlinq_emcon_activation_reserve(qlinq_emcon_activation_t *activation,
-                                   uint64_t packet_count,
+                                   uint64_t minimum_packets,
+                                   uint64_t preferred_packets,
                                    uint64_t *first_packet_number,
                                    uint64_t *reserved_until);
 

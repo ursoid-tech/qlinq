@@ -60,12 +60,21 @@ int qlinq_emcon_session_create_receiver(qlinq_emcon_session_t **session,
                                         const uint8_t *traffic_secret,
                                         size_t traffic_secret_size,
                                         uint64_t now_ms);
-/* Claims the receiver key epoch exactly once before opening its socket.
- * Restart requires a newly provisioned key epoch. */
+/* Sets up the receiver socket and claims the key epoch before packet
+ * consumption. Restart requires a newly provisioned key epoch. */
 int qlinq_emcon_session_create_receiver_claimed(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory);
+/* Prepares a receiver socket while blocking packet consumption, so callers
+ * can set up output before committing the one-shot claim. Passive multicast
+ * (join_group=false) requires a receiver-local interface index, existing host
+ * membership, and a provisioned receive-only link. */
+int qlinq_emcon_session_prepare_receiver(
+    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
+    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
+    const char *state_directory, unsigned int interface_index, bool join_group);
+int qlinq_emcon_session_claim_receiver(qlinq_emcon_session_t *session);
 void qlinq_emcon_session_free(qlinq_emcon_session_t *session);
 
 int qlinq_emcon_session_send_object(qlinq_emcon_session_t *session,

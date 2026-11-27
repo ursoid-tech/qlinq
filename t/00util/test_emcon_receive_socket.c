@@ -32,9 +32,8 @@ int main(void) {
   CHECK(qlinq_emcon_receive_socket_create(
             &receiver, (struct sockaddr *)&receiver_address,
             sizeof(receiver_address), (struct sockaddr *)&sender_address,
-            sizeof(sender_address)) == QLINQ_EMCON_SOCKET_OK &&
-            qlinq_emcon_receive_socket_egress_disabled(receiver),
-        "create receive-only socket");
+            sizeof(sender_address)) == QLINQ_EMCON_SOCKET_OK,
+        "create UDP receive socket");
   sender_address_len = sizeof(receiver_address);
   CHECK(qlinq_emcon_receive_socket_local_address(
             receiver, (struct sockaddr *)&receiver_address,

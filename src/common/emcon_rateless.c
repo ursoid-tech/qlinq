@@ -1,5 +1,6 @@
 #include "emcon_rateless.h"
 
+#include "emcon_manifest.h"
 #include "fec.h"
 #include "picotls/openssl.h"
 #include "quicly/defaults.h"
@@ -8,6 +9,13 @@
 
 #include <stdlib.h>
 #include <string.h>
+
+_Static_assert(QLINQ_EMCON_REPLAY_WINDOW_PACKETS ==
+                   QUICLY_FLEXICAST_REPLAY_WINDOW,
+               "the manifest replay window must match flexicast");
+_Static_assert(
+    QLINQ_EMCON_MAX_PACKETS_PER_KEY < (UINT64_C(1) << 31),
+    "the entire epoch must fit the packet number reconstruction window");
 
 int qlinq_emcon_flexicast_create(quicly_flexicast_flow_t **flow,
                                  uint64_t flow_id, uint32_t key_epoch,
@@ -41,8 +49,10 @@ int qlinq_emcon_flexicast_create(quicly_flexicast_flow_t **flow,
       .cipher_suite = suite,
       .crypto_engine = &quicly_default_crypto_engine,
       .traffic_secret = ptls_iovec_init(derived, traffic_secret_size),
+      .max_packets_per_key = QLINQ_EMCON_MAX_PACKETS_PER_KEY,
       .max_packet_size = QUICLY_FLEXICAST_MAX_PACKET_SIZE,
       .allow_untracked_send = allow_untracked_send ? 1 : 0,
+      .send_packet_number_length = 4,
   };
   int ret = quicly_flexicast_flow_create(flow, &cfg);
   ptls_clear_memory(derived, sizeof(derived));

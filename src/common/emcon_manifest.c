@@ -5,6 +5,7 @@
 
 #include <openssl/pem.h>
 #include <openssl/sha.h>
+#include <picotls.h>
 
 #include <stdbool.h>
 #include <fcntl.h>
@@ -66,6 +67,14 @@ static bool endpoint_valid(const qlinq_emcon_manifest_endpoint_t *endpoint) {
          endpoint->port != 0 && nonzero(endpoint->address, address_size);
 }
 
+uint64_t qlinq_emcon_manifest_packet_number_limit(
+    const qlinq_emcon_manifest_t *manifest) {
+  uint64_t limit =
+      manifest->initial_packet_number + QLINQ_EMCON_MAX_PACKETS_PER_KEY;
+  uint64_t quic_limit = PTLS_QUICINT_MAX + UINT64_C(1);
+  return limit < quic_limit ? limit : quic_limit;
+}
+
 int qlinq_emcon_manifest_validate(const qlinq_emcon_manifest_t *manifest,
                                   uint64_t now_ms) {
   if (!manifest ||
@@ -74,13 +83,12 @@ int qlinq_emcon_manifest_validate(const qlinq_emcon_manifest_t *manifest,
       !nonzero(manifest->traffic_key_id, sizeof(manifest->traffic_key_id)) ||
       manifest->flow_id == 0 || manifest->key_epoch == 0 ||
       manifest->cipher_suite != QLINQ_EMCON_CIPHER_AES_128_GCM_SHA256 ||
-      manifest->initial_packet_number == UINT64_MAX ||
+      manifest->initial_packet_number > PTLS_QUICINT_MAX ||
       manifest->valid_from_ms >= manifest->expires_at_ms ||
       !endpoint_valid(&manifest->source) ||
       !endpoint_valid(&manifest->destination) ||
       manifest->source.family != manifest->destination.family ||
-      manifest->replay_window_packets == 0 ||
-      manifest->replay_window_packets > QLINQ_EMCON_MAX_REPLAY_PACKETS ||
+      manifest->replay_window_packets != QLINQ_EMCON_REPLAY_WINDOW_PACKETS ||
       manifest->rate_bytes_per_second == 0 || manifest->burst_bytes == 0 ||
       manifest->metadata_repeat_interval_ms == 0 ||
       manifest->terminal_repeat_count == 0 ||

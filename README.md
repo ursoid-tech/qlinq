@@ -132,6 +132,61 @@ QLINQ_AUTH_TOKEN='replace-with-a-secret' \
   --cert peer.crt --key peer.key --ca mesh-ca.crt
 ```
 
+## EMCON packet numbers and key epochs
+
+Set `replay_window_packets=64` in the manifest configuration, or omit the
+setting to use that default. A receiver accepts an unseen authenticated
+packet up to 63 packet numbers behind the largest authenticated packet.
+The sender can reserve up to 8,388,608 packet numbers per AES-128-GCM key
+epoch. Each durable reservation counts toward that limit, including unused
+numbers skipped after a restart. The default reservation is 65,536 packet
+numbers. A sender restart can use the same epoch while numbers remain.
+
+Manifests with a different replay window must be regenerated and signed.
+If the manifest has already been activated, provision a fresh key epoch for
+the replacement. Activation state binds the original manifest to its epoch.
+
+## Passive multicast file reception
+
+For IPv4 and IPv6 multicast, start `qlinq-emcon receive` with
+`--preprovisioned --interface NAME` on a dedicated receiver interface. `NAME`
+is local to the receiver and can differ on each host. The manifest's
+`interface_index` selects the sender's interface for IPv6 multicast.
+
+Provision the receiver and network before starting the command:
+
+1. Provide a receive-only link for the receiver's multicast interface. In a
+   Linux software deployment, use a dedicated interface with an administrator
+   installed egress drop. For example, on an interface without an existing
+   `clsact` qdisc or egress policy, run these commands as an administrator
+   before bringing up the link or joining multicast groups.
+
+   ```bash
+   tc qdisc add dev "$RX_IF" clsact
+   tc filter add dev "$RX_IF" egress matchall skip_hw action drop
+   ```
+
+2. Configure upstream switches and routers to forward the group to that port
+   independently of receiver reports. The test harness uses a dedicated bridge
+   with snooping disabled. Assign a local address and a route to the manifest's
+   sender on the receiver interface.
+3. Keep a separate UDP socket joined to the destination group on `RX_IF` in
+   the receiver's Linux network namespace. The kernel uses this host membership
+   for IP multicast delivery. The namespace test's `netns_emcon_multicast.py`
+   helper demonstrates how to hold a membership using `IP_ADD_MEMBERSHIP` or
+   `IPV6_JOIN_GROUP`.
+
+`--preprovisioned` binds to the selected interface and accepts packets from the
+manifest's source address and UDP port. It opens no group membership itself.
+The host's existing membership can still trigger IGMP or MLD replies and the
+host can generate other network traffic. The receive-only link or egress filter
+must remain in effect for the entire silent interval, including receiver
+startup and teardown. Verify silence from outside the receiving interface.
+
+Use `--join-group` for lab networks that expect the application to join the
+group and allow IGMP/MLD on the wire. This option also accepts `--interface NAME`
+to override the manifest's numeric index on the receiver.
+
 ## Testing
 
 To run the test suite:
@@ -139,6 +194,12 @@ To run the test suite:
 ```bash
 make check
 ```
+
+`make check-emcon-netns` exercises the production CLI in isolated Linux
+network namespaces. It needs `ip`, `tc`, `nsenter`, `tcpdump`, `openssl`,
+`python3`, `timeout` and permission to create user and network namespaces or
+root with network namespace privileges. The test checks both receivers for
+exact recovery and zero Ethernet egress while router queries reach each one.
 
 Run `make indent` to format first-party C sources and headers using the
 repository's `.clang-format` configuration.

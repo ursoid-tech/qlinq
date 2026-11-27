@@ -25,7 +25,7 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret) {
       .expires_at_ms = 5000,
       .source = {.family = 4, .port = 12070},
       .destination = {.family = 4, .port = 12071},
-      .replay_window_packets = 4096,
+      .replay_window_packets = QLINQ_EMCON_REPLAY_WINDOW_PACKETS,
       .rate_bytes_per_second = 1000000,
       .burst_bytes = 2048,
       .metadata_repeat_interval_ms = 1000,
@@ -60,6 +60,16 @@ int main(void) {
   CHECK(qlinq_emcon_manifest_validate(&manifest, 2000) ==
             QLINQ_EMCON_MANIFEST_OK,
         "valid rateless manifest");
+  qlinq_emcon_manifest_t invalid = manifest;
+  invalid.replay_window_packets++;
+  CHECK(qlinq_emcon_manifest_validate(&invalid, 2000) ==
+            QLINQ_EMCON_MANIFEST_INVALID,
+        "reject a replay window different from flexicast's window");
+  invalid = manifest;
+  invalid.initial_packet_number = UINT64_C(1) << 62;
+  CHECK(qlinq_emcon_manifest_validate(&invalid, 2000) ==
+            QLINQ_EMCON_MANIFEST_INVALID,
+        "reject a packet number outside the QUIC range");
   CHECK(qlinq_emcon_manifest_validate(&manifest, 999) ==
             QLINQ_EMCON_MANIFEST_NOT_YET_VALID,
         "not-yet-valid rejection");
