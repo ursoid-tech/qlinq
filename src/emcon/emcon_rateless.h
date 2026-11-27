@@ -10,6 +10,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+typedef struct qlinq_emcon_ingress_t qlinq_emcon_ingress_t;
 typedef struct qlinq_emcon_receiver_t qlinq_emcon_receiver_t;
 typedef struct qlinq_emcon_sender_t qlinq_emcon_sender_t;
 
@@ -39,18 +40,21 @@ uint64_t
 qlinq_emcon_sender_next_packet_number(const qlinq_emcon_sender_t *sender);
 bool qlinq_emcon_sender_has_capacity(const qlinq_emcon_sender_t *sender,
                                      uint64_t packets);
-/* creates a manifest-bound epoch flexicast flow for silent reception */
-int qlinq_emcon_flexicast_create(
-    quicly_flexicast_flow_t **flow, uint64_t flow_id, uint32_t key_epoch,
+/* creates manifest-bound epoch ingress protection for silent reception */
+int qlinq_emcon_ingress_create(
+    qlinq_emcon_ingress_t **ingress, uint64_t flow_id, uint32_t key_epoch,
     const uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE],
-    uint64_t first_packet_number, const uint8_t *traffic_secret,
-    size_t traffic_secret_size);
+    uint64_t first_packet_number, uint64_t max_authentication_failures,
+    const uint8_t *traffic_secret, size_t traffic_secret_size);
+void qlinq_emcon_ingress_free(qlinq_emcon_ingress_t *ingress);
+uint64_t qlinq_emcon_ingress_authentication_failures(
+    const qlinq_emcon_ingress_t *ingress);
 int qlinq_emcon_flexicast_seal(qlinq_emcon_sender_t *sender,
                                qlinq_emcon_record_type_t type,
                                ptls_iovec_t payload, uint8_t *packet,
                                size_t capacity, size_t *packet_size,
                                uint64_t *packet_number);
-int qlinq_emcon_flexicast_open(quicly_flexicast_flow_t *flow, uint8_t *packet,
+int qlinq_emcon_flexicast_open(qlinq_emcon_ingress_t *ingress, uint8_t *packet,
                                size_t packet_size,
                                qlinq_emcon_message_t *message);
 

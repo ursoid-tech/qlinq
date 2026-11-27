@@ -87,8 +87,10 @@ open my $source_config, '<', $config or die "reopen config: $!";
 my $explicit_text = do { local $/; <$source_config> };
 close $source_config;
 my $now_ms = time() * 1000;
+my $hex_source_port = sprintf('0x%x', $source_port);
 $explicit_text =~ s/valid_for_seconds=120/valid_from_ms=@{[$now_ms - 1000]}\nexpires_at_ms=@{[$now_ms + 120000]}/;
 $explicit_text =~ s/key_epoch=1/key_epoch=2/;
+$explicit_text =~ s/source=127\.0\.0\.1:\Q$source_port\E/source=127.0.0.1:$hex_source_port/;
 my $explicit_config = "$directory/explicit.conf";
 open my $explicit_file, '>', $explicit_config or die "explicit config: $!";
 print {$explicit_file} $explicit_text;
@@ -253,7 +255,9 @@ my $capture_sock = IO::Socket::INET->new(
     LocalAddr => '127.0.0.1', LocalPort => $destination_port, Proto => 'udp'
 ) or die "capture socket: $!";
 my $reorder_input = "$directory/reorder-in.bin";
-my $reorder_payload = join '', map { chr(($_ * 41 + 9) & 0xff) } 0 .. (17 * 256 - 1);
+my $reorder_payload = join '', map {
+    chr((($_ * 41 + ($_ >> 8) * 13 + 9) & 0xff))
+} 0 .. (17 * 256 - 1);
 open my $reorder_in_fh, '>', $reorder_input or die "reorder input: $!";
 binmode $reorder_in_fh;
 print {$reorder_in_fh} $reorder_payload;
@@ -362,21 +366,36 @@ for (1 .. 200) {
     last if -z $cancel_rx_out;
     select undef, undef, undef, 0.01;
 }
+is(waitpid($cancel_rx, WNOHANG), 0,
+   'blocking receiver is still running before SIGTERM');
 kill 'TERM', $cancel_rx;
 my $rx_exited_promptly = 0;
 for (1 .. 20) {
     if (waitpid($cancel_rx, WNOHANG) == $cancel_rx) {
-        $rx_exited_promptly = ($? != 0);
+        $rx_exited_promptly = (($? & 127) == 0 && ($? >> 8) == 1);
         last;
     }
     select undef, undef, undef, 0.05;
 }
+if (!$rx_exited_promptly) {
+    kill 'KILL', $cancel_rx;
+    waitpid($cancel_rx, 0);
+}
 ok($rx_exited_promptly, 'blocking receiver exits promptly on SIGTERM');
+open my $rx_err_fh, '<', "$directory/cancel-rx.stderr" or die "rx stderr: $!";
+my $rx_stderr = do { local $/; <$rx_err_fh> };
+close $rx_err_fh;
+like($rx_stderr, qr/qlinq-emcon: interrupted/,
+     'receiver stderr records SIGTERM interruption');
 
+my $cancel_capture = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1', LocalPort => $destination_port, Proto => 'udp'
+) or die "cancel capture socket: $!";
 mkdir "$directory/cancel-sender-state", 0700 or die "cancel sender state: $!";
 my $cancel_tx = fork();
 die "fork cancel sender: $!" unless defined $cancel_tx;
 if ($cancel_tx == 0) {
+    close $cancel_capture;
     open STDOUT, '>', "$directory/cancel-tx.stdout" or exit 127;
     open STDERR, '>', "$directory/cancel-tx.stderr" or exit 127;
     exec $qlinq_emcon, 'send', '--manifest', $slow_manifest,
@@ -386,16 +405,23 @@ if ($cancel_tx == 0) {
       $input;
     exit 127;
 }
-for (1 .. 200) {
-    last if glob "$directory/cancel-sender-state/sender-*";
-    select undef, undef, undef, 0.01;
+my $first_rin = '';
+vec($first_rin, fileno($cancel_capture), 1) = 1;
+my $saw_tx_packet = select($first_rin, undef, undef, 3.0) > 0;
+my $cancel_packets = 0;
+if ($saw_tx_packet) {
+    my $datagram = '';
+    $cancel_capture->recv($datagram, 2048);
+    $cancel_packets++;
 }
-select undef, undef, undef, 0.1;
+ok($saw_tx_packet, 'paced sender emitted initial packet before SIGTERM');
+is(waitpid($cancel_tx, WNOHANG), 0,
+   'paced sender is still waiting in pacer before SIGTERM');
 kill 'TERM', $cancel_tx;
 my $tx_exited_promptly = 0;
 for (1 .. 20) {
     if (waitpid($cancel_tx, WNOHANG) == $cancel_tx) {
-        $tx_exited_promptly = ($? != 0);
+        $tx_exited_promptly = (($? & 127) == 0 && ($? >> 8) == 1);
         last;
     }
     select undef, undef, undef, 0.05;
@@ -404,6 +430,24 @@ if (!$tx_exited_promptly) {
     kill 'KILL', $cancel_tx;
     waitpid($cancel_tx, 0);
 }
+while (1) {
+    my $rin = '';
+    vec($rin, fileno($cancel_capture), 1) = 1;
+    last unless select($rin, undef, undef, 0.02);
+    my $datagram = '';
+    $cancel_capture->recv($datagram, 2048);
+    $cancel_packets++;
+}
+close $cancel_capture;
 ok($tx_exited_promptly, 'paced sender aborts mid-object promptly on SIGTERM');
+cmp_ok($cancel_packets, '<', 10,
+       'cancelled sender stops well before completing the 20-symbol object');
+open my $tx_err_fh, '<', "$directory/cancel-tx.stderr" or die "tx stderr: $!";
+my $tx_stderr = do { local $/; <$tx_err_fh> };
+close $tx_err_fh;
+like($tx_stderr, qr/qlinq-emcon: interrupted/,
+     'sender stderr records SIGTERM interruption');
+unlike($tx_stderr, qr/transmission complete/,
+       'cancelled sender does not report completion');
 
 done_testing();

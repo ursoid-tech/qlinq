@@ -64,7 +64,13 @@ int main(void) {
             qlinq_emcon_receive_socket_create_multicast(
                 &receiver, (struct sockaddr *)&receiver_address,
                 sizeof(receiver_address), (struct sockaddr *)&sender_address,
-                sizeof(sender_address), 0, true) == QLINQ_EMCON_SOCKET_OK,
+                sizeof(sender_address), UINT32_MAX,
+                true) == QLINQ_EMCON_SOCKET_SYSTEM,
+        "unicast receive honors an explicit interface index");
+  CHECK(qlinq_emcon_receive_socket_create_multicast(
+            &receiver, (struct sockaddr *)&receiver_address,
+            sizeof(receiver_address), (struct sockaddr *)&sender_address,
+            sizeof(sender_address), 0, true) == QLINQ_EMCON_SOCKET_OK,
         "create UDP receive socket");
 
   const uint8_t payload[] = "protected symbol";

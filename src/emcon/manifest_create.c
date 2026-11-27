@@ -1,6 +1,5 @@
 #include "manifest_create.h"
 
-#include "cli_parse.h"
 #include "emcon_manifest.h"
 #include "emcon_socket.h"
 
@@ -173,18 +172,36 @@ static int decode_hex_id(const char *text, uint8_t *output, size_t size) {
 
 static int parse_endpoint(const char *text,
                           qlinq_emcon_manifest_endpoint_t *endpoint) {
+  qlinq_emcon_manifest_endpoint_t parsed = {0};
   char address[INET6_ADDRSTRLEN];
-  bool has_port = false;
-  if (!cli_parse_endpoint(text, address, sizeof(address), &endpoint->port,
-                          &has_port) ||
-      !has_port)
+  const char *colon;
+  size_t address_size;
+  if (text[0] == '[') {
+    const char *close = strchr(text + 1, ']');
+    if (!close || close[1] != ':')
+      return -1;
+    address_size = (size_t)(close - (text + 1));
+    colon = close + 1;
+    parsed.family = 6;
+  } else {
+    colon = strchr(text, ':');
+    if (!colon || strrchr(text, ':') != colon)
+      return -1;
+    address_size = (size_t)(colon - text);
+    parsed.family = 4;
+  }
+  uint64_t port;
+  if (address_size == 0 || address_size >= sizeof(address) ||
+      !parse_u64(colon + 1, UINT16_MAX, &port) || port == 0)
     return -1;
-  endpoint->family = text[0] == '[' ? 6 : 4;
-  memset(endpoint->address, 0, sizeof(endpoint->address));
-  return inet_pton(endpoint->family == 4 ? AF_INET : AF_INET6, address,
-                   endpoint->address) == 1
-             ? 0
-             : -1;
+  memcpy(address, text[0] == '[' ? text + 1 : text, address_size);
+  address[address_size] = '\0';
+  if (inet_pton(parsed.family == 4 ? AF_INET : AF_INET6, address,
+                parsed.address) != 1)
+    return -1;
+  parsed.port = (uint16_t)port;
+  *endpoint = parsed;
+  return 0;
 }
 
 static int content_type(const char *text, uint8_t *value) {

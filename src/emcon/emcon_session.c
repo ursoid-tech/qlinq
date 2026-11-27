@@ -14,7 +14,7 @@
 struct qlinq_emcon_session_t {
   qlinq_emcon_manifest_t manifest;
   qlinq_emcon_sender_t *send_crypto;
-  quicly_flexicast_flow_t *receive_flow;
+  qlinq_emcon_ingress_t *receive_crypto;
   qlinq_emcon_send_socket_t *sender;
   qlinq_emcon_receive_socket_t *receiver;
   qlinq_emcon_activation_t *activation;
@@ -153,10 +153,11 @@ static int create_common(qlinq_emcon_session_t **session,
                 &created->send_crypto, manifest->flow_id, manifest->key_epoch,
                 manifest_digest, manifest->initial_packet_number,
                 first_packet_number, traffic_secret, traffic_secret_size)
-          : qlinq_emcon_flexicast_create(
-                &created->receive_flow, manifest->flow_id, manifest->key_epoch,
-                manifest_digest, manifest->initial_packet_number,
-                traffic_secret, traffic_secret_size);
+          : qlinq_emcon_ingress_create(&created->receive_crypto,
+                                       manifest->flow_id, manifest->key_epoch,
+                                       manifest_digest,
+                                       manifest->initial_packet_number, 0,
+                                       traffic_secret, traffic_secret_size);
   if (ret != QLINQ_EMCON_OK) {
     qlinq_emcon_session_free(created);
     if (ret == QLINQ_EMCON_NO_MEMORY)
@@ -249,6 +250,12 @@ int qlinq_emcon_session_create_sender_persistent(
   return QLINQ_EMCON_SESSION_OK;
 }
 
+static bool
+endpoint_is_multicast(const qlinq_emcon_manifest_endpoint_t *endpoint) {
+  return endpoint->family == 4 ? (endpoint->address[0] & 0xf0U) == 0xe0U
+                               : endpoint->address[0] == 0xffU;
+}
+
 static int create_receiver_socket(qlinq_emcon_session_t *session,
                                   unsigned int interface_index,
                                   bool join_group) {
@@ -259,17 +266,19 @@ static int create_receiver_socket(qlinq_emcon_session_t *session,
       endpoint_sockaddr(&manifest->destination, &destination,
                         &destination_len) != 0)
     return QLINQ_EMCON_SESSION_IO;
-  unsigned int scope_index =
-      interface_index ? interface_index : manifest->interface_index;
+  bool effective_join =
+      endpoint_is_multicast(&manifest->destination) && join_group;
+  unsigned int socket_interface =
+      interface_index ? interface_index
+                      : (effective_join ? manifest->interface_index : 0);
   if (manifest->source.family == 6) {
-    ((struct sockaddr_in6 *)&source)->sin6_scope_id = scope_index;
-    ((struct sockaddr_in6 *)&destination)->sin6_scope_id = scope_index;
+    ((struct sockaddr_in6 *)&source)->sin6_scope_id = socket_interface;
+    ((struct sockaddr_in6 *)&destination)->sin6_scope_id = socket_interface;
   }
   if (qlinq_emcon_receive_socket_create_multicast(
           &session->receiver, (struct sockaddr *)&destination, destination_len,
-          (struct sockaddr *)&source, source_len,
-          join_group ? scope_index : interface_index,
-          join_group) != QLINQ_EMCON_SOCKET_OK)
+          (struct sockaddr *)&source, source_len, socket_interface,
+          effective_join) != QLINQ_EMCON_SOCKET_OK)
     return QLINQ_EMCON_SESSION_IO;
   return QLINQ_EMCON_SESSION_OK;
 }
@@ -344,7 +353,7 @@ void qlinq_emcon_session_free(qlinq_emcon_session_t *session) {
   qlinq_emcon_receive_socket_free(session->receiver);
   qlinq_emcon_send_socket_free(session->sender);
   qlinq_emcon_sender_free(session->send_crypto);
-  quicly_flexicast_flow_free(session->receive_flow);
+  qlinq_emcon_ingress_free(session->receive_crypto);
   qlinq_emcon_activation_close(session->activation);
   free(session->receiver_claim_directory);
   memset(session, 0, sizeof(*session));
@@ -504,7 +513,7 @@ int qlinq_emcon_session_receive(qlinq_emcon_session_t *session,
                                 qlinq_emcon_event_t *event, bool nonblocking) {
   uint8_t packet[QLINQ_EMCON_MAX_PACKET_SIZE];
   size_t packet_size;
-  if (!session || !session->receive_flow || !session->receiver || !event)
+  if (!session || !session->receive_crypto || !session->receiver || !event)
     return QLINQ_EMCON_SESSION_INVALID;
   if (session->receiver_claim_directory)
     return QLINQ_EMCON_SESSION_ACTIVATION;
@@ -525,7 +534,7 @@ int qlinq_emcon_session_receive(qlinq_emcon_session_t *session,
   session->stats.bytes_received += packet_size;
 
   qlinq_emcon_message_t message;
-  int opened = qlinq_emcon_flexicast_open(session->receive_flow, packet,
+  int opened = qlinq_emcon_flexicast_open(session->receive_crypto, packet,
                                           packet_size, &message);
   if (opened == QLINQ_EMCON_DUPLICATE) {
     session->stats.replay_rejections++;
@@ -569,11 +578,9 @@ qlinq_emcon_session_stats(const qlinq_emcon_session_t *session) {
       session ? session->stats : (qlinq_emcon_session_stats_t){0};
   if (session && session->sender)
     stats.send = qlinq_emcon_send_socket_stats(session->sender);
-  quicly_flexicast_crypto_usage_t usage;
-  if (session && session->receive_flow &&
-      quicly_flexicast_get_crypto_usage(session->receive_flow, &usage) ==
-          QUICLY_FLEXICAST_OK)
-    stats.authentication_failures = usage.authentication_failures;
+  if (session && session->receive_crypto)
+    stats.authentication_failures =
+        qlinq_emcon_ingress_authentication_failures(session->receive_crypto);
   if (session) {
     stats.next_packet_number =
         session->send_crypto

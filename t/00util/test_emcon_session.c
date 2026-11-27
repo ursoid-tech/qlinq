@@ -329,12 +329,18 @@ int main(void) {
 
   uint64_t now = now_ms();
   qlinq_emcon_manifest_t manifest = fixture(secret, now);
+  manifest.interface_index = UINT32_MAX;
   CHECK(manifest.source.port && manifest.destination.port,
         "allocate local ports");
   qlinq_emcon_session_t *receiver = NULL, *sender = NULL;
+  CHECK(qlinq_emcon_session_prepare_receiver(
+            &receiver, &manifest, secret, sizeof(secret), now,
+            activation_directory, UINT32_MAX, true) == QLINQ_EMCON_SESSION_IO &&
+            receiver == NULL,
+        "reject invalid explicit receiver interface on unicast");
   CHECK(open_claimed_receiver(&receiver, &manifest, secret, sizeof(secret), now,
                               activation_directory) == QLINQ_EMCON_SESSION_OK,
-        "create multi-alias receiver");
+        "create multi-alias receiver ignoring sender interface on unicast");
   qlinq_emcon_event_t unknown_event;
   qlinq_emcon_manifest_t other = manifest;
   other.flow_id++;

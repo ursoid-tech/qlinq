@@ -16,6 +16,21 @@ _Static_assert(
     "the entire epoch must fit the packet number reconstruction window");
 
 #define EMCON_PACKET_NUMBER_LENGTH 4U
+#define EMCON_AES_GCM_INTEGRITY_LIMIT (UINT64_C(1) << 52)
+
+struct qlinq_emcon_ingress_t {
+  quicly_flexicast_flow_id_t flow_id;
+  ptls_cipher_context_t *header_protection;
+  ptls_aead_context_t *aead;
+  uint64_t initial_packet_number;
+  uint64_t packet_number_limit;
+  uint64_t largest_packet_number;
+  uint64_t replay_mask;
+  uint64_t decryption_attempts;
+  uint64_t authentication_failures;
+  uint64_t max_authentication_failures;
+  bool replay_initialized;
+};
 
 struct qlinq_emcon_sender_t {
   quicly_flexicast_egress_t egress;
@@ -142,37 +157,65 @@ bool qlinq_emcon_sender_has_capacity(const qlinq_emcon_sender_t *sender,
          packets <= sender->packet_number_limit - sender->next_packet_number;
 }
 
-int qlinq_emcon_flexicast_create(
-    quicly_flexicast_flow_t **flow, uint64_t flow_id, uint32_t key_epoch,
+int qlinq_emcon_ingress_create(
+    qlinq_emcon_ingress_t **ingress, uint64_t flow_id, uint32_t key_epoch,
     const uint8_t manifest_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE],
-    uint64_t first_packet_number, const uint8_t *traffic_secret,
-    size_t traffic_secret_size) {
+    uint64_t first_packet_number, uint64_t max_authentication_failures,
+    const uint8_t *traffic_secret, size_t traffic_secret_size) {
   ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
   uint8_t derived[PTLS_MAX_DIGEST_SIZE];
-  if (!flow)
+  if (!ingress)
     return QLINQ_EMCON_INVALID;
-  *flow = NULL;
+  *ingress = NULL;
+  uint64_t integrity_limit = EMCON_AES_GCM_INTEGRITY_LIMIT;
+  if (suite->aead->integrity_limit < integrity_limit)
+    integrity_limit = suite->aead->integrity_limit;
   if (flow_id == 0 || key_epoch == 0 || !manifest_digest || !traffic_secret ||
       first_packet_number > QLINQ_EMCON_MAX_PACKET_NUMBER ||
-      traffic_secret_size != suite->hash->digest_size)
+      traffic_secret_size != suite->hash->digest_size || integrity_limit == 0 ||
+      max_authentication_failures > integrity_limit)
     return QLINQ_EMCON_INVALID;
-  if (derive_epoch_secret(derived, suite->hash, key_epoch, manifest_digest,
-                          traffic_secret) != 0) {
-    ptls_clear_memory(derived, sizeof(derived));
+
+  qlinq_emcon_ingress_t *created = calloc(1, sizeof(*created));
+  if (!created)
+    return QLINQ_EMCON_NO_MEMORY;
+  created->flow_id = encode_flow_id(flow_id);
+  created->initial_packet_number = first_packet_number;
+  created->packet_number_limit =
+      qlinq_emcon_packet_number_limit(first_packet_number);
+  created->max_authentication_failures = max_authentication_failures != 0
+                                             ? max_authentication_failures
+                                             : integrity_limit;
+  int ret = derive_epoch_secret(derived, suite->hash, key_epoch,
+                                manifest_digest, traffic_secret);
+  if (ret == 0)
+    ret = quicly_default_crypto_engine.setup_cipher(
+        &quicly_default_crypto_engine, NULL, QUICLY_EPOCH_1RTT, 0,
+        &created->header_protection, &created->aead, suite->aead, suite->hash,
+        derived);
+  ptls_clear_memory(derived, sizeof(derived));
+  if (ret != 0) {
+    qlinq_emcon_ingress_free(created);
     return QLINQ_EMCON_CRYPTO;
   }
-  quicly_flexicast_config_t cfg = {
-      .flow_id = encode_flow_id(flow_id),
-      .first_packet_number = first_packet_number,
-      .cipher_suite = suite,
-      .crypto_engine = &quicly_default_crypto_engine,
-      .traffic_secret = ptls_iovec_init(derived, traffic_secret_size),
-      .max_packets_per_key = QLINQ_EMCON_MAX_PACKETS_PER_KEY,
-      .max_packet_size = QUICLY_FLEXICAST_MAX_PACKET_SIZE,
-  };
-  int ret = quicly_flexicast_flow_create(flow, &cfg);
-  ptls_clear_memory(derived, sizeof(derived));
-  return ret == QUICLY_FLEXICAST_OK ? QLINQ_EMCON_OK : QLINQ_EMCON_CRYPTO;
+  *ingress = created;
+  return QLINQ_EMCON_OK;
+}
+
+void qlinq_emcon_ingress_free(qlinq_emcon_ingress_t *ingress) {
+  if (!ingress)
+    return;
+  if (ingress->header_protection)
+    ptls_cipher_free(ingress->header_protection);
+  if (ingress->aead)
+    ptls_aead_free(ingress->aead);
+  memset(ingress, 0, sizeof(*ingress));
+  free(ingress);
+}
+
+uint64_t qlinq_emcon_ingress_authentication_failures(
+    const qlinq_emcon_ingress_t *ingress) {
+  return ingress ? ingress->authentication_failures : 0;
 }
 
 static int seal_framed(qlinq_emcon_sender_t *sender, ptls_iovec_t framed,
@@ -220,34 +263,124 @@ int qlinq_emcon_flexicast_seal(qlinq_emcon_sender_t *sender,
   return ret;
 }
 
-int qlinq_emcon_flexicast_open(quicly_flexicast_flow_t *flow, uint8_t *packet,
+static bool ingress_is_replayed(const qlinq_emcon_ingress_t *ingress,
+                                uint64_t pn) {
+  if (!ingress->replay_initialized || pn > ingress->largest_packet_number)
+    return false;
+  uint64_t distance = ingress->largest_packet_number - pn;
+  return distance >= QLINQ_EMCON_REPLAY_WINDOW_PACKETS ||
+         (ingress->replay_mask & (UINT64_C(1) << distance)) != 0;
+}
+
+static void ingress_commit_replay(qlinq_emcon_ingress_t *ingress, uint64_t pn) {
+  if (!ingress->replay_initialized) {
+    ingress->replay_initialized = true;
+    ingress->largest_packet_number = pn;
+    ingress->replay_mask = 1;
+    return;
+  }
+  if (pn > ingress->largest_packet_number) {
+    uint64_t shift = pn - ingress->largest_packet_number;
+    ingress->replay_mask = shift >= QLINQ_EMCON_REPLAY_WINDOW_PACKETS
+                               ? 1
+                               : (ingress->replay_mask << shift) | 1;
+    ingress->largest_packet_number = pn;
+    return;
+  }
+  ingress->replay_mask |= UINT64_C(1) << (ingress->largest_packet_number - pn);
+}
+
+static bool decode_single_datagram(const uint8_t *src, const uint8_t *end,
+                                   ptls_iovec_t *datagram) {
+  bool seen = false;
+  if (src == end)
+    return false;
+  while (src != end) {
+    uint64_t frame_type = quicly_decodev(&src, end);
+    if (frame_type == UINT64_MAX)
+      return false;
+    if (frame_type == QUICLY_FRAME_TYPE_PADDING ||
+        frame_type == QUICLY_FRAME_TYPE_PING)
+      continue;
+    if (frame_type != QUICLY_FRAME_TYPE_DATAGRAM_NOLEN &&
+        frame_type != QUICLY_FRAME_TYPE_DATAGRAM_WITHLEN)
+      return false;
+    quicly_datagram_frame_t frame;
+    if (seen ||
+        quicly_decode_datagram_frame(frame_type, &src, end, &frame) != 0)
+      return false;
+    *datagram = frame.payload;
+    seen = true;
+  }
+  return seen;
+}
+
+int qlinq_emcon_flexicast_open(qlinq_emcon_ingress_t *ingress, uint8_t *packet,
                                size_t packet_size,
                                qlinq_emcon_message_t *message) {
   ptls_iovec_t datagram = {0};
-  uint64_t pn = 0;
-  if (!flow || !packet || !message)
+  if (!ingress || !packet || !message)
     return QLINQ_EMCON_INVALID;
   memset(message, 0, sizeof(*message));
-  int ret = quicly_flexicast_receive_datagram(flow, packet, packet_size,
-                                              &datagram, &pn, 0, 0);
-  if (ret == QUICLY_FLEXICAST_ERROR_REPLAY)
-    return QLINQ_EMCON_DUPLICATE;
-  if (ret == QUICLY_FLEXICAST_ERROR_WRONG_FLOW ||
-      ret == QUICLY_FLEXICAST_ERROR_INVALID ||
-      ret == QUICLY_FLEXICAST_ERROR_CRYPTO)
-    return QLINQ_EMCON_DISCARDED;
-  if (ret == QUICLY_FLEXICAST_ERROR_NO_MEMORY)
-    return QLINQ_EMCON_NO_MEMORY;
-  if (ret != QUICLY_FLEXICAST_OK)
+  if (ingress->authentication_failures >= ingress->max_authentication_failures)
     return QLINQ_EMCON_CRYPTO;
-  uint64_t epoch_start = quicly_flexicast_get_next_packet_number(flow);
-  uint64_t epoch_limit = qlinq_emcon_packet_number_limit(epoch_start);
-  if (((packet[0] & 0x3U) + 1U) != EMCON_PACKET_NUMBER_LENGTH ||
-      pn < epoch_start || pn >= epoch_limit)
+
+  size_t pn_offset = 1U + ingress->flow_id.len;
+  if (packet_size > QLINQ_EMCON_MAX_PACKET_SIZE ||
+      packet_size < pn_offset + QUICLY_MAX_PN_SIZE +
+                        ingress->header_protection->algo->iv_size ||
+      (packet[0] & (QUICLY_LONG_HEADER_BIT | QUICLY_QUIC_BIT)) !=
+          QUICLY_QUIC_BIT ||
+      memcmp(packet + 1, ingress->flow_id.bytes, ingress->flow_id.len) != 0)
+    return QLINQ_EMCON_DISCARDED;
+  if (ingress->decryption_attempts >= ingress->max_authentication_failures)
+    return QLINQ_EMCON_CRYPTO;
+
+  uint8_t mask[5] = {0};
+  ptls_cipher_init(ingress->header_protection,
+                   packet + pn_offset + QUICLY_MAX_PN_SIZE);
+  ptls_cipher_encrypt(ingress->header_protection, mask, mask, sizeof(mask));
+  packet[0] ^= mask[0] & 0x1fU;
+  size_t pn_length = (packet[0] & 0x3U) + 1U;
+  uint32_t truncated = 0;
+  for (size_t i = 0; i < pn_length; i++) {
+    packet[pn_offset + i] ^= mask[i + 1];
+    truncated = (truncated << 8) | packet[pn_offset + i];
+  }
+  uint64_t expected = ingress->replay_initialized
+                          ? ingress->largest_packet_number + 1
+                          : ingress->initial_packet_number;
+  uint64_t pn =
+      quicly_determine_packet_number(truncated, pn_length * 8U, expected);
+  if (pn > PTLS_QUICINT_MAX)
+    return QLINQ_EMCON_DISCARDED;
+
+  size_t payload_from = pn_offset + pn_length;
+  ingress->decryption_attempts++;
+  size_t plaintext_size = ptls_aead_decrypt(
+      ingress->aead, packet + payload_from, packet + payload_from,
+      packet_size - payload_from, pn, packet, payload_from);
+  if (plaintext_size == SIZE_MAX) {
+    if (++ingress->authentication_failures >=
+            ingress->max_authentication_failures ||
+        ingress->decryption_attempts >= ingress->max_authentication_failures)
+      return QLINQ_EMCON_CRYPTO;
+    return QLINQ_EMCON_DISCARDED;
+  }
+
+  /* validate wire header, epoch bounds, and framing before replay commit */
+  if ((packet[0] & 0x18U) != 0 || pn_length != EMCON_PACKET_NUMBER_LENGTH ||
+      pn < ingress->initial_packet_number || pn >= ingress->packet_number_limit)
     return QLINQ_EMCON_INVALID;
-  if (datagram.len < 1U || datagram.base[0] < QLINQ_EMCON_RECORD_DATA ||
+  if (ingress_is_replayed(ingress, pn))
+    return QLINQ_EMCON_DUPLICATE;
+  const uint8_t *src = packet + payload_from;
+  if (!decode_single_datagram(src, src + plaintext_size, &datagram) ||
+      datagram.len < 1U || datagram.base[0] < QLINQ_EMCON_RECORD_DATA ||
       datagram.base[0] > QLINQ_EMCON_RECORD_END)
     return QLINQ_EMCON_INVALID;
+
+  ingress_commit_replay(ingress, pn);
   message->type = (qlinq_emcon_record_type_t)datagram.base[0];
   message->packet_number = pn;
   message->payload = ptls_iovec_init(datagram.base + 1, datagram.len - 1U);
@@ -303,7 +436,7 @@ static bool sender_config_valid(const qlinq_emcon_rateless_config_t *config,
          *data_symbols + config->repair_symbols <= QLINQ_FEC_MAX_TOTAL_SYMBOLS;
 }
 
-static bool ensure_sender_buffer(void **buffer, size_t *capacity,
+static bool ensure_sender_buffer(uint8_t **buffer, size_t *capacity,
                                  size_t required) {
   if (*capacity >= required)
     return true;
@@ -313,7 +446,7 @@ static bool ensure_sender_buffer(void **buffer, size_t *capacity,
     *buffer = NULL;
     *capacity = 0;
   }
-  void *allocated = malloc(required);
+  uint8_t *allocated = malloc(required);
   if (!allocated)
     return false;
   *buffer = allocated;
@@ -321,16 +454,30 @@ static bool ensure_sender_buffer(void **buffer, size_t *capacity,
   return true;
 }
 
-static bool ensure_sender_pointers(void **array, size_t *capacity,
-                                   size_t count) {
+static bool ensure_const_blocks(const uint8_t ***blocks, size_t *capacity,
+                                size_t count) {
   if (*capacity >= count)
     return true;
-  if (count > SIZE_MAX / sizeof(void *))
+  if (count > SIZE_MAX / sizeof(**blocks))
     return false;
-  void *grown = realloc(*array, count * sizeof(void *));
+  const uint8_t **grown = realloc(*blocks, count * sizeof(**blocks));
   if (!grown)
     return false;
-  *array = grown;
+  *blocks = grown;
+  *capacity = count;
+  return true;
+}
+
+static bool ensure_mutable_blocks(uint8_t ***blocks, size_t *capacity,
+                                  size_t count) {
+  if (*capacity >= count)
+    return true;
+  if (count > SIZE_MAX / sizeof(**blocks))
+    return false;
+  uint8_t **grown = realloc(*blocks, count * sizeof(**blocks));
+  if (!grown)
+    return false;
+  *blocks = grown;
   *capacity = count;
   return true;
 }
@@ -377,20 +524,19 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
       max_framed_size);
   if (protected_capacity == 0)
     return QLINQ_EMCON_CRYPTO;
-  if (!ensure_sender_pointers((void **)&sender->data_blocks,
-                              &sender->data_blocks_capacity, data_symbols) ||
-      !ensure_sender_pointers((void **)&sender->repair_blocks,
-                              &sender->repair_blocks_capacity,
-                              config->repair_symbols) ||
+  if (!ensure_const_blocks(&sender->data_blocks, &sender->data_blocks_capacity,
+                           data_symbols) ||
+      !ensure_mutable_blocks(&sender->repair_blocks,
+                             &sender->repair_blocks_capacity,
+                             config->repair_symbols) ||
       !ensure_sender_buffer(
-          (void **)&sender->repair_storage, &sender->repair_storage_capacity,
+          &sender->repair_storage, &sender->repair_storage_capacity,
           (size_t)config->repair_symbols * config->symbol_size) ||
-      !ensure_sender_buffer((void **)&sender->tail_symbol,
-                            &sender->tail_symbol_capacity,
+      !ensure_sender_buffer(&sender->tail_symbol, &sender->tail_symbol_capacity,
                             config->symbol_size) ||
-      !ensure_sender_buffer((void **)&sender->wire, &sender->wire_capacity,
+      !ensure_sender_buffer(&sender->wire, &sender->wire_capacity,
                             max_framed_size) ||
-      !ensure_sender_buffer((void **)&sender->packet, &sender->packet_capacity,
+      !ensure_sender_buffer(&sender->packet, &sender->packet_capacity,
                             protected_capacity))
     return QLINQ_EMCON_NO_MEMORY;
 

@@ -27,6 +27,44 @@ static bool address_is_multicast(const struct sockaddr *address) {
   return false;
 }
 
+static int bind_socket_to_interface(int fd, sa_family_t family,
+                                    uint32_t interface_index, bool multicast,
+                                    bool join_group) {
+#if defined(SO_BINDTODEVICE)
+  (void)family;
+  (void)multicast;
+  (void)join_group;
+  char interface_name[IF_NAMESIZE];
+  if (!if_indextoname(interface_index, interface_name))
+    return -1;
+  return setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, interface_name,
+                    (socklen_t)(strlen(interface_name) + 1));
+#elif defined(IP_BOUND_IF) && defined(IPV6_BOUND_IF)
+  (void)multicast;
+  (void)join_group;
+  char interface_name[IF_NAMESIZE];
+  if (!if_indextoname(interface_index, interface_name))
+    return -1;
+  unsigned int bound_index = interface_index;
+  if (family == AF_INET)
+    return setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &bound_index,
+                      sizeof(bound_index));
+  if (family == AF_INET6)
+    return setsockopt(fd, IPPROTO_IPV6, IPV6_BOUND_IF, &bound_index,
+                      sizeof(bound_index));
+  errno = EAFNOSUPPORT;
+  return -1;
+#else
+  (void)fd;
+  (void)family;
+  (void)interface_index;
+  if (multicast && join_group)
+    return 0;
+  errno = ENOTSUP;
+  return -1;
+#endif
+}
+
 int qlinq_emcon_receive_socket_create_multicast(
     qlinq_emcon_receive_socket_t **receiver,
     const struct sockaddr *local_address, socklen_t local_address_len,
@@ -56,20 +94,10 @@ int qlinq_emcon_receive_socket_create_multicast(
   if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0)
     goto SystemError;
 #endif
-  if (interface_index != 0) {
-#ifdef SO_BINDTODEVICE
-    char interface_name[IF_NAMESIZE];
-    if (!if_indextoname(interface_index, interface_name) ||
-        setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, interface_name,
-                   strlen(interface_name) + 1) != 0)
-      goto SystemError;
-#else
-    if (!join_group) {
-      errno = ENOTSUP;
-      goto SystemError;
-    }
-#endif
-  }
+  if (interface_index != 0 &&
+      bind_socket_to_interface(fd, local_address->sa_family, interface_index,
+                               multicast, join_group) != 0)
+    goto SystemError;
   if (multicast) {
     int one = 1;
     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0)
