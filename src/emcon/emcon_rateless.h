@@ -29,6 +29,19 @@ typedef struct {
   ptls_iovec_t payload; /* borrows mutable packet passed to open */
 } qlinq_emcon_message_t;
 
+typedef struct {
+  qlinq_emcon_record_type_t type;
+  uint64_t packet_number;
+  union {
+    struct {
+      qlinq_wire_fec_header_t header;
+      const uint8_t *symbol;
+      size_t symbol_size;
+    } data;
+    qlinq_wire_track_end_t end;
+  } value;
+} qlinq_emcon_frame_t;
+
 /* sender owns egress keys bound to the manifest digest and epoch PN range */
 int qlinq_emcon_sender_create(
     qlinq_emcon_sender_t **sender, uint64_t flow_id, uint32_t key_epoch,
@@ -114,11 +127,18 @@ typedef struct {
   } value;
 } qlinq_emcon_event_t;
 
-/* creates an alias assembler bounded by the stream's maximum record size */
+/* creates an alias assembler bounded by signed FEC geometry and record limit */
 qlinq_emcon_receiver_t *qlinq_emcon_receiver_create(uint8_t alias,
+                                                    uint16_t symbol_size,
+                                                    uint16_t repair_symbols,
                                                     uint32_t max_record_size);
 void qlinq_emcon_receiver_free(qlinq_emcon_receiver_t *receiver);
 
+int qlinq_emcon_decode_frame(const qlinq_emcon_message_t *message,
+                             qlinq_emcon_frame_t *frame);
+int qlinq_emcon_receiver_ingest_frame(qlinq_emcon_receiver_t *receiver,
+                                      const qlinq_emcon_frame_t *frame,
+                                      qlinq_emcon_event_t *event);
 int qlinq_emcon_receiver_ingest_message(qlinq_emcon_receiver_t *receiver,
                                         const qlinq_emcon_message_t *message,
                                         qlinq_emcon_event_t *event);

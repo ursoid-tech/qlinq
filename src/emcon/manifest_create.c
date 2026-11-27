@@ -487,6 +487,14 @@ static int write_all(int fd, const uint8_t *data, size_t size) {
   return 0;
 }
 
+static int sync_file_data(int fd) {
+#if defined(__APPLE__)
+  return fsync(fd);
+#else
+  return fdatasync(fd);
+#endif
+}
+
 static int sync_parent_directory(const char *path) {
   char *copy = strdup(path);
   if (!copy)
@@ -514,7 +522,7 @@ static int create_file(const char *path, const uint8_t *data, size_t size,
       open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, mode);
   if (fd < 0)
     return -1;
-  int ret = write_all(fd, data, size) == 0 && fdatasync(fd) == 0 ? 0 : -1;
+  int ret = write_all(fd, data, size) == 0 && sync_file_data(fd) == 0 ? 0 : -1;
   int saved_errno = errno;
   if (close(fd) != 0)
     ret = -1;
@@ -538,7 +546,7 @@ static int create_public_key_file(const char *path, EVP_PKEY *key) {
     return -1;
   }
   int ret = PEM_write_PUBKEY(file, key) == 1 && fflush(file) == 0 &&
-                    fdatasync(fd) == 0
+                    sync_file_data(fd) == 0
                 ? 0
                 : -1;
   if (fclose(file) != 0)

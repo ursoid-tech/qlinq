@@ -27,6 +27,7 @@ struct qlinq_emcon_ingress_t {
   uint64_t largest_packet_number;
   uint64_t replay_mask;
   uint64_t decryption_attempts;
+  uint64_t max_decryption_attempts;
   uint64_t authentication_failures;
   uint64_t max_authentication_failures;
   bool replay_initialized;
@@ -183,6 +184,7 @@ int qlinq_emcon_ingress_create(
   created->initial_packet_number = first_packet_number;
   created->packet_number_limit =
       qlinq_emcon_packet_number_limit(first_packet_number);
+  created->max_decryption_attempts = integrity_limit;
   created->max_authentication_failures = max_authentication_failures != 0
                                              ? max_authentication_failures
                                              : integrity_limit;
@@ -333,7 +335,7 @@ int qlinq_emcon_flexicast_open(qlinq_emcon_ingress_t *ingress, uint8_t *packet,
           QUICLY_QUIC_BIT ||
       memcmp(packet + 1, ingress->flow_id.bytes, ingress->flow_id.len) != 0)
     return QLINQ_EMCON_DISCARDED;
-  if (ingress->decryption_attempts >= ingress->max_authentication_failures)
+  if (ingress->decryption_attempts >= ingress->max_decryption_attempts)
     return QLINQ_EMCON_CRYPTO;
 
   uint8_t mask[5] = {0};
@@ -363,7 +365,7 @@ int qlinq_emcon_flexicast_open(qlinq_emcon_ingress_t *ingress, uint8_t *packet,
   if (plaintext_size == SIZE_MAX) {
     if (++ingress->authentication_failures >=
             ingress->max_authentication_failures ||
-        ingress->decryption_attempts >= ingress->max_authentication_failures)
+        ingress->decryption_attempts >= ingress->max_decryption_attempts)
       return QLINQ_EMCON_CRYPTO;
     return QLINQ_EMCON_DISCARDED;
   }
@@ -399,14 +401,16 @@ typedef struct {
   uint32_t original_size;
   uint64_t latest_symbol_pn;
   size_t received_count;
+  size_t data_received_count;
   uint8_t *storage;
   uint8_t **blocks;
-  bool *received;
   bool *missing;
 } qlinq_emcon_receive_object_t;
 
 struct qlinq_emcon_receiver_t {
   uint8_t alias;
+  uint16_t symbol_size;
+  uint16_t repair_symbols;
   uint32_t max_record_size;
   qlinq_emcon_receive_object_t objects[QLINQ_EMCON_MAX_ACTIVE_OBJECTS];
   struct {
@@ -420,7 +424,6 @@ struct qlinq_emcon_receiver_t {
 static void receiver_clear_object(qlinq_emcon_receive_object_t *object) {
   free(object->storage);
   free(object->blocks);
-  free(object->received);
   free(object->missing);
   memset(object, 0, sizeof(*object));
 }
@@ -508,7 +511,7 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
                             bool keyframe, uint8_t priority, const void *data,
                             size_t size, qlinq_emcon_emit_packet_cb emit,
                             void *user_data) {
-  size_t data_symbols, total_symbols, data_index = 0, repair_index = 0;
+  size_t data_symbols, total_symbols;
 
   if (!sender || !data || !emit ||
       !sender_config_valid(config, size, &data_symbols))
@@ -561,19 +564,8 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
     return QLINQ_EMCON_CODEC;
 
   for (size_t emitted = 0; emitted < total_symbols; emitted++) {
-    bool use_data;
-    if (data_index == data_symbols) {
-      use_data = false;
-    } else if (repair_index == config->repair_symbols) {
-      use_data = true;
-    } else {
-      /* pick class with less normalized progress */
-      use_data = (data_index + 1) * (size_t)config->repair_symbols <=
-                 (repair_index + 1) * data_symbols;
-    }
-    uint16_t symbol_index = use_data
-                                ? (uint16_t)data_index++
-                                : (uint16_t)(data_symbols + repair_index++);
+    uint16_t symbol_index = (uint16_t)emitted;
+    bool use_data = emitted < data_symbols;
     qlinq_wire_fec_header_t header = {
         .alias = config->alias,
         .is_keyframe = keyframe,
@@ -615,13 +607,21 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
 }
 
 qlinq_emcon_receiver_t *qlinq_emcon_receiver_create(uint8_t alias,
+                                                    uint16_t symbol_size,
+                                                    uint16_t repair_symbols,
                                                     uint32_t max_record_size) {
-  if (max_record_size == 0)
+  if (symbol_size == 0 || symbol_size > QLINQ_FEC_MAX_SYMBOL_SIZE ||
+      repair_symbols == 0 || repair_symbols >= QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+      max_record_size == 0 ||
+      max_record_size >
+          (size_t)(QLINQ_FEC_MAX_TOTAL_SYMBOLS - repair_symbols) * symbol_size)
     return NULL;
   qlinq_emcon_receiver_t *receiver = calloc(1, sizeof(*receiver));
   if (!receiver)
     return NULL;
   receiver->alias = alias;
+  receiver->symbol_size = symbol_size;
+  receiver->repair_symbols = repair_symbols;
   receiver->max_record_size = max_record_size;
   return receiver;
 }
@@ -638,12 +638,13 @@ static int receiver_start_object(qlinq_emcon_receive_object_t *object,
                                  const qlinq_emcon_receiver_t *receiver,
                                  const qlinq_wire_fec_header_t *header) {
   size_t bytes;
-  if (header->alias != receiver->alias || header->total_symbols == 0 ||
-      header->total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+  if (header->alias != receiver->alias ||
+      header->symbol_size != receiver->symbol_size ||
       header->data_symbols == 0 ||
-      header->data_symbols >= header->total_symbols ||
-      header->symbol_size == 0 ||
-      header->symbol_size > QLINQ_FEC_MAX_SYMBOL_SIZE ||
+      header->total_symbols <= header->data_symbols ||
+      header->total_symbols - header->data_symbols !=
+          receiver->repair_symbols ||
+      header->total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
       header->original_size == 0 ||
       header->original_size > receiver->max_record_size ||
       qlinq_wire_fec_payload_size(header) == 0)
@@ -654,16 +655,16 @@ static int receiver_start_object(qlinq_emcon_receive_object_t *object,
   object->storage = calloc(1, bytes);
   object->blocks =
       malloc((size_t)header->total_symbols * sizeof(*object->blocks));
-  object->received = calloc(header->total_symbols, sizeof(*object->received));
   object->missing =
       malloc((size_t)header->total_symbols * sizeof(*object->missing));
-  if (!object->storage || !object->blocks || !object->received ||
-      !object->missing) {
+  if (!object->storage || !object->blocks || !object->missing) {
     receiver_clear_object(object);
     return QLINQ_EMCON_NO_MEMORY;
   }
-  for (size_t i = 0; i < header->total_symbols; i++)
+  for (size_t i = 0; i < header->total_symbols; i++) {
     object->blocks[i] = object->storage + i * header->symbol_size;
+    object->missing[i] = true;
+  }
   object->active = true;
   object->group_id = header->group_id;
   object->object_id = header->object_id;
@@ -679,34 +680,21 @@ static int receiver_start_object(qlinq_emcon_receive_object_t *object,
 static int receiver_complete(qlinq_emcon_receiver_t *receiver,
                              qlinq_emcon_receive_object_t *object,
                              qlinq_emcon_record_t *record) {
-  bool all_data = true, decoded = false;
-  fec_t *fec = NULL;
-  for (size_t i = 0; i < object->data_symbols; i++)
-    all_data &= object->received[i];
-  if (all_data) {
-    decoded = true;
-  } else {
-    for (size_t i = 0; i < object->total_symbols; i++)
-      object->missing[i] = !object->received[i];
-    fec = fec_create_ex(FEC_RAPTORQ, object->data_symbols,
-                        object->total_symbols - object->data_symbols,
-                        object->symbol_size);
+  bool decoded = object->data_received_count == object->data_symbols;
+  if (!decoded) {
+    fec_t *fec = fec_create_ex(FEC_RAPTORQ, object->data_symbols,
+                               object->total_symbols - object->data_symbols,
+                               object->symbol_size);
     decoded = fec && fec_decode(fec, object->blocks, object->missing);
+    fec_destroy(fec);
   }
-  fec_destroy(fec);
   if (!decoded)
     return QLINQ_EMCON_INCOMPLETE;
 
   uint8_t *data = malloc(object->original_size);
   if (!data)
     return QLINQ_EMCON_NO_MEMORY;
-  size_t remaining = object->original_size;
-  for (size_t i = 0; i < object->data_symbols && remaining; i++) {
-    size_t chunk =
-        remaining < object->symbol_size ? remaining : object->symbol_size;
-    memcpy(data + i * object->symbol_size, object->blocks[i], chunk);
-    remaining -= chunk;
-  }
+  memcpy(data, object->storage, object->original_size);
   *record = (qlinq_emcon_record_t){
       .alias = receiver->alias,
       .group_id = object->group_id,
@@ -725,28 +713,58 @@ static int receiver_complete(qlinq_emcon_receiver_t *receiver,
   return QLINQ_EMCON_OK;
 }
 
+int qlinq_emcon_decode_frame(const qlinq_emcon_message_t *message,
+                             qlinq_emcon_frame_t *frame) {
+  if (!message || !frame)
+    return QLINQ_EMCON_INVALID;
+  memset(frame, 0, sizeof(*frame));
+  frame->type = message->type;
+  frame->packet_number = message->packet_number;
+  switch (message->type) {
+  case QLINQ_EMCON_RECORD_DATA: {
+    size_t payload_size;
+    if (message->payload.len < QLINQ_WIRE_FEC_HEADER_SIZE ||
+        qlinq_wire_decode_fec_header(
+            message->payload.base, message->payload.len,
+            &frame->value.data.header) != QLINQ_WIRE_OK ||
+        (payload_size =
+             qlinq_wire_fec_payload_size(&frame->value.data.header)) == 0 ||
+        message->payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + payload_size)
+      return QLINQ_EMCON_INVALID;
+    frame->value.data.symbol =
+        message->payload.base + QLINQ_WIRE_FEC_HEADER_SIZE;
+    frame->value.data.symbol_size = payload_size;
+    return QLINQ_EMCON_OK;
+  }
+  case QLINQ_EMCON_RECORD_END:
+    if (qlinq_wire_decode_track_end(message->payload.base, message->payload.len,
+                                    &frame->value.end) != QLINQ_WIRE_OK)
+      return QLINQ_EMCON_INVALID;
+    return QLINQ_EMCON_OK;
+  default:
+    return QLINQ_EMCON_INVALID;
+  }
+}
+
 static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
-                                const qlinq_emcon_message_t *message,
+                                const qlinq_emcon_frame_t *frame,
                                 qlinq_emcon_record_t *record) {
-  qlinq_wire_fec_header_t header;
+  const qlinq_wire_fec_header_t *header = &frame->value.data.header;
   qlinq_emcon_receive_object_t *object = NULL, *slot = NULL;
-  size_t payload_size;
-  if (message->payload.len < QLINQ_WIRE_FEC_HEADER_SIZE ||
-      qlinq_wire_decode_fec_header(message->payload.base, message->payload.len,
-                                   &header) != QLINQ_WIRE_OK ||
-      (payload_size = qlinq_wire_fec_payload_size(&header)) == 0 ||
-      message->payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + payload_size)
+  size_t payload_size = qlinq_wire_fec_payload_size(header);
+  if (!frame->value.data.symbol || payload_size == 0 ||
+      frame->value.data.symbol_size != payload_size)
     return QLINQ_EMCON_INVALID;
 
   for (size_t i = 0; i < QLINQ_EMCON_COMPLETED_OBJECTS; i++)
     if (receiver->completed[i].active &&
-        receiver->completed[i].group_id == header.group_id &&
-        receiver->completed[i].object_id == header.object_id)
+        receiver->completed[i].group_id == header->group_id &&
+        receiver->completed[i].object_id == header->object_id)
       return QLINQ_EMCON_DUPLICATE;
   for (size_t i = 0; i < QLINQ_EMCON_MAX_ACTIVE_OBJECTS; i++) {
     qlinq_emcon_receive_object_t *candidate = &receiver->objects[i];
-    if (candidate->active && candidate->group_id == header.group_id &&
-        candidate->object_id == header.object_id) {
+    if (candidate->active && candidate->group_id == header->group_id &&
+        candidate->object_id == header->object_id) {
       object = candidate;
       break;
     }
@@ -756,60 +774,74 @@ static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
   }
   if (!object) {
     /* under pressure, keep objects with the most recent useful symbols */
-    if (slot->active && message->packet_number <= slot->latest_symbol_pn)
+    if (slot->active && frame->packet_number <= slot->latest_symbol_pn)
       return QLINQ_EMCON_INCOMPLETE;
     object = slot;
-    int started = receiver_start_object(object, receiver, &header);
+    int started = receiver_start_object(object, receiver, header);
     if (started != QLINQ_EMCON_OK)
       return started;
-  } else if (object->total_symbols != header.total_symbols ||
-             object->data_symbols != header.data_symbols ||
-             object->symbol_size != header.symbol_size ||
-             object->original_size != header.original_size ||
-             object->keyframe != header.is_keyframe ||
-             object->priority != header.priority ||
-             header.alias != receiver->alias) {
+  } else if (object->total_symbols != header->total_symbols ||
+             object->data_symbols != header->data_symbols ||
+             object->symbol_size != header->symbol_size ||
+             object->original_size != header->original_size ||
+             object->keyframe != header->is_keyframe ||
+             object->priority != header->priority ||
+             header->alias != receiver->alias) {
     return QLINQ_EMCON_INVALID;
   }
 
-  if (!object->received[header.symbol_index]) {
-    memcpy(object->blocks[header.symbol_index],
-           message->payload.base + QLINQ_WIRE_FEC_HEADER_SIZE, payload_size);
-    memset(object->blocks[header.symbol_index] + payload_size, 0,
+  if (object->missing[header->symbol_index]) {
+    memcpy(object->blocks[header->symbol_index], frame->value.data.symbol,
+           payload_size);
+    memset(object->blocks[header->symbol_index] + payload_size, 0,
            object->symbol_size - payload_size);
-    object->received[header.symbol_index] = true;
+    object->missing[header->symbol_index] = false;
     object->received_count++;
-    if (message->packet_number > object->latest_symbol_pn)
-      object->latest_symbol_pn = message->packet_number;
+    if (header->symbol_index < object->data_symbols)
+      object->data_received_count++;
+    if (frame->packet_number > object->latest_symbol_pn)
+      object->latest_symbol_pn = frame->packet_number;
   }
   if (object->received_count < object->data_symbols)
     return QLINQ_EMCON_INCOMPLETE;
   return receiver_complete(receiver, object, record);
 }
 
-int qlinq_emcon_receiver_ingest_message(qlinq_emcon_receiver_t *receiver,
-                                        const qlinq_emcon_message_t *message,
-                                        qlinq_emcon_event_t *event) {
+int qlinq_emcon_receiver_ingest_frame(qlinq_emcon_receiver_t *receiver,
+                                      const qlinq_emcon_frame_t *frame,
+                                      qlinq_emcon_event_t *event) {
   int decoded;
-  if (!receiver || !message || !event)
+  if (!receiver || !frame || !event)
     return QLINQ_EMCON_INVALID;
   memset(event, 0, sizeof(*event));
-  switch (message->type) {
+  switch (frame->type) {
   case QLINQ_EMCON_RECORD_DATA:
-    decoded = receiver_ingest_data(receiver, message, &event->value.record);
+    decoded = receiver_ingest_data(receiver, frame, &event->value.record);
     if (decoded == QLINQ_EMCON_OK)
       event->type = QLINQ_EMCON_EVENT_RECORD;
     return decoded;
   case QLINQ_EMCON_RECORD_END:
-    if (qlinq_wire_decode_track_end(message->payload.base, message->payload.len,
-                                    &event->value.end) != QLINQ_WIRE_OK ||
-        event->value.end.alias != receiver->alias)
+    if (frame->value.end.alias != receiver->alias)
       return QLINQ_EMCON_INVALID;
     event->type = QLINQ_EMCON_EVENT_END;
+    event->value.end = frame->value.end;
     return QLINQ_EMCON_OK;
   default:
     return QLINQ_EMCON_INVALID;
   }
+}
+
+int qlinq_emcon_receiver_ingest_message(qlinq_emcon_receiver_t *receiver,
+                                        const qlinq_emcon_message_t *message,
+                                        qlinq_emcon_event_t *event) {
+  qlinq_emcon_frame_t frame;
+  if (!receiver || !message || !event)
+    return QLINQ_EMCON_INVALID;
+  memset(event, 0, sizeof(*event));
+  int decoded = qlinq_emcon_decode_frame(message, &frame);
+  if (decoded != QLINQ_EMCON_OK)
+    return decoded;
+  return qlinq_emcon_receiver_ingest_frame(receiver, &frame, event);
 }
 
 void qlinq_emcon_record_release(qlinq_emcon_record_t *record) {

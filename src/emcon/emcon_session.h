@@ -1,6 +1,7 @@
 #ifndef QLINQ_EMCON_SESSION_H
 #define QLINQ_EMCON_SESSION_H
 
+#include "emcon_activation.h"
 #include "emcon_manifest.h"
 #include "emcon_rateless.h"
 #include "emcon_send_socket.h"
@@ -27,7 +28,8 @@ typedef enum {
   QLINQ_EMCON_SESSION_ACTIVATION_LOCKED = -8,
   QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED = -9,
   QLINQ_EMCON_SESSION_ACTIVATION_REUSED = -10,
-  QLINQ_EMCON_SESSION_INTERRUPTED = -11
+  QLINQ_EMCON_SESSION_INTERRUPTED = -11,
+  QLINQ_EMCON_SESSION_TRANSFER_MISMATCH = -12
 } qlinq_emcon_session_result_t;
 
 typedef struct {
@@ -52,12 +54,21 @@ int qlinq_emcon_session_create_sender_persistent(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory, uint64_t reservation_packets);
+/* binds (alias, group_id) to input identity and block size before reserving */
+int qlinq_emcon_session_create_sender_bound(
+    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
+    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
+    const char *state_directory, uint64_t reservation_packets,
+    const qlinq_emcon_transfer_t *transfer);
 /* prepares receiver socket before committing the one-shot epoch claim */
 int qlinq_emcon_session_prepare_receiver(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory, unsigned int interface_index, bool join_group);
 int qlinq_emcon_session_claim_receiver(qlinq_emcon_session_t *session);
+/* discards authenticated packets for other aliases or groups before FEC */
+int qlinq_emcon_session_set_receive_filter(qlinq_emcon_session_t *session,
+                                           uint8_t alias, uint64_t group_id);
 void qlinq_emcon_session_set_cancel(qlinq_emcon_session_t *session,
                                     qlinq_emcon_cancel_fn should_cancel,
                                     void *cancel_data);

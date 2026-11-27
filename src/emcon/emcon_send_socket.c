@@ -168,45 +168,43 @@ static int wait_for_pacer(qlinq_emcon_send_socket_t *sender,
     if (earliest <= now)
       break;
 
-    uint64_t wall_ms = qlinq_emcon_realtime_ms();
+    struct timespec wall;
+    if (clock_gettime(CLOCK_REALTIME, &wall) != 0)
+      return QLINQ_EMCON_SOCKET_SYSTEM;
+    uint64_t wall_ms =
+        (uint64_t)wall.tv_sec * 1000U + (uint64_t)wall.tv_nsec / 1000000U;
     if (!wall_ms)
       return QLINQ_EMCON_SOCKET_SYSTEM;
-    if (wall_ms >= sender->expires_at_ms)
+    if (wall_ms >= sender->expires_at_ms) {
+      if (total_delay > 0) {
+        sender->stats.pacing_delays++;
+        sender->stats.pacing_delay_ns += total_delay;
+      }
       return QLINQ_EMCON_SOCKET_EXPIRED;
+    }
     uint64_t step_ns = earliest - now;
     uint64_t slice_ns = (uint64_t)QLINQ_EMCON_WAIT_SLICE_MS * UINT64_C(1000000);
     if (sender->should_cancel && step_ns > slice_ns)
       step_ns = slice_ns;
     uint64_t remaining_ms = sender->expires_at_ms - wall_ms;
-    clockid_t clock = CLOCK_MONOTONIC;
-    uint64_t target_ns = now + step_ns;
-    struct timespec deadline = {
-        .tv_sec = (time_t)(target_ns / UINT64_C(1000000000)),
-        .tv_nsec = (long)(target_ns % UINT64_C(1000000000))};
-    bool until_expiry = false;
-    if (step_ns / UINT64_C(1000000) >= remaining_ms) {
-      clock = CLOCK_REALTIME;
-      deadline.tv_sec = (time_t)(sender->expires_at_ms / 1000);
-      deadline.tv_nsec = (long)(sender->expires_at_ms % 1000) * 1000000;
-      step_ns = remaining_ms * UINT64_C(1000000);
-      until_expiry = true;
+    if (remaining_ms <= UINT64_MAX / UINT64_C(1000000)) {
+      uint64_t sub_ms_ns = (uint64_t)(wall.tv_nsec % 1000000L);
+      uint64_t expiry_ns = remaining_ms * UINT64_C(1000000) - sub_ms_ns;
+      if (step_ns > expiry_ns)
+        step_ns = expiry_ns;
     }
-    int ret = clock_nanosleep(clock, TIMER_ABSTIME, &deadline, NULL);
-    if (ret == EINTR) {
-      if (sender->should_cancel && sender->should_cancel(sender->cancel_data))
-        return QLINQ_EMCON_SOCKET_INTERRUPTED;
-      continue;
-    }
-    if (ret != 0) {
-      errno = ret;
+    struct timespec duration = {
+        .tv_sec = (time_t)(step_ns / UINT64_C(1000000000)),
+        .tv_nsec = (long)(step_ns % UINT64_C(1000000000))};
+    if (nanosleep(&duration, NULL) != 0) {
+      if (errno == EINTR) {
+        if (sender->should_cancel && sender->should_cancel(sender->cancel_data))
+          return QLINQ_EMCON_SOCKET_INTERRUPTED;
+        continue;
+      }
       return QLINQ_EMCON_SOCKET_SYSTEM;
     }
     total_delay += step_ns;
-    if (until_expiry) {
-      sender->stats.pacing_delays++;
-      sender->stats.pacing_delay_ns += total_delay;
-      return QLINQ_EMCON_SOCKET_EXPIRED;
-    }
   }
   sender->stats.pacing_delays++;
   sender->stats.pacing_delay_ns += total_delay;

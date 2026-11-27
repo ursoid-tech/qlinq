@@ -94,6 +94,15 @@ int main(void) {
             (errno == EAGAIN || errno == EWOULDBLOCK),
         "sender observes no feedback");
 
+  uint8_t oversize[sizeof(packet) + 1] = {0x42};
+  CHECK(sendto(sender, oversize, sizeof(oversize), 0,
+               (struct sockaddr *)&receiver_address,
+               sizeof(receiver_address)) == (ssize_t)sizeof(oversize) &&
+            qlinq_emcon_receive_socket_receive(
+                receiver, packet, sizeof(packet), &packet_size, false,
+                UINT64_MAX) == QLINQ_EMCON_SOCKET_TOO_LARGE,
+        "oversized datagram reports truncation");
+
   bool cancelled = true;
   qlinq_emcon_receive_socket_set_cancel(receiver, cancel_immediately,
                                         &cancelled);

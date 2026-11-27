@@ -68,9 +68,11 @@ static int ingest_symbol(qlinq_emcon_receiver_t *receiver, uint64_t pn,
 }
 
 static int test_partial_objects(void) {
-  CHECK(qlinq_emcon_receiver_create(7, 0) == NULL,
-        "reject zero maximum record size");
-  qlinq_emcon_receiver_t *receiver = qlinq_emcon_receiver_create(7, 64);
+  CHECK(qlinq_emcon_receiver_create(7, 1, 1, 0) == NULL &&
+            qlinq_emcon_receiver_create(7, 0, 1, 64) == NULL &&
+            qlinq_emcon_receiver_create(7, 1, 0, 64) == NULL,
+        "reject zero geometry or maximum record size");
+  qlinq_emcon_receiver_t *receiver = qlinq_emcon_receiver_create(7, 1, 1, 64);
   CHECK(receiver != NULL, "create bounded object assembler");
   qlinq_emcon_event_t event;
   uint64_t pn = 100;
@@ -107,8 +109,53 @@ static int test_partial_objects(void) {
         "deliver a complete record from the newer group");
   qlinq_emcon_event_release(&event);
 
-  /* enforce v2 tail omission, tight data_symbols, and maximum_record_size */
-  uint8_t bad_wire[QLINQ_WIRE_FEC_HEADER_SIZE + 256] = {0};
+  /* enforce signed FEC geometry, v2 tail omission, tight k, and record cap */
+  uint8_t bad_wire[QLINQ_WIRE_FEC_HEADER_SIZE + 1500] = {0};
+  qlinq_wire_fec_header_t wrong_sym = {.alias = 7,
+                                       .group_id = 9,
+                                       .object_id = 0,
+                                       .symbol_index = 0,
+                                       .data_symbols = 1,
+                                       .total_symbols = 2,
+                                       .symbol_size = 64,
+                                       .original_size = 64};
+  CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire), &wrong_sym) ==
+            QLINQ_WIRE_OK,
+        "encode mismatched symbol_size fixture");
+  qlinq_emcon_message_t bad_msg = {
+      .type = QLINQ_EMCON_RECORD_DATA,
+      .packet_number = 498,
+      .payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64)};
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+            QLINQ_EMCON_INVALID,
+        "reject symbol_size exceeding manifest FEC geometry");
+
+  qlinq_wire_fec_header_t wrong_repairs = {.alias = 7,
+                                           .group_id = 9,
+                                           .object_id = 0,
+                                           .symbol_index = 0,
+                                           .data_symbols = 1,
+                                           .total_symbols = 1024,
+                                           .symbol_size = 1,
+                                           .original_size = 1};
+  CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire),
+                                     &wrong_repairs) == QLINQ_WIRE_OK,
+        "encode inflated repair count fixture");
+  bad_msg.packet_number = 499;
+  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 1);
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+            QLINQ_EMCON_INVALID,
+        "reject repair_symbols exceeding manifest FEC geometry");
+
+  qlinq_emcon_receiver_t *receiver64 =
+      qlinq_emcon_receiver_create(7, 64, 1, 64);
+  qlinq_emcon_receiver_t *receiver32 =
+      qlinq_emcon_receiver_create(7, 32, 1, 64);
+  qlinq_emcon_receiver_t *receiver65 =
+      qlinq_emcon_receiver_create(7, 65, 1, 64);
+  CHECK(receiver64 && receiver32 && receiver65,
+        "create geometry-specific test assemblers");
+
   qlinq_wire_fec_header_t padded_tail = {.alias = 7,
                                          .group_id = 9,
                                          .object_id = 1,
@@ -120,11 +167,9 @@ static int test_partial_objects(void) {
   CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire),
                                      &padded_tail) == QLINQ_WIRE_OK,
         "encode padded-tail fixture");
-  qlinq_emcon_message_t bad_msg = {
-      .type = QLINQ_EMCON_RECORD_DATA,
-      .packet_number = 500,
-      .payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64)};
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+  bad_msg.packet_number = 500;
+  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64);
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver64, &bad_msg, &event) ==
             QLINQ_EMCON_INVALID,
         "reject zero-padded v2 final source symbol");
 
@@ -140,7 +185,7 @@ static int test_partial_objects(void) {
             QLINQ_WIRE_OK,
         "encode non-minimal data_symbols fixture");
   bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 32);
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver32, &bad_msg, &event) ==
             QLINQ_EMCON_INVALID,
         "reject empty trailing source symbols");
 
@@ -156,10 +201,13 @@ static int test_partial_objects(void) {
             QLINQ_WIRE_OK,
         "encode oversize record fixture");
   bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 65);
-  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver65, &bad_msg, &event) ==
             QLINQ_EMCON_INVALID,
         "reject object exceeding stream maximum_record_size");
 
+  qlinq_emcon_receiver_free(receiver65);
+  qlinq_emcon_receiver_free(receiver32);
+  qlinq_emcon_receiver_free(receiver64);
   qlinq_emcon_receiver_free(receiver);
   return 0;
 }
@@ -251,7 +299,7 @@ static int test_receive_packet_hardening(void) {
 
   /* valid 4-byte PN at start still opens because invalid PNs were not committed
    */
-  qlinq_emcon_receiver_t *assembler = qlinq_emcon_receiver_create(7, 64);
+  qlinq_emcon_receiver_t *assembler = qlinq_emcon_receiver_create(7, 64, 1, 64);
   qlinq_emcon_event_t event;
   CHECK(assembler &&
             quicly_flexicast_encode_datagram_packet(
@@ -268,6 +316,37 @@ static int test_receive_packet_hardening(void) {
         "authenticate start packet after rejecting invalid packet numbers");
   qlinq_emcon_event_release(&event);
   qlinq_emcon_receiver_free(assembler);
+
+  /* valid packets must not consume max_authentication_failures budget */
+  qlinq_emcon_ingress_t *strict_valid = NULL;
+  CHECK(qlinq_emcon_ingress_create(&strict_valid, 77, 1, digest, start, 1,
+                                   secret, sizeof(secret)) == QLINQ_EMCON_OK,
+        "create ingress with max_authentication_failures=1");
+  CHECK(quicly_flexicast_encode_datagram_packet(
+            &egress, &flow_id, start, 4,
+            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+            &packet_size) == QUICLY_FLEXICAST_OK &&
+            qlinq_emcon_flexicast_open(strict_valid, packet, packet_size,
+                                       &message) == QLINQ_EMCON_OK &&
+            quicly_flexicast_encode_datagram_packet(
+                &egress, &flow_id, start + 1, 4,
+                ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+                &packet_size) == QUICLY_FLEXICAST_OK &&
+            qlinq_emcon_flexicast_open(strict_valid, packet, packet_size,
+                                       &message) == QLINQ_EMCON_OK &&
+            qlinq_emcon_ingress_authentication_failures(strict_valid) == 0,
+        "multiple valid packets succeed with max_authentication_failures=1");
+  CHECK(quicly_flexicast_encode_datagram_packet(
+            &egress, &flow_id, start + 2, 4,
+            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+            &packet_size) == QUICLY_FLEXICAST_OK,
+        "encode packet for tag corruption");
+  packet[packet_size - 1] ^= 0x01U;
+  CHECK(qlinq_emcon_flexicast_open(strict_valid, packet, packet_size,
+                                   &message) == QLINQ_EMCON_CRYPTO &&
+            qlinq_emcon_ingress_authentication_failures(strict_valid) == 1,
+        "first failed authentication trips max_authentication_failures=1");
+  qlinq_emcon_ingress_free(strict_valid);
 
   /* manifest digest mismatch must fail AEAD and trip failure limit */
   CHECK(quicly_flexicast_encode_datagram_packet(
@@ -429,9 +508,10 @@ int main(int argc, char **argv) {
         "encode object");
   CHECK(capture.count == 30, "expected original plus repair count");
 
-  /* verify wire v2 omits zero padding from the final source symbol (136 B) */
+  /* verify systematic emission order and v2 tail omission (136 B) */
   size_t short_symbols = 0;
   for (size_t i = 0; i < capture.count; i++) {
+    CHECK(symbols[i] == i, "emit source symbols before repair symbols");
     if (symbols[i] == 19) {
       CHECK(sizes[i] == 213, "final source symbol omits implicit zero tail");
       short_symbols++;
@@ -442,7 +522,8 @@ int main(int argc, char **argv) {
   CHECK(short_symbols == 1, "exactly one short final source symbol");
 
   /* drop five original symbols and deliver the rest in reverse order */
-  qlinq_emcon_receiver_t *receiver = qlinq_emcon_receiver_create(7, 8192);
+  qlinq_emcon_receiver_t *receiver =
+      qlinq_emcon_receiver_create(7, 256, 10, 8192);
   CHECK(receiver, "receiver setup");
   qlinq_emcon_record_t record = {0};
   int result = QLINQ_EMCON_INCOMPLETE;

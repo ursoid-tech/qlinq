@@ -22,6 +22,9 @@ struct qlinq_emcon_session_t {
   qlinq_emcon_receiver_t *aliases[QLINQ_EMCON_MANIFEST_MAX_STREAMS];
   uint64_t reservation_packets;
   uint64_t reserved_until;
+  uint64_t filter_group_id;
+  uint8_t filter_alias;
+  bool filter_active;
   qlinq_emcon_cancel_fn should_cancel;
   void *cancel_data;
   qlinq_emcon_session_stats_t stats;
@@ -61,6 +64,8 @@ const char *qlinq_emcon_session_strerror(int error) {
     return "receiver key epoch already claimed";
   case QLINQ_EMCON_SESSION_INTERRUPTED:
     return "interrupted";
+  case QLINQ_EMCON_SESSION_TRANSFER_MISMATCH:
+    return "group already bound to an incompatible transfer";
   default:
     return "unknown session error";
   }
@@ -89,16 +94,21 @@ static int endpoint_sockaddr(const qlinq_emcon_manifest_endpoint_t *endpoint,
   return -1;
 }
 
-static bool find_stream(const qlinq_emcon_session_t *session, uint8_t alias,
-                        size_t *manifest_index) {
-  for (size_t i = 0; i < session->manifest.stream_count; i++) {
-    if (session->manifest.streams[i].alias == alias) {
+static bool find_manifest_stream(const qlinq_emcon_manifest_t *manifest,
+                                 uint8_t alias, size_t *manifest_index) {
+  for (size_t i = 0; i < manifest->stream_count; i++) {
+    if (manifest->streams[i].alias == alias) {
       if (manifest_index)
         *manifest_index = i;
       return true;
     }
   }
   return false;
+}
+
+static bool find_stream(const qlinq_emcon_session_t *session, uint8_t alias,
+                        size_t *manifest_index) {
+  return find_manifest_stream(&session->manifest, alias, manifest_index);
 }
 
 static qlinq_emcon_receiver_t *find_alias(qlinq_emcon_session_t *session,
@@ -168,7 +178,8 @@ static int create_common(qlinq_emcon_session_t **session,
   }
   for (size_t i = 0; !send_mode && i < manifest->stream_count; i++) {
     created->aliases[i] = qlinq_emcon_receiver_create(
-        manifest->streams[i].alias, manifest->streams[i].maximum_record_size);
+        manifest->streams[i].alias, manifest->symbol_size,
+        manifest->repair_symbols, manifest->streams[i].maximum_record_size);
     if (!created->aliases[i]) {
       qlinq_emcon_session_free(created);
       return QLINQ_EMCON_SESSION_NO_MEMORY;
@@ -200,10 +211,11 @@ static int create_sender_socket(qlinq_emcon_send_socket_t **sender,
              : QLINQ_EMCON_SESSION_IO;
 }
 
-int qlinq_emcon_session_create_sender_persistent(
+static int create_sender_persistent_internal(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
-    const char *state_directory, uint64_t reservation_packets) {
+    const char *state_directory, uint64_t reservation_packets,
+    const qlinq_emcon_transfer_t *transfer) {
   if (!session || !state_directory || reservation_packets == 0)
     return QLINQ_EMCON_SESSION_INVALID;
   *session = NULL;
@@ -211,6 +223,15 @@ int qlinq_emcon_session_create_sender_persistent(
                                         traffic_secret_size, now_ms);
   if (valid != QLINQ_EMCON_SESSION_OK)
     return valid;
+  if (transfer) {
+    size_t stream_index;
+    if (!find_manifest_stream(manifest, transfer->alias, &stream_index))
+      return QLINQ_EMCON_SESSION_UNKNOWN_ALIAS;
+    if (transfer->block_size == 0 ||
+        transfer->block_size >
+            manifest->streams[stream_index].maximum_record_size)
+      return QLINQ_EMCON_SESSION_INVALID;
+  }
 
   qlinq_emcon_activation_t *activation = NULL;
   int activated = qlinq_emcon_activation_open_managed(
@@ -219,11 +240,32 @@ int qlinq_emcon_session_create_sender_persistent(
     return QLINQ_EMCON_SESSION_ACTIVATION_LOCKED;
   if (activated != QLINQ_EMCON_ACTIVATION_OK)
     return QLINQ_EMCON_SESSION_ACTIVATION;
+  if (transfer) {
+    int checked = qlinq_emcon_activation_check_transfer(activation, transfer);
+    if (checked != QLINQ_EMCON_ACTIVATION_OK) {
+      qlinq_emcon_activation_close(activation);
+      if (checked == QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH)
+        return QLINQ_EMCON_SESSION_TRANSFER_MISMATCH;
+      if (checked == QLINQ_EMCON_ACTIVATION_INVALID)
+        return QLINQ_EMCON_SESSION_INVALID;
+      return QLINQ_EMCON_SESSION_ACTIVATION;
+    }
+  }
   qlinq_emcon_send_socket_t *sender = NULL;
   int ret = create_sender_socket(&sender, manifest);
   if (ret != QLINQ_EMCON_SESSION_OK) {
     qlinq_emcon_activation_close(activation);
     return ret;
+  }
+  if (transfer) {
+    int bound = qlinq_emcon_activation_bind_transfer(activation, transfer);
+    if (bound != QLINQ_EMCON_ACTIVATION_OK) {
+      qlinq_emcon_send_socket_free(sender);
+      qlinq_emcon_activation_close(activation);
+      return bound == QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH
+                 ? QLINQ_EMCON_SESSION_TRANSFER_MISMATCH
+                 : QLINQ_EMCON_SESSION_ACTIVATION;
+    }
   }
   uint64_t first_packet_number, reserved_until;
   activated =
@@ -248,6 +290,30 @@ int qlinq_emcon_session_create_sender_persistent(
   (*session)->reserved_until = reserved_until;
   (*session)->sender = sender;
   return QLINQ_EMCON_SESSION_OK;
+}
+
+int qlinq_emcon_session_create_sender_persistent(
+    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
+    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
+    const char *state_directory, uint64_t reservation_packets) {
+  return create_sender_persistent_internal(
+      session, manifest, traffic_secret, traffic_secret_size, now_ms,
+      state_directory, reservation_packets, NULL);
+}
+
+int qlinq_emcon_session_create_sender_bound(
+    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
+    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
+    const char *state_directory, uint64_t reservation_packets,
+    const qlinq_emcon_transfer_t *transfer) {
+  if (!transfer) {
+    if (session)
+      *session = NULL;
+    return QLINQ_EMCON_SESSION_INVALID;
+  }
+  return create_sender_persistent_internal(
+      session, manifest, traffic_secret, traffic_secret_size, now_ms,
+      state_directory, reservation_packets, transfer);
 }
 
 static bool
@@ -327,6 +393,18 @@ int qlinq_emcon_session_claim_receiver(qlinq_emcon_session_t *session) {
     return QLINQ_EMCON_SESSION_ACTIVATION;
   free(session->receiver_claim_directory);
   session->receiver_claim_directory = NULL;
+  return QLINQ_EMCON_SESSION_OK;
+}
+
+int qlinq_emcon_session_set_receive_filter(qlinq_emcon_session_t *session,
+                                           uint8_t alias, uint64_t group_id) {
+  if (!session || !session->receive_crypto)
+    return QLINQ_EMCON_SESSION_INVALID;
+  if (!find_stream(session, alias, NULL))
+    return QLINQ_EMCON_SESSION_UNKNOWN_ALIAS;
+  session->filter_active = true;
+  session->filter_alias = alias;
+  session->filter_group_id = group_id;
   return QLINQ_EMCON_SESSION_OK;
 }
 
@@ -487,28 +565,6 @@ int qlinq_emcon_session_send_end(qlinq_emcon_session_t *session, uint8_t alias,
   return ret;
 }
 
-static bool alias_from_message(const qlinq_emcon_message_t *message,
-                               uint8_t *alias) {
-  if (message->type == QLINQ_EMCON_RECORD_DATA) {
-    qlinq_wire_fec_header_t header;
-    if (qlinq_wire_decode_fec_header(message->payload.base,
-                                     message->payload.len,
-                                     &header) != QLINQ_WIRE_OK)
-      return false;
-    *alias = header.alias;
-    return true;
-  }
-  if (message->type == QLINQ_EMCON_RECORD_END) {
-    qlinq_wire_track_end_t end;
-    if (qlinq_wire_decode_track_end(message->payload.base, message->payload.len,
-                                    &end) != QLINQ_WIRE_OK)
-      return false;
-    *alias = end.alias;
-    return true;
-  }
-  return false;
-}
-
 int qlinq_emcon_session_receive(qlinq_emcon_session_t *session,
                                 qlinq_emcon_event_t *event, bool nonblocking) {
   uint8_t packet[QLINQ_EMCON_MAX_PACKET_SIZE];
@@ -547,15 +603,24 @@ int qlinq_emcon_session_receive(qlinq_emcon_session_t *session,
   if (opened != QLINQ_EMCON_OK)
     return opened == QLINQ_EMCON_INVALID ? QLINQ_EMCON_SESSION_INVALID
                                          : QLINQ_EMCON_SESSION_CRYPTO;
-  uint8_t alias = 0;
-  if (!alias_from_message(&message, &alias))
+  qlinq_emcon_frame_t frame;
+  if (qlinq_emcon_decode_frame(&message, &frame) != QLINQ_EMCON_OK)
     return QLINQ_EMCON_SESSION_INVALID;
+  uint8_t alias = frame.type == QLINQ_EMCON_RECORD_DATA
+                      ? frame.value.data.header.alias
+                      : frame.value.end.alias;
+  uint64_t group_id = frame.type == QLINQ_EMCON_RECORD_DATA
+                          ? frame.value.data.header.group_id
+                          : frame.value.end.group_id;
   qlinq_emcon_receiver_t *receiver = find_alias(session, alias);
   if (!receiver) {
     session->stats.unknown_aliases++;
     return QLINQ_EMCON_SESSION_UNKNOWN_ALIAS;
   }
-  int ingested = qlinq_emcon_receiver_ingest_message(receiver, &message, event);
+  if (session->filter_active &&
+      (alias != session->filter_alias || group_id != session->filter_group_id))
+    return QLINQ_EMCON_SESSION_DISCARDED;
+  int ingested = qlinq_emcon_receiver_ingest_frame(receiver, &frame, event);
   if (ingested == QLINQ_EMCON_INCOMPLETE)
     return QLINQ_EMCON_SESSION_INCOMPLETE;
   if (ingested == QLINQ_EMCON_DUPLICATE)

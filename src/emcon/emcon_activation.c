@@ -26,6 +26,22 @@
 #define ACTIVATION_CHECKSUM_OFFSET 128U
 #define ACTIVATION_FILENAME_SIZE 82U
 
+#define TRANSFER_MAGIC_0 'Q'
+#define TRANSFER_MAGIC_1 'E'
+#define TRANSFER_MAGIC_2 'M'
+#define TRANSFER_MAGIC_3 'T'
+#define TRANSFER_VERSION 1U
+#define TRANSFER_RECORD_SIZE 128U
+#define TRANSFER_CHECKSUM_OFFSET 96U
+
+static int sync_file_data(int fd) {
+#if defined(__APPLE__)
+  return fsync(fd);
+#else
+  return fdatasync(fd);
+#endif
+}
+
 struct qlinq_emcon_activation_t {
   int fd;
   int directory_fd;
@@ -332,13 +348,184 @@ int qlinq_emcon_receiver_activation_claim(
   int ret = fstat(fd, &info) == 0 && S_ISREG(info.st_mode) &&
                     info.st_uid == geteuid() && info.st_nlink == 1 &&
                     (info.st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
-                    fdatasync(fd) == 0 && fsync(directory_fd) == 0
+                    sync_file_data(fd) == 0 && fsync(directory_fd) == 0
                 ? QLINQ_EMCON_ACTIVATION_OK
                 : QLINQ_EMCON_ACTIVATION_IO;
   if (ret != QLINQ_EMCON_ACTIVATION_OK)
     (void)unlinkat(directory_fd, filename, 0);
   close(fd);
   close(directory_fd);
+  return ret;
+}
+
+static bool transfer_valid(const qlinq_emcon_transfer_t *transfer) {
+  if (!transfer || transfer->block_size == 0)
+    return false;
+  if (transfer->resumable)
+    return transfer->input_size != 0;
+  return transfer->input_size == 0 &&
+         all_zero(transfer->input_digest, sizeof(transfer->input_digest));
+}
+
+static int transfer_filename(char filename[ACTIVATION_FILENAME_SIZE],
+                             const qlinq_emcon_manifest_t *manifest,
+                             uint8_t alias, uint64_t group_id) {
+  static const uint8_t label[] = "qlinq emcon transfer domain v1";
+  uint8_t input[sizeof(label) - 1 + QLINQ_EMCON_MANIFEST_KEY_ID_SIZE + 15];
+  size_t offset = 0;
+  memcpy(input + offset, label, sizeof(label) - 1);
+  offset += sizeof(label) - 1;
+  memcpy(input + offset, manifest->traffic_key_id,
+         sizeof(manifest->traffic_key_id));
+  offset += sizeof(manifest->traffic_key_id);
+  qlinq_write_u32(input + offset, manifest->key_epoch);
+  offset += 4;
+  qlinq_write_u16(input + offset, manifest->cipher_suite);
+  offset += 2;
+  input[offset++] = alias;
+  qlinq_write_u64(input + offset, group_id);
+  uint8_t digest[32];
+  if (!SHA256(input, sizeof(input), digest))
+    return -1;
+  static const char hex[] = "0123456789abcdef";
+  char encoded[65];
+  for (size_t i = 0; i < sizeof(digest); i++) {
+    encoded[i * 2] = hex[digest[i] >> 4];
+    encoded[i * 2 + 1] = hex[digest[i] & 0x0f];
+  }
+  encoded[64] = '\0';
+  int written = snprintf(filename, ACTIVATION_FILENAME_SIZE,
+                         "transfer-%s.state", encoded);
+  OPENSSL_cleanse(input, sizeof(input));
+  OPENSSL_cleanse(digest, sizeof(digest));
+  return written > 0 && (size_t)written < ACTIVATION_FILENAME_SIZE ? 0 : -1;
+}
+
+static bool encode_transfer_record(uint8_t record[TRANSFER_RECORD_SIZE],
+                                   const qlinq_emcon_activation_t *activation,
+                                   const qlinq_emcon_transfer_t *transfer) {
+  memset(record, 0, TRANSFER_RECORD_SIZE);
+  record[0] = TRANSFER_MAGIC_0;
+  record[1] = TRANSFER_MAGIC_1;
+  record[2] = TRANSFER_MAGIC_2;
+  record[3] = TRANSFER_MAGIC_3;
+  qlinq_write_u16(record + 4, TRANSFER_VERSION);
+  qlinq_write_u16(record + 6, TRANSFER_RECORD_SIZE);
+  memcpy(record + 8, activation->manifest_digest,
+         sizeof(activation->manifest_digest));
+  record[40] = transfer->alias;
+  record[41] = transfer->resumable ? 1U : 0U;
+  qlinq_write_u32(record + 44, transfer->block_size);
+  qlinq_write_u64(record + 48, transfer->group_id);
+  qlinq_write_u64(record + 56, transfer->input_size);
+  memcpy(record + 64, transfer->input_digest, sizeof(transfer->input_digest));
+  return SHA256(record, TRANSFER_CHECKSUM_OFFSET,
+                record + TRANSFER_CHECKSUM_OFFSET) != NULL;
+}
+
+static int verify_existing_transfer(int fd,
+                                    const qlinq_emcon_activation_t *activation,
+                                    const qlinq_emcon_transfer_t *transfer) {
+  struct stat info;
+  if (fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) ||
+      info.st_uid != geteuid() || info.st_nlink != 1 ||
+      (info.st_mode & (S_IRWXG | S_IRWXO)) != 0)
+    return QLINQ_EMCON_ACTIVATION_IO;
+  if (info.st_size != TRANSFER_RECORD_SIZE)
+    return QLINQ_EMCON_ACTIVATION_CORRUPT;
+  uint8_t record[TRANSFER_RECORD_SIZE];
+  size_t offset = 0;
+  while (offset < sizeof(record)) {
+    ssize_t got =
+        pread(fd, record + offset, sizeof(record) - offset, (off_t)offset);
+    if (got < 0 && errno == EINTR)
+      continue;
+    if (got <= 0)
+      return QLINQ_EMCON_ACTIVATION_IO;
+    offset += (size_t)got;
+  }
+  uint8_t checksum[32];
+  if (record[0] != TRANSFER_MAGIC_0 || record[1] != TRANSFER_MAGIC_1 ||
+      record[2] != TRANSFER_MAGIC_2 || record[3] != TRANSFER_MAGIC_3 ||
+      qlinq_read_u16(record + 4) != TRANSFER_VERSION ||
+      qlinq_read_u16(record + 6) != TRANSFER_RECORD_SIZE || record[41] > 1U ||
+      record[42] != 0 || record[43] != 0 ||
+      !SHA256(record, TRANSFER_CHECKSUM_OFFSET, checksum) ||
+      CRYPTO_memcmp(checksum, record + TRANSFER_CHECKSUM_OFFSET,
+                    sizeof(checksum)) != 0)
+    return QLINQ_EMCON_ACTIVATION_CORRUPT;
+  if (CRYPTO_memcmp(record + 8, activation->manifest_digest,
+                    sizeof(activation->manifest_digest)) != 0)
+    return QLINQ_EMCON_ACTIVATION_IDENTITY_MISMATCH;
+  qlinq_emcon_transfer_t stored = {
+      .alias = record[40],
+      .resumable = record[41] != 0,
+      .block_size = qlinq_read_u32(record + 44),
+      .group_id = qlinq_read_u64(record + 48),
+      .input_size = qlinq_read_u64(record + 56),
+  };
+  memcpy(stored.input_digest, record + 64, sizeof(stored.input_digest));
+  if (!transfer_valid(&stored) || stored.alias != transfer->alias ||
+      stored.group_id != transfer->group_id)
+    return QLINQ_EMCON_ACTIVATION_CORRUPT;
+  if (!stored.resumable || !transfer->resumable ||
+      stored.block_size != transfer->block_size ||
+      stored.input_size != transfer->input_size ||
+      CRYPTO_memcmp(stored.input_digest, transfer->input_digest,
+                    sizeof(stored.input_digest)) != 0)
+    return QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH;
+  return QLINQ_EMCON_ACTIVATION_OK;
+}
+
+int qlinq_emcon_activation_check_transfer(
+    const qlinq_emcon_activation_t *activation,
+    const qlinq_emcon_transfer_t *transfer) {
+  if (!activation || !transfer_valid(transfer))
+    return QLINQ_EMCON_ACTIVATION_INVALID;
+  char filename[ACTIVATION_FILENAME_SIZE];
+  if (transfer_filename(filename, &activation->manifest, transfer->alias,
+                        transfer->group_id) != 0)
+    return QLINQ_EMCON_ACTIVATION_IO;
+  int fd = openat(activation->directory_fd, filename,
+                  O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0)
+    return errno == ENOENT ? QLINQ_EMCON_ACTIVATION_OK
+                           : QLINQ_EMCON_ACTIVATION_IO;
+  int ret = verify_existing_transfer(fd, activation, transfer);
+  close(fd);
+  return ret;
+}
+
+int qlinq_emcon_activation_bind_transfer(
+    qlinq_emcon_activation_t *activation,
+    const qlinq_emcon_transfer_t *transfer) {
+  if (!activation || !transfer_valid(transfer))
+    return QLINQ_EMCON_ACTIVATION_INVALID;
+  char filename[ACTIVATION_FILENAME_SIZE];
+  if (transfer_filename(filename, &activation->manifest, transfer->alias,
+                        transfer->group_id) != 0)
+    return QLINQ_EMCON_ACTIVATION_IO;
+  int fd = openat(activation->directory_fd, filename,
+                  O_WRONLY | O_CLOEXEC | O_NOFOLLOW | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) {
+    if (errno == EEXIST)
+      return qlinq_emcon_activation_check_transfer(activation, transfer);
+    return QLINQ_EMCON_ACTIVATION_IO;
+  }
+  struct stat info;
+  uint8_t record[TRANSFER_RECORD_SIZE];
+  int ret = fstat(fd, &info) == 0 && S_ISREG(info.st_mode) &&
+                    info.st_uid == geteuid() && info.st_nlink == 1 &&
+                    (info.st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
+                    encode_transfer_record(record, activation, transfer) &&
+                    write_exact_at(fd, record, sizeof(record), 0) == 0 &&
+                    sync_file_data(fd) == 0 &&
+                    fsync(activation->directory_fd) == 0
+                ? QLINQ_EMCON_ACTIVATION_OK
+                : QLINQ_EMCON_ACTIVATION_IO;
+  if (ret != QLINQ_EMCON_ACTIVATION_OK)
+    (void)unlinkat(activation->directory_fd, filename, 0);
+  close(fd);
   return ret;
 }
 
@@ -367,7 +554,7 @@ int qlinq_emcon_activation_reserve(qlinq_emcon_activation_t *activation,
   if (!encode_slot(slot, activation, next, generation) ||
       write_exact_at(activation->fd, slot, sizeof(slot),
                      (off_t)(slot_index * ACTIVATION_SLOT_SIZE)) != 0 ||
-      fdatasync(activation->fd) != 0 ||
+      sync_file_data(activation->fd) != 0 ||
       (activation->needs_directory_sync &&
        fsync(activation->directory_fd) != 0))
     return QLINQ_EMCON_ACTIVATION_IO;

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 struct qlinq_emcon_receive_socket_t {
@@ -181,8 +182,9 @@ int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,
     if (receiver->should_cancel &&
         receiver->should_cancel(receiver->cancel_data))
       return QLINQ_EMCON_SOCKET_INTERRUPTED;
-    ssize_t received =
-        recv(receiver->fd, packet, capacity, MSG_TRUNC | MSG_DONTWAIT);
+    struct iovec iov = {.iov_base = packet, .iov_len = capacity};
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+    ssize_t received = recvmsg(receiver->fd, &message, MSG_DONTWAIT);
     int error = errno;
     uint64_t now = qlinq_emcon_realtime_ms();
     if (!now)
@@ -190,7 +192,7 @@ int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,
     if (now >= expires_at_ms)
       return QLINQ_EMCON_SOCKET_EXPIRED;
     if (received >= 0) {
-      if ((size_t)received > capacity)
+      if ((message.msg_flags & MSG_TRUNC) != 0 || (size_t)received > capacity)
         return QLINQ_EMCON_SOCKET_TOO_LARGE;
       *packet_size = (size_t)received;
       return QLINQ_EMCON_SOCKET_OK;

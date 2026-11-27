@@ -173,10 +173,12 @@ Provision the receiver and network before starting the command:
    tc filter add dev "$RX_IF" egress matchall skip_hw action drop
    ```
 
-2. Configure upstream switches and routers to forward the group to that port
-   independently of receiver reports. The test harness uses a dedicated bridge
-   with snooping disabled. Assign a local address and a route to the manifest's
-   sender on the receiver interface.
+2. Configure upstream switches to forward the group to that port independently
+   of receiver reports. `qlinq-emcon send` fixes the IPv4 multicast TTL and IPv6
+   multicast hop limit to `1`, so multicast delivery is scoped to a single link
+   (or bridged L2 segment) and is not routed across L3 hops. The test harness
+   uses a dedicated bridge with snooping disabled. Assign a local address and a
+   route to the manifest's sender on the receiver interface.
 3. Keep a separate UDP socket joined to the destination group on `RX_IF` in
    the receiver's Linux network namespace. The kernel uses this host membership
    for IP multicast delivery. The namespace test's `netns_emcon_multicast.py`

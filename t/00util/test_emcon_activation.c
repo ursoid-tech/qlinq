@@ -408,6 +408,61 @@ int main(void) {
         "reopen a journal exhausted at the QUIC packet-number ceiling");
   qlinq_emcon_activation_close(budget);
 
+  qlinq_emcon_manifest_t transfer_manifest = manifest;
+  transfer_manifest.key_epoch = 33;
+  qlinq_emcon_activation_t *transfer_act = NULL;
+  qlinq_emcon_transfer_t bound = {
+      .alias = 8,
+      .group_id = 7,
+      .block_size = 8192,
+      .input_size = 16384,
+      .resumable = true,
+  };
+  memset(bound.input_digest, 0xa5, sizeof(bound.input_digest));
+  CHECK(qlinq_emcon_activation_open_managed(&transfer_act, directory,
+                                            &transfer_manifest) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_check_transfer(transfer_act, &bound) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_bind_transfer(transfer_act, &bound) ==
+                QLINQ_EMCON_ACTIVATION_OK,
+        "bind group transfer to input identity and block size");
+  qlinq_emcon_activation_close(transfer_act);
+  CHECK(qlinq_emcon_activation_open_managed(&transfer_act, directory,
+                                            &transfer_manifest) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_check_transfer(transfer_act, &bound) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_bind_transfer(transfer_act, &bound) ==
+                QLINQ_EMCON_ACTIVATION_OK,
+        "matching input identity and block size may resume group");
+  qlinq_emcon_transfer_t wrong_block = bound;
+  wrong_block.block_size = 4096;
+  qlinq_emcon_transfer_t wrong_digest = bound;
+  wrong_digest.input_digest[0] ^= 0x01U;
+  qlinq_emcon_transfer_t wrong_size = bound;
+  wrong_size.input_size = 8192;
+  CHECK(
+      qlinq_emcon_activation_check_transfer(transfer_act, &wrong_block) ==
+              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+          qlinq_emcon_activation_bind_transfer(transfer_act, &wrong_block) ==
+              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+          qlinq_emcon_activation_check_transfer(transfer_act, &wrong_digest) ==
+              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+          qlinq_emcon_activation_check_transfer(transfer_act, &wrong_size) ==
+              QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH,
+      "reject group reuse with altered block size or input");
+  qlinq_emcon_transfer_t stream_only = {
+      .alias = 8, .group_id = 8, .block_size = 4096, .resumable = false};
+  CHECK(qlinq_emcon_activation_bind_transfer(transfer_act, &stream_only) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_check_transfer(transfer_act, &stream_only) ==
+                QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH &&
+            qlinq_emcon_activation_bind_transfer(transfer_act, &stream_only) ==
+                QLINQ_EMCON_ACTIVATION_TRANSFER_MISMATCH,
+        "non-seekable stream group cannot be reused");
+  qlinq_emcon_activation_close(transfer_act);
+
   unlink(directory_link);
   CHECK(remove_state_directory(corrupt_dir) == 0,
         "remove corruption state directory");

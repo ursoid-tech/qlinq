@@ -130,7 +130,7 @@ static int inject_fec_packet(const qlinq_emcon_manifest_t *manifest,
   }
   qlinq_emcon_sender_t *sender = NULL;
   uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
-  uint8_t payload[QLINQ_WIRE_FEC_HEADER_SIZE + 256] = {0}, packet[512];
+  uint8_t payload[QLINQ_WIRE_FEC_HEADER_SIZE + 512] = {0}, packet[640];
   size_t payload_size = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_bytes;
   size_t packet_size = 0;
   uint64_t packet_number;
@@ -372,14 +372,14 @@ int main(void) {
             qlinq_emcon_session_stats(receiver).unknown_aliases == 1,
         "reject authenticated unknown alias");
 
-  /* enforce signed stream maximum_record_size on the receiver */
+  /* enforce signed stream maximum_record_size and FEC geometry on receiver */
   qlinq_wire_fec_header_t oversize_header = {
       .alias = 20,
       .group_id = 2,
       .object_id = 1,
       .symbol_index = 0,
       .data_symbols = 17,
-      .total_symbols = 18,
+      .total_symbols = 19,
       .symbol_size = 256,
       .original_size = 4097,
   };
@@ -389,6 +389,40 @@ int main(void) {
             qlinq_emcon_session_receive(receiver, &unknown_event, false) ==
                 QLINQ_EMCON_SESSION_INVALID,
         "reject authenticated symbol exceeding signed maximum_record_size");
+
+  qlinq_wire_fec_header_t wrong_symbol_header = {
+      .alias = 20,
+      .group_id = 2,
+      .object_id = 2,
+      .symbol_index = 0,
+      .data_symbols = 1,
+      .total_symbols = 3,
+      .symbol_size = 512,
+      .original_size = 512,
+  };
+  CHECK(inject_fec_packet(&manifest, secret,
+                          manifest.initial_packet_number + 52,
+                          &wrong_symbol_header, 512) == 0 &&
+            qlinq_emcon_session_receive(receiver, &unknown_event, false) ==
+                QLINQ_EMCON_SESSION_INVALID,
+        "reject authenticated symbol with unauthorized symbol_size");
+
+  qlinq_wire_fec_header_t wrong_repair_header = {
+      .alias = 20,
+      .group_id = 2,
+      .object_id = 3,
+      .symbol_index = 0,
+      .data_symbols = 1,
+      .total_symbols = 10,
+      .symbol_size = 256,
+      .original_size = 256,
+  };
+  CHECK(inject_fec_packet(&manifest, secret,
+                          manifest.initial_packet_number + 53,
+                          &wrong_repair_header, 256) == 0 &&
+            qlinq_emcon_session_receive(receiver, &unknown_event, false) ==
+                QLINQ_EMCON_SESSION_INVALID,
+        "reject authenticated symbol with unauthorized repair_symbols");
 
   /* advance past injected packet numbers via durable sender reservation */
   qlinq_emcon_activation_t *skip = NULL;
@@ -463,7 +497,7 @@ int main(void) {
       qlinq_emcon_session_stats(receiver);
   CHECK(sender_stats.send.packets_sent == 48 &&
             sender_stats.metadata_sent == 12 &&
-            receiver_stats.packets_received == 53 &&
+            receiver_stats.packets_received == 55 &&
             receiver_stats.records_completed == 6 &&
             receiver_stats.metadata_received == 12 &&
             receiver_stats.authentication_failures == 2 &&
@@ -652,6 +686,69 @@ int main(void) {
             65536) == QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED &&
             persistent == NULL,
         "report exhaustion after restarting the sender");
+
+  /* verify receive filter and bound sender group protection */
+  manifest.key_epoch++;
+  manifest.initial_packet_number = 1000;
+  qlinq_emcon_session_t *filtered_rx = NULL, *bound_tx = NULL;
+  CHECK(qlinq_emcon_session_prepare_receiver(
+            &filtered_rx, &manifest, secret, sizeof(secret), now,
+            activation_directory, 0, true) == QLINQ_EMCON_SESSION_OK &&
+            qlinq_emcon_session_set_receive_filter(filtered_rx, 99, 7) ==
+                QLINQ_EMCON_SESSION_UNKNOWN_ALIAS &&
+            qlinq_emcon_session_set_receive_filter(filtered_rx, 20, 7) ==
+                QLINQ_EMCON_SESSION_OK &&
+            qlinq_emcon_session_claim_receiver(filtered_rx) ==
+                QLINQ_EMCON_SESSION_OK,
+        "configure receive filter on provisioned alias and group");
+  qlinq_emcon_transfer_t tx_binding = {
+      .alias = 20,
+      .group_id = 7,
+      .block_size = 1024,
+      .input_size = sizeof(data[0]),
+      .resumable = true,
+  };
+  memset(tx_binding.input_digest, 0x3c, sizeof(tx_binding.input_digest));
+  CHECK(qlinq_emcon_session_create_sender_bound(
+            &bound_tx, &manifest, secret, sizeof(secret), now,
+            activation_directory, 16, &tx_binding) == QLINQ_EMCON_SESSION_OK,
+        "create bound persistent sender");
+  CHECK(qlinq_emcon_session_send_object(bound_tx, 21, 7, 0, false, 0, data[1],
+                                        sizeof(data[1])) ==
+                QLINQ_EMCON_SESSION_OK &&
+            qlinq_emcon_session_send_object(bound_tx, 20, 99, 0, false, 0,
+                                            data[2], sizeof(data[2])) ==
+                QLINQ_EMCON_SESSION_OK,
+        "emit unselected alias and unselected group packets");
+  for (size_t i = 0; i < 12; i++) {
+    qlinq_emcon_event_t filtered_ev;
+    CHECK(qlinq_emcon_session_receive(filtered_rx, &filtered_ev, false) ==
+              QLINQ_EMCON_SESSION_DISCARDED,
+          "discard unselected alias and group before FEC assembly");
+  }
+  CHECK(qlinq_emcon_session_stats(filtered_rx).records_completed == 0,
+        "filtered traffic completes no records");
+  qlinq_emcon_session_free(bound_tx);
+
+  qlinq_emcon_transfer_t incompatible = tx_binding;
+  incompatible.block_size = 512;
+  CHECK(qlinq_emcon_session_create_sender_bound(
+            &bound_tx, &manifest, secret, sizeof(secret), now,
+            activation_directory, 65536,
+            &incompatible) == QLINQ_EMCON_SESSION_TRANSFER_MISMATCH &&
+            bound_tx == NULL,
+        "reject incompatible group restart before reserving packet numbers");
+  CHECK(qlinq_emcon_session_create_sender_bound(
+            &bound_tx, &manifest, secret, sizeof(secret), now,
+            activation_directory, 16, &tx_binding) == QLINQ_EMCON_SESSION_OK &&
+            qlinq_emcon_session_stats(bound_tx).next_packet_number == 1016 &&
+            qlinq_emcon_session_send_object(bound_tx, 20, 7, 0, false, 0,
+                                            data[0], sizeof(data[0])) ==
+                QLINQ_EMCON_SESSION_OK &&
+            check_session_object(filtered_rx, 0, data[0], sizeof(data[0])) == 0,
+        "compatible group restart preserves unreserved packet numbers");
+  qlinq_emcon_session_free(bound_tx);
+  qlinq_emcon_session_free(filtered_rx);
   CHECK(remove_state_directory(activation_directory) == 0,
         "remove session state directory");
   puts("===EMCON SESSION OK===");

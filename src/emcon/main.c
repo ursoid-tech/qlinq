@@ -6,6 +6,7 @@
 #include "manifest_create.h"
 
 #include <openssl/crypto.h>
+#include <openssl/evp.h>
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,7 +24,8 @@
 
 #define EMCON_DEFAULT_BLOCK_SIZE 16384U
 #define EMCON_DEFAULT_RESERVATION_PACKETS 65536U
-#define EMCON_REORDER_SLOTS QLINQ_EMCON_MAX_ACTIVE_OBJECTS
+#define EMCON_FILE_REORDER_SLOTS QLINQ_EMCON_REPLAY_WINDOW_PACKETS
+#define EMCON_FILE_REORDER_MAX_BYTES (32U * 1024U * 1024U)
 
 typedef enum { EMCON_SEND, EMCON_RECEIVE } emcon_command_t;
 
@@ -203,6 +205,44 @@ static FILE *open_data_file(const char *path, const char *mode,
   return strcmp(path, "-") == 0 ? standard_stream : fopen(path, mode);
 }
 
+static bool
+hash_regular_file(int fd, uint8_t *scratch, size_t scratch_size,
+                  uint64_t *total_bytes,
+                  uint8_t digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE]) {
+  EVP_MD_CTX *context = EVP_MD_CTX_new();
+  if (!context)
+    return false;
+  bool ok = EVP_DigestInit_ex(context, EVP_sha256(), NULL) == 1;
+  uint64_t offset = 0;
+  while (ok && emcon_running) {
+    if (offset > (uint64_t)INT64_MAX) {
+      ok = false;
+      break;
+    }
+    ssize_t got = pread(fd, scratch, scratch_size, (off_t)offset);
+    if (got < 0 && errno == EINTR)
+      continue;
+    if (got < 0) {
+      ok = false;
+      break;
+    }
+    if (got == 0)
+      break;
+    ok = EVP_DigestUpdate(context, scratch, (size_t)got) == 1;
+    offset += (uint64_t)got;
+  }
+  unsigned int digest_len = 0;
+  if (ok && emcon_running)
+    ok = EVP_DigestFinal_ex(context, digest, &digest_len) == 1 &&
+         digest_len == QLINQ_EMCON_MANIFEST_DIGEST_SIZE;
+  else
+    ok = false;
+  EVP_MD_CTX_free(context);
+  if (ok)
+    *total_bytes = offset;
+  return ok;
+}
+
 static int run_sender(const emcon_options_t *options,
                       const qlinq_emcon_manifest_t *manifest,
                       const qlinq_emcon_manifest_stream_t *stream,
@@ -226,6 +266,53 @@ static int run_sender(const emcon_options_t *options,
     return 1;
   }
 
+  struct stat input_info;
+  if (fstat(fileno(input), &input_info) != 0) {
+    fprintf(stderr, "qlinq-emcon: cannot stat input: %s\n", strerror(errno));
+    free(block);
+    if (input != stdin)
+      fclose(input);
+    return 1;
+  }
+  bool regular_input = S_ISREG(input_info.st_mode);
+  qlinq_emcon_transfer_t transfer = {
+      .alias = options->alias,
+      .group_id = options->group_id,
+      .block_size = (uint32_t)block_size,
+      .resumable = regular_input,
+  };
+  EVP_MD_CTX *live_hash = NULL;
+  if (regular_input) {
+    if (!hash_regular_file(fileno(input), block, block_size,
+                           &transfer.input_size, transfer.input_digest)) {
+      fprintf(stderr, emcon_running ? "qlinq-emcon: input read failed\n"
+                                    : "qlinq-emcon: interrupted\n");
+      OPENSSL_cleanse(block, block_size);
+      free(block);
+      if (input != stdin)
+        fclose(input);
+      return 1;
+    }
+    if (transfer.input_size == 0) {
+      fprintf(stderr, "qlinq-emcon: empty input has no finite object range\n");
+      OPENSSL_cleanse(block, block_size);
+      free(block);
+      if (input != stdin)
+        fclose(input);
+      return 1;
+    }
+    live_hash = EVP_MD_CTX_new();
+    if (!live_hash || EVP_DigestInit_ex(live_hash, EVP_sha256(), NULL) != 1) {
+      EVP_MD_CTX_free(live_hash);
+      fprintf(stderr, "qlinq-emcon: cannot initialize input digest\n");
+      OPENSSL_cleanse(block, block_size);
+      free(block);
+      if (input != stdin)
+        fclose(input);
+      return 1;
+    }
+  }
+
   uint64_t object_id = 0;
   uint64_t bytes = 0;
   bool failed = false;
@@ -238,13 +325,18 @@ static int run_sender(const emcon_options_t *options,
     }
     if (size == 0 || !emcon_running)
       break;
+    if (live_hash && EVP_DigestUpdate(live_hash, block, size) != 1) {
+      fprintf(stderr, "qlinq-emcon: input digest update failed\n");
+      failed = true;
+      break;
+    }
     int ret;
     if (!session) {
       uint64_t now_ms = qlinq_emcon_realtime_ms();
-      ret = now_ms ? qlinq_emcon_session_create_sender_persistent(
+      ret = now_ms ? qlinq_emcon_session_create_sender_bound(
                          &session, manifest, traffic_secret,
                          traffic_secret_size, now_ms, options->state_directory,
-                         options->reservation_packets)
+                         options->reservation_packets, &transfer)
                    : QLINQ_EMCON_SESSION_IO;
       if (ret != QLINQ_EMCON_SESSION_OK) {
         fprintf(stderr, "qlinq-emcon: sender activation failed: %s\n",
@@ -282,6 +374,19 @@ static int run_sender(const emcon_options_t *options,
     fprintf(stderr, "qlinq-emcon: empty input has no finite object range\n");
     failed = true;
   }
+  if (!failed && regular_input) {
+    uint8_t live_digest[QLINQ_EMCON_MANIFEST_DIGEST_SIZE];
+    unsigned int live_len = 0;
+    if (bytes != transfer.input_size ||
+        EVP_DigestFinal_ex(live_hash, live_digest, &live_len) != 1 ||
+        live_len != sizeof(live_digest) ||
+        CRYPTO_memcmp(live_digest, transfer.input_digest,
+                      sizeof(live_digest)) != 0) {
+      fprintf(stderr, "qlinq-emcon: input changed during transmission\n");
+      failed = true;
+    }
+  }
+  EVP_MD_CTX_free(live_hash);
   if (!failed) {
     int end_ret = qlinq_emcon_session_send_end(
         session, options->alias, options->group_id, object_id - 1);
@@ -310,36 +415,54 @@ static bool write_record(FILE *output, const uint8_t *data, size_t size) {
   return fwrite(data, 1, size, output) == size;
 }
 
-static int store_pending(emcon_pending_t pending[EMCON_REORDER_SLOTS],
-                         qlinq_emcon_record_t *record) {
-  for (size_t i = 0; i < EMCON_REORDER_SLOTS; i++) {
+static bool
+pending_exceeds_final(const emcon_pending_t pending[EMCON_FILE_REORDER_SLOTS],
+                      uint64_t final_object) {
+  for (size_t i = 0; i < EMCON_FILE_REORDER_SLOTS; i++)
+    if (pending[i].active && pending[i].object_id > final_object)
+      return true;
+  return false;
+}
+
+static int store_pending(emcon_pending_t pending[EMCON_FILE_REORDER_SLOTS],
+                         size_t *pending_bytes, qlinq_emcon_record_t *record) {
+  emcon_pending_t *free_slot = NULL;
+  for (size_t i = 0; i < EMCON_FILE_REORDER_SLOTS; i++) {
     if (pending[i].active && pending[i].object_id == record->object_id)
       return 0;
-    if (!pending[i].active) {
-      pending[i].object_id = record->object_id;
-      pending[i].data = record->data;
-      pending[i].size = record->size;
-      pending[i].active = true;
-      record->data = NULL;
-      record->size = 0;
-      return 0;
-    }
+    if (!pending[i].active && !free_slot)
+      free_slot = &pending[i];
   }
-  return -1;
+  if (!free_slot ||
+      record->size > EMCON_FILE_REORDER_MAX_BYTES - *pending_bytes)
+    return -1;
+  free_slot->object_id = record->object_id;
+  free_slot->data = record->data;
+  free_slot->size = record->size;
+  free_slot->active = true;
+  *pending_bytes += record->size;
+  record->data = NULL;
+  record->size = 0;
+  return 0;
 }
 
 static int flush_pending(FILE *output,
-                         emcon_pending_t pending[EMCON_REORDER_SLOTS],
-                         uint64_t *next_object, uint64_t *bytes) {
+                         emcon_pending_t pending[EMCON_FILE_REORDER_SLOTS],
+                         size_t *pending_bytes, uint64_t *next_object,
+                         bool end_seen, uint64_t final_object,
+                         uint64_t *bytes) {
   bool found;
   do {
     found = false;
-    for (size_t i = 0; i < EMCON_REORDER_SLOTS; i++) {
+    for (size_t i = 0; i < EMCON_FILE_REORDER_SLOTS; i++) {
       if (!pending[i].active || pending[i].object_id != *next_object)
         continue;
+      if (end_seen && pending[i].object_id > final_object)
+        return -1;
       if (!write_record(output, pending[i].data, pending[i].size))
         return -1;
       *bytes += pending[i].size;
+      *pending_bytes -= pending[i].size;
       free(pending[i].data);
       memset(&pending[i], 0, sizeof(pending[i]));
       (*next_object)++;
@@ -350,8 +473,8 @@ static int flush_pending(FILE *output,
   return 0;
 }
 
-static void free_pending(emcon_pending_t pending[EMCON_REORDER_SLOTS]) {
-  for (size_t i = 0; i < EMCON_REORDER_SLOTS; i++)
+static void free_pending(emcon_pending_t pending[EMCON_FILE_REORDER_SLOTS]) {
+  for (size_t i = 0; i < EMCON_FILE_REORDER_SLOTS; i++)
     free(pending[i].data);
 }
 
@@ -393,9 +516,13 @@ static int run_receiver(const emcon_options_t *options,
       &session, manifest, traffic_secret, traffic_secret_size, now_ms,
       options->state_directory, options->receiver_interface,
       !options->preprovisioned);
+  if (ret == QLINQ_EMCON_SESSION_OK)
+    ret = qlinq_emcon_session_set_receive_filter(session, options->alias,
+                                                 options->group_id);
   if (ret != QLINQ_EMCON_SESSION_OK) {
     fprintf(stderr, "qlinq-emcon: receiver activation failed: %s\n",
             qlinq_emcon_session_strerror(ret));
+    qlinq_emcon_session_free(session);
     return 1;
   }
   bool truncate_output;
@@ -427,7 +554,8 @@ static int run_receiver(const emcon_options_t *options,
 
   qlinq_emcon_session_set_cancel(session, is_cancelled, NULL);
 
-  emcon_pending_t pending[EMCON_REORDER_SLOTS] = {{0}};
+  emcon_pending_t pending[EMCON_FILE_REORDER_SLOTS] = {{0}};
+  size_t pending_bytes = 0;
   uint64_t next_object = 0, bytes = 0, final_object = 0;
   bool end_seen = false, failed = false;
   while (emcon_running && (!end_seen || next_object <= final_object)) {
@@ -448,7 +576,10 @@ static int run_receiver(const emcon_options_t *options,
     if (event.type == QLINQ_EMCON_EVENT_RECORD &&
         event.value.record.alias == options->alias &&
         event.value.record.group_id == options->group_id) {
-      if (event.value.record.object_id == next_object) {
+      if (end_seen && event.value.record.object_id > final_object) {
+        fprintf(stderr, "qlinq-emcon: inconsistent terminal object range\n");
+        failed = true;
+      } else if (event.value.record.object_id == next_object) {
         if (!write_record(output, event.value.record.data,
                           event.value.record.size)) {
           fprintf(stderr, "qlinq-emcon: output write failed\n");
@@ -456,13 +587,15 @@ static int run_receiver(const emcon_options_t *options,
         } else {
           bytes += event.value.record.size;
           next_object++;
-          if (flush_pending(output, pending, &next_object, &bytes) != 0) {
+          if (flush_pending(output, pending, &pending_bytes, &next_object,
+                            end_seen, final_object, &bytes) != 0) {
             fprintf(stderr, "qlinq-emcon: output write failed\n");
             failed = true;
           }
         }
       } else if (event.value.record.object_id > next_object &&
-                 store_pending(pending, &event.value.record) != 0) {
+                 store_pending(pending, &pending_bytes, &event.value.record) !=
+                     0) {
         fprintf(stderr,
                 "qlinq-emcon: reorder capacity exceeded before object %" PRIu64
                 "\n",
@@ -474,7 +607,8 @@ static int run_receiver(const emcon_options_t *options,
                event.value.end.group_id == options->group_id) {
       if (event.value.end.final_object_id == UINT64_MAX ||
           (end_seen && final_object != event.value.end.final_object_id) ||
-          next_object > event.value.end.final_object_id + 1) {
+          next_object > event.value.end.final_object_id + 1 ||
+          pending_exceeds_final(pending, event.value.end.final_object_id)) {
         fprintf(stderr, "qlinq-emcon: inconsistent terminal object range\n");
         failed = true;
       } else {
