@@ -1160,9 +1160,11 @@ transport_t *transport_drive_create(const transport_config_t *config) {
   t->flexicast_enabled = config->enable_flexicast;
   t->flexicast_receiver_backend = config->flexicast_receiver_backend;
   if (config->flexicast_receiver_backend != TRANSPORT_GROUP_NATIVE &&
-      config->flexicast_receiver_backend != TRANSPORT_GROUP_AMT)
+      config->flexicast_receiver_backend != TRANSPORT_GROUP_AMT &&
+      config->flexicast_receiver_backend != TRANSPORT_GROUP_AMTQ &&
+      config->flexicast_receiver_backend != TRANSPORT_GROUP_AUTO)
     goto Fail;
-  if (config->flexicast_receiver_backend == TRANSPORT_GROUP_AMT &&
+  if (config->flexicast_receiver_backend != TRANSPORT_GROUP_NATIVE &&
       (!config->enable_flexicast || t->is_server ||
        !t->drive_host.flexicast_io ||
        !t->drive_host.flexicast_io->tunnel_join ||

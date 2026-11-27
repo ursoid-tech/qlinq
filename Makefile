@@ -147,7 +147,10 @@ NANOAMT_SRCS = deps/nanoamt/lib/gateway.c deps/nanoamt/lib/packet.c \
                deps/nanoamt/lib/igmp.c deps/nanoamt/lib/reassembly.c \
                deps/nanoamt/lib/membership.c deps/nanoamt/lib/relay.c \
                deps/nanoamt/lib/posix.c deps/nanoamt/lib/relay_posix.c \
-               deps/nanoamt/lib/openssl.c
+               deps/nanoamt/lib/openssl.c \
+               deps/nanoamt/lib/amtq/wire.c deps/nanoamt/lib/amtq/control.c \
+               deps/nanoamt/lib/amtq/gateway.c deps/nanoamt/lib/amtq/relay.c \
+               deps/nanoamt/lib/amtq/reassembly.c
 ifeq ($(UNAME_S),Linux)
 NANOAMT_SRCS += deps/nanoamt/lib/native_linux.c
 AMT_TESTS = t/00util/test_amt_transport t/00util/test_amt_relay
@@ -155,7 +158,7 @@ endif
 NANOAMT_OBJS = $(patsubst deps/nanoamt/%.c,tmp/nanoamt/%.o,$(NANOAMT_SRCS))
 INCLUDES += -Ideps/nanoamt/include
 
-POLL_HOST_OBJS = src/common/qlinq_relay.o src/common/transport_amt_host.o $(NANOAMT_OBJS) src/common/transport_flexicast_host.o src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
+POLL_HOST_OBJS = src/common/qlinq_relay.o src/common/transport_amt_host.o src/common/amtq_quicly.o src/common/amtq_posix.o $(NANOAMT_OBJS) src/common/transport_flexicast_host.o src/common/transport_poll_host.o src/common/transport_udp.o $(IFMON_OBJS)
 TRANSPORT_OBJS = src/common/qlinq.o $(ENGINE_OBJS) $(POLL_HOST_OBJS)
 
 COMMON_OBJS = $(TRANSPORT_OBJS)

@@ -435,13 +435,17 @@ transport_t *transport_create(const transport_config_t *config) {
   transport_poll_host_t *host = calloc(1, sizeof(*host));
   if (!host)
     return NULL;
-  if (config->flexicast_receiver_backend == TRANSPORT_GROUP_AMT) {
+  if (config->flexicast_receiver_backend != TRANSPORT_GROUP_NATIVE) {
     host->amt = transport_amt_host_new(config);
     if (!host->amt) {
       free(host);
       return NULL;
     }
-  } else if (config->flexicast_relay_address || config->flexicast_relay_port) {
+  } else if (config->flexicast_relay_address || config->flexicast_relay_port ||
+             config->flexicast_relay_amtq_port ||
+             config->flexicast_relay_server_name ||
+             config->flexicast_relay_ca_file ||
+             config->flexicast_amtq_reliable) {
     free(host);
     return NULL;
   }

@@ -16,16 +16,33 @@ static int64_t clock_ms(void) {
     return -1;
   return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
-static void print_stats(qlinq_relay_t *relay) {
+static void print_stats(qlinq_relay_t *relay, bool disable_classic,
+                        bool has_amtq) {
   qlinq_relay_stats_t s;
   qlinq_relay_get_stats(relay, &s);
+  const char *mode = disable_classic ? "amtq-relay" : "amt-relay";
+  if (!has_amtq) {
+    fprintf(stderr,
+            "{\"network_mode\":\"%s\",\"clients\":%zu,\"groups\":%zu,"
+            "\"sources\":%zu,\"sent\":%" PRIu64 ",\"input_drops\":%" PRIu64
+            ",\"send_errors\":%" PRIu64 ",\"mtu_drops\":%" PRIu64
+            ",\"upstream_errors\":%" PRIu64 "}\n",
+            mode, s.clients, s.groups, s.sources, s.packets_sent, s.input_drops,
+            s.send_errors, s.mtu_drops, s.upstream_errors);
+    return;
+  }
   fprintf(stderr,
-          "{\"network_mode\":\"amt-relay\",\"clients\":%zu,\"groups\":%zu,"
-          "\"sources\":%zu,\"sent\":%" PRIu64 ",\"input_drops\":%" PRIu64
-          ",\"send_errors\":%" PRIu64 ",\"mtu_drops\":%" PRIu64
+          "{\"network_mode\":\"%s\",\"clients\":%zu,\"amtq_clients\":%zu,"
+          "\"groups\":%zu,\"sources\":%zu,\"sent\":%" PRIu64
+          ",\"amtq_sent\":%" PRIu64 ",\"amtq_datagrams\":%" PRIu64
+          ",\"amtq_reliable_blocks\":%" PRIu64 ",\"input_drops\":%" PRIu64
+          ",\"amtq_input_drops\":%" PRIu64 ",\"send_errors\":%" PRIu64
+          ",\"amtq_send_errors\":%" PRIu64 ",\"mtu_drops\":%" PRIu64
           ",\"upstream_errors\":%" PRIu64 "}\n",
-          s.clients, s.groups, s.sources, s.packets_sent, s.input_drops,
-          s.send_errors, s.mtu_drops, s.upstream_errors);
+          mode, s.clients, s.amtq_clients, s.groups, s.sources, s.packets_sent,
+          s.amtq_packets_sent, s.amtq_datagrams, s.amtq_reliable_blocks,
+          s.input_drops, s.amtq_input_drops, s.send_errors, s.amtq_send_errors,
+          s.mtu_drops, s.upstream_errors);
 }
 int app_amt_relay_run(const qlinq_relay_config_t *config, unsigned stats_ms) {
   qlinq_relay_t *relay = qlinq_relay_open(config);
@@ -46,9 +63,22 @@ int app_amt_relay_run(const qlinq_relay_config_t *config, unsigned stats_ms) {
     qlinq_relay_close(relay);
     return 1;
   }
-  fprintf(stderr, "qlinq-app: transparent AMT relay on %s:%u, upstream %s\n",
-          config->bind_address ? config->bind_address : "0.0.0.0",
-          config->port ? config->port : 2268, config->upstream_interface);
+  const char *bind_ip = config->bind_address ? config->bind_address : "0.0.0.0";
+  bool has_amtq = config->disable_classic_amt || config->amtq_port != 0;
+  uint16_t amtq_port = config->amtq_port ? config->amtq_port : 2269;
+  if (config->disable_classic_amt) {
+    fprintf(stderr, "qlinq-app: AMTQ relay on %s:%u, upstream %s\n", bind_ip,
+            amtq_port, config->upstream_interface);
+  } else if (has_amtq) {
+    fprintf(stderr,
+            "qlinq-app: dual AMT/AMTQ relay on %s:%u (AMTQ %u), upstream %s\n",
+            bind_ip, config->port ? config->port : 2268, amtq_port,
+            config->upstream_interface);
+  } else {
+    fprintf(stderr, "qlinq-app: transparent AMT relay on %s:%u, upstream %s\n",
+            bind_ip, config->port ? config->port : 2268,
+            config->upstream_interface);
+  }
   int failed = 0;
   int64_t start = clock_ms();
   if (start < 0)
@@ -68,11 +98,11 @@ int app_amt_relay_run(const qlinq_relay_config_t *config, unsigned stats_ms) {
       break;
     }
     if (stats_ms && now >= next_stats) {
-      print_stats(relay);
+      print_stats(relay, config->disable_classic_amt, has_amtq);
       next_stats = now + stats_ms;
     }
   }
-  print_stats(relay);
+  print_stats(relay, config->disable_classic_amt, has_amtq);
   qlinq_relay_close(relay);
   (void)sigaction(SIGINT, &previous_int, NULL);
   (void)sigaction(SIGTERM, &previous_term, NULL);

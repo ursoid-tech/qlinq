@@ -106,10 +106,8 @@ void __wrap_nanoamt_native_get_stats(const nanoamt_native *native,
   (void)native;
   *stats = (nanoamt_native_stats){.groups = fixture_groups};
 }
-static void fixture_open_address(bool capture, const char *address) {
-  qlinq_relay_config_t c = {
-      .bind_address = address, .port = 10168, .upstream_interface = "lo"};
-  fixture_relay = qlinq_relay_open(&c);
+static void fixture_open_config(bool capture, const qlinq_relay_config_t *c) {
+  fixture_relay = qlinq_relay_open(c);
   assert(fixture_relay);
   if (!capture)
     return;
@@ -126,6 +124,39 @@ static void fixture_open_address(bool capture, const char *address) {
   join.imr_interface = join.imr_sourceaddr;
   assert(!setsockopt(fixture_capture, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP,
                      &join, sizeof(join)));
+}
+static void fixture_open_address(bool capture, const char *address) {
+  qlinq_relay_config_t c = {
+      .bind_address = address, .port = 10168, .upstream_interface = "lo"};
+  fixture_open_config(capture, &c);
+}
+static void fixture_open_dual(bool capture, const char *address,
+                              const char *ca_file) {
+  bool v6 = strchr(address, ':') != NULL;
+  qlinq_relay_config_t c = {.bind_address = address,
+                            .port = 10168,
+                            .amtq_port = 10169,
+                            .amtq_cert_file = v6 ? "t/assets/verified-v6.crt"
+                                                 : "t/assets/verified.crt",
+                            .amtq_key_file = v6 ? "t/assets/verified-v6.key"
+                                                : "t/assets/verified.key",
+                            .amtq_ca_file = ca_file,
+                            .upstream_interface = "lo"};
+  fixture_open_config(capture, &c);
+}
+static void fixture_open_amtq_only(bool capture, const char *address,
+                                   const char *ca_file) {
+  bool v6 = strchr(address, ':') != NULL;
+  qlinq_relay_config_t c = {.bind_address = address,
+                            .disable_classic_amt = true,
+                            .amtq_port = 10169,
+                            .amtq_cert_file = v6 ? "t/assets/verified-v6.crt"
+                                                 : "t/assets/verified.crt",
+                            .amtq_key_file = v6 ? "t/assets/verified-v6.key"
+                                                : "t/assets/verified.key",
+                            .amtq_ca_file = ca_file,
+                            .upstream_interface = "lo"};
+  fixture_open_config(capture, &c);
 }
 static void fixture_open(bool capture) {
   fixture_open_address(capture, "127.0.0.1");

@@ -100,6 +100,11 @@ typedef struct transport_flexicast_flow_t {
   bool membership_acquired;
   bool amt_tunnel;
   bool tunnel_leave_pending;
+  uint8_t relay_auto_stage; /* AUTO: 0 native, 1 AMT, 2 AMTQ */
+  int64_t relay_retry_at_ms;
+  uint32_t relay_retry_delay_ms;
+  uint64_t relay_generation;
+  uint16_t relay_slot; /* one-based, zero means unallocated */
   uint8_t ip_version;
   uint8_t alias;
   uint32_t key_epoch;
@@ -226,6 +231,7 @@ bool transport_flexicast_can_queue(const transport_t *t,
                                    size_t packets, size_t bytes);
 void transport_flexicast_tunnel_failed(transport_t *,
                                        transport_flexicast_flow_t *);
+bool transport_flexicast_retry(transport_t *, transport_flexicast_flow_t *);
 void transport_flexicast_tick(transport_t *t);
 int64_t transport_flexicast_get_first_timeout(transport_t *t);
 bool transport_flexicast_track_ready(transport_t *t,

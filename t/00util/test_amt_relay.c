@@ -1,9 +1,10 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <time.h>
+#include "amt_native_fixture.h"
+#include "amtq_posix.h"
 #include "nanoamt/openssl.h"
 #include "nanoamt/posix.h"
-#include "amt_native_fixture.h"
 #include "transport_amt_host.h"
 #include "transport_poll_host.h"
 static int64_t now_ms(void) {
@@ -73,6 +74,202 @@ static void check_shared_membership(void) {
   assert(!transport_amt_host_memberships(&t));
   assert(!transport_amt_host_poll(&t, fds, TRANSPORT_MAX_POLL_FDS));
   transport_amt_host_free(host.amt);
+}
+typedef struct {
+  bool received;
+  size_t size;
+  uint8_t payload[4096];
+} amtq_rx_t;
+static void on_amtq_packet(void *ctx, uint64_t cid, nanoamt_packet *p) {
+  (void)cid;
+  amtq_rx_t *rx = ctx;
+  assert(p->size <= sizeof(rx->payload));
+  memcpy(rx->payload, p->data, p->size);
+  rx->size = p->size;
+  rx->received = true;
+}
+static void join_amtq(amtq_posix *client) {
+  for (unsigned n = 0; n < 1000; ++n) {
+    assert(amtq_posix_send(client, now_ms()) >= 0);
+    fixture_pump();
+    while (amtq_posix_receive(client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    assert(!amtq_posix_error(client));
+    if (amtq_posix_is_ready(client) &&
+        amtq_posix_memberships_submitted(client)) {
+      fixture_pump();
+      return;
+    }
+    usleep(1000);
+  }
+  assert(!"AMTQ handshake timed out");
+}
+static void check_amtq_packet(amtq_posix *client, amtq_rx_t *rx,
+                              const uint8_t *ip, size_t size,
+                              const uint8_t *payload, size_t payload_size) {
+  rx->received = false;
+  assert(send(fixture_pair[1], ip, size, 0) == (ssize_t)size);
+  for (unsigned n = 0; n < 1000 && !rx->received; ++n) {
+    fixture_pump();
+    while (amtq_posix_receive(client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    assert(amtq_posix_send(client, now_ms()) >= 0);
+    if (!rx->received)
+      usleep(1000);
+  }
+  assert(rx->received && rx->size == payload_size &&
+         !memcmp(rx->payload, payload, payload_size));
+}
+static void check_amtq_and_dual_stack(const uint8_t *opaque, size_t opaque_len,
+                                      const uint8_t *ip6, size_t ip6_len) {
+  assert(transport_amt_host_mtu_usable(4, 6, 1280, 1358));
+  assert(!transport_amt_host_mtu_usable(4, 6, 1280, 1357));
+  assert(transport_amt_host_mtu_usable(6, 6, 1280, 1378));
+  assert(!transport_amt_host_mtu_usable(6, 6, 1280, 1377));
+  assert(!transport_amt_host_mtu_usable(6, 6, 1280, 1280));
+  assert(transport_amt_host_mtu_usable(6, 4, 1280, 1280));
+  assert(transport_amt_host_mtu_usable(6, 6, 1280, 0));
+
+  /* validation: AMTQ requires cert/key and distinct port in dual-stack mode */
+  qlinq_relay_config_t bad = {.upstream_interface = "lo", .amtq_port = 10169};
+  assert(!qlinq_relay_open(&bad) && errno == EINVAL);
+  bad = (qlinq_relay_config_t){.upstream_interface = "lo",
+                               .port = 10168,
+                               .amtq_port = 10168,
+                               .amtq_cert_file = "t/assets/verified.crt",
+                               .amtq_key_file = "t/assets/verified.key"};
+  assert(!qlinq_relay_open(&bad) && errno == EINVAL);
+  bad = (qlinq_relay_config_t){.upstream_interface = "lo",
+                               .disable_classic_amt = true,
+                               .linux_gateway_family = 4,
+                               .amtq_cert_file = "t/assets/verified.crt",
+                               .amtq_key_file = "t/assets/verified.key"};
+  assert(!qlinq_relay_open(&bad) && errno == EINVAL);
+
+  /* dual-stack: classic AMT + AMTQ datagram + AMTQ reliable block on 1 group */
+  fixture_groups = 0;
+  fixture_open_dual(false, "127.0.0.1", NULL);
+  nanoamt_config classic_cfg = {
+      .discovery = {.ip = {127, 0, 0, 1}, .ip_version = 4, .port = 10168},
+      .source = {127, 0, 0, 1},
+      .group = {232, 42, 42, 1},
+      .port = 10002,
+      .ip_version = 4,
+      .random_bytes = nanoamt_openssl_random};
+  nanoamt_posix *classic = nanoamt_posix_open(&classic_cfg, now_ms());
+  assert(classic);
+  join(classic);
+
+  amtq_rx_t dgram_rx = {0}, rel_rx = {0};
+  amtq_posix_config dgram_cfg = {
+      .listen = {.ip_version = 4},
+      .peer = {.ip = {127, 0, 0, 1}, .ip_version = 4, .port = 10169},
+      .server_name = "localhost",
+      .ca_file = "t/assets/verified.crt",
+      .session = {.gateway = {.ip_version = 4},
+                  .packet = on_amtq_packet,
+                  .packet_context = &dgram_rx}};
+  amtq_posix *dgram_client = amtq_posix_open(&dgram_cfg, now_ms());
+  assert(dgram_client);
+  nanoamtq_membership m4 = {
+      .source = {127, 0, 0, 1}, .group = {232, 42, 42, 1}, .port = 10002};
+  assert(!amtq_posix_set_memberships(dgram_client, &m4, 1));
+  join_amtq(dgram_client);
+
+  amtq_posix_config rel_cfg = dgram_cfg;
+  rel_cfg.session.gateway.data_modes = 3;
+  rel_cfg.session.gateway.preferred_mode = 1;
+  rel_cfg.session.packet_context = &rel_rx;
+  amtq_posix *rel_client = amtq_posix_open(&rel_cfg, now_ms());
+  assert(rel_client);
+  assert(!amtq_posix_set_memberships(rel_client, &m4, 1));
+  join_amtq(rel_client);
+  assert(fixture_groups == 1);
+
+  uint8_t ip[3028];
+  size_t size = fixture_ipv4(ip, opaque, 64, m4.source, m4.group, 10002);
+  check_amtq_packet(dgram_client, &dgram_rx, ip, size, opaque, 64);
+  for (unsigned n = 0; n < 500 && !rel_rx.received; ++n) {
+    fixture_pump();
+    while (amtq_posix_receive(rel_client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    assert(amtq_posix_send(rel_client, now_ms()) >= 0);
+    if (!rel_rx.received)
+      usleep(1000);
+  }
+  assert(rel_rx.received && rel_rx.size == 64 &&
+         !memcmp(rel_rx.payload, opaque, 64));
+  nanoamt_packet classic_pkt;
+  assert(nanoamt_posix_receive(classic, now_ms(), &classic_pkt) ==
+         NANOAMT_PACKET);
+
+  /* fragmented 3000-byte payload over AMTQ datagram + single reliable block */
+  size = fixture_ipv4(ip, opaque, opaque_len, m4.source, m4.group, 10002);
+  rel_rx.received = false;
+  check_amtq_packet(dgram_client, &dgram_rx, ip, size, opaque, opaque_len);
+  for (unsigned n = 0; n < 500 && !rel_rx.received; ++n) {
+    fixture_pump();
+    while (amtq_posix_receive(rel_client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    assert(amtq_posix_send(rel_client, now_ms()) >= 0);
+    if (!rel_rx.received)
+      usleep(1000);
+  }
+  assert(rel_rx.received && rel_rx.size == opaque_len &&
+         !memcmp(rel_rx.payload, opaque, opaque_len));
+  qlinq_relay_stats_t stats;
+  qlinq_relay_get_stats(fixture_relay, &stats);
+  assert(stats.clients == 1 && stats.amtq_clients == 2 &&
+         stats.amtq_datagrams >= 3 && stats.amtq_reliable_blocks == 2);
+
+  amtq_posix_close(rel_client);
+  amtq_posix_close(dgram_client);
+  nanoamt_posix_close(classic);
+  fixture_close();
+
+  /* AMTQ-only mTLS enforcement + IPv6 AMTQ */
+  fixture_open_amtq_only(false, "::1", "t/assets/verified-v6.crt");
+  amtq_rx_t v6_rx = {0};
+  amtq_posix_config unauth_cfg = {
+      .listen = {.ip_version = 6},
+      .peer = {.ip = {[15] = 1}, .ip_version = 6, .port = 10169},
+      .server_name = "::1",
+      .ca_file = "t/assets/verified-v6.crt",
+      .session = {.gateway = {.ip_version = 6},
+                  .packet = on_amtq_packet,
+                  .packet_context = &v6_rx}};
+  amtq_posix *unauth = amtq_posix_open(&unauth_cfg, now_ms());
+  assert(unauth);
+  nanoamtq_membership m6 = {.port = 10002};
+  m6.source[0] = 0x20;
+  m6.source[1] = 1;
+  m6.source[2] = 0x0d;
+  m6.source[3] = 0xb8;
+  m6.source[15] = 1;
+  m6.group[0] = 0xff;
+  m6.group[1] = 0x3e;
+  m6.group[15] = 1;
+  assert(!amtq_posix_set_memberships(unauth, &m6, 1));
+  for (unsigned n = 0; n < 200 && !amtq_posix_error(unauth); ++n) {
+    (void)amtq_posix_send(unauth, now_ms());
+    fixture_pump();
+    while (amtq_posix_receive(unauth, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    usleep(1000);
+  }
+  assert(amtq_posix_error(unauth) != 0);
+  amtq_posix_close(unauth);
+
+  amtq_posix_config mtls_cfg = unauth_cfg;
+  mtls_cfg.certificate = "t/assets/verified-v6.crt";
+  mtls_cfg.private_key = "t/assets/verified-v6.key";
+  amtq_posix *mtls_client = amtq_posix_open(&mtls_cfg, now_ms());
+  assert(mtls_client);
+  assert(!amtq_posix_set_memberships(mtls_client, &m6, 1));
+  join_amtq(mtls_client);
+  check_amtq_packet(mtls_client, &v6_rx, ip6, ip6_len, opaque, 64);
+  amtq_posix_close(mtls_client);
+  fixture_close();
 }
 int main(void) {
   check_shared_membership();
@@ -165,6 +362,7 @@ int main(void) {
   check_packet(gateway, ip6, sizeof(ip6), opaque, 64);
   nanoamt_posix_close(gateway);
   fixture_close();
+  check_amtq_and_dual_stack(opaque, sizeof(opaque), ip6, sizeof(ip6));
   puts("===AMT TRANSPARENT RELAY OK===");
   return 0;
 }

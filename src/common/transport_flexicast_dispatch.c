@@ -696,6 +696,8 @@ int64_t transport_flexicast_get_first_timeout(transport_t *t) {
       if (retry < first_timeout)
         first_timeout = retry;
     }
+    if (flow->relay_retry_at_ms > 0 && flow->relay_retry_at_ms < first_timeout)
+      first_timeout = flow->relay_retry_at_ms;
     if (!flow->crypto)
       continue;
     int64_t deadline = quicly_flexicast_get_ack_deadline(flow->crypto);

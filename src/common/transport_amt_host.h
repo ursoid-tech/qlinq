@@ -1,8 +1,10 @@
 #ifndef QLINQ_TRANSPORT_AMT_HOST_H
 #define QLINQ_TRANSPORT_AMT_HOST_H
-#include "transport_flexicast.h"
 #include "portable_sockets.h"
+#include "transport_flexicast.h"
 struct transport_amt_host;
+bool transport_amt_host_mtu_usable(uint8_t outer_family, uint8_t inner_family,
+                                   size_t udp_payload, uint32_t mtu);
 struct transport_amt_host *transport_amt_host_new(const transport_config_t *);
 void transport_amt_host_free(struct transport_amt_host *);
 bool transport_amt_host_join(transport_t *, transport_flexicast_flow_t *);

@@ -706,13 +706,23 @@ int main(int argc, char **argv) {
        strcmp(mode, "--join-fallback") == 0 ||
        strcmp(mode, "--ack-fallback") == 0 || strcmp(mode, "--pacing") == 0);
 #ifdef QLINQ_TEST_AMT
-  bool amt = !strcmp(mode, "--amt") || !strcmp(mode, "--amt-mixed") ||
-             !strcmp(mode, "--amt-unavailable");
-  bool unavailable = !strcmp(mode, "--amt-unavailable");
-  bool mixed = !strcmp(mode, "--amt-mixed");
+  bool amtq =
+      mode && (!strcmp(mode, "--amtq") || !strcmp(mode, "--amtq-reliable") ||
+               !strcmp(mode, "--amtq-mixed"));
+  bool amtq_reliable = mode && !strcmp(mode, "--amtq-reliable");
+  bool auto_amt = mode && !strcmp(mode, "--auto-amt");
+  bool auto_amtq = mode && !strcmp(mode, "--auto-amtq");
+  bool auto_backend = auto_amt || auto_amtq;
+  bool amt = amtq || auto_backend ||
+             (mode && (!strcmp(mode, "--amt") || !strcmp(mode, "--amt-mixed") ||
+                       !strcmp(mode, "--amt-unavailable")));
+  bool unavailable = mode && !strcmp(mode, "--amt-unavailable");
+  bool mixed =
+      mode && (!strcmp(mode, "--amt-mixed") || !strcmp(mode, "--amtq-mixed"));
   native_multicast |= amt;
 #else
   bool amt = false;
+  bool auto_backend = false;
 #endif
   bool join_fallback = argc == 2 && strcmp(mode, "--join-fallback") == 0;
   bool ack_fallback = argc == 2 && strcmp(mode, "--ack-fallback") == 0;
@@ -789,12 +799,40 @@ int main(int argc, char **argv) {
   }
 #ifdef QLINQ_TEST_AMT
   if (amt) {
-    if (!unavailable)
-      fixture_open(true);
-    client_a_config.flexicast_interface = NULL;
-    client_a_config.flexicast_receiver_backend = TRANSPORT_GROUP_AMT;
+    if (!unavailable) {
+      if (amtq || auto_backend)
+        fixture_open_dual(true, "127.0.0.1", NULL);
+      else
+        fixture_open(true);
+    }
+    client_a_config.flexicast_interface = auto_backend ? "192.0.2.99" : NULL;
+    client_a_config.flexicast_receiver_backend =
+        auto_backend ? TRANSPORT_GROUP_AUTO
+                     : (amtq ? TRANSPORT_GROUP_AMTQ : TRANSPORT_GROUP_AMT);
     client_a_config.flexicast_relay_address = "127.0.0.1";
-    client_a_config.flexicast_relay_port = unavailable ? 10169 : 10168;
+    if (amtq) {
+      client_a_config.flexicast_relay_port = 10169;
+      client_a_config.flexicast_relay_ca_file = "t/assets/verified.crt";
+      client_a_config.verify_peer = true;
+      client_a_config.allow_insecure_peer = false;
+      client_a_config.ca_file = "t/assets/verified.crt";
+      client_a_config.flexicast_amtq_reliable = amtq_reliable;
+    } else if (auto_backend) {
+      client_a_config.flexicast_relay_port = auto_amtq ? 10167 : 10168;
+      client_a_config.flexicast_relay_amtq_port = 10169;
+      client_a_config.flexicast_relay_ca_file = "t/assets/verified.crt";
+      client_a_config.verify_peer = true;
+      client_a_config.allow_insecure_peer = false;
+      client_a_config.ca_file = "t/assets/verified.crt";
+    } else {
+      client_a_config.flexicast_relay_port = unavailable ? 10169 : 10168;
+    }
+    if (client_a_config.verify_peer) {
+      server_config.cert_file = "t/assets/verified.crt";
+      server_config.key_file = "t/assets/verified.key";
+      client_a_config.cert_file = "t/assets/verified.crt";
+      client_a_config.key_file = "t/assets/verified.key";
+    }
   }
 #endif
   transport_config_t client_b_config = client_a_config;
@@ -805,6 +843,9 @@ int main(int argc, char **argv) {
     client_b_config.flexicast_receiver_backend = TRANSPORT_GROUP_NATIVE;
     client_b_config.flexicast_relay_address = NULL;
     client_b_config.flexicast_relay_port = 0;
+    client_b_config.flexicast_relay_amtq_port = 0;
+    client_b_config.flexicast_relay_ca_file = NULL;
+    client_b_config.flexicast_amtq_reliable = false;
     client_b_config.flexicast_interface = "127.0.0.1";
   }
 #endif
@@ -887,9 +928,25 @@ int main(int argc, char **argv) {
 
   transport_stats_t source_stats = {0};
   const size_t expected_members = join_fallback ? 0U : mixed_retry ? 1U : 2U;
-  retries = 300;
+  retries = auto_backend ? 4000 : 300;
   while (retries-- > 0) {
     drive(server, client_a, client_b);
+#ifdef QLINQ_TEST_AMT
+    if (auto_amtq) {
+      transport_t *clients[] = {client_a, client_b};
+      for (size_t i = 0; i < 2; ++i) {
+        for (size_t f = 0; f < clients[i]->flexicast.capacity; ++f) {
+          transport_flexicast_flow_t *fl = &clients[i]->flexicast.flows[f];
+          if (fl->active && fl->relay_auto_stage == 1 && !fl->join_sent) {
+            clients[i]->drive_now_ns += UINT64_C(16000000000);
+            clients[i]->turn_active = true;
+            transport_amt_host_service(clients[i], NULL, 0);
+            clients[i]->turn_active = false;
+          }
+        }
+      }
+    }
+#endif
     (void)transport_get_stats(server, &source_stats);
     if (server_state.subscriptions == 2 &&
         source_stats.flexicast_active_flows == 1 &&
@@ -998,6 +1055,28 @@ int main(int argc, char **argv) {
             source_stats.flexicast_acks_received);
     goto Fail;
   }
+#ifdef QLINQ_TEST_AMT
+  if (amtq_reliable) {
+    qlinq_relay_stats_t relay_stats;
+    qlinq_relay_get_stats(fixture_relay, &relay_stats);
+    if (relay_stats.amtq_reliable_blocks == 0 ||
+        relay_stats.amtq_datagrams != 0) {
+      fprintf(stderr, "AMTQ reliable mode did not use reliable blocks\n");
+      goto Fail;
+    }
+  }
+  if (auto_backend) {
+    uint8_t expected_stage = auto_amtq ? 2 : 1;
+    for (size_t f = 0; f < client_a->flexicast.capacity; ++f) {
+      transport_flexicast_flow_t *fl = &client_a->flexicast.flows[f];
+      if (fl->active && !fl->source && fl->relay_auto_stage != expected_stage) {
+        fprintf(stderr, "AUTO settled on stage %u (expected %u)\n",
+                fl->relay_auto_stage, expected_stage);
+        goto Fail;
+      }
+    }
+  }
+#endif
 
   if (base) {
     transport_flexicast_flow_t *flow = NULL;
