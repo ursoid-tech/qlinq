@@ -433,9 +433,10 @@ static int read_config(const char *path, qlinq_emcon_manifest_t *manifest) {
     return -1;
   }
   bool duration = (seen & FIELD_VALID_FOR) != 0;
+  bool any_explicit = (seen & (FIELD_VALID_FROM | FIELD_EXPIRES_AT)) != 0;
   bool explicit_window = (seen & (FIELD_VALID_FROM | FIELD_EXPIRES_AT)) ==
                          (FIELD_VALID_FROM | FIELD_EXPIRES_AT);
-  if (duration == explicit_window) {
+  if ((duration && any_explicit) || (!duration && !explicit_window)) {
     fprintf(
         stderr,
         "qlinq-emcon: use valid_for_seconds or both explicit time fields\n");

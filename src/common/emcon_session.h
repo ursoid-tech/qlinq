@@ -26,7 +26,8 @@ typedef enum {
   QLINQ_EMCON_SESSION_ACTIVATION = -7,
   QLINQ_EMCON_SESSION_ACTIVATION_LOCKED = -8,
   QLINQ_EMCON_SESSION_PACKET_NUMBER_EXHAUSTED = -9,
-  QLINQ_EMCON_SESSION_ACTIVATION_REUSED = -10
+  QLINQ_EMCON_SESSION_ACTIVATION_REUSED = -10,
+  QLINQ_EMCON_SESSION_INTERRUPTED = -11
 } qlinq_emcon_session_result_t;
 
 typedef struct {
@@ -44,32 +45,20 @@ typedef struct {
   qlinq_emcon_send_stats_t send;
 } qlinq_emcon_session_stats_t;
 
-int qlinq_emcon_session_create_sender(qlinq_emcon_session_t **session,
-                                      const qlinq_emcon_manifest_t *manifest,
-                                      const uint8_t *traffic_secret,
-                                      size_t traffic_secret_size,
-                                      uint64_t now_ms);
 /* production sender with durable nonce reservations and exclusive lock */
 int qlinq_emcon_session_create_sender_persistent(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory, uint64_t reservation_packets);
-int qlinq_emcon_session_create_receiver(qlinq_emcon_session_t **session,
-                                        const qlinq_emcon_manifest_t *manifest,
-                                        const uint8_t *traffic_secret,
-                                        size_t traffic_secret_size,
-                                        uint64_t now_ms);
-/* creates receiver socket and permanently claims key epoch before receive */
-int qlinq_emcon_session_create_receiver_claimed(
-    qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
-    const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
-    const char *state_directory);
 /* prepares receiver socket before committing the one-shot epoch claim */
 int qlinq_emcon_session_prepare_receiver(
     qlinq_emcon_session_t **session, const qlinq_emcon_manifest_t *manifest,
     const uint8_t *traffic_secret, size_t traffic_secret_size, uint64_t now_ms,
     const char *state_directory, unsigned int interface_index, bool join_group);
 int qlinq_emcon_session_claim_receiver(qlinq_emcon_session_t *session);
+void qlinq_emcon_session_set_cancel(qlinq_emcon_session_t *session,
+                                    qlinq_emcon_cancel_fn should_cancel,
+                                    void *cancel_data);
 void qlinq_emcon_session_free(qlinq_emcon_session_t *session);
 
 int qlinq_emcon_session_send_object(qlinq_emcon_session_t *session,

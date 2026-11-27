@@ -58,6 +58,22 @@ static int remove_state_directory(const char *path) {
   return ret == 0 ? rmdir(path) : -1;
 }
 
+static int open_claimed_receiver(qlinq_emcon_session_t **session,
+                                 const qlinq_emcon_manifest_t *manifest,
+                                 const uint8_t *secret, size_t secret_size,
+                                 uint64_t now, const char *state_directory) {
+  int ret = qlinq_emcon_session_prepare_receiver(
+      session, manifest, secret, secret_size, now, state_directory, 0, true);
+  if (ret != QLINQ_EMCON_SESSION_OK)
+    return ret;
+  ret = qlinq_emcon_session_claim_receiver(*session);
+  if (ret != QLINQ_EMCON_SESSION_OK) {
+    qlinq_emcon_session_free(*session);
+    *session = NULL;
+  }
+  return ret;
+}
+
 static qlinq_emcon_manifest_t fixture(const uint8_t *secret, uint64_t now) {
   qlinq_emcon_manifest_t manifest = {
       .flow_id = 900,
@@ -97,8 +113,10 @@ static qlinq_emcon_manifest_t fixture(const uint8_t *secret, uint64_t now) {
   return manifest;
 }
 
-static int inject_unknown_alias(const qlinq_emcon_manifest_t *manifest,
-                                const uint8_t *secret) {
+static int inject_fec_packet(const qlinq_emcon_manifest_t *manifest,
+                             const uint8_t *secret, uint64_t pn,
+                             const qlinq_wire_fec_header_t *header,
+                             size_t symbol_bytes) {
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   struct sockaddr_in source = {.sin_family = AF_INET,
                                .sin_port = htons(manifest->source.port)};
@@ -112,28 +130,20 @@ static int inject_unknown_alias(const qlinq_emcon_manifest_t *manifest,
     return -1;
   }
   qlinq_emcon_sender_t *sender = NULL;
-  qlinq_wire_fec_header_t header = {
-      .alias = 99,
-      .group_id = 1,
-      .object_id = 1,
-      .total_symbols = 1,
-      .data_symbols = 1,
-      .symbol_size = 1,
-      .original_size = 1,
-  };
-  uint8_t payload[QLINQ_WIRE_FEC_HEADER_SIZE], packet[128];
+  uint8_t payload[QLINQ_WIRE_FEC_HEADER_SIZE + 256] = {0}, packet[512];
+  size_t payload_size = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_bytes;
   size_t packet_size = 0;
   uint64_t packet_number;
   int ok =
+      payload_size <= sizeof(payload) &&
       qlinq_emcon_sender_create(&sender, manifest->flow_id, manifest->key_epoch,
-                                manifest->initial_packet_number,
-                                manifest->initial_packet_number + 50, secret,
+                                manifest->initial_packet_number, pn, secret,
                                 32) == QLINQ_EMCON_OK &&
-      qlinq_wire_encode_fec_header(payload, sizeof(payload), &header) ==
+      qlinq_wire_encode_fec_header(payload, payload_size, header) ==
           QLINQ_WIRE_OK &&
       qlinq_emcon_flexicast_seal(sender, QLINQ_EMCON_RECORD_DATA,
-                                 ptls_iovec_init(payload, sizeof(payload)),
-                                 packet, sizeof(packet), &packet_size,
+                                 ptls_iovec_init(payload, payload_size), packet,
+                                 sizeof(packet), &packet_size,
                                  &packet_number) == QLINQ_EMCON_OK &&
       sendto(fd, packet, packet_size, 0, (struct sockaddr *)&destination,
              sizeof(destination)) == (ssize_t)packet_size;
@@ -141,6 +151,21 @@ static int inject_unknown_alias(const qlinq_emcon_manifest_t *manifest,
   qlinq_emcon_sender_free(sender);
   close(fd);
   return ok ? 0 : -1;
+}
+
+static int inject_unknown_alias(const qlinq_emcon_manifest_t *manifest,
+                                const uint8_t *secret) {
+  qlinq_wire_fec_header_t header = {
+      .alias = 99,
+      .group_id = 1,
+      .object_id = 1,
+      .total_symbols = 2,
+      .data_symbols = 1,
+      .symbol_size = 1,
+      .original_size = 1,
+  };
+  return inject_fec_packet(manifest, secret,
+                           manifest->initial_packet_number + 50, &header, 1);
 }
 
 static int check_session_object(qlinq_emcon_session_t *receiver,
@@ -173,15 +198,26 @@ static int check_session_object(qlinq_emcon_session_t *receiver,
   return 0;
 }
 
-static int check_io_limits(const uint8_t secret[32]) {
+typedef struct {
+  const qlinq_emcon_session_t *session;
+  uint64_t stop_after_packets;
+} cancel_after_packets_t;
+
+static bool cancel_after_packets(void *user_data) {
+  const cancel_after_packets_t *ctx = user_data;
+  return qlinq_emcon_session_stats(ctx->session).send.packets_sent >=
+         ctx->stop_after_packets;
+}
+
+static int check_io_limits(const uint8_t secret[32], const char *state_dir) {
   uint64_t now = now_ms();
   qlinq_emcon_manifest_t manifest = fixture(secret, now);
   manifest.key_epoch += 100;
   manifest.expires_at_ms = now + 200;
   qlinq_emcon_session_t *receiver = NULL, *sender = NULL;
   qlinq_emcon_event_t event;
-  CHECK(qlinq_emcon_session_create_receiver(&receiver, &manifest, secret, 32,
-                                            now) == QLINQ_EMCON_SESSION_OK,
+  CHECK(open_claimed_receiver(&receiver, &manifest, secret, 32, now,
+                              state_dir) == QLINQ_EMCON_SESSION_OK,
         "open receiver with finite wait");
   alarm(5);
   CHECK(qlinq_emcon_session_receive(receiver, &event, false) ==
@@ -196,8 +232,9 @@ static int check_io_limits(const uint8_t secret[32]) {
   manifest.expires_at_ms = now + 400;
   manifest.burst_bytes = 600;
   manifest.rate_bytes_per_second = 100;
-  CHECK(qlinq_emcon_session_create_sender(&sender, &manifest, secret, 32,
-                                          now) == QLINQ_EMCON_SESSION_OK,
+  CHECK(qlinq_emcon_session_create_sender_persistent(&sender, &manifest, secret,
+                                                     32, now, state_dir, 64) ==
+            QLINQ_EMCON_SESSION_OK,
         "open paced sender");
   uint8_t record[1024] = {0};
   CHECK(qlinq_emcon_session_send_object(sender, 20, 0, 0, false, 0, record,
@@ -211,8 +248,9 @@ static int check_io_limits(const uint8_t secret[32]) {
   manifest.key_epoch++;
   manifest.expires_at_ms = now + 400;
   manifest.terminal_repeat_count = 32;
-  CHECK(qlinq_emcon_session_create_sender(&sender, &manifest, secret, 32,
-                                          now) == QLINQ_EMCON_SESSION_OK,
+  CHECK(qlinq_emcon_session_create_sender_persistent(&sender, &manifest, secret,
+                                                     32, now, state_dir, 64) ==
+            QLINQ_EMCON_SESSION_OK,
         "open terminal metadata sender");
   qlinq_emcon_end_metadata_t end = {.alias = 20};
   memset(end.transmission_nonce, 1, sizeof(end.transmission_nonce));
@@ -223,6 +261,43 @@ static int check_io_limits(const uint8_t secret[32]) {
   CHECK(stats.metadata_sent > 1 &&
             stats.metadata_sent < manifest.terminal_repeat_count,
         "transmit only the terminal repeats that fit");
+  qlinq_emcon_session_free(sender);
+
+  /* verify immediate cancellation mid-object and mid-END-repeat */
+  now = now_ms();
+  manifest.key_epoch++;
+  manifest.expires_at_ms = now + 60000;
+  CHECK(qlinq_emcon_session_create_sender_persistent(&sender, &manifest, secret,
+                                                     32, now, state_dir, 64) ==
+            QLINQ_EMCON_SESSION_OK,
+        "open cancellable object sender");
+  cancel_after_packets_t cancel_ctx = {.session = sender,
+                                       .stop_after_packets = 2};
+  qlinq_emcon_session_set_cancel(sender, cancel_after_packets, &cancel_ctx);
+  uint64_t start_cancel = now_ms();
+  CHECK(qlinq_emcon_session_send_object(sender, 20, 0, 0, false, 0, record,
+                                        sizeof(record)) ==
+                QLINQ_EMCON_SESSION_INTERRUPTED &&
+            qlinq_emcon_session_stats(sender).send.packets_sent == 2 &&
+            now_ms() - start_cancel < 1000,
+        "cancel stops mid-object without waiting for remaining symbols");
+  qlinq_emcon_session_free(sender);
+
+  now = now_ms();
+  manifest.key_epoch++;
+  CHECK(qlinq_emcon_session_create_sender_persistent(&sender, &manifest, secret,
+                                                     32, now, state_dir, 64) ==
+            QLINQ_EMCON_SESSION_OK,
+        "open cancellable END sender");
+  cancel_ctx =
+      (cancel_after_packets_t){.session = sender, .stop_after_packets = 3};
+  qlinq_emcon_session_set_cancel(sender, cancel_after_packets, &cancel_ctx);
+  start_cancel = now_ms();
+  CHECK(qlinq_emcon_session_send_end(sender, &end) ==
+                QLINQ_EMCON_SESSION_INTERRUPTED &&
+            qlinq_emcon_session_stats(sender).send.packets_sent == 3 &&
+            now_ms() - start_cancel < 1000,
+        "cancel stops END-repeat loop immediately");
   qlinq_emcon_session_free(sender);
 
   uint8_t packet[128] = {0};
@@ -252,15 +327,18 @@ static int check_io_limits(const uint8_t secret[32]) {
 int main(void) {
   uint8_t secret[32];
   memset(secret, 0xb7, sizeof(secret));
-  CHECK(check_io_limits(secret) == 0, "enforce signed I/O limits");
+  char activation_directory[] = "/tmp/qlinq-emcon-session-XXXXXX";
+  CHECK(mkdtemp(activation_directory), "create session state directory");
+  CHECK(check_io_limits(secret, activation_directory) == 0,
+        "enforce signed I/O limits");
+
   uint64_t now = now_ms();
   qlinq_emcon_manifest_t manifest = fixture(secret, now);
   CHECK(manifest.source.port && manifest.destination.port,
         "allocate local ports");
   qlinq_emcon_session_t *receiver = NULL, *sender = NULL;
-  CHECK(qlinq_emcon_session_create_receiver(&receiver, &manifest, secret,
-                                            sizeof(secret),
-                                            now) == QLINQ_EMCON_SESSION_OK,
+  CHECK(open_claimed_receiver(&receiver, &manifest, secret, sizeof(secret), now,
+                              activation_directory) == QLINQ_EMCON_SESSION_OK,
         "create multi-alias receiver");
   qlinq_emcon_event_t unknown_event;
   qlinq_emcon_manifest_t other = manifest;
@@ -285,15 +363,46 @@ int main(void) {
                 QLINQ_EMCON_SESSION_UNKNOWN_ALIAS &&
             qlinq_emcon_session_stats(receiver).unknown_aliases == 1,
         "reject authenticated unknown alias");
-  CHECK(qlinq_emcon_session_create_sender(&sender, &manifest, secret,
-                                          sizeof(secret),
-                                          now) == QLINQ_EMCON_SESSION_OK,
+
+  /* enforce signed stream maximum_record_size on the receiver */
+  qlinq_wire_fec_header_t oversize_header = {
+      .alias = 20,
+      .group_id = 2,
+      .object_id = 1,
+      .symbol_index = 0,
+      .data_symbols = 17,
+      .total_symbols = 18,
+      .symbol_size = 256,
+      .original_size = 4097,
+  };
+  CHECK(inject_fec_packet(&manifest, secret,
+                          manifest.initial_packet_number + 51, &oversize_header,
+                          256) == 0 &&
+            qlinq_emcon_session_receive(receiver, &unknown_event, false) ==
+                QLINQ_EMCON_SESSION_INVALID,
+        "reject authenticated symbol exceeding signed maximum_record_size");
+
+  /* advance past injected packet numbers via durable sender reservation */
+  qlinq_emcon_activation_t *skip = NULL;
+  uint64_t skip_first, skip_limit;
+  CHECK(qlinq_emcon_activation_open_managed(&skip, activation_directory,
+                                            &manifest) ==
+                QLINQ_EMCON_ACTIVATION_OK &&
+            qlinq_emcon_activation_reserve(skip, 64, 64, &skip_first,
+                                           &skip_limit) ==
+                QLINQ_EMCON_ACTIVATION_OK,
+        "advance sender reservation past injected test packets");
+  qlinq_emcon_activation_close(skip);
+
+  CHECK(qlinq_emcon_session_create_sender_persistent(
+            &sender, &manifest, secret, sizeof(secret), now,
+            activation_directory, 65536) == QLINQ_EMCON_SESSION_OK,
         "create manifest sender");
   uint8_t wrong_secret[32] = {0};
   qlinq_emcon_session_t *invalid = NULL;
-  CHECK(qlinq_emcon_session_create_sender(&invalid, &manifest, wrong_secret,
-                                          sizeof(wrong_secret),
-                                          now) == QLINQ_EMCON_SESSION_INVALID,
+  CHECK(qlinq_emcon_session_create_sender_persistent(
+            &invalid, &manifest, wrong_secret, sizeof(wrong_secret), now,
+            activation_directory, 65536) == QLINQ_EMCON_SESSION_INVALID,
         "reject wrong traffic key");
   uint8_t data[6][1024];
   for (size_t stream = 0; stream < 6; stream++) {
@@ -353,7 +462,7 @@ int main(void) {
       qlinq_emcon_session_stats(receiver);
   CHECK(sender_stats.send.packets_sent == 49 &&
             sender_stats.metadata_sent == 13 &&
-            receiver_stats.packets_received == 52 &&
+            receiver_stats.packets_received == 53 &&
             receiver_stats.records_completed == 6 &&
             receiver_stats.metadata_received == 13 &&
             receiver_stats.authentication_failures == 1 &&
@@ -366,21 +475,22 @@ int main(void) {
   manifest.key_epoch++;
   const uint64_t before_wrap = UINT32_MAX - 100;
   manifest.initial_packet_number = before_wrap;
-  char activation_directory[] = "/tmp/qlinq-emcon-session-XXXXXX";
-  CHECK(mkdtemp(activation_directory), "create session state directory");
   qlinq_emcon_session_t *persistent = NULL, *competing = NULL;
   qlinq_emcon_session_t *persistent_receiver = NULL, *reused_receiver = NULL;
-  qlinq_emcon_session_t *port_holder = NULL;
-  CHECK(qlinq_emcon_session_create_receiver(&port_holder, &manifest, secret,
-                                            sizeof(secret),
-                                            now) == QLINQ_EMCON_SESSION_OK,
+  int port_holder = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in occupied_rx = {.sin_family = AF_INET,
+                                    .sin_port =
+                                        htons(manifest.destination.port),
+                                    .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  CHECK(port_holder >= 0 && bind(port_holder, (struct sockaddr *)&occupied_rx,
+                                 sizeof(occupied_rx)) == 0,
         "occupy receiver port");
-  CHECK(qlinq_emcon_session_create_receiver_claimed(
-            &persistent_receiver, &manifest, secret, sizeof(secret), now,
-            activation_directory) == QLINQ_EMCON_SESSION_IO &&
+  CHECK(open_claimed_receiver(&persistent_receiver, &manifest, secret,
+                              sizeof(secret), now,
+                              activation_directory) == QLINQ_EMCON_SESSION_IO &&
             persistent_receiver == NULL,
         "receiver socket failure leaves epoch available");
-  qlinq_emcon_session_free(port_holder);
+  close(port_holder);
   CHECK(qlinq_emcon_session_prepare_receiver(
             &persistent_receiver, &manifest, secret, sizeof(secret), now,
             activation_directory, 0, true) == QLINQ_EMCON_SESSION_OK,
@@ -399,20 +509,26 @@ int main(void) {
   CHECK(qlinq_emcon_session_receive(persistent_receiver, &pending_event,
                                     true) == QLINQ_EMCON_SESSION_UNKNOWN_ALIAS,
         "receiver can consume queued packet after the claim");
-  CHECK(qlinq_emcon_session_create_receiver_claimed(
-            &reused_receiver, &manifest, secret, sizeof(secret), now,
-            activation_directory) == QLINQ_EMCON_SESSION_ACTIVATION_REUSED,
+  CHECK(open_claimed_receiver(&reused_receiver, &manifest, secret,
+                              sizeof(secret), now, activation_directory) ==
+            QLINQ_EMCON_SESSION_ACTIVATION_REUSED,
         "reject receiver restart in the same key epoch");
-  CHECK(qlinq_emcon_session_create_sender(&sender, &manifest, secret,
-                                          sizeof(secret),
-                                          now) == QLINQ_EMCON_SESSION_OK,
+
+  int sender_holder = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in occupied_tx = {.sin_family = AF_INET,
+                                    .sin_port = htons(manifest.source.port),
+                                    .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+  CHECK(sender_holder >= 0 &&
+            bind(sender_holder, (struct sockaddr *)&occupied_tx,
+                 sizeof(occupied_tx)) == 0,
         "hold the sender port open");
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &persistent, &manifest, secret, sizeof(secret), now,
             activation_directory, 65536) == QLINQ_EMCON_SESSION_IO &&
             persistent == NULL,
         "sender bind failure leaves the packet range available");
-  qlinq_emcon_session_free(sender);
+  close(sender_holder);
+
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &persistent, &manifest, secret, sizeof(secret), now,
             activation_directory, 4) == QLINQ_EMCON_SESSION_OK,
@@ -466,10 +582,11 @@ int main(void) {
   qlinq_emcon_session_free(persistent_receiver);
   qlinq_emcon_session_free(persistent);
 
+  char late_directory[] = "/tmp/qlinq-emcon-late-XXXXXX";
+  CHECK(mkdtemp(late_directory), "create late receiver state directory");
   qlinq_emcon_session_t *late_receiver = NULL;
-  CHECK(qlinq_emcon_session_create_receiver(&late_receiver, &manifest, secret,
-                                            sizeof(secret),
-                                            now) == QLINQ_EMCON_SESSION_OK,
+  CHECK(open_claimed_receiver(&late_receiver, &manifest, secret, sizeof(secret),
+                              now, late_directory) == QLINQ_EMCON_SESSION_OK,
         "open a fresh listener provisioned with the original packet number");
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &persistent, &manifest, secret, sizeof(secret), now,
@@ -485,6 +602,8 @@ int main(void) {
       "late listener reconstructs the full packet numbers after wire rollover");
   qlinq_emcon_session_free(late_receiver);
   qlinq_emcon_session_free(persistent);
+  CHECK(remove_state_directory(late_directory) == 0,
+        "remove late receiver state directory");
 
   manifest.key_epoch++;
   manifest.initial_packet_number = QLINQ_EMCON_MAX_PACKET_NUMBER - 10;
@@ -500,9 +619,9 @@ int main(void) {
             budget_reserved == key_limit - 7,
         "leave seven packet numbers in a fresh epoch");
   qlinq_emcon_activation_close(budget);
-  CHECK(qlinq_emcon_session_create_receiver(&persistent_receiver, &manifest,
-                                            secret, sizeof(secret),
-                                            now) == QLINQ_EMCON_SESSION_OK,
+  CHECK(open_claimed_receiver(&persistent_receiver, &manifest, secret,
+                              sizeof(secret), now,
+                              activation_directory) == QLINQ_EMCON_SESSION_OK,
         "open a receiver near the 62-bit ceiling");
   CHECK(qlinq_emcon_session_create_sender_persistent(
             &persistent, &manifest, secret, sizeof(secret), now,

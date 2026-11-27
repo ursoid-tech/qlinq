@@ -19,6 +19,8 @@ struct qlinq_emcon_send_socket_t {
   uint64_t burst_ns;
   uint64_t expires_at_ms;
   uint64_t virtual_finish_ns;
+  qlinq_emcon_cancel_fn should_cancel;
+  void *cancel_data;
   qlinq_emcon_send_stats_t stats;
 };
 
@@ -89,14 +91,13 @@ void qlinq_emcon_send_socket_free(qlinq_emcon_send_socket_t *sender) {
   free(sender);
 }
 
-int qlinq_emcon_send_socket_local_address(
-    const qlinq_emcon_send_socket_t *sender, struct sockaddr *address,
-    socklen_t *address_len) {
-  if (!sender || sender->fd < 0 || !address || !address_len) {
-    errno = EINVAL;
-    return -1;
-  }
-  return getsockname(sender->fd, address, address_len);
+void qlinq_emcon_send_socket_set_cancel(qlinq_emcon_send_socket_t *sender,
+                                        qlinq_emcon_cancel_fn should_cancel,
+                                        void *cancel_data) {
+  if (!sender)
+    return;
+  sender->should_cancel = should_cancel;
+  sender->cancel_data = cancel_data;
 }
 
 int qlinq_emcon_send_socket_set_destination(qlinq_emcon_send_socket_t *sender,
@@ -151,6 +152,8 @@ int qlinq_emcon_send_socket_set_destination(qlinq_emcon_send_socket_t *sender,
 
 static int wait_for_pacer(qlinq_emcon_send_socket_t *sender,
                           uint64_t packet_ns) {
+  if (sender->should_cancel && sender->should_cancel(sender->cancel_data))
+    return QLINQ_EMCON_SOCKET_INTERRUPTED;
   uint64_t now = monotonic_ns();
   if (!now)
     return QLINQ_EMCON_SOCKET_SYSTEM;
@@ -161,35 +164,59 @@ static int wait_for_pacer(qlinq_emcon_send_socket_t *sender,
   if (earliest <= now)
     return QLINQ_EMCON_SOCKET_OK;
 
-  uint64_t wall_ms = qlinq_emcon_realtime_ms();
-  if (!wall_ms)
-    return QLINQ_EMCON_SOCKET_SYSTEM;
-  if (wall_ms >= sender->expires_at_ms)
-    return QLINQ_EMCON_SOCKET_EXPIRED;
-  uint64_t delay = earliest - now;
-  uint64_t remaining_ms = sender->expires_at_ms - wall_ms;
-  clockid_t clock = CLOCK_MONOTONIC;
-  struct timespec deadline = {
-      .tv_sec = (time_t)(earliest / UINT64_C(1000000000)),
-      .tv_nsec = (long)(earliest % UINT64_C(1000000000))};
-  if (delay / 1000000 >= remaining_ms) {
-    clock = CLOCK_REALTIME;
-    deadline.tv_sec = (time_t)(sender->expires_at_ms / 1000);
-    deadline.tv_nsec = (long)(sender->expires_at_ms % 1000) * 1000000;
-    delay = remaining_ms * 1000000;
-  }
-  int ret;
-  do {
-    ret = clock_nanosleep(clock, TIMER_ABSTIME, &deadline, NULL);
-  } while (ret == EINTR);
-  if (ret != 0) {
-    errno = ret;
-    return QLINQ_EMCON_SOCKET_SYSTEM;
+  uint64_t total_delay = 0;
+  for (;;) {
+    if (sender->should_cancel && sender->should_cancel(sender->cancel_data))
+      return QLINQ_EMCON_SOCKET_INTERRUPTED;
+    now = monotonic_ns();
+    if (!now)
+      return QLINQ_EMCON_SOCKET_SYSTEM;
+    if (earliest <= now)
+      break;
+
+    uint64_t wall_ms = qlinq_emcon_realtime_ms();
+    if (!wall_ms)
+      return QLINQ_EMCON_SOCKET_SYSTEM;
+    if (wall_ms >= sender->expires_at_ms)
+      return QLINQ_EMCON_SOCKET_EXPIRED;
+    uint64_t step_ns = earliest - now;
+    uint64_t slice_ns = (uint64_t)QLINQ_EMCON_WAIT_SLICE_MS * UINT64_C(1000000);
+    if (sender->should_cancel && step_ns > slice_ns)
+      step_ns = slice_ns;
+    uint64_t remaining_ms = sender->expires_at_ms - wall_ms;
+    clockid_t clock = CLOCK_MONOTONIC;
+    uint64_t target_ns = now + step_ns;
+    struct timespec deadline = {
+        .tv_sec = (time_t)(target_ns / UINT64_C(1000000000)),
+        .tv_nsec = (long)(target_ns % UINT64_C(1000000000))};
+    bool until_expiry = false;
+    if (step_ns / UINT64_C(1000000) >= remaining_ms) {
+      clock = CLOCK_REALTIME;
+      deadline.tv_sec = (time_t)(sender->expires_at_ms / 1000);
+      deadline.tv_nsec = (long)(sender->expires_at_ms % 1000) * 1000000;
+      step_ns = remaining_ms * UINT64_C(1000000);
+      until_expiry = true;
+    }
+    int ret = clock_nanosleep(clock, TIMER_ABSTIME, &deadline, NULL);
+    if (ret == EINTR) {
+      if (sender->should_cancel && sender->should_cancel(sender->cancel_data))
+        return QLINQ_EMCON_SOCKET_INTERRUPTED;
+      continue;
+    }
+    if (ret != 0) {
+      errno = ret;
+      return QLINQ_EMCON_SOCKET_SYSTEM;
+    }
+    total_delay += step_ns;
+    if (until_expiry) {
+      sender->stats.pacing_delays++;
+      sender->stats.pacing_delay_ns += total_delay;
+      return QLINQ_EMCON_SOCKET_EXPIRED;
+    }
   }
   sender->stats.pacing_delays++;
-  sender->stats.pacing_delay_ns += delay;
-  return clock == CLOCK_REALTIME ? QLINQ_EMCON_SOCKET_EXPIRED
-                                 : QLINQ_EMCON_SOCKET_OK;
+  sender->stats.pacing_delay_ns += total_delay;
+  return QLINQ_EMCON_SOCKET_OK;
 }
 
 int qlinq_emcon_send_socket_send(qlinq_emcon_send_socket_t *sender,
@@ -208,6 +235,8 @@ int qlinq_emcon_send_socket_send(qlinq_emcon_send_socket_t *sender,
   if (ret != QLINQ_EMCON_SOCKET_OK)
     return ret;
   for (;;) {
+    if (sender->should_cancel && sender->should_cancel(sender->cancel_data))
+      return QLINQ_EMCON_SOCKET_INTERRUPTED;
     uint64_t now = qlinq_emcon_realtime_ms();
     if (!now)
       return QLINQ_EMCON_SOCKET_SYSTEM;
@@ -218,10 +247,14 @@ int qlinq_emcon_send_socket_send(qlinq_emcon_send_socket_t *sender,
                           sender->destination_len);
     if (sent == (ssize_t)packet_size)
       break;
-    if (sent < 0 && errno == EINTR)
+    if (sent < 0 && errno == EINTR) {
+      if (sender->should_cancel && sender->should_cancel(sender->cancel_data))
+        return QLINQ_EMCON_SOCKET_INTERRUPTED;
       continue;
+    }
     if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      ret = qlinq_emcon_socket_wait(sender->fd, POLLOUT, sender->expires_at_ms);
+      ret = qlinq_emcon_socket_wait(sender->fd, POLLOUT, sender->expires_at_ms,
+                                    sender->should_cancel, sender->cancel_data);
       if (ret != QLINQ_EMCON_SOCKET_OK)
         return ret;
       continue;

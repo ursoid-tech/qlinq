@@ -3,6 +3,7 @@
 #include "transport_wire.h"
 
 #include "picotls/openssl.h"
+#include "quicly/defaults.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,25 @@ typedef struct {
   size_t count;
   size_t capacity;
 } capture_t;
+
+static int open_and_ingest_record(quicly_flexicast_flow_t *flow,
+                                  qlinq_emcon_receiver_t *receiver,
+                                  uint8_t *packet, size_t packet_size,
+                                  qlinq_emcon_record_t *record) {
+  qlinq_emcon_message_t message;
+  qlinq_emcon_event_t event;
+  memset(record, 0, sizeof(*record));
+  int ret = qlinq_emcon_flexicast_open(flow, packet, packet_size, &message);
+  if (ret != QLINQ_EMCON_OK)
+    return ret;
+  ret = qlinq_emcon_receiver_ingest_message(receiver, &message, &event);
+  if (ret != QLINQ_EMCON_OK)
+    return ret;
+  if (event.type != QLINQ_EMCON_EVENT_RECORD)
+    return QLINQ_EMCON_INVALID;
+  *record = event.value.record;
+  return QLINQ_EMCON_OK;
+}
 
 static int ingest_symbol(qlinq_emcon_receiver_t *receiver, uint64_t pn,
                          uint64_t group, uint64_t object, uint16_t index,
@@ -48,8 +68,9 @@ static int ingest_symbol(qlinq_emcon_receiver_t *receiver, uint64_t pn,
 }
 
 static int test_partial_objects(void) {
-  qlinq_emcon_receiver_t *receiver =
-      qlinq_emcon_receiver_create_for_messages(7);
+  CHECK(qlinq_emcon_receiver_create(7, 0) == NULL,
+        "reject zero maximum record size");
+  qlinq_emcon_receiver_t *receiver = qlinq_emcon_receiver_create(7, 64);
   CHECK(receiver != NULL, "create bounded object assembler");
   qlinq_emcon_event_t event;
   uint64_t pn = 100;
@@ -85,6 +106,60 @@ static int test_partial_objects(void) {
             memcmp(event.value.record.data, "ABC", 3) == 0,
         "deliver a complete record from the newer group");
   qlinq_emcon_event_release(&event);
+
+  /* enforce v2 tail omission, tight data_symbols, and maximum_record_size */
+  uint8_t bad_wire[QLINQ_WIRE_FEC_HEADER_SIZE + 256] = {0};
+  qlinq_wire_fec_header_t padded_tail = {.alias = 7,
+                                         .group_id = 9,
+                                         .object_id = 1,
+                                         .symbol_index = 0,
+                                         .data_symbols = 1,
+                                         .total_symbols = 2,
+                                         .symbol_size = 64,
+                                         .original_size = 20};
+  CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire),
+                                     &padded_tail) == QLINQ_WIRE_OK,
+        "encode padded-tail fixture");
+  qlinq_emcon_message_t bad_msg = {
+      .type = QLINQ_EMCON_RECORD_DATA,
+      .packet_number = 500,
+      .payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 64)};
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+            QLINQ_EMCON_INVALID,
+        "reject zero-padded v2 final source symbol");
+
+  qlinq_wire_fec_header_t loose_k = {.alias = 7,
+                                     .group_id = 9,
+                                     .object_id = 2,
+                                     .symbol_index = 0,
+                                     .data_symbols = 2,
+                                     .total_symbols = 3,
+                                     .symbol_size = 32,
+                                     .original_size = 32};
+  CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire), &loose_k) ==
+            QLINQ_WIRE_OK,
+        "encode non-minimal data_symbols fixture");
+  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 32);
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+            QLINQ_EMCON_INVALID,
+        "reject empty trailing source symbols");
+
+  qlinq_wire_fec_header_t oversize = {.alias = 7,
+                                      .group_id = 9,
+                                      .object_id = 3,
+                                      .symbol_index = 0,
+                                      .data_symbols = 1,
+                                      .total_symbols = 2,
+                                      .symbol_size = 65,
+                                      .original_size = 65};
+  CHECK(qlinq_wire_encode_fec_header(bad_wire, sizeof(bad_wire), &oversize) ==
+            QLINQ_WIRE_OK,
+        "encode oversize record fixture");
+  bad_msg.payload = ptls_iovec_init(bad_wire, QLINQ_WIRE_FEC_HEADER_SIZE + 65);
+  CHECK(qlinq_emcon_receiver_ingest_message(receiver, &bad_msg, &event) ==
+            QLINQ_EMCON_INVALID,
+        "reject object exceeding stream maximum_record_size");
+
   qlinq_emcon_receiver_free(receiver);
   return 0;
 }
@@ -102,6 +177,66 @@ static bool capture_packet(void *user_data, uint16_t symbol_index,
   capture->symbols[capture->count] = symbol_index;
   capture->count++;
   return true;
+}
+
+static int test_receive_packet_hardening(void) {
+  const uint8_t secret[32] = {0x49};
+  const uint64_t start = 500;
+  quicly_flexicast_flow_t *receiver = NULL;
+  CHECK(qlinq_emcon_flexicast_create(&receiver, 77, 1, start, secret,
+                                     sizeof(secret)) == QLINQ_EMCON_OK,
+        "create hardened receive flow");
+
+  /* derive the same epoch secret to craft raw flexicast packets */
+  ptls_cipher_suite_t *suite = &ptls_openssl_aes128gcmsha256;
+  uint8_t derived[PTLS_MAX_DIGEST_SIZE], epoch_be[4];
+  quicly_encode32(epoch_be, 1);
+  CHECK(ptls_hkdf_expand_label(
+            suite->hash, derived, suite->hash->digest_size,
+            ptls_iovec_init(secret, sizeof(secret)), "qlinq emcon epoch",
+            ptls_iovec_init(epoch_be, sizeof(epoch_be)), NULL) == 0,
+        "derive test epoch secret");
+  quicly_flexicast_egress_t egress = {.crypto_engine =
+                                          &quicly_default_crypto_engine};
+  CHECK(egress.crypto_engine->setup_cipher(
+            egress.crypto_engine, NULL, QUICLY_EPOCH_1RTT, 1,
+            &egress.header_protection, &egress.aead, suite->aead, suite->hash,
+            derived) == 0,
+        "setup raw egress cipher");
+  ptls_clear_memory(derived, sizeof(derived));
+
+  uint8_t flow_bytes[8];
+  quicly_encode64(flow_bytes, 77);
+  quicly_flexicast_flow_id_t flow_id =
+      quicly_flexicast_flow_id_init(flow_bytes, sizeof(flow_bytes));
+  uint8_t framed[2] = {QLINQ_EMCON_RECORD_SESSION, 0};
+  uint8_t packet[128];
+  size_t packet_size = 0;
+  qlinq_emcon_message_t message;
+
+  /* 2-byte truncated wire packet number must be rejected */
+  CHECK(quicly_flexicast_encode_datagram_packet(
+            &egress, &flow_id, start, QUICLY_SEND_PN_SIZE,
+            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+            &packet_size) == QUICLY_FLEXICAST_OK &&
+            qlinq_emcon_flexicast_open(receiver, packet, packet_size,
+                                       &message) == QLINQ_EMCON_INVALID,
+        "reject 2-byte wire packet number");
+
+  /* packet number at or above the epoch's 2^23 limit must be rejected */
+  uint64_t past_limit = qlinq_emcon_packet_number_limit(start);
+  CHECK(quicly_flexicast_encode_datagram_packet(
+            &egress, &flow_id, past_limit, 4,
+            ptls_iovec_init(framed, sizeof(framed)), packet, sizeof(packet),
+            &packet_size) == QUICLY_FLEXICAST_OK &&
+            qlinq_emcon_flexicast_open(receiver, packet, packet_size,
+                                       &message) == QLINQ_EMCON_INVALID,
+        "reject packet number at epoch upper bound");
+
+  ptls_cipher_free(egress.header_protection);
+  ptls_aead_free(egress.aead);
+  quicly_flexicast_flow_free(receiver);
+  return 0;
 }
 
 static int test_late_join(void) {
@@ -194,7 +329,8 @@ static int test_packet_number_ceiling(void) {
 
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--late-join") == 0) {
-    if (test_late_join() != 0 || test_packet_number_ceiling() != 0)
+    if (test_late_join() != 0 || test_packet_number_ceiling() != 0 ||
+        test_receive_packet_hardening() != 0)
       return 1;
     puts("===EMCON LATE JOIN OK===");
     return 0;
@@ -236,17 +372,28 @@ int main(int argc, char **argv) {
         "encode object");
   CHECK(capture.count == 30, "expected original plus repair count");
 
+  /* verify wire v2 omits zero padding from the final source symbol (136 B) */
+  size_t short_symbols = 0;
+  for (size_t i = 0; i < capture.count; i++) {
+    if (symbols[i] == 19) {
+      CHECK(sizes[i] == 213, "final source symbol omits implicit zero tail");
+      short_symbols++;
+    } else {
+      CHECK(sizes[i] == 333, "full source and repair symbols use symbol_size");
+    }
+  }
+  CHECK(short_symbols == 1, "exactly one short final source symbol");
+
   /* drop five original symbols and deliver the rest in reverse order */
-  qlinq_emcon_receiver_t *receiver =
-      qlinq_emcon_receiver_create(receiver_protection, 7);
+  qlinq_emcon_receiver_t *receiver = qlinq_emcon_receiver_create(7, 8192);
   CHECK(receiver, "receiver setup");
   qlinq_emcon_record_t record = {0};
   int result = QLINQ_EMCON_INCOMPLETE;
   for (size_t at = capture.count; at-- > 0;) {
     if (symbols[at] < 5)
       continue;
-    result =
-        qlinq_emcon_receiver_ingest(receiver, packets[at], sizes[at], &record);
+    result = open_and_ingest_record(receiver_protection, receiver, packets[at],
+                                    sizes[at], &record);
     CHECK(result == QLINQ_EMCON_INCOMPLETE || result == QLINQ_EMCON_OK,
           "ingest protected symbol");
     if (result == QLINQ_EMCON_OK)
@@ -277,8 +424,8 @@ int main(int argc, char **argv) {
       size_t at = indices[which];
       if (symbols[at] < 5)
         continue;
-      result = qlinq_emcon_receiver_ingest(receiver, packets[at], sizes[at],
-                                           &record);
+      result = open_and_ingest_record(receiver_protection, receiver,
+                                      packets[at], sizes[at], &record);
       CHECK(result == QLINQ_EMCON_INCOMPLETE || result == QLINQ_EMCON_OK ||
                 result == QLINQ_EMCON_DUPLICATE,
             "ingest crossed object symbol");

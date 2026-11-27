@@ -60,6 +60,11 @@ static void handle_signal(int signal_number) {
   emcon_running = 0;
 }
 
+static bool is_cancelled(void *user_data) {
+  (void)user_data;
+  return !emcon_running;
+}
+
 static void show_help(FILE *output, const char *program) {
   fprintf(output,
           "usage: %s send [options] INPUT|-\n"
@@ -259,12 +264,14 @@ static int run_sender(const emcon_options_t *options,
         failed = true;
         break;
       }
+      qlinq_emcon_session_set_cancel(session, is_cancelled, NULL);
     }
     ret = qlinq_emcon_session_send_object(session, options->alias,
                                           options->group_id, object_id, false,
                                           0, block, size);
     if (ret != QLINQ_EMCON_SESSION_OK) {
-      fprintf(stderr, "qlinq-emcon: send object failed: %d\n", ret);
+      if (ret != QLINQ_EMCON_SESSION_INTERRUPTED)
+        fprintf(stderr, "qlinq-emcon: send object failed: %d\n", ret);
       failed = true;
       break;
     }
@@ -293,10 +300,16 @@ static int run_sender(const emcon_options_t *options,
         .final_object_id = object_id - 1,
     };
     if (RAND_bytes(end.transmission_nonce, sizeof(end.transmission_nonce)) !=
-            1 ||
-        qlinq_emcon_session_send_end(session, &end) != QLINQ_EMCON_SESSION_OK) {
+        1) {
       fprintf(stderr, "qlinq-emcon: terminal metadata failed\n");
       failed = true;
+    } else {
+      int end_ret = qlinq_emcon_session_send_end(session, &end);
+      if (end_ret != QLINQ_EMCON_SESSION_OK) {
+        if (end_ret != QLINQ_EMCON_SESSION_INTERRUPTED)
+          fprintf(stderr, "qlinq-emcon: terminal metadata failed\n");
+        failed = true;
+      }
     }
   }
   qlinq_emcon_session_stats_t stats = qlinq_emcon_session_stats(session);
@@ -430,16 +443,16 @@ static int run_receiver(const emcon_options_t *options,
     return 1;
   }
 
+  qlinq_emcon_session_set_cancel(session, is_cancelled, NULL);
+
   emcon_pending_t pending[EMCON_REORDER_SLOTS] = {{0}};
   uint64_t next_object = 0, bytes = 0, final_object = 0;
   bool end_seen = false, failed = false;
   while (emcon_running && (!end_seen || next_object <= final_object)) {
     qlinq_emcon_event_t event;
-    ret = qlinq_emcon_session_receive(session, &event, true);
-    if (ret == QLINQ_EMCON_SESSION_WOULD_BLOCK) {
-      usleep(1000);
-      continue;
-    }
+    ret = qlinq_emcon_session_receive(session, &event, false);
+    if (ret == QLINQ_EMCON_SESSION_INTERRUPTED)
+      break;
     if (ret == QLINQ_EMCON_SESSION_INCOMPLETE ||
         ret == QLINQ_EMCON_SESSION_DUPLICATE ||
         ret == QLINQ_EMCON_SESSION_DISCARDED)
@@ -452,15 +465,25 @@ static int run_receiver(const emcon_options_t *options,
     if (event.type == QLINQ_EMCON_EVENT_RECORD &&
         event.value.record.alias == options->alias &&
         event.value.record.group_id == options->group_id) {
-      if (event.value.record.object_id >= next_object &&
-          store_pending(pending, &event.value.record) != 0) {
+      if (event.value.record.object_id == next_object) {
+        if (!write_record(output, event.value.record.data,
+                          event.value.record.size)) {
+          fprintf(stderr, "qlinq-emcon: output write failed\n");
+          failed = true;
+        } else {
+          bytes += event.value.record.size;
+          next_object++;
+          if (flush_pending(output, pending, &next_object, &bytes) != 0) {
+            fprintf(stderr, "qlinq-emcon: output write failed\n");
+            failed = true;
+          }
+        }
+      } else if (event.value.record.object_id > next_object &&
+                 store_pending(pending, &event.value.record) != 0) {
         fprintf(stderr,
                 "qlinq-emcon: reorder capacity exceeded before object %" PRIu64
                 "\n",
                 next_object);
-        failed = true;
-      } else if (flush_pending(output, pending, &next_object, &bytes) != 0) {
-        fprintf(stderr, "qlinq-emcon: output write failed\n");
         failed = true;
       }
     } else if (event.type == QLINQ_EMCON_EVENT_END &&
@@ -519,8 +542,14 @@ int main(int argc, char **argv) {
     show_help(stderr, argv[0]);
     return 2;
   }
-  signal(SIGINT, handle_signal);
-  signal(SIGTERM, handle_signal);
+  struct sigaction action = {0};
+  action.sa_handler = handle_signal;
+  sigemptyset(&action.sa_mask);
+  if (sigaction(SIGINT, &action, NULL) != 0 ||
+      sigaction(SIGTERM, &action, NULL) != 0) {
+    fprintf(stderr, "qlinq-emcon: signal handler setup failed\n");
+    return 1;
+  }
 
   uint64_t now_ms = qlinq_emcon_realtime_ms();
   qlinq_emcon_manifest_t manifest;

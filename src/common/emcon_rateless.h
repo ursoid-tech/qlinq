@@ -119,21 +119,11 @@ typedef struct {
   } value;
 } qlinq_emcon_event_t;
 
-qlinq_emcon_receiver_t *
-qlinq_emcon_receiver_create(quicly_flexicast_flow_t *flow, uint8_t alias);
-/* creates an alias assembler for a session sharing one flexicast flow */
-qlinq_emcon_receiver_t *qlinq_emcon_receiver_create_for_messages(uint8_t alias);
+/* creates an alias assembler bounded by the stream's maximum record size */
+qlinq_emcon_receiver_t *qlinq_emcon_receiver_create(uint8_t alias,
+                                                    uint32_t max_record_size);
 void qlinq_emcon_receiver_free(qlinq_emcon_receiver_t *receiver);
 
-/* opens and ingests one protected DATA packet */
-int qlinq_emcon_receiver_ingest(qlinq_emcon_receiver_t *receiver,
-                                uint8_t *packet, size_t packet_size,
-                                qlinq_emcon_record_t *record);
-
-/* opens one protected packet and dispatches DATA or in-band metadata */
-int qlinq_emcon_receiver_ingest_packet(qlinq_emcon_receiver_t *receiver,
-                                       uint8_t *packet, size_t packet_size,
-                                       qlinq_emcon_event_t *event);
 int qlinq_emcon_receiver_ingest_message(qlinq_emcon_receiver_t *receiver,
                                         const qlinq_emcon_message_t *message,
                                         qlinq_emcon_event_t *event);

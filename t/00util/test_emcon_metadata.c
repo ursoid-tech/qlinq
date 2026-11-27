@@ -107,8 +107,7 @@ static int test_protected_dispatch(void) {
                                          PTLS_QUICINT_MAX, secret,
                                          secret_size) == QLINQ_EMCON_OK,
         "set up an epoch at the last QUIC packet number");
-  qlinq_emcon_receiver_t *receiver =
-      qlinq_emcon_receiver_create(receiver_flow, 7);
+  qlinq_emcon_receiver_t *receiver = qlinq_emcon_receiver_create(7, 4096);
   CHECK(sender && receiver_flow && receiver, "protected fixture");
   CHECK(
       qlinq_emcon_encode_window(payload, sizeof(payload), &window) ==
@@ -137,8 +136,10 @@ static int test_protected_dispatch(void) {
         "key exhaustion remains fatal");
   quicly_flexicast_flow_free(limited);
   qlinq_emcon_event_t event;
-  CHECK(qlinq_emcon_receiver_ingest_packet(receiver, packet, packet_size,
-                                           &event) == QLINQ_EMCON_OK &&
+  CHECK(qlinq_emcon_flexicast_open(receiver_flow, packet, packet_size,
+                                   &message) == QLINQ_EMCON_OK &&
+            qlinq_emcon_receiver_ingest_message(receiver, &message, &event) ==
+                QLINQ_EMCON_OK &&
             event.type == QLINQ_EMCON_EVENT_WINDOW &&
             event.value.window.group_id == 3 &&
             event.value.window.first_object_id == 100 &&

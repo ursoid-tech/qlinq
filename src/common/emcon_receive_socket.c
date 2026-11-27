@@ -11,6 +11,8 @@
 
 struct qlinq_emcon_receive_socket_t {
   int fd;
+  qlinq_emcon_cancel_fn should_cancel;
+  void *cancel_data;
 };
 
 static bool address_is_multicast(const struct sockaddr *address) {
@@ -55,11 +57,18 @@ int qlinq_emcon_receive_socket_create_multicast(
     goto SystemError;
 #endif
   if (interface_index != 0) {
+#ifdef SO_BINDTODEVICE
     char interface_name[IF_NAMESIZE];
     if (!if_indextoname(interface_index, interface_name) ||
         setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, interface_name,
                    strlen(interface_name) + 1) != 0)
       goto SystemError;
+#else
+    if (!join_group) {
+      errno = ENOTSUP;
+      goto SystemError;
+    }
+#endif
   }
   if (multicast) {
     int one = 1;
@@ -118,16 +127,6 @@ SystemError: {
 }
 }
 
-int qlinq_emcon_receive_socket_create(qlinq_emcon_receive_socket_t **receiver,
-                                      const struct sockaddr *local_address,
-                                      socklen_t local_address_len,
-                                      const struct sockaddr *source_address,
-                                      socklen_t source_address_len) {
-  return qlinq_emcon_receive_socket_create_multicast(
-      receiver, local_address, local_address_len, source_address,
-      source_address_len, 0, true);
-}
-
 void qlinq_emcon_receive_socket_free(qlinq_emcon_receive_socket_t *receiver) {
   if (!receiver)
     return;
@@ -135,14 +134,13 @@ void qlinq_emcon_receive_socket_free(qlinq_emcon_receive_socket_t *receiver) {
   free(receiver);
 }
 
-int qlinq_emcon_receive_socket_local_address(
-    const qlinq_emcon_receive_socket_t *receiver, struct sockaddr *address,
-    socklen_t *address_len) {
-  if (!receiver || receiver->fd < 0 || !address || !address_len)
-    return QLINQ_EMCON_SOCKET_INVALID;
-  return getsockname(receiver->fd, address, address_len) == 0
-             ? QLINQ_EMCON_SOCKET_OK
-             : QLINQ_EMCON_SOCKET_SYSTEM;
+void qlinq_emcon_receive_socket_set_cancel(
+    qlinq_emcon_receive_socket_t *receiver, qlinq_emcon_cancel_fn should_cancel,
+    void *cancel_data) {
+  if (!receiver)
+    return;
+  receiver->should_cancel = should_cancel;
+  receiver->cancel_data = cancel_data;
 }
 
 int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,
@@ -152,6 +150,9 @@ int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,
   if (!receiver || receiver->fd < 0 || !packet || capacity == 0 || !packet_size)
     return QLINQ_EMCON_SOCKET_INVALID;
   for (;;) {
+    if (receiver->should_cancel &&
+        receiver->should_cancel(receiver->cancel_data))
+      return QLINQ_EMCON_SOCKET_INTERRUPTED;
     ssize_t received =
         recv(receiver->fd, packet, capacity, MSG_TRUNC | MSG_DONTWAIT);
     int error = errno;
@@ -166,13 +167,19 @@ int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,
       *packet_size = (size_t)received;
       return QLINQ_EMCON_SOCKET_OK;
     }
-    if (error == EINTR)
+    if (error == EINTR) {
+      if (receiver->should_cancel &&
+          receiver->should_cancel(receiver->cancel_data))
+        return QLINQ_EMCON_SOCKET_INTERRUPTED;
       continue;
+    }
     if (error != EAGAIN && error != EWOULDBLOCK)
       return QLINQ_EMCON_SOCKET_SYSTEM;
     if (nonblocking)
       return QLINQ_EMCON_SOCKET_WOULD_BLOCK;
-    int ret = qlinq_emcon_socket_wait(receiver->fd, POLLIN, expires_at_ms);
+    int ret =
+        qlinq_emcon_socket_wait(receiver->fd, POLLIN, expires_at_ms,
+                                receiver->should_cancel, receiver->cancel_data);
     if (ret != QLINQ_EMCON_SOCKET_OK)
       return ret;
   }

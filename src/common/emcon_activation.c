@@ -266,33 +266,6 @@ static int finish_activation_open(qlinq_emcon_activation_t **activation, int fd,
   return QLINQ_EMCON_ACTIVATION_OK;
 }
 
-int qlinq_emcon_activation_open(qlinq_emcon_activation_t **activation,
-                                const char *state_file,
-                                const qlinq_emcon_manifest_t *manifest) {
-  if (!activation || !state_file || !state_file[0] || !manifest ||
-      qlinq_emcon_manifest_validate(manifest, 0) != QLINQ_EMCON_MANIFEST_OK)
-    return QLINQ_EMCON_ACTIVATION_INVALID;
-  *activation = NULL;
-  const char *slash = strrchr(state_file, '/');
-  const char *filename = slash ? slash + 1 : state_file;
-  char *parent = slash && slash != state_file
-                     ? strndup(state_file, (size_t)(slash - state_file))
-                     : strdup(slash ? "/" : ".");
-  if (!parent)
-    return QLINQ_EMCON_ACTIVATION_IO;
-  int directory_fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-  free(parent);
-  if (directory_fd < 0)
-    return QLINQ_EMCON_ACTIVATION_IO;
-  int fd = openat(directory_fd, filename,
-                  O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_CREAT, 0600);
-  if (fd < 0) {
-    close(directory_fd);
-    return QLINQ_EMCON_ACTIVATION_IO;
-  }
-  return finish_activation_open(activation, fd, directory_fd, manifest);
-}
-
 int qlinq_emcon_activation_open_managed(
     qlinq_emcon_activation_t **activation, const char *state_directory,
     const qlinq_emcon_manifest_t *manifest) {

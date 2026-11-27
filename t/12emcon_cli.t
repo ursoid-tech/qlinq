@@ -100,6 +100,23 @@ ok(run_command($qlinq_emcon, 'manifest', 'create', $explicit_config,
                "$directory/explicit.sig", '--traffic-key', $traffic_key),
    'accept explicit manifest validity bounds');
 
+for my $mixed_field ("valid_from_ms=@{[$now_ms - 1000]}",
+                     "expires_at_ms=@{[$now_ms + 120000]}") {
+    open my $mixed_in, '<', $config or die "reopen config: $!";
+    my $mixed_text = do { local $/; <$mixed_in> };
+    close $mixed_in;
+    $mixed_text .= "$mixed_field\n";
+    my $mixed_config = "$directory/mixed.conf";
+    open my $mixed_out, '>', $mixed_config or die "mixed config: $!";
+    print {$mixed_out} $mixed_text;
+    close $mixed_out;
+    ok(!run_command($qlinq_emcon, 'manifest', 'create', $mixed_config,
+                    '--signing-key', $signing_key, '--output',
+                    "$directory/mixed.bin", '--signature',
+                    "$directory/mixed.sig", '--traffic-key', $traffic_key),
+       "reject valid_for_seconds combined with $mixed_field");
+}
+
 open my $key_file, '<', $traffic_key or die "open traffic key: $!";
 binmode $key_file;
 local $/;
@@ -202,5 +219,194 @@ ok(!run_command($qlinq_emcon, 'manifest', 'create', $config,
    'reject exposed signing key');
 ok(!-e "$directory/unsafe.bin" && !-e "$directory/unsafe.sig",
    'signing-key rejection leaves no provisioning outputs');
+chmod 0600, $signing_key;
+
+# Verify full 16-slot reorder drain when object 0 arrives after objects 1..16.
+my $reorder_conf = "$directory/reorder.conf";
+my $reorder_manifest = "$directory/reorder.bin";
+my $reorder_sig = "$directory/reorder.sig";
+open my $reorder_cf, '>', $reorder_conf or die "reorder config: $!";
+print {$reorder_cf} <<"REORDER_CONFIG";
+session_id=random
+sender_id=random
+flow_id=92
+key_epoch=3
+initial_packet_number=10
+valid_for_seconds=120
+source=127.0.0.1:$source_port
+destination=127.0.0.1:$destination_port
+interface_index=0
+replay_window_packets=64
+rate_bytes_per_second=100000000
+burst_bytes=4096
+metadata_repeat_interval_ms=10000
+terminal_repeat_count=2
+symbol_size=512
+repair_symbols=1
+stream=7,data,65536,reorder-test
+REORDER_CONFIG
+close $reorder_cf;
+ok(run_command($qlinq_emcon, 'manifest', 'create', $reorder_conf,
+               '--signing-key', $signing_key, '--output', $reorder_manifest,
+               '--signature', $reorder_sig, '--traffic-key', $traffic_key),
+   'create reorder test manifest');
+
+my $capture_sock = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1', LocalPort => $destination_port, Proto => 'udp'
+) or die "capture socket: $!";
+my $reorder_input = "$directory/reorder-in.bin";
+my $reorder_payload = join '', map { chr(($_ * 41 + 9) & 0xff) } 0 .. (17 * 256 - 1);
+open my $reorder_in_fh, '>', $reorder_input or die "reorder input: $!";
+binmode $reorder_in_fh;
+print {$reorder_in_fh} $reorder_payload;
+close $reorder_in_fh;
+ok(run_command($qlinq_emcon, 'send', '--manifest', $reorder_manifest,
+               '--signature', $reorder_sig, '--public-key', $public_key,
+               '--traffic-key', $traffic_key, '--alias', '7', '--group', '9',
+               '--state-dir', "$directory/sender-state", '--block-size', '256',
+               $reorder_input),
+   'capture 17 single-symbol objects');
+my @captured;
+while (1) {
+    my $rin = '';
+    vec($rin, fileno($capture_sock), 1) = 1;
+    last unless select($rin, undef, undef, 0.05);
+    my $datagram = '';
+    $capture_sock->recv($datagram, 2048);
+    push @captured, $datagram;
+}
+close $capture_sock;
+is(scalar(@captured), 37, 'captured SESSION + 17*2 object packets + 2 END packets');
+
+my $reorder_output = "$directory/reorder-out.bin";
+open my $seed_fh, '>', $reorder_output or die "seed reorder output: $!";
+print {$seed_fh} 'seed';
+close $seed_fh;
+my $reorder_rx = fork();
+die "fork reorder receiver: $!" unless defined $reorder_rx;
+if ($reorder_rx == 0) {
+    open STDOUT, '>', "$directory/reorder.stdout" or exit 127;
+    open STDERR, '>', "$directory/reorder.stderr" or exit 127;
+    exec $qlinq_emcon, 'receive', '--manifest', $reorder_manifest,
+      '--signature', $reorder_sig, '--public-key', $public_key,
+      '--traffic-key', $traffic_key, '--alias', '7', '--group', '9',
+      '--state-dir', "$directory/receiver-state", $reorder_output;
+    exit 127;
+}
+for (1 .. 200) {
+    last if -z $reorder_output;
+    select undef, undef, undef, 0.01;
+}
+ok(-z $reorder_output, 'reorder receiver ready');
+
+my $replay_sock = IO::Socket::INET->new(
+    LocalAddr => '127.0.0.1', LocalPort => $source_port,
+    PeerAddr  => '127.0.0.1', PeerPort  => $destination_port,
+    Proto     => 'udp',
+) or die "replay socket: $!";
+# Send SESSION (0), objects 1..16 (3..34), then delayed object 0 (1..2), then END (35..36).
+for my $idx (0, 3 .. 34, 1, 2, 35, 36) {
+    $replay_sock->send($captured[$idx]) or die "replay send: $!";
+}
+close $replay_sock;
+ok(wait_child($reorder_rx), 'receiver drains 16 buffered objects once object 0 arrives');
+open my $reorder_out_fh, '<', $reorder_output or die "open reorder output: $!";
+binmode $reorder_out_fh;
+my $reordered_bytes = do { local $/; <$reorder_out_fh> };
+close $reorder_out_fh;
+is($reordered_bytes, $reorder_payload, 'reordered stream reconstructed byte-for-byte');
+
+# Verify prompt SIGTERM cancellation on paced sender and blocking receiver.
+my $slow_conf = "$directory/slow.conf";
+my $slow_manifest = "$directory/slow.bin";
+my $slow_sig = "$directory/slow.sig";
+open my $slow_cf, '>', $slow_conf or die "slow config: $!";
+print {$slow_cf} <<"SLOW_CONFIG";
+session_id=random
+sender_id=random
+flow_id=93
+key_epoch=4
+initial_packet_number=0
+valid_for_seconds=120
+source=127.0.0.1:$source_port
+destination=127.0.0.1:$destination_port
+interface_index=0
+replay_window_packets=64
+rate_bytes_per_second=500
+burst_bytes=1200
+metadata_repeat_interval_ms=10000
+terminal_repeat_count=4
+symbol_size=512
+repair_symbols=4
+stream=7,data,65536,cancel-test
+SLOW_CONFIG
+close $slow_cf;
+ok(run_command($qlinq_emcon, 'manifest', 'create', $slow_conf,
+               '--signing-key', $signing_key, '--output', $slow_manifest,
+               '--signature', $slow_sig, '--traffic-key', $traffic_key),
+   'create slow paced manifest for cancellation test');
+
+my $cancel_rx_out = "$directory/cancel-rx.bin";
+open my $cancel_seed, '>', $cancel_rx_out or die "seed cancel output: $!";
+print {$cancel_seed} 'seed';
+close $cancel_seed;
+my $cancel_rx = fork();
+die "fork cancel receiver: $!" unless defined $cancel_rx;
+if ($cancel_rx == 0) {
+    open STDOUT, '>', "$directory/cancel-rx.stdout" or exit 127;
+    open STDERR, '>', "$directory/cancel-rx.stderr" or exit 127;
+    exec $qlinq_emcon, 'receive', '--manifest', $slow_manifest,
+      '--signature', $slow_sig, '--public-key', $public_key,
+      '--traffic-key', $traffic_key, '--alias', '7', '--group', '1',
+      '--state-dir', "$directory/receiver-state", $cancel_rx_out;
+    exit 127;
+}
+for (1 .. 200) {
+    last if -z $cancel_rx_out;
+    select undef, undef, undef, 0.01;
+}
+kill 'TERM', $cancel_rx;
+my $rx_exited_promptly = 0;
+for (1 .. 20) {
+    if (waitpid($cancel_rx, WNOHANG) == $cancel_rx) {
+        $rx_exited_promptly = ($? != 0);
+        last;
+    }
+    select undef, undef, undef, 0.05;
+}
+ok($rx_exited_promptly, 'blocking receiver exits promptly on SIGTERM');
+
+mkdir "$directory/cancel-sender-state", 0700 or die "cancel sender state: $!";
+my $cancel_tx = fork();
+die "fork cancel sender: $!" unless defined $cancel_tx;
+if ($cancel_tx == 0) {
+    open STDOUT, '>', "$directory/cancel-tx.stdout" or exit 127;
+    open STDERR, '>', "$directory/cancel-tx.stderr" or exit 127;
+    exec $qlinq_emcon, 'send', '--manifest', $slow_manifest,
+      '--signature', $slow_sig, '--public-key', $public_key,
+      '--traffic-key', $traffic_key, '--alias', '7', '--group', '1',
+      '--state-dir', "$directory/cancel-sender-state", '--block-size', '8192',
+      $input;
+    exit 127;
+}
+for (1 .. 200) {
+    last if glob "$directory/cancel-sender-state/sender-*";
+    select undef, undef, undef, 0.01;
+}
+select undef, undef, undef, 0.1;
+kill 'TERM', $cancel_tx;
+my $tx_exited_promptly = 0;
+for (1 .. 20) {
+    if (waitpid($cancel_tx, WNOHANG) == $cancel_tx) {
+        $tx_exited_promptly = ($? != 0);
+        last;
+    }
+    select undef, undef, undef, 0.05;
+}
+if (!$tx_exited_promptly) {
+    kill 'KILL', $cancel_tx;
+    waitpid($cancel_tx, 0);
+}
+ok($tx_exited_promptly, 'paced sender aborts mid-object promptly on SIGTERM');
 
 done_testing();

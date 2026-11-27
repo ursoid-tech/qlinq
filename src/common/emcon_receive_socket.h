@@ -17,16 +17,11 @@ int qlinq_emcon_receive_socket_create_multicast(
     const struct sockaddr *local_address, socklen_t local_address_len,
     const struct sockaddr *source_address, socklen_t source_address_len,
     uint32_t interface_index, bool join_group);
-int qlinq_emcon_receive_socket_create(qlinq_emcon_receive_socket_t **receiver,
-                                      const struct sockaddr *local_address,
-                                      socklen_t local_address_len,
-                                      const struct sockaddr *source_address,
-                                      socklen_t source_address_len);
 void qlinq_emcon_receive_socket_free(qlinq_emcon_receive_socket_t *receiver);
 
-int qlinq_emcon_receive_socket_local_address(
-    const qlinq_emcon_receive_socket_t *receiver, struct sockaddr *address,
-    socklen_t *address_len);
+void qlinq_emcon_receive_socket_set_cancel(
+    qlinq_emcon_receive_socket_t *receiver, qlinq_emcon_cancel_fn should_cancel,
+    void *cancel_data);
 int qlinq_emcon_receive_socket_receive(qlinq_emcon_receive_socket_t *receiver,
                                        uint8_t *packet, size_t capacity,
                                        size_t *packet_size, bool nonblocking,

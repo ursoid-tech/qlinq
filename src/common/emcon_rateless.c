@@ -24,6 +24,21 @@ struct qlinq_emcon_sender_t {
   quicly_flexicast_flow_id_t flow_id;
   uint64_t next_packet_number;
   uint64_t packet_number_limit;
+  fec_t *fec;
+  size_t fec_data_symbols;
+  size_t fec_symbol_size;
+  const uint8_t **data_blocks;
+  size_t data_blocks_capacity;
+  uint8_t **repair_blocks;
+  size_t repair_blocks_capacity;
+  uint8_t *repair_storage;
+  size_t repair_storage_capacity;
+  uint8_t *tail_symbol;
+  size_t tail_symbol_capacity;
+  uint8_t *wire;
+  size_t wire_capacity;
+  uint8_t *packet;
+  size_t packet_capacity;
 };
 
 static quicly_flexicast_flow_id_t encode_flow_id(uint64_t flow_id) {
@@ -93,6 +108,25 @@ void qlinq_emcon_sender_free(qlinq_emcon_sender_t *sender) {
     ptls_cipher_free(sender->egress.header_protection);
   if (sender->egress.aead)
     ptls_aead_free(sender->egress.aead);
+  fec_destroy(sender->fec);
+  if (sender->repair_storage) {
+    ptls_clear_memory(sender->repair_storage, sender->repair_storage_capacity);
+    free(sender->repair_storage);
+  }
+  if (sender->tail_symbol) {
+    ptls_clear_memory(sender->tail_symbol, sender->tail_symbol_capacity);
+    free(sender->tail_symbol);
+  }
+  if (sender->wire) {
+    ptls_clear_memory(sender->wire, sender->wire_capacity);
+    free(sender->wire);
+  }
+  if (sender->packet) {
+    ptls_clear_memory(sender->packet, sender->packet_capacity);
+    free(sender->packet);
+  }
+  free(sender->data_blocks);
+  free(sender->repair_blocks);
   free(sender);
 }
 
@@ -205,6 +239,11 @@ int qlinq_emcon_flexicast_open(quicly_flexicast_flow_t *flow, uint8_t *packet,
     return QLINQ_EMCON_NO_MEMORY;
   if (ret != QUICLY_FLEXICAST_OK)
     return QLINQ_EMCON_CRYPTO;
+  uint64_t epoch_start = quicly_flexicast_get_next_packet_number(flow);
+  uint64_t epoch_limit = qlinq_emcon_packet_number_limit(epoch_start);
+  if (((packet[0] & 0x3U) + 1U) != EMCON_PACKET_NUMBER_LENGTH ||
+      pn < epoch_start || pn >= epoch_limit)
+    return QLINQ_EMCON_INVALID;
   if (datagram.len < 1U || datagram.base[0] < QLINQ_EMCON_RECORD_DATA ||
       datagram.base[0] > QLINQ_EMCON_RECORD_ABORT)
     return QLINQ_EMCON_INVALID;
@@ -233,8 +272,8 @@ typedef struct {
 } qlinq_emcon_receive_object_t;
 
 struct qlinq_emcon_receiver_t {
-  quicly_flexicast_flow_t *flow; /* borrowed */
   uint8_t alias;
+  uint32_t max_record_size;
   qlinq_emcon_receive_object_t objects[QLINQ_EMCON_MAX_ACTIVE_OBJECTS];
   struct {
     bool active;
@@ -263,6 +302,58 @@ static bool sender_config_valid(const qlinq_emcon_rateless_config_t *config,
          *data_symbols + config->repair_symbols <= QLINQ_FEC_MAX_TOTAL_SYMBOLS;
 }
 
+static bool ensure_sender_buffer(void **buffer, size_t *capacity,
+                                 size_t required) {
+  if (*capacity >= required)
+    return true;
+  if (*buffer) {
+    ptls_clear_memory(*buffer, *capacity);
+    free(*buffer);
+    *buffer = NULL;
+    *capacity = 0;
+  }
+  void *allocated = malloc(required);
+  if (!allocated)
+    return false;
+  *buffer = allocated;
+  *capacity = required;
+  return true;
+}
+
+static bool ensure_sender_pointers(void **array, size_t *capacity,
+                                   size_t count) {
+  if (*capacity >= count)
+    return true;
+  if (count > SIZE_MAX / sizeof(void *))
+    return false;
+  void *grown = realloc(*array, count * sizeof(void *));
+  if (!grown)
+    return false;
+  *array = grown;
+  *capacity = count;
+  return true;
+}
+
+static fec_t *ensure_sender_fec(qlinq_emcon_sender_t *sender,
+                                size_t data_symbols, size_t repair_symbols,
+                                size_t symbol_size) {
+  if (sender->fec && sender->fec_data_symbols == data_symbols &&
+      sender->fec_symbol_size == symbol_size &&
+      fec_set_parity_symbols(sender->fec, repair_symbols))
+    return sender->fec;
+  fec_destroy(sender->fec);
+  sender->fec = NULL;
+  sender->fec_data_symbols = 0;
+  sender->fec_symbol_size = 0;
+  sender->fec =
+      fec_create_ex(FEC_RAPTORQ, data_symbols, repair_symbols, symbol_size);
+  if (sender->fec) {
+    sender->fec_data_symbols = data_symbols;
+    sender->fec_symbol_size = symbol_size;
+  }
+  return sender->fec;
+}
+
 int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
                             const qlinq_emcon_rateless_config_t *config,
                             uint64_t group_id, uint64_t object_id,
@@ -270,11 +361,6 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
                             size_t size, qlinq_emcon_emit_packet_cb emit,
                             void *user_data) {
   size_t data_symbols, total_symbols, data_index = 0, repair_index = 0;
-  uint8_t *data_storage = NULL, *repair_storage = NULL, *wire = NULL,
-          *packet = NULL;
-  uint8_t **data_blocks = NULL, **repair_blocks = NULL;
-  fec_t *fec = NULL;
-  int result = QLINQ_EMCON_NO_MEMORY;
 
   if (!sender || !data || !emit ||
       !sender_config_valid(config, size, &data_symbols))
@@ -283,34 +369,49 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
   if (!qlinq_emcon_sender_has_capacity(sender, total_symbols))
     return QLINQ_EMCON_PACKET_NUMBER_EXHAUSTED;
 
-  data_storage = calloc(data_symbols, config->symbol_size);
-  repair_storage = malloc((size_t)config->repair_symbols * config->symbol_size);
-  data_blocks = malloc(data_symbols * sizeof(*data_blocks));
-  repair_blocks =
-      malloc((size_t)config->repair_symbols * sizeof(*repair_blocks));
-  size_t framed_size = 1U + QLINQ_WIRE_FEC_HEADER_SIZE + config->symbol_size;
-  wire = malloc(framed_size);
+  size_t max_framed_size =
+      1U + QLINQ_WIRE_FEC_HEADER_SIZE + config->symbol_size;
   size_t protected_capacity = quicly_flexicast_datagram_packet_size(
       &sender->egress, &sender->flow_id, EMCON_PACKET_NUMBER_LENGTH,
-      framed_size);
-  packet = protected_capacity != 0 ? malloc(protected_capacity) : NULL;
-  if (!data_storage || !repair_storage || !data_blocks || !repair_blocks ||
-      !wire || !packet)
-    goto Exit;
+      max_framed_size);
+  if (protected_capacity == 0)
+    return QLINQ_EMCON_CRYPTO;
+  if (!ensure_sender_pointers((void **)&sender->data_blocks,
+                              &sender->data_blocks_capacity, data_symbols) ||
+      !ensure_sender_pointers((void **)&sender->repair_blocks,
+                              &sender->repair_blocks_capacity,
+                              config->repair_symbols) ||
+      !ensure_sender_buffer(
+          (void **)&sender->repair_storage, &sender->repair_storage_capacity,
+          (size_t)config->repair_symbols * config->symbol_size) ||
+      !ensure_sender_buffer((void **)&sender->tail_symbol,
+                            &sender->tail_symbol_capacity,
+                            config->symbol_size) ||
+      !ensure_sender_buffer((void **)&sender->wire, &sender->wire_capacity,
+                            max_framed_size) ||
+      !ensure_sender_buffer((void **)&sender->packet, &sender->packet_capacity,
+                            protected_capacity))
+    return QLINQ_EMCON_NO_MEMORY;
 
-  memcpy(data_storage, data, size);
-  for (size_t i = 0; i < data_symbols; i++)
-    data_blocks[i] = data_storage + i * config->symbol_size;
-  for (size_t i = 0; i < config->repair_symbols; i++)
-    repair_blocks[i] = repair_storage + i * config->symbol_size;
-
-  fec = fec_create_ex(FEC_RAPTORQ, data_symbols, config->repair_symbols,
-                      config->symbol_size);
-  if (!fec ||
-      !fec_encode(fec, (const uint8_t *const *)data_blocks, repair_blocks)) {
-    result = QLINQ_EMCON_CODEC;
-    goto Exit;
+  const uint8_t *bytes = data;
+  for (size_t i = 0; i + 1 < data_symbols; i++)
+    sender->data_blocks[i] = bytes + i * config->symbol_size;
+  size_t tail_offset = (data_symbols - 1) * config->symbol_size;
+  size_t tail_size = size - tail_offset;
+  if (tail_size == config->symbol_size) {
+    sender->data_blocks[data_symbols - 1] = bytes + tail_offset;
+  } else {
+    memcpy(sender->tail_symbol, bytes + tail_offset, tail_size);
+    memset(sender->tail_symbol + tail_size, 0, config->symbol_size - tail_size);
+    sender->data_blocks[data_symbols - 1] = sender->tail_symbol;
   }
+  for (size_t i = 0; i < config->repair_symbols; i++)
+    sender->repair_blocks[i] = sender->repair_storage + i * config->symbol_size;
+
+  fec_t *fec = ensure_sender_fec(sender, data_symbols, config->repair_symbols,
+                                 config->symbol_size);
+  if (!fec || !fec_encode(fec, sender->data_blocks, sender->repair_blocks))
+    return QLINQ_EMCON_CODEC;
 
   for (size_t emitted = 0; emitted < total_symbols; emitted++) {
     bool use_data;
@@ -340,57 +441,41 @@ int qlinq_emcon_send_object(qlinq_emcon_sender_t *sender,
         .original_size = (uint32_t)size,
         .send_time_ns = 0,
     };
-    wire[0] = (uint8_t)QLINQ_EMCON_RECORD_DATA;
+    size_t symbol_payload_size = qlinq_wire_fec_payload_size(&header);
+    if (symbol_payload_size == 0)
+      return QLINQ_EMCON_INVALID;
+    size_t framed_size = 1U + QLINQ_WIRE_FEC_HEADER_SIZE + symbol_payload_size;
+    sender->wire[0] = (uint8_t)QLINQ_EMCON_RECORD_DATA;
     if (qlinq_wire_encode_fec_header(
-            wire + 1, QLINQ_WIRE_FEC_HEADER_SIZE + config->symbol_size,
-            &header) != QLINQ_WIRE_OK) {
-      result = QLINQ_EMCON_INVALID;
-      goto Exit;
-    }
-    const uint8_t *symbol = use_data
-                                ? data_blocks[symbol_index]
-                                : repair_blocks[symbol_index - data_symbols];
-    memcpy(wire + 1 + QLINQ_WIRE_FEC_HEADER_SIZE, symbol, config->symbol_size);
+            sender->wire + 1, QLINQ_WIRE_FEC_HEADER_SIZE + symbol_payload_size,
+            &header) != QLINQ_WIRE_OK)
+      return QLINQ_EMCON_INVALID;
+    const uint8_t *symbol =
+        use_data ? sender->data_blocks[symbol_index]
+                 : sender->repair_blocks[symbol_index - data_symbols];
+    memcpy(sender->wire + 1 + QLINQ_WIRE_FEC_HEADER_SIZE, symbol,
+           symbol_payload_size);
     size_t packet_size;
-    result = seal_framed(sender, ptls_iovec_init(wire, framed_size), packet,
-                         protected_capacity, &packet_size, NULL);
+    int result = seal_framed(sender, ptls_iovec_init(sender->wire, framed_size),
+                             sender->packet, sender->packet_capacity,
+                             &packet_size, NULL);
     if (result != QLINQ_EMCON_OK)
-      goto Exit;
-    if (!emit(user_data, symbol_index, packet, packet_size)) {
-      result = QLINQ_EMCON_EMIT_FAILED;
-      goto Exit;
-    }
+      return result;
+    if (!emit(user_data, symbol_index, sender->packet, packet_size))
+      return QLINQ_EMCON_EMIT_FAILED;
   }
-  result = QLINQ_EMCON_OK;
-
-Exit:
-  fec_destroy(fec);
-  free(packet);
-  free(wire);
-  free(repair_blocks);
-  free(data_blocks);
-  free(repair_storage);
-  free(data_storage);
-  return result;
+  return QLINQ_EMCON_OK;
 }
 
-qlinq_emcon_receiver_t *
-qlinq_emcon_receiver_create(quicly_flexicast_flow_t *flow, uint8_t alias) {
-  if (!flow)
+qlinq_emcon_receiver_t *qlinq_emcon_receiver_create(uint8_t alias,
+                                                    uint32_t max_record_size) {
+  if (max_record_size == 0)
     return NULL;
   qlinq_emcon_receiver_t *receiver = calloc(1, sizeof(*receiver));
   if (!receiver)
     return NULL;
-  receiver->flow = flow;
   receiver->alias = alias;
-  return receiver;
-}
-
-qlinq_emcon_receiver_t *
-qlinq_emcon_receiver_create_for_messages(uint8_t alias) {
-  qlinq_emcon_receiver_t *receiver = calloc(1, sizeof(*receiver));
-  if (receiver)
-    receiver->alias = alias;
+  receiver->max_record_size = max_record_size;
   return receiver;
 }
 
@@ -403,18 +488,18 @@ void qlinq_emcon_receiver_free(qlinq_emcon_receiver_t *receiver) {
 }
 
 static int receiver_start_object(qlinq_emcon_receive_object_t *object,
-                                 uint8_t expected_alias,
+                                 const qlinq_emcon_receiver_t *receiver,
                                  const qlinq_wire_fec_header_t *header) {
   size_t bytes;
-  if (header->alias != expected_alias || header->total_symbols == 0 ||
+  if (header->alias != receiver->alias || header->total_symbols == 0 ||
       header->total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
       header->data_symbols == 0 ||
       header->data_symbols >= header->total_symbols ||
       header->symbol_size == 0 ||
       header->symbol_size > QLINQ_FEC_MAX_SYMBOL_SIZE ||
       header->original_size == 0 ||
-      header->original_size >
-          (uint32_t)header->data_symbols * header->symbol_size)
+      header->original_size > receiver->max_record_size ||
+      qlinq_wire_fec_payload_size(header) == 0)
     return QLINQ_EMCON_INVALID;
   bytes = (size_t)header->total_symbols * header->symbol_size;
   if (object->active)
@@ -498,11 +583,12 @@ static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
                                 qlinq_emcon_record_t *record) {
   qlinq_wire_fec_header_t header;
   qlinq_emcon_receive_object_t *object = NULL, *slot = NULL;
+  size_t payload_size;
   if (message->payload.len < QLINQ_WIRE_FEC_HEADER_SIZE ||
       qlinq_wire_decode_fec_header(message->payload.base, message->payload.len,
                                    &header) != QLINQ_WIRE_OK ||
-      header.symbol_index >= header.total_symbols ||
-      message->payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + header.symbol_size)
+      (payload_size = qlinq_wire_fec_payload_size(&header)) == 0 ||
+      message->payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + payload_size)
     return QLINQ_EMCON_INVALID;
 
   for (size_t i = 0; i < QLINQ_EMCON_COMPLETED_OBJECTS; i++)
@@ -526,7 +612,7 @@ static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
     if (slot->active && message->packet_number <= slot->latest_symbol_pn)
       return QLINQ_EMCON_INCOMPLETE;
     object = slot;
-    int started = receiver_start_object(object, receiver->alias, &header);
+    int started = receiver_start_object(object, receiver, &header);
     if (started != QLINQ_EMCON_OK)
       return started;
   } else if (object->total_symbols != header.total_symbols ||
@@ -541,8 +627,9 @@ static int receiver_ingest_data(qlinq_emcon_receiver_t *receiver,
 
   if (!object->received[header.symbol_index]) {
     memcpy(object->blocks[header.symbol_index],
-           message->payload.base + QLINQ_WIRE_FEC_HEADER_SIZE,
-           object->symbol_size);
+           message->payload.base + QLINQ_WIRE_FEC_HEADER_SIZE, payload_size);
+    memset(object->blocks[header.symbol_index] + payload_size, 0,
+           object->symbol_size - payload_size);
     object->received[header.symbol_index] = true;
     object->received_count++;
     if (message->packet_number > object->latest_symbol_pn)
@@ -601,37 +688,6 @@ int qlinq_emcon_receiver_ingest_message(qlinq_emcon_receiver_t *receiver,
   }
   return decoded == QLINQ_EMCON_METADATA_OK ? QLINQ_EMCON_OK
                                             : QLINQ_EMCON_INVALID;
-}
-
-int qlinq_emcon_receiver_ingest_packet(qlinq_emcon_receiver_t *receiver,
-                                       uint8_t *packet, size_t packet_size,
-                                       qlinq_emcon_event_t *event) {
-  qlinq_emcon_message_t message;
-  if (!receiver || !receiver->flow || !packet || !event)
-    return QLINQ_EMCON_INVALID;
-  int opened =
-      qlinq_emcon_flexicast_open(receiver->flow, packet, packet_size, &message);
-  if (opened != QLINQ_EMCON_OK)
-    return opened;
-  return qlinq_emcon_receiver_ingest_message(receiver, &message, event);
-}
-
-int qlinq_emcon_receiver_ingest(qlinq_emcon_receiver_t *receiver,
-                                uint8_t *packet, size_t packet_size,
-                                qlinq_emcon_record_t *record) {
-  qlinq_emcon_event_t event;
-  int ret;
-  if (!record)
-    return QLINQ_EMCON_INVALID;
-  memset(record, 0, sizeof(*record));
-  ret =
-      qlinq_emcon_receiver_ingest_packet(receiver, packet, packet_size, &event);
-  if (ret != QLINQ_EMCON_OK)
-    return ret;
-  if (event.type != QLINQ_EMCON_EVENT_RECORD)
-    return QLINQ_EMCON_INVALID;
-  *record = event.value.record;
-  return QLINQ_EMCON_OK;
 }
 
 void qlinq_emcon_record_release(qlinq_emcon_record_t *record) {

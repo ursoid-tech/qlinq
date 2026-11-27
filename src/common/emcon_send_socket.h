@@ -25,9 +25,9 @@ int qlinq_emcon_send_socket_create(qlinq_emcon_send_socket_t **sender,
                                    size_t burst_bytes, uint64_t expires_at_ms);
 void qlinq_emcon_send_socket_free(qlinq_emcon_send_socket_t *sender);
 
-int qlinq_emcon_send_socket_local_address(
-    const qlinq_emcon_send_socket_t *sender, struct sockaddr *address,
-    socklen_t *address_len);
+void qlinq_emcon_send_socket_set_cancel(qlinq_emcon_send_socket_t *sender,
+                                        qlinq_emcon_cancel_fn should_cancel,
+                                        void *cancel_data);
 int qlinq_emcon_send_socket_set_destination(qlinq_emcon_send_socket_t *sender,
                                             const struct sockaddr *destination,
                                             socklen_t destination_len);

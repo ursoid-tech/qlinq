@@ -18,12 +18,8 @@ typedef enum {
   QLINQ_EMCON_ACTIVATION_REUSED = -7
 } qlinq_emcon_activation_result_t;
 
-/* opens and exclusively locks one sender activation file until close */
-int qlinq_emcon_activation_open(qlinq_emcon_activation_t **activation,
-                                const char *state_file,
-                                const qlinq_emcon_manifest_t *manifest);
-
-/* derives one canonical sender state filename from the traffic-key epoch */
+/* derives one canonical sender state filename from the traffic-key epoch and
+ * holds an exclusive lock until close */
 int qlinq_emcon_activation_open_managed(qlinq_emcon_activation_t **activation,
                                         const char *state_directory,
                                         const qlinq_emcon_manifest_t *manifest);
