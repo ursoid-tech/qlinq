@@ -713,11 +713,6 @@ int amtq_posix_fd(const amtq_posix *io) {
   return io ? io->fd : -1;
 }
 
-void amtq_posix_bound(const amtq_posix *io, nanoamt_endpoint *ep) {
-  if (io && ep)
-    *ep = io->bound;
-}
-
 int amtq_posix_tick(amtq_posix *io, int64_t now) {
   if (!io || now < io->now || now == INT64_MAX)
     return NANOAMTQ_ERROR_ARGUMENT;
@@ -887,9 +882,8 @@ int amtq_posix_send(amtq_posix *io, int64_t now) {
     return AMTQ_ERROR_IO;
   io->stats.send_errors += (unsigned)rc;
   size_t empty = 0;
-  for (unsigned attempt = 0;
-       attempt < io->config.send_budget && empty < io->config.max_connections;
-       ++attempt) {
+  for (unsigned attempt = 0; attempt < io->config.send_budget &&
+                             empty < io->config.max_connections;) {
     quic_peer *peer = &io->peers[io->send_next];
     io->send_next = (io->send_next + 1) % io->config.max_connections;
     if (!peer->session) {
@@ -898,14 +892,14 @@ int amtq_posix_send(amtq_posix *io, int64_t now) {
     }
     amtq_quicly_output output;
     peer->needs_send = 0;
-    if (peer->head) {
+    while (peer->head) {
       rc = amtq_quicly_forward_queued(peer->session, now, peer->head->at,
                                       peer->head->bytes, peer->head->size);
-      if (rc != NANOAMTQ_ERROR_LIMIT) {
-        input_pop(io, peer);
-        if (rc)
-          ++io->stats.input_dropped;
-      }
+      if (rc == NANOAMTQ_ERROR_LIMIT)
+        break;
+      input_pop(io, peer);
+      if (rc)
+        ++io->stats.input_dropped;
     }
     rc = amtq_quicly_send(peer->session, now, &output);
     if (rc != NANOAMTQ_PACKET) {
@@ -913,9 +907,11 @@ int amtq_posix_send(amtq_posix *io, int64_t now) {
       ++empty;
       continue;
     }
-    empty = 0;
-    if (!amtq_quicly_output_valid(peer->session, now, &output))
+    ++attempt;
+    if (!amtq_quicly_output_valid(peer->session, now, &output)) {
+      empty = 0;
       continue;
+    }
     nanoamt_endpoint source = output.source;
     if (peer->local.port && endpoint_equal(&source, &peer->local))
       source.scope_id = peer->local.scope_id;
@@ -924,8 +920,10 @@ int amtq_posix_send(amtq_posix *io, int64_t now) {
     peer->blocked = !rc;
     if (!rc) {
       ++io->stats.backpressure;
+      ++empty;
       continue;
     }
+    empty = 0;
     if (rc < 0)
       ++io->stats.send_errors;
     else {
@@ -1091,11 +1089,6 @@ void amtq_posix_close(amtq_posix *io) {
 int amtq_posix_fd(const amtq_posix *io) {
   (void)io;
   return -1;
-}
-void amtq_posix_bound(const amtq_posix *io, nanoamt_endpoint *endpoint) {
-  (void)io;
-  if (endpoint)
-    memset(endpoint, 0, sizeof(*endpoint));
 }
 int amtq_posix_receive(amtq_posix *io, int64_t now_ms) {
   (void)io;

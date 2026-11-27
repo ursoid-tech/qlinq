@@ -21,7 +21,7 @@ typedef struct {
   uint32_t path_mtu;              /* 0: 1500; native PMTU feedback enabled */
   unsigned max_clients;           /* 0: 64; maximum 1024 */
   unsigned max_groups;            /* 0: 1024; maximum 4096 */
-  unsigned max_sources;           /* 0: 4096; maximum 65536 */
+  unsigned max_sources;           /* 0: 4096; maximum 65535 */
   unsigned linux_gateway_family;  /* 0: RFC 7450, or linux compatibility 4/6 */
 } qlinq_relay_config_t;
 typedef struct {

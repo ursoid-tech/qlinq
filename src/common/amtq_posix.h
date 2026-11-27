@@ -43,7 +43,6 @@ typedef struct amtq_posix_stats {
 amtq_posix *amtq_posix_open(const amtq_posix_config *config, int64_t now_ms);
 void amtq_posix_close(amtq_posix *io);
 int amtq_posix_fd(const amtq_posix *io);
-void amtq_posix_bound(const amtq_posix *io, nanoamt_endpoint *endpoint);
 int amtq_posix_receive(amtq_posix *io, int64_t now_ms);
 int amtq_posix_send(amtq_posix *io, int64_t now_ms);
 int amtq_posix_tick(amtq_posix *io, int64_t now_ms);

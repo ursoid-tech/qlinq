@@ -51,10 +51,6 @@ int amtq_quicly_is_ready(const amtq_quicly *session);
 int amtq_quicly_error(const amtq_quicly *session);
 int64_t amtq_quicly_next_timeout(amtq_quicly *session);
 int amtq_quicly_tick(amtq_quicly *session, int64_t now_ms);
-int amtq_quicly_receive(amtq_quicly *session, int64_t now_ms,
-                        const nanoamt_endpoint *peer,
-                        const nanoamt_endpoint *local, uint8_t *bytes,
-                        size_t size);
 int amtq_quicly_receive_ecn(amtq_quicly *session, int64_t now_ms,
                             const nanoamt_endpoint *peer,
                             const nanoamt_endpoint *local, uint8_t *bytes,

@@ -653,14 +653,9 @@ void transport_amt_host_service(transport_t *t, const struct pollfd *fds,
     c->transport = t;
     if (budget && (scan || readable(amtq_posix_fd(c->amtq), fds, count))) {
       while (c->amtq && budget) {
-        amtq_posix_stats before, after;
-        amtq_posix_get_stats(c->amtq, &before);
         int rc = amtq_posix_receive(c->amtq, now);
-        amtq_posix_get_stats(c->amtq, &after);
         drain_channel(c);
-        if (rc < 0)
-          break;
-        if (before.received == after.received)
+        if (rc <= 0)
           break;
         --budget;
       }

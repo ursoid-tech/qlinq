@@ -8,13 +8,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define AMTQ_FLIGHT_DEFAULT 1500U
+#define AMTQ_RELIABLE_MAX_RECORDS 16U
+#define AMTQ_RELIABLE_MAX_BYTES 32768U
+
+typedef struct reliable_tuple {
+  uint8_t ip_version, source[16], group[16];
+} reliable_tuple;
+
 typedef struct reliable_stream {
   quicly_streambuf_t buffer; /* streambuf requires this first */
   quicly_stream_t *stream;
-  nanoamtq_relay_datagram_output metadata;
-  uint8_t *record;
-  size_t record_size, pending;
-  int ended;
+  uint64_t context_id, block_id;
+  size_t pending, written;
+  unsigned records, tuple_count;
+  reliable_tuple tuples[AMTQ_RELIABLE_MAX_RECORDS];
+  int sealed, ended;
 } reliable_stream;
 
 struct amtq_quicly {
@@ -27,11 +36,12 @@ struct amtq_quicly {
   nanoamtq_membership memberships[64];
   size_t membership_count, control_bytes, reliable_bytes;
   reliable_stream *reliable[NANOAMTQ_MAX_CONTEXTS];
+  reliable_stream *open_reliable;
   nanoamtq_control control;
   nanoamtq_relay_cursor cursor;
   nanoamtq_relay_datagram_output datagram;
-  uint8_t *ip;
-  uint8_t frame[65577], flight[65536];
+  uint8_t *ip, *frame, *flight;
+  size_t frame_capacity, flight_capacity;
   amtq_quicly_output output;
   int error, bound, freeing, context_open, queued, flight_data;
   int64_t now, started, input_at, frame_at;
@@ -127,6 +137,8 @@ static int authorize(amtq_quicly *s) {
 
 static void revoke(amtq_quicly *s);
 
+static int seal_reliable(amtq_quicly *s);
+
 static void drain_control(amtq_quicly *s) {
   int rc = activate(s);
   if (rc || !s->stream)
@@ -143,6 +155,8 @@ static void drain_control(amtq_quicly *s) {
       if (consumed)
         quicly_streambuf_ingress_shift(s->stream, consumed);
       if (rc == NANOAMTQ_MEMBERSHIP) {
+        if (seal_reliable(s))
+          return;
         /* revoke retained data before a later update can reauthorize it */
         revoke(s);
         if (authorize(s))
@@ -211,11 +225,12 @@ static void check_reliable_cancel(amtq_quicly *s, reliable_stream *data) {
     return;
   if (quicly_sendstate_eos_type(&data->stream->sendstate) ==
       QUICLY_SENDSTATE_EOS_TYPE_RESET) {
+    if (s->open_reliable == data)
+      s->open_reliable = NULL;
     data->ended = 1;
     if (s->relay)
-      (void)nanoamtq_relay_reliable_abort(s->relay, s->now,
-                                          data->metadata.context_id,
-                                          data->metadata.packet_id);
+      (void)nanoamtq_relay_reliable_abort(s->relay, s->now, data->context_id,
+                                          data->block_id);
     fail(s, NANOAMTQ_ERROR_PROTOCOL, NANOAMTQ_CLOSE_CONTEXT);
   }
 }
@@ -231,11 +246,14 @@ static void stream_destroy(quicly_stream_t *stream, quicly_error_t error) {
   }
   if (s && stream->stream_id != 0 && stream->data) {
     reliable_stream *data = stream->data;
+    if (s->open_reliable == data)
+      s->open_reliable = NULL;
     for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i)
       if (s->reliable[i] == data)
         s->reliable[i] = NULL;
-    s->reliable_bytes -= data->record_size;
-    free(data->record);
+    s->reliable_bytes -=
+        data->pending <= s->reliable_bytes ? data->pending : s->reliable_bytes;
+    data->pending = 0;
   }
   if (stream->data)
     quicly_streambuf_destroy(stream, error);
@@ -246,10 +264,12 @@ static void stream_shift(quicly_stream_t *stream, size_t size) {
   quicly_streambuf_egress_shift(stream, size);
   if (stream->stream_id != 0) {
     reliable_stream *data = stream->data;
-    if (size > data->pending)
+    if (size > data->pending) {
       fail(s, NANOAMTQ_ERROR_PROTOCOL, NANOAMTQ_CLOSE_INTERNAL);
-    else
+    } else {
       data->pending -= size;
+      s->reliable_bytes -= size <= s->reliable_bytes ? size : s->reliable_bytes;
+    }
     /* STOP_SENDING after local FIN resets the stream and shifts unacked bytes
      */
     check_reliable_cancel(s, data);
@@ -268,9 +288,11 @@ static void stream_stop(quicly_stream_t *stream, quicly_error_t error) {
     fail(s, NANOAMTQ_ERROR_PROTOCOL, NANOAMTQ_CLOSE_CONTROL_STREAM);
   } else if (s->config.server) {
     reliable_stream *data = stream->data;
+    if (s->open_reliable == data)
+      s->open_reliable = NULL;
     data->ended = 1;
-    nanoamtq_relay_reliable_abort(s->relay, s->now, data->metadata.context_id,
-                                  data->metadata.packet_id);
+    nanoamtq_relay_reliable_abort(s->relay, s->now, data->context_id,
+                                  data->block_id);
     fail(s, NANOAMTQ_ERROR_PROTOCOL, NANOAMTQ_CLOSE_CONTEXT);
   } else if (!activate(s)) {
     nanoamt_packet packet;
@@ -384,12 +406,14 @@ void amtq_quicly_configure(quicly_context_t *context) {
   context->transport_params.max_datagram_frame_size = 65535;
   context->transport_params.max_streams_bidi = 1;
   context->transport_params.max_streams_uni = NANOAMTQ_MAX_CONTEXTS;
-  context->transport_params.max_stream_data.uni = 65536;
+  context->transport_params.max_stream_data.uni = 131072;
   context->transport_params.max_stream_data.bidi_local = 65536;
   context->transport_params.max_stream_data.bidi_remote = 65536;
-  context->transport_params.max_data = 131072;
+  context->transport_params.max_data = 524288;
   context->allow_variable_datagram_sizes = 1;
   context->egress[0].enable_pmtud = 1;
+  if (!context->egress[0].max_udp_payload_size)
+    context->egress[0].max_udp_payload_size = 1472;
   if (context->tls) {
     context->tls->max_early_data_size = 0;
     quicly_amend_ptls_context(context->tls);
@@ -434,6 +458,15 @@ amtq_quicly *amtq_quicly_new(quicly_context_t *context,
     free(s);
     return NULL;
   }
+  s->flight_capacity =
+      context->egress[0].max_udp_payload_size >= AMTQ_FLIGHT_DEFAULT
+          ? context->egress[0].max_udp_payload_size
+          : AMTQ_FLIGHT_DEFAULT;
+  s->flight = malloc(s->flight_capacity);
+  if (!s->flight) {
+    free(s);
+    return NULL;
+  }
   s->now = s->started = now;
   return s;
 }
@@ -457,6 +490,8 @@ void amtq_quicly_free(amtq_quicly *s) {
   nanoamtq_free(s->gateway);
   nanoamtq_relay_free(s->relay);
   free(s->ip);
+  free(s->frame);
+  free(s->flight);
   free(s);
 }
 
@@ -506,6 +541,7 @@ int amtq_quicly_error(const amtq_quicly *s) {
 static int input_allowed(amtq_quicly *s, const uint8_t *bytes, size_t size) {
   ip_packet ip;
   return s->relay && !s->error && nanoamtq_relay_is_ready(s->relay) &&
+         !nanoamtq_relay_pending(s->relay) &&
          nanoamt_ip_forward_decode(bytes, size, &ip) && ip.size == size &&
          ip.ttl && address_unicast(ip.source, ip.version) &&
          multicast(ip.destination, ip.version) &&
@@ -530,10 +566,28 @@ int amtq_quicly_accepts_ip(amtq_quicly *s, int64_t now, const uint8_t *ip,
 }
 
 static int frame_valid(amtq_quicly *s) {
-  return s->relay && !s->error &&
+  return s->relay && !s->error && s->frame &&
+         s->datagram.size <= s->frame_capacity &&
          (uint64_t)(s->now - s->frame_at) < s->config.data_age_ms &&
          nanoamtq_relay_datagram_valid(s->relay, s->now, &s->datagram, s->frame,
                                        s->datagram.size);
+}
+
+static int reliable_policy_revoked(amtq_quicly *s,
+                                   const reliable_stream *data) {
+  if (s->error || !s->relay)
+    return 1;
+  const nanoamt_memberships *req = nanoamtq_relay_requested(s->relay);
+  const nanoamt_memberships *auth = nanoamtq_relay_authorized(s->relay);
+  for (unsigned k = 0; k < data->tuple_count; ++k) {
+    const reliable_tuple *t = &data->tuples[k];
+    /* abort only when policy revokes a group still requested by the client;
+     * client-initiated withdrawals drain FIN and are filtered on delivery */
+    if (nanoamt_memberships_allows(req, t->ip_version, t->group, t->source) &&
+        !nanoamt_memberships_allows(auth, t->ip_version, t->group, t->source))
+      return 1;
+  }
+  return 0;
 }
 
 static void revoke(amtq_quicly *s) {
@@ -552,10 +606,10 @@ static void revoke(amtq_quicly *s) {
   }
   for (unsigned i = 0; i < NANOAMTQ_MAX_CONTEXTS; ++i) {
     reliable_stream *data = s->reliable[i];
-    if (data && data->record && !data->ended &&
-        !nanoamtq_relay_reliable_valid(s->relay, s->now, &data->metadata,
-                                       data->record, data->record_size)) {
-      /* abort session if policy revokes a block already admitted to QUIC */
+    if (data && data->tuple_count && !data->ended && data->pending &&
+        reliable_policy_revoked(s, data)) {
+      if (s->open_reliable == data)
+        s->open_reliable = NULL;
       data->ended = 1;
       if (quicly_sendstate_eos_type(&data->stream->sendstate) !=
               QUICLY_SENDSTATE_EOS_TYPE_RESET &&
@@ -651,13 +705,6 @@ static void sockaddr_endpoint(const nanoamt_endpoint *ep,
   }
 }
 
-int amtq_quicly_receive(amtq_quicly *s, int64_t now,
-                        const nanoamt_endpoint *peer,
-                        const nanoamt_endpoint *local, uint8_t *bytes,
-                        size_t size) {
-  return amtq_quicly_receive_ecn(s, now, peer, local, bytes, size, -1);
-}
-
 int amtq_quicly_receive_ecn(amtq_quicly *s, int64_t now,
                             const nanoamt_endpoint *peer,
                             const nanoamt_endpoint *local, uint8_t *bytes,
@@ -701,6 +748,124 @@ int amtq_quicly_receive_decoded(amtq_quicly *s, int64_t now,
   return amtq_quicly_tick(s, now);
 }
 
+static int ensure_frame(amtq_quicly *s, size_t needed) {
+  if (s->frame_capacity >= needed)
+    return 0;
+  size_t cap = s->frame_capacity ? s->frame_capacity : 1536U;
+  while (cap < needed)
+    cap = cap > 32768U ? 65587U : cap * 2U;
+  if (cap < needed)
+    cap = needed;
+  uint8_t *buf = realloc(s->frame, cap);
+  if (!buf)
+    return -1;
+  s->frame = buf;
+  s->frame_capacity = cap;
+  return 0;
+}
+
+static int seal_reliable(amtq_quicly *s) {
+  reliable_stream *data = s->open_reliable;
+  if (!data)
+    return NANOAMTQ_OK;
+  s->open_reliable = NULL;
+  if (data->ended || data->sealed)
+    return NANOAMTQ_OK;
+  if (quicly_streambuf_egress_shutdown(data->stream))
+    return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
+  data->sealed = 1;
+  int rc = nanoamtq_relay_reliable_finish(s->relay, s->now, data->context_id,
+                                          data->block_id);
+  if (rc)
+    return fail(s, rc, NANOAMTQ_CLOSE_CONTEXT);
+  return NANOAMTQ_OK;
+}
+
+static void record_reliable_tuple(reliable_stream *data,
+                                  const nanoamtq_relay_datagram_output *meta) {
+  size_t addr_len = ip_address_size(meta->ip_version);
+  for (unsigned i = 0; i < data->tuple_count; ++i) {
+    if (data->tuples[i].ip_version == meta->ip_version &&
+        !memcmp(data->tuples[i].source, meta->source, addr_len) &&
+        !memcmp(data->tuples[i].group, meta->group, addr_len))
+      return;
+  }
+  if (data->tuple_count < AMTQ_RELIABLE_MAX_RECORDS) {
+    reliable_tuple *t = &data->tuples[data->tuple_count++];
+    memset(t, 0, sizeof(*t));
+    t->ip_version = meta->ip_version;
+    memcpy(t->source, meta->source, addr_len);
+    memcpy(t->group, meta->group, addr_len);
+  }
+}
+
+static int append_reliable(amtq_quicly *s, int64_t now, const uint8_t *ip,
+                           size_t size) {
+  if (!input_allowed(s, ip, size))
+    return NANOAMTQ_IGNORED;
+  size_t max_rec = size + 10; /* max varint prefix plus AMT header */
+  if (s->open_reliable &&
+      (s->open_reliable->records >= AMTQ_RELIABLE_MAX_RECORDS ||
+       (s->open_reliable->records > 0 &&
+        s->open_reliable->written + max_rec > AMTQ_RELIABLE_MAX_BYTES))) {
+    int rc = seal_reliable(s);
+    if (rc)
+      return rc;
+  }
+  size_t needed = max_rec + (s->open_reliable ? 0U : 24U);
+  if (needed > s->config.reliable_buffer_bytes - s->reliable_bytes)
+    return NANOAMTQ_ERROR_LIMIT;
+  if (ensure_frame(s, max_rec))
+    return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
+  if (!s->open_reliable) {
+    unsigned slot = 0;
+    while (slot < NANOAMTQ_MAX_CONTEXTS && s->reliable[slot])
+      ++slot;
+    if (slot == NANOAMTQ_MAX_CONTEXTS)
+      return NANOAMTQ_ERROR_LIMIT;
+    uint64_t block = 0;
+    uint8_t header[24];
+    size_t header_size = 0;
+    int rc = nanoamtq_relay_reliable_begin(s->relay, now, 0, &block, header,
+                                           sizeof(header), &header_size);
+    if (rc == NANOAMTQ_ERROR_LIMIT)
+      return NANOAMTQ_ERROR_LIMIT;
+    if (rc != NANOAMTQ_PACKET)
+      return fail(s, rc, NANOAMTQ_CLOSE_CONTEXT);
+    quicly_stream_t *stream = NULL;
+    if (quicly_open_stream(s->connection, &stream, 1) ||
+        quicly_streambuf_egress_write(stream, header, header_size))
+      return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
+    reliable_stream *data = stream->data;
+    data->context_id = 0;
+    data->block_id = block;
+    data->pending += header_size;
+    data->written += header_size;
+    s->reliable_bytes += header_size;
+    s->open_reliable = data;
+    ++s->stats.reliable_blocks;
+  }
+  reliable_stream *data = s->open_reliable;
+  nanoamtq_relay_datagram_output metadata;
+  int rc = nanoamtq_relay_reliable_record(s->relay, now, data->context_id,
+                                          data->block_id, ip, size, s->frame,
+                                          s->frame_capacity, &metadata);
+  if (rc != NANOAMTQ_PACKET)
+    return fail(s, rc < 0 ? rc : NANOAMTQ_ERROR_PROTOCOL,
+                NANOAMTQ_CLOSE_CONTEXT);
+  if (quicly_streambuf_egress_write(data->stream, s->frame, metadata.size))
+    return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
+  data->pending += metadata.size;
+  data->written += metadata.size;
+  s->reliable_bytes += metadata.size;
+  ++data->records;
+  record_reliable_tuple(data, &metadata);
+  if (data->records >= AMTQ_RELIABLE_MAX_RECORDS ||
+      data->written >= AMTQ_RELIABLE_MAX_BYTES)
+    return seal_reliable(s);
+  return NANOAMTQ_OK;
+}
+
 int amtq_quicly_forward_queued(amtq_quicly *s, int64_t now, int64_t at,
                                const uint8_t *ip, size_t size) {
   int rc = amtq_quicly_tick(s, now);
@@ -710,17 +875,12 @@ int amtq_quicly_forward_queued(amtq_quicly *s, int64_t now, int64_t at,
     return NANOAMTQ_ERROR_ARGUMENT;
   if ((uint64_t)(now - at) >= s->config.data_age_ms)
     return NANOAMTQ_IGNORED;
+  if (nanoamtq_relay_context_mode(s->relay, 0) == 1)
+    return append_reliable(s, now, ip, size);
   nanoamtq_relay_cursor cursor = {0};
-  if (nanoamtq_relay_context_mode(s->relay, 0) == 1) {
-    if (!input_allowed(s, ip, size))
-      return NANOAMTQ_IGNORED;
-    cursor.owner = s->relay;
-    cursor.size = size;
-  } else {
-    rc = nanoamtq_relay_datagram_begin(s->relay, now, 0, ip, size, &cursor);
-    if (rc)
-      return rc;
-  }
+  rc = nanoamtq_relay_datagram_begin(s->relay, now, 0, ip, size, &cursor);
+  if (rc)
+    return rc;
   if (s->ip || s->queued || s->flight_data)
     return NANOAMTQ_ERROR_LIMIT;
   s->ip = malloc(size);
@@ -736,61 +896,6 @@ int amtq_quicly_forward_queued(amtq_quicly *s, int64_t now, int64_t at,
 int amtq_quicly_forward(amtq_quicly *s, int64_t now, const uint8_t *ip,
                         size_t size) {
   return amtq_quicly_forward_queued(s, now, now, ip, size);
-}
-
-static int pump_reliable(amtq_quicly *s) {
-  size_t retained = s->cursor.size + 10; /* max varint prefix plus AMT header */
-  if (retained > s->config.reliable_buffer_bytes - s->reliable_bytes)
-    return NANOAMTQ_OK;
-  unsigned i = 0;
-  while (i < NANOAMTQ_MAX_CONTEXTS && s->reliable[i])
-    ++i;
-  if (i == NANOAMTQ_MAX_CONTEXTS)
-    return NANOAMTQ_OK;
-  uint8_t *record = malloc(retained);
-  if (!record)
-    return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
-  uint64_t block;
-  uint8_t header[24];
-  size_t header_size;
-  int rc = nanoamtq_relay_reliable_begin(s->relay, s->now, 0, &block, header,
-                                         sizeof(header), &header_size);
-  if (rc != NANOAMTQ_PACKET) {
-    free(record);
-    return rc == NANOAMTQ_ERROR_LIMIT ? NANOAMTQ_OK
-                                      : fail(s, rc, NANOAMTQ_CLOSE_CONTEXT);
-  }
-  nanoamtq_relay_datagram_output metadata;
-  rc = nanoamtq_relay_reliable_record(s->relay, s->now, 0, block, s->ip,
-                                      s->cursor.size, record, retained,
-                                      &metadata);
-  if (rc != NANOAMTQ_PACKET) {
-    free(record);
-    return fail(s, rc < 0 ? rc : NANOAMTQ_ERROR_PROTOCOL,
-                NANOAMTQ_CLOSE_CONTEXT);
-  }
-  quicly_stream_t *stream;
-  if (quicly_open_stream(s->connection, &stream, 1)) {
-    free(record);
-    return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
-  }
-  reliable_stream *data = stream->data;
-  data->record = record;
-  data->record_size = metadata.size;
-  data->metadata = metadata;
-  s->reliable_bytes += data->record_size;
-  if (quicly_streambuf_egress_write(stream, header, header_size) ||
-      quicly_streambuf_egress_write(stream, record, metadata.size) ||
-      quicly_streambuf_egress_shutdown(stream))
-    return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
-  data->pending = header_size + metadata.size;
-  rc = nanoamtq_relay_reliable_finish(s->relay, s->now, 0, block);
-  if (rc)
-    return fail(s, rc, NANOAMTQ_CLOSE_CONTEXT);
-  free(s->ip);
-  s->ip = NULL;
-  ++s->stats.reliable_blocks;
-  return NANOAMTQ_OK;
 }
 
 static int pump(amtq_quicly *s) {
@@ -817,15 +922,20 @@ static int pump(amtq_quicly *s) {
     s->control.size = 0;
     ++s->stats.controls;
   }
+  if (s->open_reliable) {
+    int rc = seal_reliable(s);
+    if (rc)
+      return rc;
+  }
   if (s->relay && s->ip && !s->queued && !s->flight_data) {
-    if (nanoamtq_relay_context_mode(s->relay, 0) == 1)
-      return pump_reliable(s);
     size_t limit = quicly_get_datagram_payload_limit(s->connection, 0);
     if (!limit)
       return NANOAMTQ_OK;
+    if (ensure_frame(s, limit < 65577U ? limit : 65577U))
+      return fail(s, NANOAMTQ_ERROR_MEMORY, NANOAMTQ_CLOSE_INTERNAL);
     int rc =
         nanoamtq_relay_datagram_next(s->relay, s->now, &s->cursor, limit,
-                                     s->frame, sizeof(s->frame), &s->datagram);
+                                     s->frame, s->frame_capacity, &s->datagram);
     if (rc == NANOAMTQ_ERROR_BUFFER && s->datagram.size > limit)
       return NANOAMTQ_OK; /* retain cursor until budget grows or age expires */
     if (rc == NANOAMTQ_OK || rc == NANOAMTQ_IGNORED) {
@@ -864,7 +974,7 @@ int amtq_quicly_send(amtq_quicly *s, int64_t now, amtq_quicly_output *output) {
   quicly_address_t destination, source;
   quicly_error_t result =
       quicly_send(s->connection, &destination, &source, &packet, &count,
-                  s->flight, sizeof(s->flight));
+                  s->flight, s->flight_capacity);
   if (result)
     return fail(s, NANOAMTQ_ERROR_PROTOCOL, NANOAMTQ_CLOSE_PROTOCOL);
   if (!count)

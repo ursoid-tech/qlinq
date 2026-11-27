@@ -96,7 +96,7 @@ qlinq_relay_t *qlinq_relay_open(const qlinq_relay_config_t *config) {
        config->linux_gateway_family != 6) ||
       (config->path_mtu && config->path_mtu < 576) ||
       config->path_mtu > 65535 || config->max_clients > 1024 ||
-      config->max_groups > 4096 || config->max_sources > 65536) {
+      config->max_groups > 4096 || config->max_sources > 65535) {
     errno = EINVAL;
     return NULL;
   }
@@ -292,19 +292,14 @@ int qlinq_relay_service(qlinq_relay_t *relay, int timeout_ms) {
     }
   if (relay->amtq && (fds[2].revents & POLLIN))
     for (unsigned i = 0; i < 64; ++i) {
-      amtq_posix_stats before, after;
-      amtq_posix_get_stats(relay->amtq, &before);
       rc = amtq_posix_receive(relay->amtq, now);
-      amtq_posix_get_stats(relay->amtq, &after);
       if (rc < 0)
         return -1;
-      relay->reconcile_at = 0;
-      if (before.received == after.received)
+      if (rc == NANOAMTQ_OK)
         break;
     }
-  unsigned native_budget = relay->amtq ? 4U : 64U;
   if (fds[1].revents & POLLIN)
-    for (unsigned i = 0; i < native_budget; ++i) {
+    for (unsigned i = 0; i < 64; ++i) {
       nanoamt_native_packet packet;
       rc = nanoamt_native_receive(relay->native, &packet);
       if (rc == NANOAMT_AGAIN)
@@ -313,9 +308,9 @@ int qlinq_relay_service(qlinq_relay_t *relay, int timeout_ms) {
         return -1;
       if (rc == NANOAMT_PACKET) {
         if (relay->amtq) {
-          if (amtq_posix_forward(relay->amtq, now, packet.ip, packet.size) <
-                  0 ||
-              amtq_posix_send(relay->amtq, now) < 0)
+          if (amtq_posix_forward(relay->amtq, now, packet.ip, packet.size) < 0)
+            return -1;
+          if (((i + 1U) & 15U) == 0 && amtq_posix_send(relay->amtq, now) < 0)
             return -1;
         }
         if (relay->io) {

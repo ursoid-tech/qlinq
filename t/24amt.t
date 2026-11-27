@@ -32,6 +32,7 @@ subtest 'mode validation' => sub {
                   '--network-mode amt-relay --relay-interface lo --listen 2268 --amtq-port 2268 --cert x --key y',
                   '--network-mode amtq-relay --relay-interface lo --linux-gateway-family 4 --cert x --key y',
                   '--network-mode amt-relay --relay-interface lo --relay-clients 1025',
+                  '--network-mode amt-relay --relay-interface lo --relay-sources 65536',
                   '--network-mode amt-relay --relay-interface lo --relay-mtu 575',
                   '--network-mode amt-relay --relay-interface lo --bind bad',
                   '--network-mode multicast-fanout --listen 19999',

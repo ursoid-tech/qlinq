@@ -36,12 +36,14 @@ static void print_stats(qlinq_relay_t *relay, bool disable_classic,
           "\"groups\":%zu,\"sources\":%zu,\"sent\":%" PRIu64
           ",\"amtq_sent\":%" PRIu64 ",\"amtq_datagrams\":%" PRIu64
           ",\"amtq_reliable_blocks\":%" PRIu64 ",\"input_drops\":%" PRIu64
-          ",\"amtq_input_drops\":%" PRIu64 ",\"send_errors\":%" PRIu64
-          ",\"amtq_send_errors\":%" PRIu64 ",\"mtu_drops\":%" PRIu64
-          ",\"upstream_errors\":%" PRIu64 "}\n",
+          ",\"amtq_input_drops\":%" PRIu64 ",\"amtq_backpressure\":%" PRIu64
+          ",\"send_errors\":%" PRIu64 ",\"amtq_send_errors\":%" PRIu64
+          ",\"amtq_session_errors\":%" PRIu64 ",\"amtq_policy_errors\":%" PRIu64
+          ",\"mtu_drops\":%" PRIu64 ",\"upstream_errors\":%" PRIu64 "}\n",
           mode, s.clients, s.amtq_clients, s.groups, s.sources, s.packets_sent,
           s.amtq_packets_sent, s.amtq_datagrams, s.amtq_reliable_blocks,
-          s.input_drops, s.amtq_input_drops, s.send_errors, s.amtq_send_errors,
+          s.input_drops, s.amtq_input_drops, s.amtq_backpressure, s.send_errors,
+          s.amtq_send_errors, s.amtq_session_errors, s.amtq_policy_errors,
           s.mtu_drops, s.upstream_errors);
 }
 int app_amt_relay_run(const qlinq_relay_config_t *config, unsigned stats_ms) {

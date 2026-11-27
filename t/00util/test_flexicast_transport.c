@@ -1067,13 +1067,79 @@ int main(int argc, char **argv) {
   }
   if (auto_backend) {
     uint8_t expected_stage = auto_amtq ? 2 : 1;
+    transport_flexicast_flow_t *a_flow = NULL, *b_flow = NULL;
     for (size_t f = 0; f < client_a->flexicast.capacity; ++f) {
       transport_flexicast_flow_t *fl = &client_a->flexicast.flows[f];
-      if (fl->active && !fl->source && fl->relay_auto_stage != expected_stage) {
-        fprintf(stderr, "AUTO settled on stage %u (expected %u)\n",
-                fl->relay_auto_stage, expected_stage);
-        goto Fail;
+      if (fl->active && !fl->source) {
+        a_flow = fl;
+        if (fl->relay_auto_stage != expected_stage) {
+          fprintf(stderr, "AUTO settled on stage %u (expected %u)\n",
+                  fl->relay_auto_stage, expected_stage);
+          goto Fail;
+        }
       }
+    }
+    for (size_t f = 0; f < client_b->flexicast.capacity; ++f) {
+      if (client_b->flexicast.flows[f].active &&
+          !client_b->flexicast.flows[f].source) {
+        b_flow = &client_b->flexicast.flows[f];
+        break;
+      }
+    }
+    /* repeated SUBSCRIBE refresh must not emit duplicate SUBSCRIBE events */
+    size_t subs_before = server_state.subscriptions;
+    if (!transport_subscribe(client_a, track)) {
+      fprintf(stderr, "repeat SUBSCRIBE failed\n");
+      goto Fail;
+    }
+    for (int i = 0; i < 40; ++i) {
+      drive(server, client_a, client_b);
+      usleep(2000);
+    }
+    if (server_state.subscriptions != subs_before) {
+      fprintf(stderr,
+              "repeat SUBSCRIBE inflated subscriber count (%zu != %zu)\n",
+              server_state.subscriptions, subs_before);
+      goto Fail;
+    }
+    /* native interface removal must leave active AUTO tunnel untouched */
+    const uint8_t removed_v4[4] = {192, 0, 2, 99};
+    client_a->turn_active = true;
+    transport_flexicast_interface_removed(client_a, 4, removed_v4, 0);
+    client_a->turn_active = false;
+    if (!a_flow || !a_flow->membership_acquired || !a_flow->amt_tunnel ||
+        a_flow->multicast_unavailable) {
+      fprintf(stderr, "native interface removal disabled active AUTO tunnel\n");
+      goto Fail;
+    }
+    /* delayed FC_KEY after tunnel failure must not clear retry deadline */
+    if (!b_flow || !b_flow->control_conn) {
+      fprintf(stderr, "missing client_b AUTO flow\n");
+      goto Fail;
+    }
+    client_b->turn_active = true;
+    transport_flexicast_tunnel_failed(client_b, b_flow);
+    int64_t scheduled_retry = b_flow->relay_retry_at_ms;
+    uint8_t dummy_secret[TRANSPORT_FLEXICAST_SECRET_SIZE] = {0x5a};
+    quicly_flexicast_frame_t late_key = {
+        .type = QUICLY_FRAME_TYPE_FC_KEY,
+        .data.key = {.sequence = b_flow->key_epoch,
+                     .algorithm = PTLS_CIPHER_SUITE_AES_128_GCM_SHA256,
+                     .first_packet_number = 0,
+                     .key =
+                         ptls_iovec_init(dummy_secret, sizeof(dummy_secret))}};
+    late_key.data.key.flow_id.len = 8;
+    for (size_t b = 0; b < 8; ++b)
+      late_key.data.key.flow_id.bytes[7 - b] =
+          (uint8_t)(b_flow->flow_id >> (b * 8));
+    bool key_ok = transport_flexicast_receive_quic_frame(
+        client_b, b_flow->control_conn, &late_key);
+    client_b->turn_active = false;
+    if (!key_ok || scheduled_retry <= 0 ||
+        b_flow->relay_retry_at_ms != scheduled_retry ||
+        !b_flow->multicast_unavailable || b_flow->membership_acquired) {
+      fprintf(stderr, "late FC_KEY canceled tunnel recovery\n");
+      goto Fail;
     }
   }
 #endif

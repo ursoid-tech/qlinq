@@ -140,7 +140,7 @@ native|amt|amtq|auto` selects the receiver group backend (`--amt-relay` defaults
 to `amt` when `--group-backend` is omitted). When the receiver configures `--cert`
 and `--key`, AMTQ automatically presents that client certificate if the relay
 requests mTLS. `--amtq-ca` overrides `--ca` when the relay uses a separate PKI
-from the publication source, and `--insecure` skips relay certificate
+from the publication source, and `--insecure-no-verify` skips relay certificate
 verification in test environments. Native, classic AMT, and AMTQ receivers can
 subscribe to the same publication concurrently. In `auto` mode, each flow tries
 native multicast first (when a local group interface is usable), then classic
@@ -160,7 +160,7 @@ Relay defaults and limits:
 | --- | --- | --- |
 | `--relay-clients` | 64 | 1024 |
 | `--relay-groups` | 1024 | 4096 |
-| `--relay-sources` | 4096 | 65536 |
+| `--relay-sources` | 4096 | 65535 |
 | `--relay-mtu` | 1500 | 65535 |
 
 The minimum configured relay MTU is 576. Classic AMT accounts for encapsulation,

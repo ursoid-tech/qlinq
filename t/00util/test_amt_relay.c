@@ -77,6 +77,7 @@ static void check_shared_membership(void) {
 }
 typedef struct {
   bool received;
+  unsigned count;
   size_t size;
   uint8_t payload[4096];
 } amtq_rx_t;
@@ -87,6 +88,7 @@ static void on_amtq_packet(void *ctx, uint64_t cid, nanoamt_packet *p) {
   memcpy(rx->payload, p->data, p->size);
   rx->size = p->size;
   rx->received = true;
+  rx->count++;
 }
 static void join_amtq(amtq_posix *client) {
   for (unsigned n = 0; n < 1000; ++n) {
@@ -145,6 +147,19 @@ static void check_amtq_and_dual_stack(const uint8_t *opaque, size_t opaque_len,
                                .amtq_cert_file = "t/assets/verified.crt",
                                .amtq_key_file = "t/assets/verified.key"};
   assert(!qlinq_relay_open(&bad) && errno == EINVAL);
+  bad =
+      (qlinq_relay_config_t){.upstream_interface = "lo", .max_sources = 65536};
+  assert(!qlinq_relay_open(&bad) && errno == EINVAL);
+  qlinq_relay_config_t max_src_cfg = {.bind_address = "127.0.0.1",
+                                      .port = 10168,
+                                      .amtq_port = 10169,
+                                      .amtq_cert_file = "t/assets/verified.crt",
+                                      .amtq_key_file = "t/assets/verified.key",
+                                      .upstream_interface = "lo",
+                                      .max_sources = 65535};
+  qlinq_relay_t *max_src_relay = qlinq_relay_open(&max_src_cfg);
+  assert(max_src_relay);
+  qlinq_relay_close(max_src_relay);
 
   /* dual-stack: classic AMT + AMTQ datagram + AMTQ reliable block on 1 group */
   fixture_groups = 0;
@@ -221,6 +236,65 @@ static void check_amtq_and_dual_stack(const uint8_t *opaque, size_t opaque_len,
   qlinq_relay_get_stats(fixture_relay, &stats);
   assert(stats.clients == 1 && stats.amtq_clients == 2 &&
          stats.amtq_datagrams >= 3 && stats.amtq_reliable_blocks == 2);
+
+  /* burst coalescing + send budget with 1 active peer: 8 queued packets deliver
+   * cleanly and coalesce into fewer reliable blocks than packets */
+  dgram_rx.count = 0;
+  rel_rx.count = 0;
+  size = fixture_ipv4(ip, opaque, 128, m4.source, m4.group, 10002);
+  for (unsigned b = 0; b < 8; ++b)
+    assert(send(fixture_pair[1], ip, size, 0) == (ssize_t)size);
+  for (unsigned n = 0; n < 500 && (dgram_rx.count < 8 || rel_rx.count < 8);
+       ++n) {
+    fixture_pump();
+    while (amtq_posix_receive(dgram_client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    while (amtq_posix_receive(rel_client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    assert(amtq_posix_send(dgram_client, now_ms()) >= 0);
+    assert(amtq_posix_send(rel_client, now_ms()) >= 0);
+    if (dgram_rx.count < 8 || rel_rx.count < 8)
+      usleep(1000);
+  }
+  qlinq_relay_get_stats(fixture_relay, &stats);
+  assert(dgram_rx.count == 8 && rel_rx.count == 8 && !stats.amtq_input_drops &&
+         stats.amtq_reliable_blocks <= 4);
+
+  /* withdrawing one group with an unacked reliable block preserves sibling
+   * groups on the same AMTQ session */
+  nanoamtq_membership m4_pair[2] = {m4, m4};
+  m4_pair[1].group[3] = 2;
+  assert(!amtq_posix_set_memberships(rel_client, m4_pair, 2));
+  for (unsigned n = 0; n < 200 && fixture_groups < 2; ++n) {
+    assert(amtq_posix_send(rel_client, now_ms()) >= 0);
+    fixture_pump();
+    while (amtq_posix_receive(rel_client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    usleep(1000);
+  }
+  assert(fixture_groups == 2);
+  size =
+      fixture_ipv4(ip, opaque, 96, m4_pair[0].source, m4_pair[0].group, 10002);
+  assert(send(fixture_pair[1], ip, size, 0) == (ssize_t)size);
+  fixture_pump();
+  /* withdraw group 0 before rel_client ACKs the in-flight reliable stream */
+  assert(!amtq_posix_set_memberships(rel_client, &m4_pair[1], 1));
+  for (unsigned n = 0; n < 200; ++n) {
+    assert(amtq_posix_send(rel_client, now_ms()) >= 0);
+    fixture_pump();
+    while (amtq_posix_receive(rel_client, now_ms()) == NANOAMTQ_PACKET) {
+    }
+    if (amtq_posix_memberships_submitted(rel_client))
+      break;
+    usleep(1000);
+  }
+  fixture_pump();
+  rel_rx.received = false;
+  size =
+      fixture_ipv4(ip, opaque, 80, m4_pair[1].source, m4_pair[1].group, 10002);
+  check_amtq_packet(rel_client, &rel_rx, ip, size, opaque, 80);
+  qlinq_relay_get_stats(fixture_relay, &stats);
+  assert(!stats.amtq_session_errors && stats.amtq_clients == 2);
 
   amtq_posix_close(rel_client);
   amtq_posix_close(dgram_client);

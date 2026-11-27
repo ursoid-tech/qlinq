@@ -882,7 +882,7 @@ static bool parse_options(int argc, char **argv, options_t *options) {
                !strcmp(arg, "--relay-groups") ||
                !strcmp(arg, "--relay-sources") ||
                !strcmp(arg, "--linux-gateway-family")) {
-      if (!cli_parse_u64(value, 65536, &parsed) || !parsed)
+      if (!cli_parse_u64(value, 65535, &parsed) || !parsed)
         goto invalid;
       if (!strcmp(arg, "--relay-mtu")) {
         if (parsed < 576 || parsed > 65535)
